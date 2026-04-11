@@ -22,10 +22,10 @@ pub use geo::{BoundingBox, GeoError, Latitude, Longitude, WkbGeometry};
 pub use graph::{AdjacencyRow, DrainageGraph, GraphError};
 pub use id::{AtomId, IdError, SnapId};
 pub use manifest::{
-    AtomCount, FormatVersion, Manifest, ManifestBuilder, ManifestError, RasterAvailability,
+    AtomCount, Crs, FormatVersion, Manifest, ManifestBuilder, ManifestError, RasterAvailability,
     SnapAvailability, Topology, UpAreaAvailability,
 };
-pub use raster::FlowDirEncoding;
+pub use raster::{FlowDirEncoding, FlowDirEncodingError};
 pub use snap::{MainstemStatus, SnapTarget};
 
 /// Trait for types that carry a spatial bounding box.

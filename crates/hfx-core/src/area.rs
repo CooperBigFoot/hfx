@@ -54,8 +54,10 @@ impl AreaKm2 {
     }
 }
 
-/// A dimensionless weight used for proportional allocation across catchment atoms.
+/// Snap ranking priority weight.
 ///
+/// Higher values indicate preferred snap targets during outlet resolution.
+/// Typically upstream drainage area in km² or upstream cell count.
 /// Invariant: the wrapped value is always finite and non-negative.
 ///
 /// `Eq` is intentionally not derived for the same reason as [`AreaKm2`].

@@ -1,5 +1,7 @@
 //! HFX dataset manifest types.
 
+use std::str::FromStr;
+
 use crate::geo::BoundingBox;
 use crate::raster::FlowDirEncoding;
 
@@ -12,11 +14,77 @@ pub enum Topology {
     Dag,
 }
 
+impl std::fmt::Display for Topology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Topology::Tree => write!(f, "tree"),
+            Topology::Dag => write!(f, "dag"),
+        }
+    }
+}
+
+impl FromStr for Topology {
+    type Err = ManifestError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tree" => Ok(Topology::Tree),
+            "dag" => Ok(Topology::Dag),
+            _ => Err(ManifestError::UnsupportedTopology { value: s.to_owned() }),
+        }
+    }
+}
+
 /// HFX format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FormatVersion {
     /// HFX specification version 0.1.
     V0_1,
+}
+
+impl std::fmt::Display for FormatVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormatVersion::V0_1 => write!(f, "0.1"),
+        }
+    }
+}
+
+impl FromStr for FormatVersion {
+    type Err = ManifestError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "0.1" => Ok(FormatVersion::V0_1),
+            _ => Err(ManifestError::UnsupportedFormatVersion { value: s.to_owned() }),
+        }
+    }
+}
+
+/// Coordinate reference system for all HFX vector and raster data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Crs {
+    /// WGS84 geographic coordinates. The only CRS supported in HFX v0.1.
+    Epsg4326,
+}
+
+impl std::fmt::Display for Crs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Crs::Epsg4326 => write!(f, "EPSG:4326"),
+        }
+    }
+}
+
+impl FromStr for Crs {
+    type Err = ManifestError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "EPSG:4326" => Ok(Crs::Epsg4326),
+            _ => Err(ManifestError::UnsupportedCrs { value: s.to_owned() }),
+        }
+    }
 }
 
 /// Whether upstream area values are precomputed in catchments.
@@ -67,6 +135,41 @@ pub enum ManifestError {
     /// Returned when created_at timestamp is empty.
     #[error("created_at timestamp must not be empty")]
     EmptyCreatedAt,
+
+    /// Returned when terminal_sink_id is not 0.
+    #[error("terminal_sink_id must be 0, got {value}")]
+    InvalidTerminalSinkId {
+        /// The non-zero value.
+        value: i64,
+    },
+
+    /// Returned when fabric_name contains uppercase characters.
+    #[error("fabric name must be lowercase, got {value:?}")]
+    NonLowercaseFabricName {
+        /// The invalid fabric name.
+        value: String,
+    },
+
+    /// Returned when an unsupported CRS string is provided.
+    #[error("unsupported CRS: {value:?}, expected \"EPSG:4326\"")]
+    UnsupportedCrs {
+        /// The unrecognized CRS string.
+        value: String,
+    },
+
+    /// Returned when an unsupported format version is provided.
+    #[error("unsupported format version: {value:?}, expected \"0.1\"")]
+    UnsupportedFormatVersion {
+        /// The unrecognized version string.
+        value: String,
+    },
+
+    /// Returned when an unsupported topology string is provided.
+    #[error("unsupported topology: {value:?}, expected \"tree\" or \"dag\"")]
+    UnsupportedTopology {
+        /// The unrecognized topology string.
+        value: String,
+    },
 }
 
 /// Non-zero count of catchment atoms in a dataset.
@@ -104,11 +207,12 @@ pub struct Manifest {
     fabric_name: String,
     fabric_version: Option<String>,
     fabric_level: Option<u32>,
-    crs: String,
+    crs: Crs,
     up_area: UpAreaAvailability,
     rasters: RasterAvailability,
     snap: SnapAvailability,
     topology: Topology,
+    terminal_sink_id: i64,
     region: Option<String>,
     bbox: BoundingBox,
     atom_count: AtomCount,
@@ -122,7 +226,7 @@ impl Manifest {
         self.format_version
     }
 
-    /// Returns the source fabric name (e.g. `"HydroBASINS"`).
+    /// Returns the source fabric name (e.g. `"hydrobasins"`).
     pub fn fabric_name(&self) -> &str {
         &self.fabric_name
     }
@@ -137,9 +241,9 @@ impl Manifest {
         self.fabric_level
     }
 
-    /// Returns the coordinate reference system string (always `"EPSG:4326"` in v0.1).
-    pub fn crs(&self) -> &str {
-        &self.crs
+    /// Returns the coordinate reference system for this dataset.
+    pub fn crs(&self) -> Crs {
+        self.crs
     }
 
     /// Returns whether upstream area values are precomputed in this dataset.
@@ -160,6 +264,11 @@ impl Manifest {
     /// Returns the declared graph topology of this dataset.
     pub fn topology(&self) -> Topology {
         self.topology
+    }
+
+    /// Returns the terminal sink ID for this dataset (always `0` in v0.1).
+    pub fn terminal_sink_id(&self) -> i64 {
+        self.terminal_sink_id
     }
 
     /// Returns the optional region label for this dataset, if declared.
@@ -196,9 +305,13 @@ impl Manifest {
 /// Required fields are supplied to [`ManifestBuilder::new`] and validated
 /// immediately. Optional fields are set via chainable `with_*` methods.
 /// Call [`ManifestBuilder::build`] to produce the final [`Manifest`].
+#[derive(Debug)]
 pub struct ManifestBuilder {
+    format_version: FormatVersion,
     fabric_name: String,
+    crs: Crs,
     topology: Topology,
+    terminal_sink_id: i64,
     bbox: BoundingBox,
     atom_count: AtomCount,
     created_at: String,
@@ -218,19 +331,35 @@ impl ManifestBuilder {
     ///
     /// | Variant | Condition |
     /// |---|---|
+    /// | [`ManifestError::InvalidTerminalSinkId`] | `terminal_sink_id` is not 0 |
     /// | [`ManifestError::EmptyFabricName`] | `fabric_name` is empty |
+    /// | [`ManifestError::NonLowercaseFabricName`] | `fabric_name` contains uppercase characters |
     /// | [`ManifestError::EmptyAdapterVersion`] | `adapter_version` is empty |
     /// | [`ManifestError::EmptyCreatedAt`] | `created_at` is empty |
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        fabric_name: String,
+        format_version: FormatVersion,
+        fabric_name: impl Into<String>,
+        crs: Crs,
         topology: Topology,
+        terminal_sink_id: i64,
         bbox: BoundingBox,
         atom_count: AtomCount,
-        created_at: String,
-        adapter_version: String,
+        created_at: impl Into<String>,
+        adapter_version: impl Into<String>,
     ) -> Result<Self, ManifestError> {
+        let fabric_name = fabric_name.into();
+        let created_at = created_at.into();
+        let adapter_version = adapter_version.into();
+
+        if terminal_sink_id != 0 {
+            return Err(ManifestError::InvalidTerminalSinkId { value: terminal_sink_id });
+        }
         if fabric_name.is_empty() {
             return Err(ManifestError::EmptyFabricName);
+        }
+        if fabric_name.chars().any(|c| c.is_uppercase()) {
+            return Err(ManifestError::NonLowercaseFabricName { value: fabric_name });
         }
         if adapter_version.is_empty() {
             return Err(ManifestError::EmptyAdapterVersion);
@@ -240,8 +369,11 @@ impl ManifestBuilder {
         }
 
         Ok(Self {
+            format_version,
             fabric_name,
+            crs,
             topology,
+            terminal_sink_id,
             bbox,
             atom_count,
             created_at,
@@ -275,8 +407,8 @@ impl ManifestBuilder {
     }
 
     /// Sets the optional fabric version string.
-    pub fn with_fabric_version(mut self, v: String) -> Self {
-        self.fabric_version = Some(v);
+    pub fn with_fabric_version(mut self, v: impl Into<String>) -> Self {
+        self.fabric_version = Some(v.into());
         self
     }
 
@@ -287,27 +419,26 @@ impl ManifestBuilder {
     }
 
     /// Sets the optional region label for this dataset.
-    pub fn with_region(mut self, region: String) -> Self {
-        self.region = Some(region);
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
         self
     }
 
     /// Consumes the builder and returns a validated [`Manifest`].
     ///
     /// This method is infallible: all validation occurs in [`ManifestBuilder::new`].
-    /// The format version is pinned to [`FormatVersion::V0_1`] and the CRS is
-    /// set to `"EPSG:4326"`.
     pub fn build(self) -> Manifest {
         Manifest {
-            format_version: FormatVersion::V0_1,
+            format_version: self.format_version,
             fabric_name: self.fabric_name,
             fabric_version: self.fabric_version,
             fabric_level: self.fabric_level,
-            crs: String::from("EPSG:4326"),
+            crs: self.crs,
             up_area: self.up_area,
             rasters: self.rasters,
             snap: self.snap,
             topology: self.topology,
+            terminal_sink_id: self.terminal_sink_id,
             region: self.region,
             bbox: self.bbox,
             atom_count: self.atom_count,
@@ -333,12 +464,15 @@ mod tests {
 
     fn minimal_builder() -> ManifestBuilder {
         ManifestBuilder::new(
-            String::from("HydroBASINS"),
+            FormatVersion::V0_1,
+            "hydrobasins",
+            Crs::Epsg4326,
             Topology::Tree,
+            0,
             test_bbox(),
             test_atom_count(100),
-            String::from("2026-01-01T00:00:00Z"),
-            String::from("hfx-adapter-v1"),
+            "2026-01-01T00:00:00Z",
+            "hfx-adapter-v1",
         )
         .unwrap()
     }
@@ -368,12 +502,15 @@ mod tests {
     #[test]
     fn builder_empty_fabric_name_fails() {
         let err = ManifestBuilder::new(
-            String::from(""),
+            FormatVersion::V0_1,
+            "",
+            Crs::Epsg4326,
             Topology::Tree,
+            0,
             test_bbox(),
             test_atom_count(1),
-            String::from("2026-01-01T00:00:00Z"),
-            String::from("v1"),
+            "2026-01-01T00:00:00Z",
+            "v1",
         )
         .err()
         .unwrap();
@@ -383,12 +520,15 @@ mod tests {
     #[test]
     fn builder_empty_adapter_version_fails() {
         let err = ManifestBuilder::new(
-            String::from("HydroBASINS"),
+            FormatVersion::V0_1,
+            "hydrobasins",
+            Crs::Epsg4326,
             Topology::Tree,
+            0,
             test_bbox(),
             test_atom_count(1),
-            String::from("2026-01-01T00:00:00Z"),
-            String::from(""),
+            "2026-01-01T00:00:00Z",
+            "",
         )
         .err()
         .unwrap();
@@ -398,16 +538,71 @@ mod tests {
     #[test]
     fn builder_empty_created_at_fails() {
         let err = ManifestBuilder::new(
-            String::from("HydroBASINS"),
+            FormatVersion::V0_1,
+            "hydrobasins",
+            Crs::Epsg4326,
             Topology::Tree,
+            0,
             test_bbox(),
             test_atom_count(1),
-            String::from(""),
-            String::from("v1"),
+            "",
+            "v1",
         )
         .err()
         .unwrap();
         assert!(matches!(err, ManifestError::EmptyCreatedAt));
+    }
+
+    #[test]
+    fn terminal_sink_id_nonzero_fails() {
+        let err = ManifestBuilder::new(
+            FormatVersion::V0_1,
+            "hydrobasins",
+            Crs::Epsg4326,
+            Topology::Tree,
+            5,
+            test_bbox(),
+            test_atom_count(1),
+            "2026-01-01T00:00:00Z",
+            "v1",
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ManifestError::InvalidTerminalSinkId { value: 5 }));
+    }
+
+    #[test]
+    fn fabric_name_uppercase_fails() {
+        let err = ManifestBuilder::new(
+            FormatVersion::V0_1,
+            "HydroBASINS",
+            Crs::Epsg4326,
+            Topology::Tree,
+            0,
+            test_bbox(),
+            test_atom_count(1),
+            "2026-01-01T00:00:00Z",
+            "v1",
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ManifestError::NonLowercaseFabricName { .. }));
+    }
+
+    #[test]
+    fn fabric_name_lowercase_succeeds() {
+        let result = ManifestBuilder::new(
+            FormatVersion::V0_1,
+            "hydrobasins",
+            Crs::Epsg4326,
+            Topology::Tree,
+            0,
+            test_bbox(),
+            test_atom_count(1),
+            "2026-01-01T00:00:00Z",
+            "v1",
+        );
+        assert!(result.is_ok());
     }
 
     // --- Minimal manifest defaults ---
@@ -420,10 +615,22 @@ mod tests {
         assert_eq!(manifest.rasters(), RasterAvailability::Absent);
         assert_eq!(manifest.snap(), SnapAvailability::Absent);
         assert_eq!(manifest.format_version(), FormatVersion::V0_1);
-        assert_eq!(manifest.crs(), "EPSG:4326");
+        assert_eq!(manifest.crs(), Crs::Epsg4326);
         assert_eq!(manifest.fabric_version(), None);
         assert_eq!(manifest.fabric_level(), None);
         assert_eq!(manifest.region(), None);
+    }
+
+    #[test]
+    fn crs_getter_returns_enum() {
+        let manifest = minimal_builder().build();
+        assert_eq!(manifest.crs(), Crs::Epsg4326);
+    }
+
+    #[test]
+    fn terminal_sink_id_getter_returns_zero() {
+        let manifest = minimal_builder().build();
+        assert_eq!(manifest.terminal_sink_id(), 0);
     }
 
     // --- Optional field builders ---
@@ -452,9 +659,9 @@ mod tests {
             .with_up_area()
             .with_rasters(FlowDirEncoding::Taudem)
             .with_snap()
-            .with_fabric_version(String::from("v2024"))
+            .with_fabric_version("v2024")
             .with_fabric_level(8)
-            .with_region(String::from("North America"))
+            .with_region("North America")
             .build();
 
         assert_eq!(manifest.up_area(), UpAreaAvailability::Precomputed);
@@ -464,6 +671,48 @@ mod tests {
         assert_eq!(manifest.fabric_level(), Some(8));
         assert_eq!(manifest.region(), Some("North America"));
         assert_eq!(manifest.format_version(), FormatVersion::V0_1);
-        assert_eq!(manifest.crs(), "EPSG:4326");
+        assert_eq!(manifest.crs(), Crs::Epsg4326);
+    }
+
+    // --- Display / FromStr roundtrips ---
+
+    #[test]
+    fn topology_display_roundtrip() {
+        assert_eq!(Topology::Tree.to_string(), "tree");
+        assert_eq!(Topology::Dag.to_string(), "dag");
+        assert_eq!("tree".parse::<Topology>().unwrap(), Topology::Tree);
+        assert_eq!("dag".parse::<Topology>().unwrap(), Topology::Dag);
+    }
+
+    #[test]
+    fn format_version_display_roundtrip() {
+        assert_eq!(FormatVersion::V0_1.to_string(), "0.1");
+        assert_eq!("0.1".parse::<FormatVersion>().unwrap(), FormatVersion::V0_1);
+    }
+
+    #[test]
+    fn crs_display_roundtrip() {
+        assert_eq!(Crs::Epsg4326.to_string(), "EPSG:4326");
+        assert_eq!("EPSG:4326".parse::<Crs>().unwrap(), Crs::Epsg4326);
+    }
+
+    // --- FromStr error cases ---
+
+    #[test]
+    fn topology_fromstr_invalid() {
+        let err = "invalid".parse::<Topology>().unwrap_err();
+        assert!(matches!(err, ManifestError::UnsupportedTopology { .. }));
+    }
+
+    #[test]
+    fn crs_fromstr_invalid() {
+        let err = "EPSG:32632".parse::<Crs>().unwrap_err();
+        assert!(matches!(err, ManifestError::UnsupportedCrs { .. }));
+    }
+
+    #[test]
+    fn format_version_fromstr_invalid() {
+        let err = "0.2".parse::<FormatVersion>().unwrap_err();
+        assert!(matches!(err, ManifestError::UnsupportedFormatVersion { .. }));
     }
 }

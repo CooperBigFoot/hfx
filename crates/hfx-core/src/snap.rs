@@ -17,6 +17,15 @@ pub enum MainstemStatus {
     Tributary,
 }
 
+impl std::fmt::Display for MainstemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MainstemStatus::Mainstem => write!(f, "mainstem"),
+            MainstemStatus::Tributary => write!(f, "tributary"),
+        }
+    }
+}
+
 /// A candidate location to which a pour point may be snapped.
 ///
 /// Each `SnapTarget` belongs to exactly one [`CatchmentAtom`] (via

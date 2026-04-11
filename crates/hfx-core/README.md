@@ -1,0 +1,74 @@
+# hfx-core
+
+Shared types and validation primitives for HFX artifacts.
+
+## Purpose
+
+`hfx-core` defines the canonical in-memory representation of the [HFX specification](../../spec/HFX_SPEC.md). Every type enforces its invariants at construction time (parse, don't validate): an `AtomId` is always positive, a `BoundingBox` is always non-degenerate, a `Manifest` always names a real fabric. Invalid states are unrepresentable.
+
+The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, and GeoTIFF is the responsibility of downstream crates (`hfx-validator`, source adapters, the delineation engine).
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph Primitives
+        id["id.rs\nAtomId, SnapId\nIdError"]
+        area["area.rs\nAreaKm2, Weight\nMeasureError"]
+        geo["geo.rs\nLongitude, Latitude\nBoundingBox, WkbGeometry\nGeoError"]
+        raster["raster.rs\nFlowDirEncoding\nFlowDirEncodingError"]
+    end
+
+    subgraph Composites
+        catchment["catchment.rs\nCatchmentAtom"]
+        snap["snap.rs\nSnapTarget, MainstemStatus"]
+        graph["graph.rs\nAdjacencyRow, DrainageGraph\nGraphError"]
+        manifest["manifest.rs\nManifest, ManifestBuilder\nCrs, Topology, FormatVersion\nUpAreaAvailability, RasterAvailability\nSnapAvailability, AtomCount\nManifestError"]
+    end
+
+    subgraph "lib.rs (root)"
+        lib["HasBbox trait\nHasAtomId trait\nre-exports"]
+    end
+
+    catchment --> id & area & geo
+    snap --> id & area & geo
+    graph --> id
+    manifest --> geo & raster
+    lib --> catchment & snap & graph & manifest
+```
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Catchment atom | Smallest indivisible drainage unit in an HFX dataset; one row of `catchments.parquet` |
+| Snap target | A candidate point or linestring reach to which a pour point may be snapped; one row of `snap.parquet` |
+| Adjacency row | One node in the upstream drainage graph — an atom ID plus the IDs of its direct upstream neighbours |
+| Drainage graph | Complete upstream adjacency over all atoms; in-memory representation of `graph.arrow` |
+| Manifest | Dataset metadata (`manifest.json`): format version, CRS, topology, artifact availability, bounding box |
+| Mainstem | Primary channel in a drainage network, as opposed to tributaries or distributaries |
+| WKB | Well-Known Binary — OGC binary encoding for geometry; treated as an opaque byte buffer by this crate |
+| D8 | Single-flow-direction model where each raster cell drains to exactly one of its eight neighbours |
+| Pfafstetter level | Hierarchical basin delineation level used by HydroBASINS and similar fabrics |
+| Terminal sink | The virtual outlet for an entire dataset; ID value `0` is reserved as its sentinel |
+
+## Key Types
+
+| Type | Module | Role |
+|---|---|---|
+| `AtomId` | `id` | Strictly-positive `i64` identifier for a catchment atom; distinct from `SnapId` to prevent accidental mixing |
+| `SnapId` | `id` | Strictly-positive `i64` identifier for a snap target |
+| `AreaKm2` | `area` | Finite, non-negative `f32` area in km² |
+| `Weight` | `area` | Finite, non-negative `f32` snap ranking weight (typically upstream area or cell count) |
+| `BoundingBox` | `geo` | Axis-aligned WGS84 bbox; enforces `min < max` on both axes at construction |
+| `WkbGeometry` | `geo` | Non-empty WKB byte buffer; geometry parsing is delegated to callers |
+| `CatchmentAtom` | `catchment` | One row of `catchments.parquet` — id, local area, optional upstream area, bbox, geometry |
+| `SnapTarget` | `snap` | One row of `snap.parquet` — id, catchment FK, weight, `MainstemStatus`, bbox, geometry |
+| `MainstemStatus` | `snap` | Enum (`Mainstem` / `Tributary`) — replaces a `bool` flag so call sites are self-documenting |
+| `AdjacencyRow` | `graph` | One node in the adjacency graph — atom ID and its upstream neighbour IDs |
+| `DrainageGraph` | `graph` | HashMap-indexed adjacency over all atoms; O(1) lookup by `AtomId`. Optimised for validation, not traversal — engines are expected to convert to CSR at load time |
+| `FlowDirEncoding` | `raster` | D8 convention enum (`Esri` / `Taudem`); stored in `RasterAvailability::Present` so encoding is only expressible when rasters actually exist |
+| `Manifest` | `manifest` | Parsed `manifest.json`; constructed exclusively via `ManifestBuilder` |
+| `ManifestBuilder` | `manifest` | Builder for `Manifest` — required fields validated in `new()`, optional fields set via chainable `with_*` methods |
+| `HasBbox` | `lib` | Trait for generic spatial filtering over any artifact row type |
+| `HasAtomId` | `lib` | Trait for generic operations over any atom-identified row type |

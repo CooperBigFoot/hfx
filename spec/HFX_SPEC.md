@@ -224,7 +224,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `format_version` | string | Yes | HFX version this dataset targets |
-| `fabric_name` | string | Yes | Source fabric identifier. Free text, lowercase |
+| `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
 | `fabric_level` | int | No | Pfafstetter level (HydroBASINS only) |
 | `crs` | string | Yes | CRS for all vector and raster data. Must be `"EPSG:4326"` in HFX v0.1. The field exists for forward compatibility with projected CRS support in future versions |
@@ -237,7 +237,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 | `region` | string | No | Geographic region label. Informational |
 | `bbox` | float[4] | Yes | `[minx, miny, maxx, maxy]` covering all atoms. Used by engine for fast pre-filtering |
 | `atom_count` | int | Yes | Total number of rows in `catchments.parquet`. Sanity check |
-| `created_at` | string | Yes | ISO 8601 UTC timestamp of ETL run |
+| `created_at` | string | Yes | ISO 8601 / RFC 3339 timestamp of ETL run |
 | `adapter_version` | string | Yes | Version of the adapter that produced this dataset |
 
 ---
@@ -269,6 +269,7 @@ A conformant HFX dataset must pass the following checks (provided as a standalon
 **Snap presence check:**
 
 - If `has_snap = true`, `snap.parquet` must be present.
+- If `has_snap = false`, `snap.parquet` may be present in the directory but is ignored by the engine and not validated. Adapters should avoid shipping unused artifacts.
 
 **Referential integrity (if `has_snap = true`):**
 
@@ -300,6 +301,10 @@ A conformant HFX dataset must pass the following checks (provided as a standalon
 **Geometry spot-check:**
 
 - 1% random sample of geometries in `catchments.parquet` are valid WKB polygons.
+
+**Snap geometry type check (if `has_snap = true`):**
+
+- All geometries in `snap.parquet` must be WKB Point or LineString.
 
 ---
 

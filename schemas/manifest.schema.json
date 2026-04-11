@@ -26,7 +26,8 @@
     },
     "fabric_name": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]*$"
     },
     "fabric_version": {
       "type": "string",
