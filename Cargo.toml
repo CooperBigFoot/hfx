@@ -1,13 +1,13 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/hfx-core", "crates/hfx-validator"]
+resolver = "2"
 
-[package]
-name = "hfx"
-version = "0.1.5"
+[workspace.package]
+version = "0.1.6"
 edition = "2024"
 
-[dependencies]
-hfx-core = { path = "crates/core" }
+[workspace.dependencies]
 anyhow = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

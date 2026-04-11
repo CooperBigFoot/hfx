@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hfx.dev/schemas/manifest.schema.json",
+  "title": "HFX Manifest",
+  "description": "Schema for the HFX dataset manifest defined by the HFX v0.1 specification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format_version",
+    "fabric_name",
+    "crs",
+    "has_up_area",
+    "has_rasters",
+    "terminal_sink_id",
+    "topology",
+    "bbox",
+    "atom_count",
+    "created_at",
+    "adapter_version"
+  ],
+  "properties": {
+    "format_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "fabric_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fabric_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fabric_level": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "crs": {
+      "type": "string",
+      "const": "EPSG:4326"
+    },
+    "has_up_area": {
+      "type": "boolean"
+    },
+    "has_rasters": {
+      "type": "boolean"
+    },
+    "flow_dir_encoding": {
+      "type": "string",
+      "enum": ["esri", "taudem"]
+    },
+    "terminal_sink_id": {
+      "type": "integer",
+      "const": 0
+    },
+    "topology": {
+      "type": "string",
+      "enum": ["tree", "dag"]
+    },
+    "region": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bbox": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "atom_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "adapter_version": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "has_rasters": {
+            "const": true
+          }
+        },
+        "required": ["has_rasters"]
+      },
+      "then": {
+        "required": ["flow_dir_encoding"]
+      }
+    }
+  ]
+}

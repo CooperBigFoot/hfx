@@ -9,7 +9,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("hello");
+    info!("hfx-validator initialized");
 
     Ok(())
 }

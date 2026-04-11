@@ -1,0 +1,10 @@
+[package]
+name = "hfx-validator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hfx-core = { path = "../hfx-core" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -6,13 +6,13 @@
 
 ## Overview
 
-Format X is the canonical data contract consumed by the watershed delineation engine. It is not a native hydrofabric format. Every source fabric (HydroBASINS, GRIT, MERIT Hydro, etc.) must be compiled into Format X by an adapter before the engine sees it.
+HFX is the canonical data contract consumed by the watershed delineation engine. It is not a native hydrofabric format. Every source fabric (HydroBASINS, GRIT, MERIT Hydro, etc.) must be compiled into HFX by an adapter before the engine sees it.
 
-The engine operates on Format X exclusively. It contains no fabric-specific logic.
+The engine operates on HFX exclusively. It contains no fabric-specific logic.
 
 ### Terminology
 
-A **catchment atom** is the smallest indivisible drainage unit within a compiled dataset. The atom boundary depends on the source fabric and the adapter that produced it: a HydroBASINS level-8 sub-basin, a GRIT segment catchment, a MERIT Hydro unit catchment, etc. Format X does not prescribe how atoms are derived — only that they form a non-overlapping drainage partition over the dataset domain, and that each atom participates in a directed drainage graph that may be convergent or branching.
+A **catchment atom** is the smallest indivisible drainage unit within a compiled dataset. The atom boundary depends on the source fabric and the adapter that produced it: a HydroBASINS level-8 sub-basin, a GRIT segment catchment, a MERIT Hydro unit catchment, etc. HFX does not prescribe how atoms are derived — only that they form a non-overlapping drainage partition over the dataset domain, and that each atom participates in a directed drainage graph that may be convergent or branching.
 
 ---
 
@@ -222,11 +222,11 @@ The manifest describes **what the data is**, not how the engine should use it. T
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `format_version` | string | Yes | Format X version this dataset targets |
+| `format_version` | string | Yes | HFX version this dataset targets |
 | `fabric_name` | string | Yes | Source fabric identifier. Free text, lowercase |
 | `fabric_version` | string | No | Version of the source fabric |
 | `fabric_level` | int | No | Pfafstetter level (HydroBASINS only) |
-| `crs` | string | Yes | CRS for all vector and raster data. Must be `"EPSG:4326"` in Format X v0.1. The field exists for forward compatibility with projected CRS support in future versions |
+| `crs` | string | Yes | CRS for all vector and raster data. Must be `"EPSG:4326"` in HFX v0.1. The field exists for forward compatibility with projected CRS support in future versions |
 | `has_up_area` | bool | Yes | Whether `up_area_km2` is populated in `catchments.parquet`. If false, engine computes it from graph traversal |
 | `has_rasters` | bool | Yes | Whether `flow_dir.tif` and `flow_acc.tif` are present. If false, raster refinement is skipped |
 | `flow_dir_encoding` | string | Cond. | Required if `has_rasters = true`. One of `"esri"` or `"taudem"` |
@@ -242,7 +242,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 
 ## Engine Behaviour Contract (v0.1)
 
-Version 0.1 of the engine implements **inclusive upstream accumulation** only. Given a valid Format X dataset and an outlet point, the engine:
+Version 0.1 of the engine implements **inclusive upstream accumulation** only. Given a valid HFX dataset and an outlet point, the engine:
 
 1. **Snap** — query `snap.parquet` within search radius, resolve terminal atom via the tiered ranking described in §3.
 2. **Locate** — the resolved `catchment_id` is the terminal atom.
@@ -262,7 +262,7 @@ A future engine version may support mainstem-only (branch) traversal, where BFS 
 
 ## Validation
 
-A conformant Format X dataset must pass the following checks (provided as a standalone validator tool):
+A conformant HFX dataset must pass the following checks (provided as a standalone validator tool):
 
 **Referential integrity:**
 

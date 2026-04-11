@@ -52,16 +52,35 @@ Current design boundaries for HFX v0.1:
 - The graph supports both tree and DAG topologies.
 - Adapter implementation is intentionally out of scope for the spec: any tool that produces conformant artifacts is valid.
 
-## Repository Scope
+## Repository Layout
 
-This repository is currently early scaffolding. The intended contents are:
+This repository is organized as a spec-first monorepo:
 
-- The HFX v0.1 specification in [HFX_SPEC.md](./HFX_SPEC.md)
-- A standalone Rust validator for manifest shape, cross-file integrity, graph acyclicity, ID rules, bbox consistency, raster alignment, and geometry validity
-- Future adapter implementations, starting with MERIT and GRIT
+| Path | Purpose |
+|---|---|
+| [`spec/`](./spec) | Canonical HFX specification and spec changelog |
+| [`schemas/`](./schemas) | Machine-readable schema artifacts, starting with the manifest schema |
+| [`examples/`](./examples) | Reference datasets and implementer-facing examples |
+| [`conformance/`](./conformance) | Valid and invalid fixtures for validator and interoperability work |
+| [`crates/`](./crates) | Rust toolkit crates, including shared logic and the validator CLI |
+| [`adapters/`](./adapters) | Future source-fabric compilers such as MERIT and GRIT adapters |
+| [`docs/decisions/`](./docs/decisions) | Short decision records for important spec and architecture choices |
+| [`scripts/`](./scripts) | Repo helper scripts and release support utilities |
 
-The full specification is the source of truth. The README is an orientation document; schema details and behavioral guarantees belong in the spec.
+## Source Of Truth
+
+The primary normative artifact is the development specification at [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
+
+Supporting public interfaces live alongside it:
+
+- [schemas/manifest.schema.json](./schemas/manifest.schema.json) defines the manifest contract in machine-readable form.
+- [examples/](./examples) will hold reference datasets for implementers.
+- [conformance/](./conformance) will hold validator fixtures and intentionally invalid datasets.
+
+The validator and future adapters exist to serve the specification, not define it.
 
 ## Status
 
-Language choice is Rust for the validator and future engine-facing tooling. Python bindings are planned later. At the moment, the repo still contains mostly boilerplate workspace scaffolding, so the immediate work is to shape the spec, validator, and crate layout around the HFX contract.
+HFX is still in initial scaffolding. The repository now has stable public paths for the spec, schemas, examples, conformance fixtures, adapters, and Rust toolkit crates, but most implementation areas are still placeholders.
+
+Language choice is Rust for the validator and future engine-facing tooling. Python bindings are planned later.

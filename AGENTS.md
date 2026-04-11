@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-HFX (HydroFabric Exchange) is an open specification and Rust toolkit for a compiled drainage format that lets delineation engines consume any source hydrofabric through one normalized contract. Source-specific adapters compile HydroBASINS, GRIT, MERIT Hydro, and similar fabrics into HFX offline; the engine then reads HFX only, with no fabric-specific logic in runtime traversal or snapping.
+HFX (HydroFabric Exchange) is an open specification and Rust toolkit for a compiled drainage format that lets delineation engines consume any source hydrofabric through one normalized contract. Source-specific adapters compile HydroBASINS, GRIT, MERIT Hydro, and similar fabrics into HFX offline; the engine then reads HFX only, with no fabric-specific logic in runtime traversal or snapping. The canonical dev spec lives at `spec/HFX_SPEC.md`, and the official validator CLI lives in `crates/hfx-validator`.
 
 ## Version Bumping (mandatory)
 
