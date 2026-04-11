@@ -22,7 +22,7 @@ A **catchment atom** is the smallest indivisible drainage unit within a compiled
 |---|---|---|
 | `catchments.parquet` | Yes | Atom polygons |
 | `graph.arrow` | Yes | Upstream adjacency graph |
-| `snap.parquet` | Yes | Outlet snapping targets |
+| `snap.parquet` | No | Outlet snapping targets |
 | `flow_dir.tif` | No | D8 flow direction raster for terminal refinement |
 | `flow_acc.tif` | No | Flow accumulation raster for terminal refinement |
 | `manifest.json` | Yes | Dataset metadata and contract declaration |
@@ -90,7 +90,7 @@ The upstream adjacency graph over catchment atoms. Contains no geometry. This is
 
 ## 3. `snap.parquet`
 
-Snapping targets used to attach an outlet point to the drainage network. These are the features the engine spatially queries first.
+Snapping targets used to attach an outlet point to the drainage network. **This artifact is optional.** If absent (`has_snap = false` in manifest), the engine resolves the terminal atom via point-in-polygon spatial containment on `catchments.parquet`. When present, the engine uses the tiered ranking below for higher precision outlet resolution. Snap targets are most valuable for fabrics with explicit stream features (e.g., GRIT reach segments). For polygon-only fabrics (e.g., HydroBASINS), point-in-polygon is typically sufficient.
 
 ### Schema
 
@@ -125,7 +125,7 @@ Same Hilbert-sort and row group statistics requirements as `catchments.parquet`.
 
 ### Notes
 
-- For HydroBASINS (no explicit reaches), snap targets are synthetic. The preferred approach is outlet-directed representative geometries: skeletonized centerlines or pour-point-derived lines that approximate the drainage path within each atom. As a lower-quality fallback, the polygon centroid may be used as a Point with `weight = up_area_km2`, but centroids can be poor proxies for drainage attachment in elongated or irregular polygons.
+- For HydroBASINS (no explicit reaches), adapters may omit `snap.parquet` entirely (`has_snap = false`) and let the engine fall back to point-in-polygon on `catchments.parquet`. If the adapter does provide snap targets (e.g., for higher-precision outlet resolution), the preferred approach is outlet-directed representative geometries: skeletonized centerlines or pour-point-derived lines that approximate the drainage path within each atom. As a lower-quality fallback, the polygon centroid may be used as a Point with `weight = up_area_km2`, but centroids can be poor proxies for drainage attachment in elongated or irregular polygons.
 - For GRIT, snap targets are the vectorized reach segments with `weight = drainage_area_km2` and `is_mainstem` from the GRIT mainstem flag.
 - `is_mainstem = true` for all features in non-bifurcating fabrics.
 
@@ -207,6 +207,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
   "crs": "EPSG:4326",
   "has_up_area": true,
   "has_rasters": true,
+  "has_snap": true,
   "flow_dir_encoding": "esri",
   "terminal_sink_id": 0,
   "topology": "tree",
@@ -229,6 +230,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 | `crs` | string | Yes | CRS for all vector and raster data. Must be `"EPSG:4326"` in HFX v0.1. The field exists for forward compatibility with projected CRS support in future versions |
 | `has_up_area` | bool | Yes | Whether `up_area_km2` is populated in `catchments.parquet`. If false, engine computes it from graph traversal |
 | `has_rasters` | bool | Yes | Whether `flow_dir.tif` and `flow_acc.tif` are present. If false, raster refinement is skipped |
+| `has_snap` | bool | Yes | Whether `snap.parquet` is present. If false, engine uses point-in-polygon on `catchments.parquet` for outlet resolution |
 | `flow_dir_encoding` | string | Cond. | Required if `has_rasters = true`. One of `"esri"` or `"taudem"` |
 | `terminal_sink_id` | int | Yes | The ID value used to indicate no downstream neighbor. Must be `0` |
 | `topology` | string | Yes | Graph topology class. `"tree"` for strictly convergent fabrics (HydroBASINS, MERIT Hydro). `"dag"` for fabrics with bifurcations (GRIT). Informational — the engine handles both, but may use this for optimization hints |
@@ -244,7 +246,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 
 Version 0.1 of the engine implements **inclusive upstream accumulation** only. Given a valid HFX dataset and an outlet point, the engine:
 
-1. **Snap** — query `snap.parquet` within search radius, resolve terminal atom via the tiered ranking described in §3.
+1. **Snap** — If `has_snap = true`: query `snap.parquet` within search radius, resolve terminal atom via the tiered ranking described in §3. If `has_snap = false`: perform point-in-polygon spatial containment query on `catchments.parquet` using bbox column statistics for row-group pruning. The containing atom is the terminal atom.
 2. **Locate** — the resolved `catchment_id` is the terminal atom.
 3. **Traverse** — BFS over `graph.arrow` from the terminal atom. Maintain a visited set; collect all reachable upstream atom IDs. Every upstream path is followed regardless of `is_mainstem` status (inclusive mode).
 4. **Refine** (if `has_rasters = true`) — window `flow_acc.tif` and `flow_dir.tif` to the terminal atom's bbox. Snap outlet to nearest cell exceeding the accumulation threshold. Run reverse D8 trace from that cell. Convert the resulting cell mask to a polygon. Replace the terminal atom geometry with this refined sub-polygon.
@@ -264,9 +266,16 @@ A future engine version may support mainstem-only (branch) traversal, where BFS 
 
 A conformant HFX dataset must pass the following checks (provided as a standalone validator tool):
 
-**Referential integrity:**
+**Snap presence check:**
+
+- If `has_snap = true`, `snap.parquet` must be present.
+
+**Referential integrity (if `has_snap = true`):**
 
 - All `catchment_id` values in `snap.parquet` exist in `catchments.parquet`.
+
+**Referential integrity:**
+
 - All `id` values in `graph.arrow` exist in `catchments.parquet`.
 - All entries within `upstream_ids` in `graph.arrow` exist in `catchments.parquet`.
 - Every `id` in `catchments.parquet` has a corresponding row in `graph.arrow`.
@@ -278,7 +287,7 @@ A conformant HFX dataset must pass the following checks (provided as a standalon
 
 **Schema checks:**
 
-- `bbox_min* < bbox_max*` for every row in both `catchments.parquet` and `snap.parquet`.
+- `bbox_min* < bbox_max*` for every row in `catchments.parquet` and (if `has_snap = true`) `snap.parquet`.
 - `atom_count` in manifest matches row count in `catchments.parquet`.
 
 **Raster checks (if `has_rasters = true`):**

@@ -11,6 +11,7 @@
     "crs",
     "has_up_area",
     "has_rasters",
+    "has_snap",
     "terminal_sink_id",
     "topology",
     "bbox",
@@ -43,6 +44,9 @@
       "type": "boolean"
     },
     "has_rasters": {
+      "type": "boolean"
+    },
+    "has_snap": {
       "type": "boolean"
     },
     "flow_dir_encoding": {
