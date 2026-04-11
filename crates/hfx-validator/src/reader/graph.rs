@@ -1,0 +1,1 @@
+//! Graph arrow IPC reader.
