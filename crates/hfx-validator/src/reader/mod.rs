@@ -28,18 +28,55 @@ pub fn read_dataset(dir: &Path) -> ParsedDataset {
 
     let manifest = raw_manifest.as_ref().and_then(try_build_manifest);
 
-    // TODO: Step 2 will implement catchments, graph, snap, raster reading
+    // --- Catchments ---
+    let catchments = if let Some(path) = &files.catchments_path {
+        let (data, diags) = catchments::read_catchments(path);
+        read_diagnostics.extend(diags);
+        data
+    } else {
+        None
+    };
+
+    // --- Graph ---
+    let graph = if let Some(path) = &files.graph_path {
+        let (data, diags) = graph::read_graph(path);
+        read_diagnostics.extend(diags);
+        data
+    } else {
+        None
+    };
+
+    // --- Snap (optional — only read if has_snap is true or file present) ---
+    let has_snap = raw_manifest
+        .as_ref()
+        .and_then(|r| r.has_snap)
+        .unwrap_or(false);
+    let snap = if has_snap {
+        if let Some(path) = &files.snap_path {
+            let (data, diags) = snap::read_snap(path);
+            read_diagnostics.extend(diags);
+            data
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // TODO: Step 3 will implement raster reading
+    let flow_dir = None;
+    let flow_acc = None;
 
     ParsedDataset {
         files,
         manifest_json,
         raw_manifest,
         manifest,
-        catchments: None,
-        graph: None,
-        snap: None,
-        flow_dir: None,
-        flow_acc: None,
+        catchments,
+        graph,
+        snap,
+        flow_dir,
+        flow_acc,
         read_diagnostics,
     }
 }

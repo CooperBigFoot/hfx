@@ -20,7 +20,7 @@ use crate::diagnostic::Diagnostic;
 pub fn run_checks(dataset: &ParsedDataset, _strict: bool, _skip_rasters: bool, _sample_pct: f64) -> Vec<Diagnostic> {
     let mut all = Vec::new();
 
-    // Include any diagnostics from the read phase
+    // Include any diagnostics from the read phase (B1/B2/B3 schema errors come from here).
     all.extend(dataset.read_diagnostics.iter().cloned());
 
     // Phase 1a: file presence
@@ -32,7 +32,9 @@ pub fn run_checks(dataset: &ParsedDataset, _strict: bool, _skip_rasters: bool, _
         all.extend(manifest::check_manifest(raw));
     }
 
-    // TODO: Step 2 will add schema, id, geometry, raster checks
+    // Phase 2: schema checks (B4-B6)
+    all.extend(schema::check_schemas(dataset));
+
     // TODO: Step 3 will add referential integrity and graph checks
     // TODO: Step 4 will wire everything together
 
