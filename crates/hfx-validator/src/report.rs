@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::{Diagnostic, Location, Severity};
 
 /// Aggregated validation result for a complete dataset.
 #[derive(Debug, Clone)]
@@ -94,16 +94,31 @@ struct JsonDiagnostic {
     category: String,
     artifact: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    column: Option<String>,
 }
 
 impl From<&Diagnostic> for JsonDiagnostic {
     fn from(d: &Diagnostic) -> Self {
+        let (row, field, column) = match &d.location {
+            Location::None => (None, None, None),
+            Location::Row { index } => (Some(*index), None, None),
+            Location::Field { name } => (None, Some(name.clone()), None),
+            Location::Column { name } => (None, None, Some(name.clone())),
+        };
         Self {
             check_id: d.check_id.to_string(),
             severity: d.severity.to_string(),
             category: d.category.to_string(),
             artifact: d.artifact.to_string(),
             message: d.message.clone(),
+            row,
+            field,
+            column,
         }
     }
 }

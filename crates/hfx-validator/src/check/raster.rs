@@ -39,6 +39,19 @@ pub fn check_flow_dir(meta: &RasterMeta) -> Vec<Diagnostic> {
         ));
     }
 
+    // Nodata check: spec requires 255 for flow_dir.
+    // Warning (not error) because some TIFF writers may not embed the nodata tag.
+    if let Some(nodata) = meta.nodata {
+        if (nodata - 255.0).abs() > f64::EPSILON {
+            diags.push(Diagnostic::warning(
+                "raster.flow_dir_nodata",
+                Category::Raster,
+                Artifact::FlowDir,
+                format!("flow_dir.tif nodata should be 255, got {nodata}"),
+            ));
+        }
+    }
+
     diags
 }
 
@@ -69,6 +82,19 @@ pub fn check_flow_acc(meta: &RasterMeta) -> Vec<Diagnostic> {
             Artifact::FlowAcc,
             "flow_acc.tif must be COG-tiled (TileWidth / TileLength tags present)",
         ));
+    }
+
+    // Nodata check: spec requires -1.0 for flow_acc.
+    // Warning (not error) because some TIFF writers may not embed the nodata tag.
+    if let Some(nodata) = meta.nodata {
+        if (nodata - (-1.0)).abs() > f64::EPSILON {
+            diags.push(Diagnostic::warning(
+                "raster.flow_acc_nodata",
+                Category::Raster,
+                Artifact::FlowAcc,
+                format!("flow_acc.tif nodata should be -1.0, got {nodata}"),
+            ));
+        }
     }
 
     diags
@@ -205,6 +231,45 @@ mod tests {
         assert!(diags.iter().any(|d| d.check_id == "raster.flow_dir_not_tiled"));
     }
 
+    #[test]
+    fn flow_dir_correct_nodata_produces_no_warning() {
+        let meta = RasterMeta {
+            nodata: Some(255.0),
+            ..valid_flow_dir_meta()
+        };
+        let diags = check_flow_dir(&meta);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
+            "correct nodata=255 should not produce a warning, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn flow_dir_wrong_nodata_produces_warning() {
+        let meta = RasterMeta {
+            nodata: Some(0.0),
+            ..valid_flow_dir_meta()
+        };
+        let diags = check_flow_dir(&meta);
+        assert!(
+            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Warning),
+            "wrong nodata should produce a warning, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn flow_dir_absent_nodata_produces_no_warning() {
+        let meta = RasterMeta {
+            nodata: None,
+            ..valid_flow_dir_meta()
+        };
+        let diags = check_flow_dir(&meta);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
+            "absent nodata tag should not produce a warning, got: {diags:#?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // flow_acc checks
     // -----------------------------------------------------------------------
@@ -274,6 +339,45 @@ mod tests {
         let diags = check_flow_acc(&meta);
         assert!(diags.iter().any(|d| d.check_id == "raster.flow_acc_dtype"));
         assert!(diags.iter().any(|d| d.check_id == "raster.flow_acc_not_tiled"));
+    }
+
+    #[test]
+    fn flow_acc_correct_nodata_produces_no_warning() {
+        let meta = RasterMeta {
+            nodata: Some(-1.0),
+            ..valid_flow_acc_meta()
+        };
+        let diags = check_flow_acc(&meta);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
+            "correct nodata=-1.0 should not produce a warning, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn flow_acc_wrong_nodata_produces_warning() {
+        let meta = RasterMeta {
+            nodata: Some(0.0),
+            ..valid_flow_acc_meta()
+        };
+        let diags = check_flow_acc(&meta);
+        assert!(
+            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Warning),
+            "wrong nodata should produce a warning, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn flow_acc_absent_nodata_produces_no_warning() {
+        let meta = RasterMeta {
+            nodata: None,
+            ..valid_flow_acc_meta()
+        };
+        let diags = check_flow_acc(&meta);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
+            "absent nodata tag should not produce a warning, got: {diags:#?}"
+        );
     }
 
     // -----------------------------------------------------------------------

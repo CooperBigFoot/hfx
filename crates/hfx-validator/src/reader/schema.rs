@@ -19,48 +19,40 @@ impl ExpectedColumn {
     }
 }
 
-/// Returns `true` if `actual` is compatible with `expected`.
-///
-/// Geometry columns accept both [`DataType::Binary`] and [`DataType::LargeBinary`].
-/// List columns accept both [`DataType::List`] and [`DataType::LargeList`] with
-/// compatible item types.
-fn types_compatible(actual: &DataType, expected: &DataType) -> bool {
-    // Exact match.
-    if actual == expected {
-        return true;
-    }
-
-    // Binary / LargeBinary interchangeable for geometry.
+/// Check whether `actual` is a "large" variant of `expected` (LargeBinary for Binary,
+/// LargeList for List).  Returns `true` only when the pair is a known large-variant
+/// relationship — exact matches are NOT considered here.
+fn is_large_variant(actual: &DataType, expected: &DataType) -> bool {
     match (actual, expected) {
-        (DataType::Binary, DataType::LargeBinary)
-        | (DataType::LargeBinary, DataType::Binary) => return true,
-        _ => {}
+        // LargeBinary where Binary is expected.
+        (DataType::LargeBinary, DataType::Binary) => true,
+        // Binary where LargeBinary is expected (reversed — unexpected but still warn).
+        (DataType::Binary, DataType::LargeBinary) => true,
+        // LargeList<T> where List<T> is expected (item types must match exactly).
+        (DataType::LargeList(a_field), DataType::List(e_field)) => {
+            a_field.data_type() == e_field.data_type()
+        }
+        (DataType::List(a_field), DataType::LargeList(e_field)) => {
+            a_field.data_type() == e_field.data_type()
+        }
+        _ => false,
     }
-
-    // List / LargeList with compatible item types.
-    let actual_item = match actual {
-        DataType::List(f) => Some(f.data_type()),
-        DataType::LargeList(f) => Some(f.data_type()),
-        _ => None,
-    };
-    let expected_item = match expected {
-        DataType::List(f) => Some(f.data_type()),
-        DataType::LargeList(f) => Some(f.data_type()),
-        _ => None,
-    };
-    if let (Some(ai), Some(ei)) = (actual_item, expected_item) {
-        return types_compatible(ai, ei);
-    }
-
-    false
 }
 
 /// Validate an Arrow schema against expected columns.
 ///
 /// For each expected column, checks that:
 /// 1. The column exists in `actual`.
-/// 2. The data type is compatible (with relaxed rules for Binary/LargeBinary and List/LargeList).
-/// 3. The nullability matches.
+/// 2. The data type matches exactly.  When the type is a "large" Arrow variant
+///    (e.g. [`DataType::LargeBinary`] instead of [`DataType::Binary`], or
+///    [`DataType::LargeList`] instead of [`DataType::List`]) a **warning** is
+///    emitted rather than an error, because such files are technically readable
+///    but go beyond what the HFX spec mandates.
+/// 3. Non-nullable columns that are marked nullable in the actual schema emit an
+///    **error** (not a warning), because a producer that omits the non-null
+///    constraint may silently produce null values that downstream readers cannot
+///    handle safely.  The reverse (non-nullable where nullable is expected) is
+///    only a warning.
 ///
 /// Returns a [`Diagnostic`] for each mismatch.  An empty vec means the schema is valid.
 pub fn validate_schema(
@@ -85,7 +77,32 @@ pub fn validate_schema(
                 );
             }
             Ok(field) => {
-                if !types_compatible(field.data_type(), &col.dtype) {
+                if field.data_type() == &col.dtype {
+                    // Exact match — no type diagnostic.
+                } else if is_large_variant(field.data_type(), &col.dtype) {
+                    // Compatible "large" variant — warn rather than error.
+                    debug!(
+                        column = col.name,
+                        actual = ?field.data_type(),
+                        expected = ?col.dtype,
+                        "column uses large Arrow variant; spec requires the standard type"
+                    );
+                    diags.push(
+                        Diagnostic::warning(
+                            "schema.large_variant",
+                            Category::Schema,
+                            artifact,
+                            format!(
+                                "column '{}' has type {:?} but the spec requires {:?}; \
+                                 large variants are readable but non-conformant",
+                                col.name,
+                                field.data_type(),
+                                col.dtype
+                            ),
+                        )
+                        .at(Location::Column { name: col.name.to_string() }),
+                    );
+                } else {
                     debug!(
                         column = col.name,
                         actual = ?field.data_type(),
@@ -108,6 +125,7 @@ pub fn validate_schema(
                     );
                 }
 
+                // Nullability check.
                 if field.is_nullable() != col.nullable {
                     debug!(
                         column = col.name,
@@ -115,7 +133,21 @@ pub fn validate_schema(
                         expected_nullable = col.nullable,
                         "column nullability mismatch"
                     );
-                    diags.push(
+                    // A non-nullable column declared as nullable is an error: the producer
+                    // may write nulls that readers cannot safely handle.
+                    // The reverse (nullable expected, non-nullable actual) is only a warning.
+                    let diag = if !col.nullable && field.is_nullable() {
+                        Diagnostic::error(
+                            "schema.wrong_nullability",
+                            Category::Schema,
+                            artifact,
+                            format!(
+                                "column '{}' is declared nullable but the spec requires it to be \
+                                 non-nullable; null values in this column will cause read errors",
+                                col.name,
+                            ),
+                        )
+                    } else {
                         Diagnostic::warning(
                             "schema.wrong_nullability",
                             Category::Schema,
@@ -127,8 +159,8 @@ pub fn validate_schema(
                                 col.nullable
                             ),
                         )
-                        .at(Location::Column { name: col.name.to_string() }),
-                    );
+                    };
+                    diags.push(diag.at(Location::Column { name: col.name.to_string() }));
                 }
             }
         }
@@ -192,34 +224,54 @@ mod tests {
     }
 
     #[test]
-    fn binary_and_large_binary_are_compatible() {
-        // schema has LargeBinary, expected is Binary → compatible
+    fn large_binary_instead_of_binary_produces_warning() {
+        // schema has LargeBinary, expected is Binary → warning (non-conformant but readable)
         let schema = make_schema(vec![Field::new("geometry", DataType::LargeBinary, false)]);
         let expected = vec![ExpectedColumn::new("geometry", DataType::Binary, false)];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert!(diags.is_empty());
-
-        // schema has Binary, expected is LargeBinary → compatible
-        let schema2 = make_schema(vec![Field::new("geometry", DataType::Binary, false)]);
-        let expected2 = vec![ExpectedColumn::new("geometry", DataType::LargeBinary, false)];
-        let diags2 = validate_schema(&schema2, &expected2, Artifact::Catchments);
-        assert!(diags2.is_empty());
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(diags[0].check_id, "schema.large_variant");
+        assert_eq!(diags[0].severity, Severity::Warning);
     }
 
     #[test]
-    fn list_and_large_list_int64_are_compatible() {
+    fn binary_instead_of_large_binary_produces_warning() {
+        // schema has Binary, expected is LargeBinary → warning
+        let schema = make_schema(vec![Field::new("geometry", DataType::Binary, false)]);
+        let expected = vec![ExpectedColumn::new("geometry", DataType::LargeBinary, false)];
+        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(diags[0].check_id, "schema.large_variant");
+        assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn large_list_instead_of_list_produces_warning() {
         let large_list_field = DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
         let schema = make_schema(vec![Field::new("upstream_ids", large_list_field, false)]);
         let expected = vec![ExpectedColumn::new("upstream_ids", list_int64_field(), false)];
         let diags = validate_schema(&schema, &expected, Artifact::Graph);
-        assert!(diags.is_empty());
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(diags[0].check_id, "schema.large_variant");
+        assert_eq!(diags[0].severity, Severity::Warning);
     }
 
     #[test]
-    fn nullability_mismatch_produces_warning() {
-        // expected: nullable=false, actual: nullable=true
+    fn non_nullable_column_declared_nullable_produces_error() {
+        // expected: nullable=false, actual: nullable=true → error (producer may write nulls)
         let schema = make_schema(vec![Field::new("id", DataType::Int64, true)]);
         let expected = vec![ExpectedColumn::new("id", DataType::Int64, false)];
+        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].check_id, "schema.wrong_nullability");
+        assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn nullable_column_declared_non_nullable_produces_warning() {
+        // expected: nullable=true, actual: nullable=false → warning (stricter than required)
+        let schema = make_schema(vec![Field::new("up_area_km2", DataType::Float32, false)]);
+        let expected = vec![ExpectedColumn::new("up_area_km2", DataType::Float32, true)];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].check_id, "schema.wrong_nullability");

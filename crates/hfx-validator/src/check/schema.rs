@@ -87,19 +87,22 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     }
 
     // B6: atom_count in manifest matches catchments row count.
-    if let (Some(manifest), Some(catchments)) = (&dataset.manifest, &dataset.catchments) {
-        let declared = manifest.atom_count().get() as usize;
-        let actual = catchments.row_count;
-        if declared != actual {
-            diags.push(Diagnostic::error(
-                "schema.atom_count_mismatch",
-                Category::Schema,
-                Artifact::CrossFile,
-                format!(
-                    "manifest atom_count ({declared}) does not match \
-                     catchments.parquet row count ({actual})"
-                ),
-            ));
+    // Use raw_manifest so a bad fabric_name (or any other unparseable field)
+    // does not suppress this check.
+    if let (Some(raw), Some(catchments)) = (&dataset.raw_manifest, &dataset.catchments) {
+        if let Some(declared) = raw.atom_count {
+            let actual = catchments.row_count as u64;
+            if declared != actual {
+                diags.push(Diagnostic::error(
+                    "schema.atom_count_mismatch",
+                    Category::Schema,
+                    Artifact::CrossFile,
+                    format!(
+                        "manifest atom_count ({declared}) does not match \
+                         catchments.parquet row count ({actual})"
+                    ),
+                ));
+            }
         }
     }
 
@@ -112,6 +115,7 @@ mod tests {
     use super::*;
     use crate::dataset::{CatchmentsData, FilePresenceMap, ParsedDataset, SnapData};
     use crate::diagnostic::Severity;
+    use crate::reader::manifest::RawManifest;
 
     fn empty_dataset() -> ParsedDataset {
         ParsedDataset {
@@ -150,23 +154,25 @@ mod tests {
         }
     }
 
-    fn build_manifest_with_atom_count(count: u64) -> hfx_core::Manifest {
-        use hfx_core::{AtomCount, BoundingBox, Crs, FormatVersion, ManifestBuilder, Topology};
-        use std::str::FromStr;
-
-        let builder = ManifestBuilder::new(
-            FormatVersion::from_str("0.1").unwrap(),
-            "hydrobasins",
-            Crs::from_str("EPSG:4326").unwrap(),
-            Topology::from_str("tree").unwrap(),
-            0,
-            BoundingBox::new(-180.0, -90.0, 180.0, 90.0).unwrap(),
-            AtomCount::new(count).unwrap(),
-            "2026-01-01T00:00:00Z",
-            "v1",
-        )
-        .unwrap();
-        builder.build()
+    fn raw_manifest_with_atom_count(count: u64) -> RawManifest {
+        RawManifest {
+            format_version: Some("0.1".into()),
+            fabric_name: Some("hydrobasins".into()),
+            fabric_version: None,
+            fabric_level: None,
+            crs: Some("EPSG:4326".into()),
+            has_up_area: Some(false),
+            has_rasters: Some(false),
+            has_snap: Some(false),
+            flow_dir_encoding: None,
+            terminal_sink_id: Some(0),
+            topology: Some("tree".into()),
+            region: None,
+            bbox: Some(vec![-180.0, -90.0, 180.0, 90.0]),
+            atom_count: Some(count),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            adapter_version: Some("v1".into()),
+        }
     }
 
     #[test]
@@ -225,10 +231,10 @@ mod tests {
     #[test]
     fn b6_atom_count_mismatch_produces_error() {
         let mut dataset = empty_dataset();
-        // Manifest says 10, catchments has 3 rows
-        dataset.manifest = Some(build_manifest_with_atom_count(10));
+        // raw_manifest says 10, catchments has 3 rows
+        dataset.raw_manifest = Some(raw_manifest_with_atom_count(10));
         dataset.catchments = Some(catchments_with_rg(vec![4096], vec![true]));
-        // Override row_count
+        // Override row_count to force a mismatch
         let mut c = dataset.catchments.take().unwrap();
         c.row_count = 3;
         dataset.catchments = Some(c);
@@ -240,10 +246,29 @@ mod tests {
     #[test]
     fn b6_atom_count_matches_no_error() {
         let mut dataset = empty_dataset();
-        dataset.manifest = Some(build_manifest_with_atom_count(4096));
+        dataset.raw_manifest = Some(raw_manifest_with_atom_count(4096));
         dataset.catchments = Some(catchments_with_rg(vec![4096], vec![true]));
         let diags = check_schemas(&dataset);
         assert!(!diags.iter().any(|d| d.check_id == "schema.atom_count_mismatch"));
+    }
+
+    #[test]
+    fn b6_bad_fabric_name_does_not_suppress_atom_count_check() {
+        // A raw_manifest with an invalid fabric_name would fail try_build_manifest,
+        // so dataset.manifest would be None. But the B6 check should still fire
+        // because it reads from raw_manifest directly.
+        let mut dataset = empty_dataset();
+        let mut raw = raw_manifest_with_atom_count(10);
+        raw.fabric_name = Some("INVALID NAME".into()); // would cause try_build_manifest to return None
+        dataset.raw_manifest = Some(raw);
+        dataset.catchments = Some(catchments_with_rg(vec![4096], vec![true]));
+        let mut c = dataset.catchments.take().unwrap();
+        c.row_count = 3;
+        dataset.catchments = Some(c);
+        // manifest is intentionally None (simulating failed build)
+        let diags = check_schemas(&dataset);
+        assert!(diags.iter().any(|d| d.check_id == "schema.atom_count_mismatch"),
+            "atom_count check should fire even when manifest build fails; got: {diags:#?}");
     }
 
     #[test]

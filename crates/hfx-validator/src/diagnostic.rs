@@ -171,10 +171,27 @@ impl Diagnostic {
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] {} ({}): {}",
-            self.severity, self.artifact, self.check_id, self.message
-        )
+        match &self.location {
+            Location::None => write!(
+                f,
+                "[{}] {} ({}): {}",
+                self.severity, self.artifact, self.check_id, self.message
+            ),
+            Location::Row { index } => write!(
+                f,
+                "[{}] {} row {} ({}): {}",
+                self.severity, self.artifact, index, self.check_id, self.message
+            ),
+            Location::Field { name } => write!(
+                f,
+                "[{}] {} field {:?} ({}): {}",
+                self.severity, self.artifact, name, self.check_id, self.message
+            ),
+            Location::Column { name } => write!(
+                f,
+                "[{}] {} column {:?} ({}): {}",
+                self.severity, self.artifact, name, self.check_id, self.message
+            ),
+        }
     }
 }

@@ -15,6 +15,7 @@ use crate::dataset::{FilePresenceMap, ParsedDataset};
 /// Read all files from a dataset directory and produce a ParsedDataset.
 ///
 /// This function never panics. All I/O errors become diagnostics.
+#[tracing::instrument(skip_all, fields(dir = %dir.display()))]
 pub fn read_dataset(dir: &Path) -> ParsedDataset {
     let files = discover_files(dir);
     let mut read_diagnostics: Vec<crate::diagnostic::Diagnostic> = Vec::new();

@@ -17,6 +17,7 @@ use crate::diagnostic::Diagnostic;
 ///
 /// Checks are executed in phase order. Later phases may be skipped
 /// if earlier phases indicate that required data is missing.
+#[tracing::instrument(skip_all)]
 pub fn run_checks(dataset: &ParsedDataset, _strict: bool, skip_rasters: bool, sample_pct: f64) -> Vec<Diagnostic> {
     let mut all = Vec::new();
 
@@ -59,11 +60,15 @@ pub fn run_checks(dataset: &ParsedDataset, _strict: bool, skip_rasters: bool, sa
     if let (Some(catchments), Some(graph)) = (&dataset.catchments, &dataset.graph) {
         all.extend(referential::check_id_coverage(catchments, graph));
         all.extend(referential::check_upstream_refs(catchments, graph));
+    }
 
-        if let Some(ref snap) = dataset.snap {
-            all.extend(referential::check_snap_refs(catchments, snap));
-        }
+    // D3 snap refs — only needs catchments + snap, not graph
+    if let (Some(catchments), Some(snap)) = (&dataset.catchments, &dataset.snap) {
+        all.extend(referential::check_snap_refs(catchments, snap));
+    }
 
+    // D4 bbox enclosure — only needs catchments + manifest, not graph
+    if let Some(catchments) = &dataset.catchments {
         if let Some(raw) = raw_manifest_ref {
             all.extend(values::check_bbox_enclosure(raw, catchments));
         }

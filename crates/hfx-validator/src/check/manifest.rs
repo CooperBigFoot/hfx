@@ -462,10 +462,11 @@ fn is_valid_fabric_name(name: &str) -> bool {
 
 /// Lightweight RFC 3339 format check (no external deps).
 ///
-/// Accepts strings of the form `YYYY-MM-DDThh:mm:ss[offset]` where offset is
-/// `Z`, `+HH:MM`, or `-HH:MM`. The date/time components are checked for
-/// plausible numeric ranges; full calendar validity (leap years, etc.) is not
-/// enforced.
+/// Accepts strings of the form `YYYY-MM-DDThh:mm:ss[.frac][offset]` where
+/// offset is `Z`, `+HH:MM`, or `-HH:MM`. The optional fractional seconds
+/// part (`.` followed by one or more digits) is skipped. Date/time components
+/// are checked for plausible numeric ranges; full calendar validity (leap
+/// years, etc.) is not enforced.
 fn is_valid_rfc3339(s: &str) -> bool {
     // Minimum: "2000-01-01T00:00:00Z" (20 chars)
     if s.len() < 20 {
@@ -488,17 +489,12 @@ fn is_valid_rfc3339(s: &str) -> bool {
     let min   = parse_digits(&bytes[14..16]);
     let sec   = parse_digits(&bytes[17..19]);
 
-    if year.is_none() || month.is_none() || day.is_none()
-        || hour.is_none() || min.is_none() || sec.is_none()
-    {
+    let (Some(month), Some(day), Some(hour), Some(min), Some(sec)) =
+        (month, day, hour, min, sec)
+    else {
         return false;
-    }
-
-    let month = month.unwrap();
-    let day = day.unwrap();
-    let hour = hour.unwrap();
-    let min = min.unwrap();
-    let sec = sec.unwrap();
+    };
+    if year.is_none() { return false; }
 
     if !(1..=12).contains(&month) { return false; }
     if !(1..=31).contains(&day) { return false; }
@@ -507,8 +503,23 @@ fn is_valid_rfc3339(s: &str) -> bool {
     // Allow leap seconds (60).
     if sec > 60 { return false; }
 
+    // After the seconds field (byte 19), there may be an optional fractional
+    // part: `.` followed by one or more ASCII digits.
+    let mut offset_start = 19usize;
+    if bytes.get(offset_start) == Some(&b'.') {
+        offset_start += 1; // skip the dot
+        // skip all following digit bytes
+        while offset_start < bytes.len() && bytes[offset_start].is_ascii_digit() {
+            offset_start += 1;
+        }
+        // Must have consumed at least one digit after the dot.
+        if offset_start == 20 {
+            return false;
+        }
+    }
+
     // Timezone: Z | +HH:MM | -HH:MM
-    let offset_part = &s[19..];
+    let offset_part = &s[offset_start..];
     is_valid_rfc3339_offset(offset_part)
 }
 
@@ -846,6 +857,21 @@ mod tests {
     #[test]
     fn invalid_rfc3339_non_digits_fail() {
         assert!(!is_valid_rfc3339("YYYY-MM-DDThh:mm:ssZ"));
+    }
+
+    #[test]
+    fn valid_rfc3339_fractional_seconds_three_digits_passes() {
+        assert!(is_valid_rfc3339("2026-01-01T00:00:00.123Z"));
+    }
+
+    #[test]
+    fn valid_rfc3339_fractional_seconds_one_digit_passes() {
+        assert!(is_valid_rfc3339("2026-01-01T00:00:00.0Z"));
+    }
+
+    #[test]
+    fn valid_rfc3339_fractional_seconds_with_offset_passes() {
+        assert!(is_valid_rfc3339("2026-01-01T12:30:00.456+05:30"));
     }
 
     #[test]

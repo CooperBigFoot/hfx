@@ -20,14 +20,17 @@ const MAX_VIOLATIONS: usize = 100;
 // C1: Catchment IDs
 // ---------------------------------------------------------------------------
 
-/// C1 — Check all catchment IDs are positive and non-zero.
+/// C1 — Check all catchment IDs are positive, non-zero, and unique.
 ///
 /// Every `id` in `CatchmentsData.ids` must be > 0.  Zero and negative values
 /// each produce a separate check_id so they can be filtered independently.
+/// Duplicate IDs also produce a distinct diagnostic.
 pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::with_capacity(data.ids.len());
     let mut zero_count = 0usize;
     let mut neg_count = 0usize;
+    let mut dup_count = 0usize;
 
     for (i, &id) in data.ids.iter().enumerate() {
         if id == 0 {
@@ -56,6 +59,20 @@ pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
                     .at(Location::Row { index: i }),
                 );
             }
+        } else if !seen.insert(id) {
+            // id > 0 but already seen — duplicate
+            dup_count += 1;
+            if dup_count <= MAX_VIOLATIONS {
+                diags.push(
+                    Diagnostic::error(
+                        "ids.catchment_duplicate",
+                        Category::IdConstraint,
+                        Artifact::Catchments,
+                        format!("catchment id {id} at row {i} is duplicated; all IDs must be unique"),
+                    )
+                    .at(Location::Row { index: i }),
+                );
+            }
         }
     }
 
@@ -73,6 +90,14 @@ pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
             Category::IdConstraint,
             Artifact::Catchments,
             format!("... and {} more negative catchment ID violations (only first {MAX_VIOLATIONS} shown)", neg_count - MAX_VIOLATIONS),
+        ));
+    }
+    if dup_count > MAX_VIOLATIONS {
+        diags.push(Diagnostic::error(
+            "ids.catchment_duplicate",
+            Category::IdConstraint,
+            Artifact::Catchments,
+            format!("... and {} more duplicate catchment ID violations (only first {MAX_VIOLATIONS} shown)", dup_count - MAX_VIOLATIONS),
         ));
     }
 
@@ -328,9 +353,12 @@ pub fn check_upstream_ids(data: &GraphData) -> Vec<Diagnostic> {
 pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut id_violation = 0usize;
+    let mut dup_count = 0usize;
     let mut cid_violation = 0usize;
     let mut weight_violation = 0usize;
     let mut bbox_violation = 0usize;
+
+    let mut seen: HashSet<i64> = HashSet::with_capacity(data.ids.len());
 
     for (i, &id) in data.ids.iter().enumerate() {
         if id <= 0 {
@@ -342,6 +370,20 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
                         Category::IdConstraint,
                         Artifact::Snap,
                         format!("snap id {id} at row {i} must be > 0"),
+                    )
+                    .at(Location::Row { index: i }),
+                );
+            }
+        } else if !seen.insert(id) {
+            // id > 0 but already seen — duplicate
+            dup_count += 1;
+            if dup_count <= MAX_VIOLATIONS {
+                diags.push(
+                    Diagnostic::error(
+                        "ids.snap_duplicate",
+                        Category::IdConstraint,
+                        Artifact::Snap,
+                        format!("snap id {id} at row {i} is duplicated; all snap IDs must be unique"),
                     )
                     .at(Location::Row { index: i }),
                 );
@@ -408,6 +450,14 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             Category::IdConstraint,
             Artifact::Snap,
             format!("... and {} more snap ID violations (only first {MAX_VIOLATIONS} shown)", id_violation - MAX_VIOLATIONS),
+        ));
+    }
+    if dup_count > MAX_VIOLATIONS {
+        diags.push(Diagnostic::error(
+            "ids.snap_duplicate",
+            Category::IdConstraint,
+            Artifact::Snap,
+            format!("... and {} more duplicate snap ID violations (only first {MAX_VIOLATIONS} shown)", dup_count - MAX_VIOLATIONS),
         ));
     }
     if cid_violation > MAX_VIOLATIONS {
@@ -644,6 +694,28 @@ mod tests {
         assert_eq!(count_id(&diags, "ids.catchment_negative"), 2);
     }
 
+    #[test]
+    fn c1_duplicate_id_produces_error() {
+        let data = make_catchments(vec![1, 2, 1], vec![valid_bbox(); 3], vec![1.0; 3]);
+        let diags = check_catchment_ids(&data);
+        assert_eq!(count_id(&diags, "ids.catchment_duplicate"), 1);
+        assert!(diags[0].location == Location::Row { index: 2 });
+    }
+
+    #[test]
+    fn c1_multiple_duplicates_each_reported() {
+        let data = make_catchments(vec![1, 2, 1, 2, 3, 3], vec![valid_bbox(); 6], vec![1.0; 6]);
+        let diags = check_catchment_ids(&data);
+        assert_eq!(count_id(&diags, "ids.catchment_duplicate"), 3);
+    }
+
+    #[test]
+    fn c1_unique_valid_ids_produce_no_errors() {
+        let data = make_catchments(vec![1, 2, 3, 4], vec![valid_bbox(); 4], vec![1.0; 4]);
+        let diags = check_catchment_ids(&data);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
+    }
+
     // ========================
     // C2: check_catchment_bboxes
     // ========================
@@ -868,5 +940,32 @@ mod tests {
         let data = make_snap(vec![1], vec![10], vec![0.0], vec![valid_bbox()]);
         let diags = check_snap_data(&data);
         assert!(diags.is_empty(), "zero weight should be valid");
+    }
+
+    #[test]
+    fn c7_duplicate_snap_id_produces_error() {
+        let data = make_snap(vec![1, 2, 1], vec![10, 20, 30], vec![0.5; 3], vec![valid_bbox(); 3]);
+        let diags = check_snap_data(&data);
+        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 1);
+        assert!(diags[0].location == Location::Row { index: 2 });
+    }
+
+    #[test]
+    fn c7_multiple_duplicate_snap_ids_each_reported() {
+        let data = make_snap(
+            vec![1, 2, 1, 2, 3, 3],
+            vec![10, 20, 10, 20, 30, 30],
+            vec![0.5; 6],
+            vec![valid_bbox(); 6],
+        );
+        let diags = check_snap_data(&data);
+        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 3);
+    }
+
+    #[test]
+    fn c7_unique_snap_ids_produce_no_duplicate_errors() {
+        let data = make_snap(vec![1, 2, 3], vec![10, 20, 30], vec![0.5; 3], vec![valid_bbox(); 3]);
+        let diags = check_snap_data(&data);
+        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 0);
     }
 }

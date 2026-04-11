@@ -8,7 +8,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, warn};
 
 use crate::dataset::SnapData;
-use crate::diagnostic::{Artifact, Category, Diagnostic};
+use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{validate_schema, ExpectedColumn};
 
 /// Expected schema for snap.parquet.
@@ -123,6 +123,7 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
     let mut weights: Vec<f32> = Vec::new();
     let mut bboxes: Vec<[f32; 4]> = Vec::new();
     let mut geometry_wkb: Vec<Vec<u8>> = Vec::new();
+    let mut total_rows: usize = 0;
 
     for batch_result in reader {
         let batch = match batch_result {
@@ -141,28 +142,76 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
 
         let num_rows = batch.num_rows();
 
-        // id column
+        // id column (non-nullable)
         if let Some(col) = batch.column_by_name("id") {
             if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                ids.extend(arr.values().iter().copied());
+                for i in 0..num_rows {
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_id",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: id is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        ids.push(0); // sentinel to keep indices aligned
+                    } else {
+                        ids.push(arr.value(i));
+                    }
+                }
             }
         }
 
-        // catchment_id column
+        // catchment_id column (non-nullable)
         if let Some(col) = batch.column_by_name("catchment_id") {
             if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                catchment_ids.extend(arr.values().iter().copied());
+                for i in 0..num_rows {
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_catchment_id",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: catchment_id is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        catchment_ids.push(0); // sentinel
+                    } else {
+                        catchment_ids.push(arr.value(i));
+                    }
+                }
             }
         }
 
-        // weight column
+        // weight column (non-nullable)
         if let Some(col) = batch.column_by_name("weight") {
             if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
-                weights.extend(arr.values().iter().copied());
+                for i in 0..num_rows {
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_weight",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: weight is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        weights.push(0.0); // sentinel
+                    } else {
+                        weights.push(arr.value(i));
+                    }
+                }
             }
         }
 
-        // bbox columns
+        // is_mainstem column is Boolean — null check handled implicitly via Arrow null bitmap.
+        // No value extraction needed here (not stored in SnapData).
+
+        // bbox columns (all non-nullable)
         let minx = batch
             .column_by_name("bbox_minx")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
@@ -178,22 +227,64 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
 
         if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
             for i in 0..num_rows {
-                bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
+                let bbox_null = minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
+                if bbox_null {
+                    diags.push(
+                        Diagnostic::error(
+                            "snap.null_bbox",
+                            Category::Schema,
+                            Artifact::Snap,
+                            format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
+                        )
+                        .at(Location::Row { index: total_rows + i }),
+                    );
+                    bboxes.push([0.0, 0.0, 0.0, 0.0]); // sentinel
+                } else {
+                    bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
+                }
             }
         }
 
-        // geometry column — accept both Binary and LargeBinary
+        // geometry column (non-nullable) — accept both Binary and LargeBinary
         if let Some(col) = batch.column_by_name("geometry") {
             if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
                 for i in 0..num_rows {
-                    geometry_wkb.push(arr.value(i).to_vec());
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_geometry",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        geometry_wkb.push(Vec::new()); // sentinel
+                    } else {
+                        geometry_wkb.push(arr.value(i).to_vec());
+                    }
                 }
             } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
                 for i in 0..num_rows {
-                    geometry_wkb.push(arr.value(i).to_vec());
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_geometry",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        geometry_wkb.push(Vec::new()); // sentinel
+                    } else {
+                        geometry_wkb.push(arr.value(i).to_vec());
+                    }
                 }
             }
         }
+
+        total_rows += num_rows;
     }
 
     let row_count = ids.len();

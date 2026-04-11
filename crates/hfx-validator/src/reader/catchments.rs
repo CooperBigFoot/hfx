@@ -8,7 +8,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, warn};
 
 use crate::dataset::CatchmentsData;
-use crate::diagnostic::{Artifact, Category, Diagnostic};
+use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{validate_schema, ExpectedColumn};
 
 /// Expected schema for catchments.parquet.
@@ -121,9 +121,14 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     let mut ids: Vec<i64> = Vec::new();
     let mut areas_km2: Vec<f32> = Vec::new();
     let mut bboxes: Vec<[f32; 4]> = Vec::new();
+    // TODO: For large datasets, geometry should be read lazily or sampled during reading.
+    // Currently all WKB bytes are loaded into memory even though the geometry checker only
+    // samples ~1% of rows.  A future improvement would be to accept row indices from the
+    // checker and re-read the parquet file for just those rows, avoiding the full load.
     let mut geometry_wkb: Vec<Vec<u8>> = Vec::new();
     let mut up_area_null_count: usize = 0;
     let mut up_area_total: usize = 0;
+    let mut total_rows: usize = 0;
 
     for batch_result in reader {
         let batch = match batch_result {
@@ -142,23 +147,53 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
 
         let num_rows = batch.num_rows();
 
-        // id column
+        // id column (non-nullable — check each row)
         let id_col = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
         if let Some(arr) = id_col {
-            ids.extend(arr.values().iter().copied());
+            for i in 0..num_rows {
+                if arr.is_null(i) {
+                    diags.push(
+                        Diagnostic::error(
+                            "catchments.null_id",
+                            Category::Schema,
+                            Artifact::Catchments,
+                            format!("row {}: id is null in a non-nullable column", total_rows + i),
+                        )
+                        .at(Location::Row { index: total_rows + i }),
+                    );
+                    ids.push(0); // sentinel to keep indices aligned
+                } else {
+                    ids.push(arr.value(i));
+                }
+            }
         }
 
-        // area_km2 column
+        // area_km2 column (non-nullable)
         let area_col = batch
             .column_by_name("area_km2")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
         if let Some(arr) = area_col {
-            areas_km2.extend(arr.values().iter().copied());
+            for i in 0..num_rows {
+                if arr.is_null(i) {
+                    diags.push(
+                        Diagnostic::error(
+                            "catchments.null_area_km2",
+                            Category::Schema,
+                            Artifact::Catchments,
+                            format!("row {}: area_km2 is null in a non-nullable column", total_rows + i),
+                        )
+                        .at(Location::Row { index: total_rows + i }),
+                    );
+                    areas_km2.push(0.0); // sentinel
+                } else {
+                    areas_km2.push(arr.value(i));
+                }
+            }
         }
 
-        // up_area_km2 (nullable)
+        // up_area_km2 (nullable — existing null-counting logic is correct)
         up_area_total += num_rows;
         if let Some(up_col) = batch.column_by_name("up_area_km2") {
             up_area_null_count += up_col.null_count();
@@ -166,7 +201,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             up_area_null_count += num_rows;
         }
 
-        // bbox columns
+        // bbox columns (all non-nullable)
         let minx = batch
             .column_by_name("bbox_minx")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
@@ -182,23 +217,65 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
 
         if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
             for i in 0..num_rows {
-                bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
+                let bbox_null = minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
+                if bbox_null {
+                    diags.push(
+                        Diagnostic::error(
+                            "catchments.null_bbox",
+                            Category::Schema,
+                            Artifact::Catchments,
+                            format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
+                        )
+                        .at(Location::Row { index: total_rows + i }),
+                    );
+                    bboxes.push([0.0, 0.0, 0.0, 0.0]); // sentinel
+                } else {
+                    bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
+                }
             }
         }
 
-        // geometry column — accept both Binary and LargeBinary
+        // geometry column (non-nullable) — accept both Binary and LargeBinary
         let geom_col = batch.column_by_name("geometry");
         if let Some(col) = geom_col {
             if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
                 for i in 0..num_rows {
-                    geometry_wkb.push(arr.value(i).to_vec());
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_geometry",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        geometry_wkb.push(Vec::new()); // sentinel
+                    } else {
+                        geometry_wkb.push(arr.value(i).to_vec());
+                    }
                 }
             } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
                 for i in 0..num_rows {
-                    geometry_wkb.push(arr.value(i).to_vec());
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_geometry",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                        geometry_wkb.push(Vec::new()); // sentinel
+                    } else {
+                        geometry_wkb.push(arr.value(i).to_vec());
+                    }
                 }
             }
         }
+
+        total_rows += num_rows;
     }
 
     let row_count = ids.len();

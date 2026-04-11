@@ -21,6 +21,16 @@ pub fn check_file_presence(
 ) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
 
+    // manifest.json — always required.
+    if files.manifest_path.is_none() {
+        diags.push(Diagnostic::error(
+            "file_presence.manifest",
+            Category::FilePresence,
+            Artifact::Manifest,
+            "manifest.json is missing from the dataset directory",
+        ));
+    }
+
     // catchments.parquet — always required.
     if files.catchments_path.is_none() {
         diags.push(Diagnostic::error(
@@ -115,6 +125,21 @@ mod tests {
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
 
+        // manifest_path is None → manifest check fires
+        let diags = check_file_presence(&files, None);
+        assert_eq!(errors_with_id(&diags, "file_presence.manifest"), 1);
+        // no other errors beyond manifest
+        assert_eq!(diags.len(), 1, "expected only manifest error, got: {diags:#?}");
+    }
+
+    #[test]
+    fn all_required_files_present_with_manifest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
+        files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
+        files.graph_path = Some(touch(dir.path(), "graph.arrow"));
+
         let diags = check_file_presence(&files, None);
         assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
     }
@@ -122,9 +147,22 @@ mod tests {
     // --- missing required files ---
 
     #[test]
+    fn missing_manifest_produces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = empty_files();
+        files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
+        files.graph_path = Some(touch(dir.path(), "graph.arrow"));
+        // manifest_path intentionally absent
+
+        let diags = check_file_presence(&files, None);
+        assert_eq!(errors_with_id(&diags, "file_presence.manifest"), 1);
+    }
+
+    #[test]
     fn missing_catchments_produces_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
 
         let diags = check_file_presence(&files, None);
@@ -135,6 +173,7 @@ mod tests {
     fn missing_graph_produces_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
 
         let diags = check_file_presence(&files, None);
@@ -144,6 +183,8 @@ mod tests {
     #[test]
     fn missing_both_required_produces_two_errors() {
         let diags = check_file_presence(&empty_files(), None);
+        // manifest + catchments + graph are all missing
+        assert_eq!(errors_with_id(&diags, "file_presence.manifest"), 1);
         assert_eq!(errors_with_id(&diags, "file_presence.catchments"), 1);
         assert_eq!(errors_with_id(&diags, "file_presence.graph"), 1);
     }
@@ -154,6 +195,7 @@ mod tests {
     fn has_snap_true_but_file_missing_produces_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
 
@@ -184,6 +226,7 @@ mod tests {
     fn has_snap_true_and_file_present_no_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
         files.snap_path = Some(touch(dir.path(), "snap.parquet"));
@@ -216,6 +259,7 @@ mod tests {
     fn has_snap_false_snap_file_not_required() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
         // snap_path is None and that is fine
@@ -249,6 +293,7 @@ mod tests {
     fn has_rasters_true_but_flow_dir_missing_produces_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
         files.flow_acc_path = Some(touch(dir.path(), "flow_acc.tif"));
@@ -282,6 +327,7 @@ mod tests {
     fn has_rasters_true_but_flow_acc_missing_produces_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
         files.flow_dir_path = Some(touch(dir.path(), "flow_dir.tif"));
@@ -315,6 +361,7 @@ mod tests {
     fn has_rasters_false_raster_files_not_required() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
 
@@ -342,13 +389,15 @@ mod tests {
     }
 
     #[test]
-    fn no_manifest_raster_files_not_required() {
+    fn no_raw_manifest_raster_files_not_required() {
         let dir = tempfile::tempdir().unwrap();
         let mut files = empty_files();
+        files.manifest_path = Some(touch(dir.path(), "manifest.json"));
         files.catchments_path = Some(touch(dir.path(), "catchments.parquet"));
         files.graph_path = Some(touch(dir.path(), "graph.arrow"));
 
+        // raw_manifest is None but manifest_path is present — raster files are optional
         let diags = check_file_presence(&files, None);
-        assert!(diags.is_empty(), "expected no diagnostics when manifest absent");
+        assert!(diags.is_empty(), "expected no diagnostics when raw manifest is None");
     }
 }
