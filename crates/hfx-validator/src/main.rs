@@ -15,7 +15,7 @@ enum OutputFormat {
 
 /// HFX dataset validator — checks an HFX directory against the spec.
 #[derive(Debug, Parser)]
-#[command(name = "hfx-validator", version, about)]
+#[command(name = "hfx", version, about)]
 struct Cli {
     /// Path to the HFX dataset directory to validate.
     dataset_path: PathBuf,

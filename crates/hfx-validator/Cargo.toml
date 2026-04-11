@@ -3,6 +3,10 @@ name = "hfx-validator"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "hfx"
+path = "src/main.rs"
+
 [dependencies]
 hfx-core = { path = "../hfx-core" }
 tracing.workspace = true
