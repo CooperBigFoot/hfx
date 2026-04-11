@@ -3,7 +3,7 @@ members = ["crates/hfx-core", "crates/hfx-validator"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 
 [workspace.dependencies]

@@ -63,9 +63,27 @@ pub fn read_dataset(dir: &Path) -> ParsedDataset {
         None
     };
 
-    // TODO: Step 3 will implement raster reading
-    let flow_dir = None;
-    let flow_acc = None;
+    // --- Rasters (only read if manifest declares has_rasters = true) ---
+    let has_rasters = raw_manifest
+        .as_ref()
+        .and_then(|m| m.has_rasters)
+        .unwrap_or(false);
+
+    let mut flow_dir = None;
+    let mut flow_acc = None;
+
+    if has_rasters {
+        if let Some(ref path) = files.flow_dir_path {
+            let (meta, diags) = raster::read_raster_meta(path, "flow_dir.tif");
+            read_diagnostics.extend(diags);
+            flow_dir = meta;
+        }
+        if let Some(ref path) = files.flow_acc_path {
+            let (meta, diags) = raster::read_raster_meta(path, "flow_acc.tif");
+            read_diagnostics.extend(diags);
+            flow_acc = meta;
+        }
+    }
 
     ParsedDataset {
         files,
