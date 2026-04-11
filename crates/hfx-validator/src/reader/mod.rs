@@ -9,6 +9,7 @@ pub mod schema;
 
 use std::path::Path;
 
+use crate::check::manifest::try_build_manifest;
 use crate::dataset::{FilePresenceMap, ParsedDataset};
 
 /// Read all files from a dataset directory and produce a ParsedDataset.
@@ -16,20 +17,30 @@ use crate::dataset::{FilePresenceMap, ParsedDataset};
 /// This function never panics. All I/O errors become diagnostics.
 pub fn read_dataset(dir: &Path) -> ParsedDataset {
     let files = discover_files(dir);
+    let mut read_diagnostics: Vec<crate::diagnostic::Diagnostic> = Vec::new();
 
-    // TODO: Step 1 will implement manifest reading
+    // --- Manifest ---
+    let (manifest_json, raw_manifest, manifest_diags) = match &files.manifest_path {
+        Some(path) => manifest::read_manifest(path),
+        None => (None, None, vec![]),
+    };
+    read_diagnostics.extend(manifest_diags);
+
+    let manifest = raw_manifest.as_ref().and_then(try_build_manifest);
+
     // TODO: Step 2 will implement catchments, graph, snap, raster reading
 
     ParsedDataset {
         files,
-        manifest_json: None,
-        manifest: None,
+        manifest_json,
+        raw_manifest,
+        manifest,
         catchments: None,
         graph: None,
         snap: None,
         flow_dir: None,
         flow_acc: None,
-        read_diagnostics: Vec::new(),
+        read_diagnostics,
     }
 }
 

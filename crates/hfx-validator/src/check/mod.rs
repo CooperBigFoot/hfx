@@ -23,7 +23,15 @@ pub fn run_checks(dataset: &ParsedDataset, _strict: bool, _skip_rasters: bool, _
     // Include any diagnostics from the read phase
     all.extend(dataset.read_diagnostics.iter().cloned());
 
-    // TODO: Step 1 will add file_presence and manifest checks
+    // Phase 1a: file presence
+    let raw_manifest_ref = dataset.raw_manifest.as_ref();
+    all.extend(file_presence::check_file_presence(&dataset.files, raw_manifest_ref));
+
+    // Phase 1b: manifest field validation (only when successfully deserialized)
+    if let Some(raw) = raw_manifest_ref {
+        all.extend(manifest::check_manifest(raw));
+    }
+
     // TODO: Step 2 will add schema, id, geometry, raster checks
     // TODO: Step 3 will add referential integrity and graph checks
     // TODO: Step 4 will wire everything together

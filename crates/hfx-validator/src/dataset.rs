@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use hfx_core::Manifest;
 
 use crate::diagnostic::Diagnostic;
+use crate::reader::manifest::RawManifest;
 
 /// File existence status for all artifacts.
 #[derive(Debug, Clone)]
@@ -78,6 +79,7 @@ pub enum RasterSampleFormat {
 pub struct ParsedDataset {
     pub files: FilePresenceMap,
     pub manifest_json: Option<serde_json::Value>,
+    pub raw_manifest: Option<RawManifest>,
     pub manifest: Option<Manifest>,
     pub catchments: Option<CatchmentsData>,
     pub graph: Option<GraphData>,
