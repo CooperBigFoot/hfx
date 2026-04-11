@@ -208,8 +208,25 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
             }
         }
 
-        // is_mainstem column is Boolean — null check handled implicitly via Arrow null bitmap.
-        // No value extraction needed here (not stored in SnapData).
+        // is_mainstem column (non-nullable Boolean) — check for nulls even though
+        // the value is not stored in SnapData.
+        if let Some(col) = batch.column_by_name("is_mainstem") {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+                for i in 0..num_rows {
+                    if arr.is_null(i) {
+                        diags.push(
+                            Diagnostic::error(
+                                "snap.null_is_mainstem",
+                                Category::Schema,
+                                Artifact::Snap,
+                                format!("row {}: is_mainstem is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
+                }
+            }
+        }
 
         // bbox columns (all non-nullable)
         let minx = batch

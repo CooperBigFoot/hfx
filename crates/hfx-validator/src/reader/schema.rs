@@ -45,9 +45,8 @@ fn is_large_variant(actual: &DataType, expected: &DataType) -> bool {
 /// 1. The column exists in `actual`.
 /// 2. The data type matches exactly.  When the type is a "large" Arrow variant
 ///    (e.g. [`DataType::LargeBinary`] instead of [`DataType::Binary`], or
-///    [`DataType::LargeList`] instead of [`DataType::List`]) a **warning** is
-///    emitted rather than an error, because such files are technically readable
-///    but go beyond what the HFX spec mandates.
+///    [`DataType::LargeList`] instead of [`DataType::List`]) an **error** is
+///    emitted, because the spec mandates specific on-disk types.
 /// 3. Non-nullable columns that are marked nullable in the actual schema emit an
 ///    **error** (not a warning), because a producer that omits the non-null
 ///    constraint may silently produce null values that downstream readers cannot
@@ -88,13 +87,13 @@ pub fn validate_schema(
                         "column uses large Arrow variant; spec requires the standard type"
                     );
                     diags.push(
-                        Diagnostic::warning(
+                        Diagnostic::error(
                             "schema.large_variant",
                             Category::Schema,
                             artifact,
                             format!(
                                 "column '{}' has type {:?} but the spec requires {:?}; \
-                                 large variants are readable but non-conformant",
+                                 large variants are non-conformant",
                                 col.name,
                                 field.data_type(),
                                 col.dtype
@@ -224,36 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn large_binary_instead_of_binary_produces_warning() {
-        // schema has LargeBinary, expected is Binary → warning (non-conformant but readable)
+    fn large_binary_instead_of_binary_produces_error() {
         let schema = make_schema(vec![Field::new("geometry", DataType::LargeBinary, false)]);
         let expected = vec![ExpectedColumn::new("geometry", DataType::Binary, false)];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
         assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
         assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]
-    fn binary_instead_of_large_binary_produces_warning() {
-        // schema has Binary, expected is LargeBinary → warning
+    fn binary_instead_of_large_binary_produces_error() {
         let schema = make_schema(vec![Field::new("geometry", DataType::Binary, false)]);
         let expected = vec![ExpectedColumn::new("geometry", DataType::LargeBinary, false)];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
         assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
         assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]
-    fn large_list_instead_of_list_produces_warning() {
+    fn large_list_instead_of_list_produces_error() {
         let large_list_field = DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
         let schema = make_schema(vec![Field::new("upstream_ids", large_list_field, false)]);
         let expected = vec![ExpectedColumn::new("upstream_ids", list_int64_field(), false)];
         let diags = validate_schema(&schema, &expected, Artifact::Graph);
         assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
         assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]

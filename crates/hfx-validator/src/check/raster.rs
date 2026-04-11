@@ -39,17 +39,25 @@ pub fn check_flow_dir(meta: &RasterMeta) -> Vec<Diagnostic> {
         ));
     }
 
-    // Nodata check: spec requires 255 for flow_dir.
-    // Warning (not error) because some TIFF writers may not embed the nodata tag.
-    if let Some(nodata) = meta.nodata {
-        if (nodata - 255.0).abs() > f64::EPSILON {
-            diags.push(Diagnostic::warning(
+    // Nodata check: spec requires NoData = 255 for flow_dir.
+    match meta.nodata {
+        Some(nodata) if (nodata - 255.0).abs() > f64::EPSILON => {
+            diags.push(Diagnostic::error(
                 "raster.flow_dir_nodata",
                 Category::Raster,
                 Artifact::FlowDir,
-                format!("flow_dir.tif nodata should be 255, got {nodata}"),
+                format!("flow_dir.tif nodata must be 255, got {nodata}"),
             ));
         }
+        None => {
+            diags.push(Diagnostic::error(
+                "raster.flow_dir_nodata",
+                Category::Raster,
+                Artifact::FlowDir,
+                "flow_dir.tif is missing a nodata value; spec requires 255",
+            ));
+        }
+        _ => {}
     }
 
     diags
@@ -84,30 +92,43 @@ pub fn check_flow_acc(meta: &RasterMeta) -> Vec<Diagnostic> {
         ));
     }
 
-    // Nodata check: spec requires -1.0 for flow_acc.
-    // Warning (not error) because some TIFF writers may not embed the nodata tag.
-    if let Some(nodata) = meta.nodata {
-        if (nodata - (-1.0)).abs() > f64::EPSILON {
-            diags.push(Diagnostic::warning(
+    // Nodata check: spec requires NoData = -1.0 for flow_acc.
+    match meta.nodata {
+        Some(nodata) if (nodata - (-1.0)).abs() > f64::EPSILON => {
+            diags.push(Diagnostic::error(
                 "raster.flow_acc_nodata",
                 Category::Raster,
                 Artifact::FlowAcc,
-                format!("flow_acc.tif nodata should be -1.0, got {nodata}"),
+                format!("flow_acc.tif nodata must be -1.0, got {nodata}"),
             ));
         }
+        None => {
+            diags.push(Diagnostic::error(
+                "raster.flow_acc_nodata",
+                Category::Raster,
+                Artifact::FlowAcc,
+                "flow_acc.tif is missing a nodata value; spec requires -1.0",
+            ));
+        }
+        _ => {}
     }
 
     diags
 }
 
-/// G3: Emit an informational note that CRS and extent checks are deferred
-/// because they require GDAL, which is not available in this validator.
-pub fn crs_extent_deferred_note() -> Vec<Diagnostic> {
-    vec![Diagnostic::info(
-        "raster.crs_extent_deferred",
+/// G3: Emit a warning that CRS and extent checks are not implemented.
+///
+/// The spec requires raster CRS to match the manifest CRS and raster extent to
+/// contain the manifest bbox. These checks require GeoTIFF metadata parsing
+/// beyond what the pure-Rust `tiff` crate provides. This is a known conformance
+/// gap — datasets with wrong CRS or insufficient extent will NOT be caught.
+pub fn crs_extent_not_implemented() -> Vec<Diagnostic> {
+    vec![Diagnostic::warning(
+        "raster.crs_extent_not_implemented",
         Category::Raster,
         Artifact::FlowDir,
-        "CRS and spatial extent checks are deferred: they require GDAL, which is not linked",
+        "raster CRS and spatial extent checks are NOT implemented (requires GDAL); \
+         spec rules §raster-CRS-match and §raster-extent-containment are unchecked",
     )]
 }
 
@@ -232,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_dir_correct_nodata_produces_no_warning() {
+    fn flow_dir_correct_nodata_produces_no_error() {
         let meta = RasterMeta {
             nodata: Some(255.0),
             ..valid_flow_dir_meta()
@@ -240,33 +261,33 @@ mod tests {
         let diags = check_flow_dir(&meta);
         assert!(
             !diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
-            "correct nodata=255 should not produce a warning, got: {diags:#?}"
+            "correct nodata=255 should not produce an error, got: {diags:#?}"
         );
     }
 
     #[test]
-    fn flow_dir_wrong_nodata_produces_warning() {
+    fn flow_dir_wrong_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: Some(0.0),
             ..valid_flow_dir_meta()
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Warning),
-            "wrong nodata should produce a warning, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
+            "wrong nodata should produce an error, got: {diags:#?}"
         );
     }
 
     #[test]
-    fn flow_dir_absent_nodata_produces_no_warning() {
+    fn flow_dir_absent_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: None,
             ..valid_flow_dir_meta()
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            !diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
-            "absent nodata tag should not produce a warning, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
+            "absent nodata should produce an error, got: {diags:#?}"
         );
     }
 
@@ -342,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_acc_correct_nodata_produces_no_warning() {
+    fn flow_acc_correct_nodata_produces_no_error() {
         let meta = RasterMeta {
             nodata: Some(-1.0),
             ..valid_flow_acc_meta()
@@ -350,33 +371,33 @@ mod tests {
         let diags = check_flow_acc(&meta);
         assert!(
             !diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
-            "correct nodata=-1.0 should not produce a warning, got: {diags:#?}"
+            "correct nodata=-1.0 should not produce an error, got: {diags:#?}"
         );
     }
 
     #[test]
-    fn flow_acc_wrong_nodata_produces_warning() {
+    fn flow_acc_wrong_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: Some(0.0),
             ..valid_flow_acc_meta()
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Warning),
-            "wrong nodata should produce a warning, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
+            "wrong nodata should produce an error, got: {diags:#?}"
         );
     }
 
     #[test]
-    fn flow_acc_absent_nodata_produces_no_warning() {
+    fn flow_acc_absent_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: None,
             ..valid_flow_acc_meta()
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            !diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
-            "absent nodata tag should not produce a warning, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
+            "absent nodata should produce an error, got: {diags:#?}"
         );
     }
 
@@ -385,10 +406,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn crs_deferred_note_produces_info_diagnostic() {
-        let diags = crs_extent_deferred_note();
+    fn crs_not_implemented_produces_warning() {
+        let diags = crs_extent_not_implemented();
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Info);
-        assert_eq!(diags[0].check_id, "raster.crs_extent_deferred");
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].check_id, "raster.crs_extent_not_implemented");
     }
 }

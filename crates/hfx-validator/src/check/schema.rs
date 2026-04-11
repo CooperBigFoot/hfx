@@ -29,12 +29,13 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     if let Some(catchments) = &dataset.catchments {
         for (rg_idx, has_stats) in catchments.row_group_has_bbox_stats.iter().enumerate() {
             if !has_stats {
-                diags.push(Diagnostic::warning(
+                diags.push(Diagnostic::error(
                     "schema.catchments.bbox_stats_missing",
                     Category::Schema,
                     Artifact::Catchments,
                     format!(
-                        "catchments.parquet row group {rg_idx} is missing statistics for bbox columns; spatial filtering will be slower"
+                        "catchments.parquet row group {rg_idx} is missing statistics for bbox columns; \
+                         spec requires row group statistics on bbox columns"
                     ),
                 ));
             }
@@ -60,12 +61,13 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     if let Some(snap) = &dataset.snap {
         for (rg_idx, has_stats) in snap.row_group_has_bbox_stats.iter().enumerate() {
             if !has_stats {
-                diags.push(Diagnostic::warning(
+                diags.push(Diagnostic::error(
                     "schema.snap.bbox_stats_missing",
                     Category::Schema,
                     Artifact::Snap,
                     format!(
-                        "snap.parquet row group {rg_idx} is missing statistics for bbox columns; spatial filtering will be slower"
+                        "snap.parquet row group {rg_idx} is missing statistics for bbox columns; \
+                         spec requires row group statistics on bbox columns"
                     ),
                 ));
             }

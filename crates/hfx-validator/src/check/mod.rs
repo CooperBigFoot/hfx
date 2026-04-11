@@ -103,7 +103,7 @@ pub fn run_checks(dataset: &ParsedDataset, _strict: bool, skip_rasters: bool, sa
         }
 
         if has_rasters {
-            all.extend(raster::crs_extent_deferred_note());
+            all.extend(raster::crs_extent_not_implemented());
         }
     }
 

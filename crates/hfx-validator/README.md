@@ -53,3 +53,16 @@ hfx-validator <DATASET_PATH> [--format text|json] [--strict] [--skip-rasters] [-
 ```
 
 Exit codes: `0` = valid, `1` = invalid.
+
+## Known Conformance Gaps
+
+The following spec-required checks are **not implemented** and will emit warnings rather than errors:
+
+| Spec Rule | Reason | Tracking |
+|---|---|---|
+| Raster CRS must match manifest CRS | Requires GeoTIFF metadata parsing beyond what `tiff` 0.9 provides; needs GDAL or a GeoKeys parser | `raster.crs_extent_not_implemented` |
+| Raster extent must contain manifest bbox | Same as above | `raster.crs_extent_not_implemented` |
+| Hilbert sort order on catchments/snap rows | Curve parameters not yet specified in the spec | Deferred |
+| Polygon self-intersection / geometric validity | `geozero` checks WKB structural validity, not topological validity | Partial |
+
+A dataset that passes this validator with `--strict` is conformant on all checked rules. The unchecked rules above mean a passing result does **not** guarantee full spec conformance.
