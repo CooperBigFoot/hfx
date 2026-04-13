@@ -389,3 +389,28 @@ fn report_counts_are_consistent() {
         "error + warning + info counts must sum to total diagnostics"
     );
 }
+
+#[test]
+fn binary_json_stdout_is_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    create_valid_dataset(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hfx"))
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to run hfx binary");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let trimmed = stdout.trim();
+    assert!(
+        trimmed.starts_with('{'),
+        "stdout must start with '{{' for JSON mode, got first 100 chars: {:?}",
+        &trimmed[..trimmed.len().min(100)]
+    );
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .expect("stdout must be valid JSON");
+    assert!(parsed.get("passed").is_some(), "JSON must have 'passed' field");
+    assert!(parsed.get("diagnostics").is_some(), "JSON must have 'diagnostics' field");
+}

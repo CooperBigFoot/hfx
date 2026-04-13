@@ -38,14 +38,18 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    if cli.format != OutputFormat::Json {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
+
     info!(path = %cli.dataset_path.display(), "validating HFX dataset");
 
     let report = hfx_validator::validate(

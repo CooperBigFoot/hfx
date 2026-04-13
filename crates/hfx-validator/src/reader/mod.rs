@@ -9,6 +9,14 @@ pub mod schema;
 
 use std::path::Path;
 
+/// Maximum number of per-row null diagnostics emitted per column before
+/// remaining violations are suppressed with a summary count.
+pub(crate) const MAX_NULL_DIAGNOSTICS_PER_COLUMN: usize = 10;
+
+/// Maximum number of consecutive batch-read failures before the reader
+/// aborts with a summary diagnostic.
+pub(crate) const MAX_CONSECUTIVE_BATCH_FAILURES: usize = 3;
+
 use crate::check::manifest::try_build_manifest;
 use crate::dataset::{FilePresenceMap, ParsedDataset};
 

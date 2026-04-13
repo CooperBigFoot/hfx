@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use crate::dataset::CatchmentsData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{validate_schema, ExpectedColumn};
+use super::{MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_CONSECUTIVE_BATCH_FAILURES};
 
 /// Expected schema for catchments.parquet.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -130,11 +131,37 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     let mut up_area_total: usize = 0;
     let mut total_rows: usize = 0;
 
+    // Per-column null counters (used to cap per-row diagnostics).
+    let mut null_id_count: usize = 0;
+    let mut null_area_count: usize = 0;
+    let mut null_bbox_count: usize = 0;
+    let mut null_geom_count: usize = 0;
+
+    let mut consecutive_batch_failures: usize = 0;
+
     for batch_result in reader {
+        if consecutive_batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
+            diags.push(Diagnostic::error(
+                "catchments.batch_read_aborted",
+                Category::Schema,
+                Artifact::Catchments,
+                format!(
+                    "aborting read after {} consecutive batch failures; \
+                     file may be unreadable (unsupported codec or corruption)",
+                    MAX_CONSECUTIVE_BATCH_FAILURES
+                ),
+            ));
+            break;
+        }
+
         let batch = match batch_result {
-            Ok(b) => b,
+            Ok(b) => {
+                consecutive_batch_failures = 0;
+                b
+            }
             Err(err) => {
                 warn!(error = %err, "error reading catchments record batch");
+                consecutive_batch_failures += 1;
                 diags.push(Diagnostic::error(
                     "catchments.batch_read",
                     Category::Schema,
@@ -154,15 +181,18 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         if let Some(arr) = id_col {
             for i in 0..num_rows {
                 if arr.is_null(i) {
-                    diags.push(
-                        Diagnostic::error(
-                            "catchments.null_id",
-                            Category::Schema,
-                            Artifact::Catchments,
-                            format!("row {}: id is null in a non-nullable column", total_rows + i),
-                        )
-                        .at(Location::Row { index: total_rows + i }),
-                    );
+                    null_id_count += 1;
+                    if null_id_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_id",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: id is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
                     ids.push(0); // sentinel to keep indices aligned
                 } else {
                     ids.push(arr.value(i));
@@ -177,15 +207,18 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         if let Some(arr) = area_col {
             for i in 0..num_rows {
                 if arr.is_null(i) {
-                    diags.push(
-                        Diagnostic::error(
-                            "catchments.null_area_km2",
-                            Category::Schema,
-                            Artifact::Catchments,
-                            format!("row {}: area_km2 is null in a non-nullable column", total_rows + i),
-                        )
-                        .at(Location::Row { index: total_rows + i }),
-                    );
+                    null_area_count += 1;
+                    if null_area_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_area_km2",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: area_km2 is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
                     areas_km2.push(0.0); // sentinel
                 } else {
                     areas_km2.push(arr.value(i));
@@ -219,15 +252,18 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             for i in 0..num_rows {
                 let bbox_null = minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
                 if bbox_null {
-                    diags.push(
-                        Diagnostic::error(
-                            "catchments.null_bbox",
-                            Category::Schema,
-                            Artifact::Catchments,
-                            format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
-                        )
-                        .at(Location::Row { index: total_rows + i }),
-                    );
+                    null_bbox_count += 1;
+                    if null_bbox_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_bbox",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
                     bboxes.push([0.0, 0.0, 0.0, 0.0]); // sentinel
                 } else {
                     bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
@@ -241,15 +277,18 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
                 for i in 0..num_rows {
                     if arr.is_null(i) {
-                        diags.push(
-                            Diagnostic::error(
-                                "catchments.null_geometry",
-                                Category::Schema,
-                                Artifact::Catchments,
-                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
-                            )
-                            .at(Location::Row { index: total_rows + i }),
-                        );
+                        null_geom_count += 1;
+                        if null_geom_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                            diags.push(
+                                Diagnostic::error(
+                                    "catchments.null_geometry",
+                                    Category::Schema,
+                                    Artifact::Catchments,
+                                    format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                                )
+                                .at(Location::Row { index: total_rows + i }),
+                            );
+                        }
                         geometry_wkb.push(Vec::new()); // sentinel
                     } else {
                         geometry_wkb.push(arr.value(i).to_vec());
@@ -258,15 +297,18 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
                 for i in 0..num_rows {
                     if arr.is_null(i) {
-                        diags.push(
-                            Diagnostic::error(
-                                "catchments.null_geometry",
-                                Category::Schema,
-                                Artifact::Catchments,
-                                format!("row {}: geometry is null in a non-nullable column", total_rows + i),
-                            )
-                            .at(Location::Row { index: total_rows + i }),
-                        );
+                        null_geom_count += 1;
+                        if null_geom_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                            diags.push(
+                                Diagnostic::error(
+                                    "catchments.null_geometry",
+                                    Category::Schema,
+                                    Artifact::Catchments,
+                                    format!("row {}: geometry is null in a non-nullable column", total_rows + i),
+                                )
+                                .at(Location::Row { index: total_rows + i }),
+                            );
+                        }
                         geometry_wkb.push(Vec::new()); // sentinel
                     } else {
                         geometry_wkb.push(arr.value(i).to_vec());
@@ -276,6 +318,52 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         }
 
         total_rows += num_rows;
+    }
+
+    // Emit summary diagnostics for columns that exceeded the per-row cap.
+    if null_id_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_id_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_id",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in 'id' column suppressed ({null_id_count} total)"
+            ),
+        ));
+    }
+    if null_area_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_area_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_area_km2",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in 'area_km2' column suppressed ({null_area_count} total)"
+            ),
+        ));
+    }
+    if null_bbox_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_bbox_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_bbox",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in 'bbox' column suppressed ({null_bbox_count} total)"
+            ),
+        ));
+    }
+    if null_geom_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_geom_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_geometry",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in 'geometry' column suppressed ({null_geom_count} total)"
+            ),
+        ));
     }
 
     let row_count = ids.len();
@@ -305,6 +393,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
 
     use super::*;
 
@@ -444,5 +534,51 @@ mod tests {
             diags.iter().any(|d| d.check_id == "schema.missing_column"),
             "expected schema.missing_column diagnostic"
         );
+    }
+
+    #[test]
+    fn zstd_compressed_parquet_reads_correctly() {
+        let (schema, batch) = make_valid_batch();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catchments.parquet");
+        std::fs::write(&path, &buf).unwrap();
+
+        let (data, diags) = read_catchments(&path);
+        let data = data.expect("zstd-compressed parquet should read successfully");
+        assert_eq!(data.row_count, 3);
+        assert!(!diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error));
+    }
+
+    #[test]
+    fn snappy_compressed_parquet_reads_correctly() {
+        let (schema, batch) = make_valid_batch();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catchments.parquet");
+        std::fs::write(&path, &buf).unwrap();
+
+        let (data, diags) = read_catchments(&path);
+        let data = data.expect("snappy-compressed parquet should read successfully");
+        assert_eq!(data.row_count, 3);
+        assert!(!diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error));
     }
 }
