@@ -6,13 +6,13 @@
 
 ## Overview
 
-HFX is the canonical data contract consumed by the watershed delineation engine. It is not a native hydrofabric format. Every source fabric (HydroBASINS, GRIT, MERIT Hydro, etc.) must be compiled into HFX by an adapter before the engine sees it.
+HFX is the canonical data contract consumed by the watershed delineation engine. It is not a native hydrofabric format. Every source fabric must be compiled into HFX by an adapter before the engine sees it.
 
 The engine operates on HFX exclusively. It contains no fabric-specific logic.
 
 ### Terminology
 
-A **catchment atom** is the smallest indivisible drainage unit within a compiled dataset. The atom boundary depends on the source fabric and the adapter that produced it: a HydroBASINS level-8 sub-basin, a GRIT segment catchment, a MERIT Hydro unit catchment, etc. HFX does not prescribe how atoms are derived — only that they form a non-overlapping drainage partition over the dataset domain, and that each atom participates in a directed drainage graph that may be convergent or branching.
+A **catchment atom** is the smallest indivisible drainage unit within a compiled dataset. The atom boundary depends on the source fabric and the adapter that produced it: a hierarchically subdivided sub-basin, a stream-segment catchment, a unit catchment, etc. HFX does not prescribe how atoms are derived — only that they form a non-overlapping drainage partition over the dataset domain, and that each atom participates in a directed drainage graph that may be convergent or branching.
 
 ---
 
@@ -41,7 +41,7 @@ One row per catchment atom.
 |---|---|---|---|
 | `id` | `int64` | No | Unique atom ID within this dataset |
 | `area_km2` | `float32` | No | Geodesic area of this atom in km² |
-| `up_area_km2` | `float32` | Yes | Total upstream drainage area in km². Null if not precomputed by source fabric |
+| `up_area_km2` | `float32` | Yes | Inclusive cumulative upstream drainage area in km² (sum of all upstream atoms' `area_km2` plus this atom's own `area_km2`). Null if not precomputed by the adapter |
 | `bbox_minx` | `float32` | No | Bounding box — western edge (degrees longitude) |
 | `bbox_miny` | `float32` | No | Bounding box — southern edge (degrees latitude) |
 | `bbox_maxx` | `float32` | No | Bounding box — eastern edge (degrees longitude) |
@@ -60,6 +60,7 @@ One row per catchment atom.
 - Negative IDs are invalid.
 - Geometries must be valid (no self-intersections). Run `ST_MakeValid` during ETL if source data is dirty.
 - CRS must be EPSG:4326. Adapters are responsible for reprojection.
+- `up_area_km2`, when present, **must** represent the inclusive cumulative upstream area: the sum of `area_km2` for this atom and all atoms reachable upstream through `graph.arrow`. For DAG-topology datasets where the source fabric partitions drainage area at bifurcations, adapters **should** set `has_up_area = false` in the manifest and leave `up_area_km2` null, allowing the engine to compute it from graph traversal.
 
 ---
 
@@ -77,9 +78,9 @@ The upstream adjacency graph over catchment atoms. Contains no geometry. This is
 ### Notes
 
 - Every `id` present in `catchments.parquet` **must** have a corresponding row here, even headwaters (with `upstream_ids = []`).
-- For tree-topology fabrics (HydroBASINS, MERIT Hydro), `upstream_ids` has 0–2 entries per row.
-- For DAG-topology fabrics (GRIT), `upstream_ids` may have more entries where distributaries re-merge. The engine **must** maintain a visited set during BFS to avoid visiting shared upstream nodes more than once.
-- The graph must be acyclic. Adapters must detect and break cycles (e.g., GRIT endorheic loops) during ETL.
+- For tree-topology fabrics (`topology = "tree"`), `upstream_ids` has 0–2 entries per row.
+- For DAG-topology fabrics (`topology = "dag"`), `upstream_ids` may have more entries where distributaries re-merge. The engine **must** maintain a visited set during BFS to avoid visiting shared upstream nodes more than once.
+- The graph must be acyclic. Adapters must detect and break cycles (e.g., endorheic loops) during ETL.
 - Arrow IPC format (not Parquet) is used for zero-copy memory mapping.
 
 **On-disk vs. in-memory layout.** The Arrow IPC list-column schema above is the on-disk contract — all adapters must produce this layout, and the validator checks it. The engine may convert the list-column representation to CSR (flat neighbors array + offsets array) or any other layout at load time. The in-memory representation is an implementation detail, not part of this specification.
@@ -90,7 +91,7 @@ The upstream adjacency graph over catchment atoms. Contains no geometry. This is
 
 ## 3. `snap.parquet`
 
-Snapping targets used to attach an outlet point to the drainage network. **This artifact is optional.** If absent (`has_snap = false` in manifest), the engine resolves the terminal atom via point-in-polygon spatial containment on `catchments.parquet`. When present, the engine uses the tiered ranking below for higher precision outlet resolution. Snap targets are most valuable for fabrics with explicit stream features (e.g., GRIT reach segments). For polygon-only fabrics (e.g., HydroBASINS), point-in-polygon is typically sufficient.
+Snapping targets used to attach an outlet point to the drainage network. **This artifact is optional.** If absent (`has_snap = false` in manifest), the engine resolves the terminal atom via point-in-polygon spatial containment on `catchments.parquet`. When present, the engine uses the tiered ranking below for higher precision outlet resolution. Snap targets are most valuable for fabrics with explicit stream-line features. For polygon-only fabrics without reach geometry, point-in-polygon is typically sufficient.
 
 ### Schema
 
@@ -125,8 +126,7 @@ Same Hilbert-sort and row group statistics requirements as `catchments.parquet`.
 
 ### Notes
 
-- For HydroBASINS (no explicit reaches), adapters may omit `snap.parquet` entirely (`has_snap = false`) and let the engine fall back to point-in-polygon on `catchments.parquet`. If the adapter does provide snap targets (e.g., for higher-precision outlet resolution), the preferred approach is outlet-directed representative geometries: skeletonized centerlines or pour-point-derived lines that approximate the drainage path within each atom. As a lower-quality fallback, the polygon centroid may be used as a Point with `weight = up_area_km2`, but centroids can be poor proxies for drainage attachment in elongated or irregular polygons.
-- For GRIT, snap targets are the vectorized reach segments with `weight = drainage_area_km2` and `is_mainstem` from the GRIT mainstem flag.
+- For polygon-only fabrics without explicit reach geometry, adapters MAY omit `snap.parquet` entirely (`has_snap = false`) and let the engine fall back to point-in-polygon on `catchments.parquet`. If the adapter does provide snap targets (e.g., for higher-precision outlet resolution), the preferred approach is outlet-directed representative geometries: skeletonized centerlines or pour-point-derived lines that approximate the drainage path within each atom. As a lower-quality fallback, the polygon centroid may be used as a Point with `weight = up_area_km2`, but centroids can be poor proxies for drainage attachment in elongated or irregular polygons.
 - `is_mainstem = true` for all features in non-bifurcating fabrics.
 
 ---
@@ -201,9 +201,9 @@ The manifest describes **what the data is**, not how the engine should use it. T
 ```json
 {
   "format_version": "0.1",
-  "fabric_name": "hydrobasins",
-  "fabric_version": "v1c",
-  "fabric_level": 8,
+  "fabric_name": "example-fabric",
+  "fabric_version": "2024.1",
+  "fabric_level": 3,
   "crs": "EPSG:4326",
   "has_up_area": true,
   "has_rasters": true,
@@ -226,14 +226,14 @@ The manifest describes **what the data is**, not how the engine should use it. T
 | `format_version` | string | Yes | HFX version this dataset targets |
 | `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
-| `fabric_level` | int | No | Pfafstetter level (HydroBASINS only) |
+| `fabric_level` | int | No | Optional hierarchical subdivision level within the source fabric (e.g., resolution tier, nesting depth) |
 | `crs` | string | Yes | CRS for all vector and raster data. Must be `"EPSG:4326"` in HFX v0.1. The field exists for forward compatibility with projected CRS support in future versions |
 | `has_up_area` | bool | Yes | Whether `up_area_km2` is populated in `catchments.parquet`. If false, engine computes it from graph traversal |
 | `has_rasters` | bool | Yes | Whether `flow_dir.tif` and `flow_acc.tif` are present. If false, raster refinement is skipped |
 | `has_snap` | bool | Yes | Whether `snap.parquet` is present. If false, engine uses point-in-polygon on `catchments.parquet` for outlet resolution |
 | `flow_dir_encoding` | string | Cond. | Required if `has_rasters = true`. One of `"esri"` or `"taudem"` |
 | `terminal_sink_id` | int | Yes | The ID value used to indicate no downstream neighbor. Must be `0` |
-| `topology` | string | Yes | Graph topology class. `"tree"` for strictly convergent fabrics (HydroBASINS, MERIT Hydro). `"dag"` for fabrics with bifurcations (GRIT). Informational — the engine handles both, but may use this for optimization hints |
+| `topology` | string | Yes | Graph topology class. `"tree"` for strictly convergent fabrics where each atom has at most one downstream neighbor. `"dag"` for fabrics with bifurcations (one atom draining to multiple downstream atoms). Informational — the engine handles both, but MAY use this for optimization hints |
 | `region` | string | No | Geographic region label. Informational |
 | `bbox` | float[4] | Yes | `[minx, miny, maxx, maxy]` covering all atoms. Used by engine for fast pre-filtering |
 | `atom_count` | int | Yes | Total number of rows in `catchments.parquet`. Sanity check |
@@ -288,7 +288,8 @@ A conformant HFX dataset must pass the following checks (provided as a standalon
 
 **Schema checks:**
 
-- `bbox_min* < bbox_max*` for every row in `catchments.parquet` and (if `has_snap = true`) `snap.parquet`.
+- `bbox_min* < bbox_max*` (strict inequality) for every row in `catchments.parquet`.
+- `bbox_min* <= bbox_max*` (non-strict inequality) for every row in `snap.parquet` (if `has_snap = true`). Snap features MAY be LineString geometries whose bounding-box extent is zero along one axis.
 - `atom_count` in manifest matches row count in `catchments.parquet`.
 
 **Raster checks (if `has_rasters = true`):**
