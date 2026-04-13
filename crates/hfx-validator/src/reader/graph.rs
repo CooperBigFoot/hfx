@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::dataset::GraphData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{list_int64_field, validate_schema, ExpectedColumn};
-use super::{MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_CONSECUTIVE_BATCH_FAILURES};
+use super::{MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_CONSECUTIVE_BATCH_FAILURES, MAX_TOTAL_BATCH_FAILURES};
 
 /// Expected schema for graph.arrow.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -76,19 +76,14 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
     let mut null_upstream_ids_count: usize = 0;
 
     let mut consecutive_batch_failures: usize = 0;
+    let mut total_batch_failures: usize = 0;
+    let mut batch_read_aborted = false;
 
     for batch_result in reader {
-        if consecutive_batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
-            diags.push(Diagnostic::error(
-                "graph.batch_read_aborted",
-                Category::Schema,
-                Artifact::Graph,
-                format!(
-                    "aborting read after {} consecutive batch failures; \
-                     file may be unreadable (unsupported codec or corruption)",
-                    MAX_CONSECUTIVE_BATCH_FAILURES
-                ),
-            ));
+        if consecutive_batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES
+            || total_batch_failures >= MAX_TOTAL_BATCH_FAILURES
+        {
+            batch_read_aborted = true;
             break;
         }
 
@@ -100,6 +95,7 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
             Err(err) => {
                 warn!(error = %err, "error reading graph record batch");
                 consecutive_batch_failures += 1;
+                total_batch_failures += 1;
                 diags.push(Diagnostic::error(
                     "graph.batch_read",
                     Category::Schema,
@@ -200,6 +196,29 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
         }
 
         total_rows += num_rows;
+    }
+
+    // Emit abort summary if we broke out early OR if the iterator exhausted
+    // right after hitting the cap (so the break never fired).
+    if batch_read_aborted
+        || consecutive_batch_failures >= MAX_CONSECUTIVE_BATCH_FAILURES
+        || total_batch_failures >= MAX_TOTAL_BATCH_FAILURES
+    {
+        batch_read_aborted = true;
+        diags.push(Diagnostic::error(
+            "graph.batch_read_aborted",
+            Category::Schema,
+            Artifact::Graph,
+            format!(
+                "aborting read after batch failures ({} consecutive, {} total); \
+                 file may be unreadable (unsupported codec or corruption)",
+                consecutive_batch_failures, total_batch_failures
+            ),
+        ));
+    }
+
+    if batch_read_aborted {
+        return (None, diags);
     }
 
     // Emit summary diagnostics for columns that exceeded the per-row cap.

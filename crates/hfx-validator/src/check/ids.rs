@@ -575,9 +575,9 @@ fn validate_bbox_f32(
                 .at(Location::Row { index: row }),
             );
         }
-        // For catchments: strict inequality (polygons must have non-zero area).
+        // Strict by default (polygons must have non-zero area).
         // For snap: non-strict inequality (line features may have zero extent in one axis).
-        let strict = matches!(artifact, Artifact::Catchments);
+        let strict = !matches!(artifact, Artifact::Snap);
 
         if strict {
             if minx >= maxx {

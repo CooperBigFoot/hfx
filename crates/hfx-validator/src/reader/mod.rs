@@ -17,6 +17,11 @@ pub(crate) const MAX_NULL_DIAGNOSTICS_PER_COLUMN: usize = 10;
 /// aborts with a summary diagnostic.
 pub(crate) const MAX_CONSECUTIVE_BATCH_FAILURES: usize = 3;
 
+/// Maximum total batch-read failures (across the entire file) before the
+/// reader aborts. This catches intermittent corruption that the consecutive
+/// counter misses.
+pub(crate) const MAX_TOTAL_BATCH_FAILURES: usize = 10;
+
 use crate::check::manifest::try_build_manifest;
 use crate::dataset::{FilePresenceMap, ParsedDataset};
 
