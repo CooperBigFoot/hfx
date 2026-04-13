@@ -49,7 +49,7 @@ graph TD
 | Mainstem | Primary channel in a drainage network, as opposed to tributaries or distributaries |
 | WKB | Well-Known Binary — OGC binary encoding for geometry; treated as an opaque byte buffer by this crate |
 | D8 | Single-flow-direction model where each raster cell drains to exactly one of its eight neighbours |
-| Pfafstetter level | Hierarchical basin delineation level used by HydroBASINS and similar fabrics |
+| Fabric level | Optional hierarchical subdivision level within the source fabric (e.g., resolution tier, nesting depth) |
 | Terminal sink | The virtual outlet for an entire dataset; ID value `0` is reserved as its sentinel |
 
 ## Key Types

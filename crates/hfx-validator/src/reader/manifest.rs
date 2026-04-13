@@ -116,7 +116,7 @@ mod tests {
     fn valid_manifest_deserializes() {
         let json = serde_json::json!({
             "format_version": "0.1",
-            "fabric_name": "hydrobasins",
+            "fabric_name": "testfabric",
             "crs": "EPSG:4326",
             "has_up_area": true,
             "has_rasters": false,
@@ -137,7 +137,7 @@ mod tests {
 
         let raw = raw.unwrap();
         assert_eq!(raw.format_version.as_deref(), Some("0.1"));
-        assert_eq!(raw.fabric_name.as_deref(), Some("hydrobasins"));
+        assert_eq!(raw.fabric_name.as_deref(), Some("testfabric"));
         assert_eq!(raw.atom_count, Some(42));
         assert_eq!(raw.has_up_area, Some(true));
         assert_eq!(raw.has_rasters, Some(false));

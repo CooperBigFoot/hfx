@@ -571,7 +571,7 @@ mod tests {
     fn valid_raw() -> RawManifest {
         RawManifest {
             format_version: Some("0.1".into()),
-            fabric_name: Some("hydrobasins".into()),
+            fabric_name: Some("testfabric".into()),
             fabric_version: None,
             fabric_level: None,
             crs: Some("EPSG:4326".into()),

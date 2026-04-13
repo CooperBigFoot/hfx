@@ -226,7 +226,7 @@ impl Manifest {
         self.format_version
     }
 
-    /// Returns the source fabric name (e.g. `"hydrobasins"`).
+    /// Returns the source fabric name (e.g. `"example-fabric"`).
     pub fn fabric_name(&self) -> &str {
         &self.fabric_name
     }
@@ -236,7 +236,7 @@ impl Manifest {
         self.fabric_version.as_deref()
     }
 
-    /// Returns the optional Pfafstetter level of the fabric, if declared.
+    /// Returns the optional hierarchical subdivision level of the fabric, if declared.
     pub fn fabric_level(&self) -> Option<u32> {
         self.fabric_level
     }
@@ -412,7 +412,7 @@ impl ManifestBuilder {
         self
     }
 
-    /// Sets the optional Pfafstetter level of the source fabric.
+    /// Sets the optional hierarchical subdivision level of the source fabric.
     pub fn with_fabric_level(mut self, level: u32) -> Self {
         self.fabric_level = Some(level);
         self
@@ -465,7 +465,7 @@ mod tests {
     fn minimal_builder() -> ManifestBuilder {
         ManifestBuilder::new(
             FormatVersion::V0_1,
-            "hydrobasins",
+            "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
             0,
@@ -521,7 +521,7 @@ mod tests {
     fn builder_empty_adapter_version_fails() {
         let err = ManifestBuilder::new(
             FormatVersion::V0_1,
-            "hydrobasins",
+            "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
             0,
@@ -539,7 +539,7 @@ mod tests {
     fn builder_empty_created_at_fails() {
         let err = ManifestBuilder::new(
             FormatVersion::V0_1,
-            "hydrobasins",
+            "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
             0,
@@ -557,7 +557,7 @@ mod tests {
     fn terminal_sink_id_nonzero_fails() {
         let err = ManifestBuilder::new(
             FormatVersion::V0_1,
-            "hydrobasins",
+            "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
             5,
@@ -593,7 +593,7 @@ mod tests {
     fn fabric_name_lowercase_succeeds() {
         let result = ManifestBuilder::new(
             FormatVersion::V0_1,
-            "hydrobasins",
+            "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
             0,

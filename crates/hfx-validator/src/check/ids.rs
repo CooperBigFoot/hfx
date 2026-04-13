@@ -575,27 +575,56 @@ fn validate_bbox_f32(
                 .at(Location::Row { index: row }),
             );
         }
-        if minx >= maxx {
-            out.push(
-                Diagnostic::error(
-                    check_id,
-                    Category::IdConstraint,
-                    artifact,
-                    format!("bbox at row {row} is degenerate in x: minx ({minx}) >= maxx ({maxx})"),
-                )
-                .at(Location::Row { index: row }),
-            );
-        }
-        if miny >= maxy {
-            out.push(
-                Diagnostic::error(
-                    check_id,
-                    Category::IdConstraint,
-                    artifact,
-                    format!("bbox at row {row} is degenerate in y: miny ({miny}) >= maxy ({maxy})"),
-                )
-                .at(Location::Row { index: row }),
-            );
+        // For catchments: strict inequality (polygons must have non-zero area).
+        // For snap: non-strict inequality (line features may have zero extent in one axis).
+        let strict = matches!(artifact, Artifact::Catchments);
+
+        if strict {
+            if minx >= maxx {
+                out.push(
+                    Diagnostic::error(
+                        check_id,
+                        Category::IdConstraint,
+                        artifact,
+                        format!("bbox at row {row} is degenerate in x: minx ({minx}) >= maxx ({maxx})"),
+                    )
+                    .at(Location::Row { index: row }),
+                );
+            }
+            if miny >= maxy {
+                out.push(
+                    Diagnostic::error(
+                        check_id,
+                        Category::IdConstraint,
+                        artifact,
+                        format!("bbox at row {row} is degenerate in y: miny ({miny}) >= maxy ({maxy})"),
+                    )
+                    .at(Location::Row { index: row }),
+                );
+            }
+        } else {
+            if minx > maxx {
+                out.push(
+                    Diagnostic::error(
+                        check_id,
+                        Category::IdConstraint,
+                        artifact,
+                        format!("bbox at row {row} is inverted in x: minx ({minx}) > maxx ({maxx})"),
+                    )
+                    .at(Location::Row { index: row }),
+                );
+            }
+            if miny > maxy {
+                out.push(
+                    Diagnostic::error(
+                        check_id,
+                        Category::IdConstraint,
+                        artifact,
+                        format!("bbox at row {row} is inverted in y: miny ({miny}) > maxy ({maxy})"),
+                    )
+                    .at(Location::Row { index: row }),
+                );
+            }
         }
     }
 
@@ -930,7 +959,8 @@ mod tests {
 
     #[test]
     fn c7_invalid_snap_bbox_produces_error() {
-        let data = make_snap(vec![1], vec![10], vec![0.5], vec![[5.0, -5.0, 5.0, 5.0]]);
+        // Inverted bbox (minx > maxx) is invalid even for snap
+        let data = make_snap(vec![1], vec![10], vec![0.5], vec![[10.0, -5.0, 5.0, 5.0]]);
         let diags = check_snap_data(&data);
         assert!(diags.iter().any(|d| d.check_id == "ids.snap_bbox"));
     }
@@ -967,5 +997,52 @@ mod tests {
         let data = make_snap(vec![1, 2, 3], vec![10, 20, 30], vec![0.5; 3], vec![valid_bbox(); 3]);
         let diags = check_snap_data(&data);
         assert_eq!(count_id(&diags, "ids.snap_duplicate"), 0);
+    }
+
+    #[test]
+    fn c7_snap_bbox_degenerate_x_passes() {
+        // Snap bbox with minx == maxx (vertical line) should pass
+        let data = make_snap(
+            vec![1],
+            vec![10],
+            vec![0.5],
+            vec![[5.0, -5.0, 5.0, 5.0]],  // minx == maxx
+        );
+        let diags = check_snap_data(&data);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "ids.snap_bbox"),
+            "snap bbox with minx == maxx (vertical line) should not produce an error"
+        );
+    }
+
+    #[test]
+    fn c7_snap_bbox_degenerate_y_passes() {
+        // Snap bbox with miny == maxy (horizontal line) should pass
+        let data = make_snap(
+            vec![1],
+            vec![10],
+            vec![0.5],
+            vec![[-10.0, 5.0, 10.0, 5.0]],  // miny == maxy
+        );
+        let diags = check_snap_data(&data);
+        assert!(
+            !diags.iter().any(|d| d.check_id == "ids.snap_bbox"),
+            "snap bbox with miny == maxy (horizontal line) should not produce an error"
+        );
+    }
+
+    #[test]
+    fn c2_catchment_bbox_degenerate_x_still_errors() {
+        // Catchment bbox with minx == maxx should still error (polygon must have area)
+        let data = make_catchments(
+            vec![1],
+            vec![[5.0, -5.0, 5.0, 5.0]],  // minx == maxx
+            vec![1.0],
+        );
+        let diags = check_catchment_bboxes(&data);
+        assert!(
+            diags.iter().any(|d| d.check_id == "ids.catchment_bbox"),
+            "catchment bbox with minx == maxx should produce an error"
+        );
     }
 }

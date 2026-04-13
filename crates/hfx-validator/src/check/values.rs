@@ -202,7 +202,7 @@ mod tests {
     fn raw_with_up_area(has_up_area: Option<bool>, bbox: Option<Vec<f64>>) -> RawManifest {
         RawManifest {
             format_version: Some("0.1".into()),
-            fabric_name: Some("hydrobasins".into()),
+            fabric_name: Some("testfabric".into()),
             fabric_version: None,
             fabric_level: None,
             crs: Some("EPSG:4326".into()),
