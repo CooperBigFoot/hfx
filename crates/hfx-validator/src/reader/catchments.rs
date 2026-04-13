@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn null_id_diagnostics_are_capped() {
+    fn null_id_capping_is_unreachable_after_schema_validation() {
         // This test verifies the null-diagnostic capping behaviour described by the
         // MAX_NULL_DIAGNOSTICS_PER_COLUMN constant.
         //

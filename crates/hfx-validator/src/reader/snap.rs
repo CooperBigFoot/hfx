@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn null_weight_diagnostics_are_capped() {
+    fn null_weight_capping_is_unreachable_after_schema_validation() {
         // This test verifies the null-diagnostic capping behaviour for the weight column.
         //
         // Background: in Parquet, REQUIRED column repetition means no definition levels
