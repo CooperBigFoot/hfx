@@ -25,18 +25,13 @@ Use `--strict` to promote warnings to errors. Exit code `0` means valid; exit co
 
 ## Architecture
 
-```mermaid
-graph LR
-    CLI["main.rs<br/>clap CLI"] --> Lib["lib.rs<br/>validate()"]
-    Lib --> R["reader/<br/>I/O layer"]
-    Lib --> C["check/<br/>validation logic"]
-    R --> D["dataset.rs<br/>ParsedDataset"]
-    D --> C
-    C --> Rep["report.rs<br/>ValidationReport"]
-    Rep --> Out["text / JSON output"]
-```
+- `main.rs` provides the clap CLI and hands off to `lib.rs`.
+- `lib.rs` exposes `validate()` as the crate entry point.
+- `reader/` loads JSON, Parquet, Arrow IPC, and TIFF inputs into `ParsedDataset`.
+- `check/` runs pure validation passes against that parsed representation.
+- `report.rs` formats the resulting diagnostics as text or JSON.
 
-Two layers, decoupled by `ParsedDataset`:
+Two layers are decoupled by `ParsedDataset`:
 
 - **`reader/`** reads Parquet, Arrow IPC, TIFF, and JSON into lightweight intermediate representations (`CatchmentsData`, `GraphData`, `SnapData`, `RasterMeta`). These hold raw column arrays (`Vec<i64>`, `Vec<f32>`) so the validator can report ALL errors instead of failing fast on the first bad value.
 - **`check/`** contains pure validation logic. Each module is free functions that take `&`-references to intermediate data and return `Vec<Diagnostic>`. No I/O, no trait objects.

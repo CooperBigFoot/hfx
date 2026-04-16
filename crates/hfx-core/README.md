@@ -10,32 +10,17 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
 
 ## Architecture
 
-```mermaid
-graph TD
-    subgraph Primitives
-        id["id.rs\nAtomId, SnapId\nIdError"]
-        area["area.rs\nAreaKm2, Weight\nMeasureError"]
-        geo["geo.rs\nLongitude, Latitude\nBoundingBox, WkbGeometry\nGeoError"]
-        raster["raster.rs\nFlowDirEncoding\nFlowDirEncodingError"]
-    end
-
-    subgraph Composites
-        catchment["catchment.rs\nCatchmentAtom"]
-        snap["snap.rs\nSnapTarget, MainstemStatus"]
-        graph["graph.rs\nAdjacencyRow, DrainageGraph\nGraphError"]
-        manifest["manifest.rs\nManifest, ManifestBuilder\nCrs, Topology, FormatVersion\nUpAreaAvailability, RasterAvailability\nSnapAvailability, AtomCount\nManifestError"]
-    end
-
-    subgraph "lib.rs (root)"
-        lib["HasBbox trait\nHasAtomId trait\nre-exports"]
-    end
-
-    catchment --> id & area & geo
-    snap --> id & area & geo
-    graph --> id
-    manifest --> geo & raster
-    lib --> catchment & snap & graph & manifest
-```
+- Primitive modules:
+  - `id.rs`: `AtomId`, `SnapId`, `IdError`
+  - `area.rs`: `AreaKm2`, `Weight`, `MeasureError`
+  - `geo.rs`: `Longitude`, `Latitude`, `BoundingBox`, `WkbGeometry`, `GeoError`
+  - `raster.rs`: `FlowDirEncoding`, `FlowDirEncodingError`
+- Composite modules:
+  - `catchment.rs`: `CatchmentAtom`
+  - `snap.rs`: `SnapTarget`, `MainstemStatus`
+  - `graph.rs`: `AdjacencyRow`, `DrainageGraph`, `GraphError`
+  - `manifest.rs`: `Manifest`, `ManifestBuilder`, related enums and errors
+- `lib.rs` re-exports the public surface and defines shared helper traits such as `HasBbox` and `HasAtomId`.
 
 ## Glossary
 
