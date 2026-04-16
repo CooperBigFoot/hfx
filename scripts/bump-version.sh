@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CARGO_TOML="$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml"
+HFX_VALIDATOR_TOML="$(cd "$(dirname "$0")/.." && pwd)/crates/hfx-validator/Cargo.toml"
 
 usage() {
     echo "Usage: $0 <patch|minor|major>" >&2
@@ -46,5 +47,11 @@ NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 # Edit Cargo.toml in-place (compatible with both macOS and GNU sed)
 sed -i.bak "s/^version = \"${CURRENT_VERSION}\"/version = \"${NEW_VERSION}\"/" "$CARGO_TOML"
 rm -f "${CARGO_TOML}.bak"
+
+# Keep the publishable internal crate dependency aligned with the workspace version.
+sed -i.bak -E \
+    "s|^hfx-core = \\{ path = \"\\.\\./hfx-core\", version = \"=${CURRENT_VERSION}\" \\}$|hfx-core = { path = \"../hfx-core\", version = \"=${NEW_VERSION}\" }|" \
+    "$HFX_VALIDATOR_TOML"
+rm -f "${HFX_VALIDATOR_TOML}.bak"
 
 echo "${CURRENT_VERSION} -> ${NEW_VERSION}"

@@ -79,6 +79,27 @@ Supporting public interfaces live alongside it:
 
 The validator and future adapters exist to serve the specification, not define it.
 
+## Validator CLI
+
+The validator is published as the `hfx-validator` crate and installs the `hfx` binary:
+
+```bash
+cargo install hfx-validator
+hfx ./path/to/dataset
+```
+
+For machine-readable output:
+
+```bash
+hfx --format json ./path/to/dataset
+```
+
+- `--strict` promotes warnings to errors.
+- `--skip-rasters` skips `flow_dir.tif` and `flow_acc.tif` checks.
+- Exit code `0` means the dataset is valid; exit code `1` means it is invalid.
+
+Validation behavior is defined against [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
+
 ## Status
 
 HFX is still in initial scaffolding. The repository now has stable public paths for the spec, schemas, examples, conformance fixtures, adapters, and Rust toolkit crates, but most implementation areas are still placeholders.

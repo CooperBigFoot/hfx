@@ -6,6 +6,23 @@ CLI tool that validates HFX dataset directories against `spec/HFX_SPEC.md`.
 
 Reads an HFX dataset directory (manifest.json, catchments.parquet, graph.arrow, and optional snap.parquet / raster files) and reports all spec violations in a single pass.
 
+## Quickstart
+
+Install the crate:
+
+```bash
+cargo install hfx-validator
+```
+
+This installs the `hfx` binary:
+
+```bash
+hfx ./path/to/dataset
+hfx --format json ./path/to/dataset
+```
+
+Use `--strict` to promote warnings to errors. Exit code `0` means valid; exit code `1` means invalid.
+
 ## Architecture
 
 ```mermaid
@@ -49,7 +66,7 @@ Checks run in dependency order inside `check/mod.rs::run_checks()`:
 ## Usage
 
 ```
-hfx-validator <DATASET_PATH> [--format text|json] [--strict] [--skip-rasters] [--sample-pct N]
+hfx <DATASET_PATH> [--format text|json] [--strict] [--skip-rasters] [--sample-pct N]
 ```
 
 Exit codes: `0` = valid, `1` = invalid.

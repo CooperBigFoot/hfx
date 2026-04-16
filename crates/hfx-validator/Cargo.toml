@@ -2,13 +2,18 @@
 name = "hfx-validator"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI and library for validating HFX (HydroFabric Exchange) datasets."
+readme = "README.md"
+keywords = ["hydrology", "hydrofabric", "validation", "watershed", "cli"]
 
 [[bin]]
 name = "hfx"
 path = "src/main.rs"
 
 [dependencies]
-hfx-core = { path = "../hfx-core" }
+hfx-core = { path = "../hfx-core", version = "=0.1.25" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

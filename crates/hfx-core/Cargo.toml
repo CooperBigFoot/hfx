@@ -2,6 +2,11 @@
 name = "hfx-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types and manifest models for HFX (HydroFabric Exchange) datasets."
+readme = "README.md"
+keywords = ["hydrology", "hydrofabric", "watershed", "geo"]
 
 [dependencies]
 thiserror.workspace = true
