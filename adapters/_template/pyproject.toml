@@ -1,0 +1,19 @@
+[project]
+name = "hfx-adapter-template"
+version = "0.1.0"
+description = "Template HFX adapter skeleton. Copy to adapters/<your-source>/ and fill in."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "geopandas>=1.1",
+  "geoparquet-io==1.0.0b2",
+  "pyarrow>=12,<23",
+  "rasterio",
+  "shapely>=2",
+]
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = false
