@@ -19,9 +19,45 @@ import pyarrow as pa
 import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 import pyogrio
+from geoparquet_io.core.validate import validate_geoparquet
 
 
 DEFAULT_ROOT = Path("/tmp/grit-hfx-eu")
+
+
+def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
+    """Build GeoParquet 1.1 ``geo`` metadata for embedding into an Arrow schema.
+
+    No ``crs`` key is written — GeoParquet 1.1 defaults to OGC:CRS84 when absent,
+    which is semantically equivalent to EPSG:4326 for lon/lat data.  Writing a
+    plain string ``"EPSG:4326"`` would violate the spec (requires PROJJSON dict or
+    null), so we omit the key entirely.
+    """
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {
+            "geometry": {
+                "encoding": "WKB",
+                "geometry_types": geometry_types,
+            },
+        },
+    }
+    return {b"geo": json.dumps(geo).encode("utf-8")}
+
+
+def assert_geoparquet_valid(out_path: Path) -> None:
+    """Assert that ``out_path`` passes GeoParquet 1.1 validation.
+
+    Raises ``RuntimeError`` listing every failed check if validation fails.
+    """
+    result = validate_geoparquet(str(out_path), target_version="1.1")
+    if not result.is_valid:
+        failures = [c for c in result.checks if c.status.value == "failed"]
+        raise RuntimeError(
+            f"GeoParquet 1.1 validation failed for {out_path}: "
+            + "; ".join(f"{c.name}: {c.message}" for c in failures)
+        )
 
 EU_INPUTS = {
     "segments": "GRITv1.0_segments_EU_EPSG4326.gpkg.zip",
@@ -216,6 +252,11 @@ def build_catchments(
             pa.field("geometry", pa.binary(), nullable=False),
         ]
     )
+    # Attach GeoParquet 1.1 metadata so downstream consumers recognise this file
+    # as GeoParquet rather than plain Parquet with a binary geometry column.
+    schema = schema.with_metadata(
+        build_geo_metadata(["Polygon", "MultiPolygon"])
+    )
     out_path = out_dir / "catchments.parquet"
     with pq.ParquetWriter(
         out_path,
@@ -248,6 +289,8 @@ def build_catchments(
     del centroids
     gc.collect()
     log(f"wrote {out_path}")
+    assert_geoparquet_valid(out_path)
+    log("catchments.parquet passed GeoParquet 1.1 validation")
     return ids, total_bounds
 
 
@@ -341,6 +384,11 @@ def build_snap(
             pa.field("geometry", pa.binary(), nullable=False),
         ]
     )
+    # Attach GeoParquet 1.1 metadata. GRIT segment geometries are LineStrings
+    # (or MultiLineString where segments are split across dateline or similar).
+    schema = schema.with_metadata(
+        build_geo_metadata(["LineString", "MultiLineString"])
+    )
     with pq.ParquetWriter(
         out_path,
         schema=schema,
@@ -371,6 +419,8 @@ def build_snap(
     del gdf
     gc.collect()
     log(f"wrote {out_path}")
+    assert_geoparquet_valid(out_path)
+    log("snap.parquet passed GeoParquet 1.1 validation")
     return row_count
 
 
