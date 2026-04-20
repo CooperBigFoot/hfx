@@ -1,0 +1,15 @@
+[project]
+name = "grit-hfx-scratch"
+version = "0.1.0"
+description = "Scratch GRIT to HFX wrangling utilities for spec validation."
+requires-python = ">=3.11"
+dependencies = [
+  "geopandas>=1.1.0",
+  "polars>=1.30.0",
+  "pyarrow>=23.0.0",
+  "pyogrio>=0.11.0",
+  "shapely>=2.0.0",
+]
+
+[tool.uv]
+package = false

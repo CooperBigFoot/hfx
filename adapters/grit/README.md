@@ -8,6 +8,23 @@ Validated against the Europe EPSG:4326 slice (150,325 segment catchments). Produ
 
 This is a single-script scratch adapter for spec validation, not a production pipeline.
 
+## How to Run
+
+Supply the outer GRIT archive via `--outer-archive` or the `GRIT_OUTER_ARCHIVE` environment variable:
+
+```bash
+# Using the flag
+uv run --project adapters/grit python adapters/grit/build_grit_eu_hfx.py \
+    --outer-archive /path/to/17435232.zip build
+
+# Using the environment variable
+export GRIT_OUTER_ARCHIVE=/path/to/17435232.zip
+uv run --project adapters/grit python adapters/grit/build_grit_eu_hfx.py build
+uv run --project adapters/grit python adapters/grit/build_grit_eu_hfx.py validate
+```
+
+See `WORKFLOW.md` for the full step-by-step workflow.
+
 ## Requirements
 
 - Python >= 3.11
@@ -60,3 +77,7 @@ These workarounds were required to pass strict validation:
 | `WORKFLOW.md` | Step-by-step commands for running the adapter |
 | `GRIT_HFX_SPEC_VALIDATION.md` | Historical record of findings from the first validation pass |
 | `pyproject.toml` | Python dependencies (uv-managed) |
+
+## Adapter Guide
+
+This adapter is the **canonical worked example** for the HFX adapter development guide. For authoring a new adapter against a different source hydrofabric, refer to `../../docs/ADAPTER_GUIDE.md` (created in Phase 3 of the adapter refactor). That guide generalizes the patterns established here — Hilbert sorting, row-group balancing, snap weight conformance, and manifest construction — into reusable guidance for any HFX adapter author.
