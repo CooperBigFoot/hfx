@@ -99,7 +99,7 @@ Snapping targets used to attach an outlet point to the drainage network. **This 
 |---|---|---|---|
 | `id` | `int64` | No | Unique snap feature ID |
 | `catchment_id` | `int64` | No | FK → `catchments.parquet`. The atom this snap target belongs to |
-| `weight` | `float32` | No | Snapping priority weight. Higher = preferred. Typically upstream area in km² or cell count |
+| `weight` | `float32` | No | Snap ranking weight. MUST be monotonically increasing in drainage dominance: a higher weight MUST indicate the more hydrologically significant reach. Adapters typically use upstream drainage area (km² or cell count). Datasets whose weights do not satisfy this ordering are non-conformant with v0.2 snapping semantics. |
 | `is_mainstem` | `bool` | No | True if this feature is on the mainstem. Used to prefer mainstem snap targets over distributaries |
 | `bbox_minx` | `float32` | No | Bounding box west |
 | `bbox_miny` | `float32` | No | Bounding box south |
@@ -109,14 +109,15 @@ Snapping targets used to attach an outlet point to the drainage network. **This 
 
 ### Snapping Logic (engine-side)
 
-The engine resolves an outlet point to a terminal atom via tiered ranking:
+The engine resolves an outlet point to a terminal atom via a weight-first cascade:
 
-1. **Filter by distance.** Query snap features within a configurable search radius of the outlet point. Discard all candidates outside the radius.
-2. **Rank by distance.** Among candidates, prefer the nearest feature (minimum distance from outlet to feature geometry).
-3. **Break ties by weight.** If multiple features are equidistant (within a configurable tolerance), prefer the feature with highest `weight`.
-4. **Break ties by mainstem preference.** If still tied, prefer `is_mainstem = true`.
+1. **Filter by radius.** Query snap features within a configurable search radius of the outlet point. Discard all candidates outside the radius.
+2. **Rank by weight.** Prefer the candidate with the highest `weight`.
+3. **Break ties by mainstem preference.** If multiple features share the winning weight (within a configurable tolerance), prefer `is_mainstem = true`.
+4. **Break ties by distance.** If still tied, prefer the nearest geometry (minimum distance from outlet to feature).
+5. **Break final ties by snap id.** Ascending `id` for determinism.
 
-The engine exposes the snap strategy as a runtime configuration. The default strategy is the tiered ranking above. Alternative strategies (e.g., weight-first, or mainstem-biased) may be added in future versions.
+The engine exposes the snap strategy as a runtime configuration. Alternative strategies (distance-first tiered ranking, mainstem-biased) remain available as opt-ins for datasets whose weights are not rank-meaningful.
 
 The winning feature's `catchment_id` is the terminal atom ID.
 
@@ -246,7 +247,7 @@ The manifest describes **what the data is**, not how the engine should use it. T
 
 Version 0.1 of the engine implements **inclusive upstream accumulation** only. Given a valid HFX dataset and an outlet point, the engine:
 
-1. **Snap** — If `has_snap = true`: query `snap.parquet` within search radius, resolve terminal atom via the tiered ranking described in §3. If `has_snap = false`: perform point-in-polygon spatial containment query on `catchments.parquet` using bbox column statistics for row-group pruning. The containing atom is the terminal atom.
+1. **Snap** — If `has_snap = true`: query `snap.parquet` within search radius, resolve terminal atom via the weight-first cascade described in §3. If `has_snap = false`: perform point-in-polygon spatial containment query on `catchments.parquet` using bbox column statistics for row-group pruning. The containing atom is the terminal atom.
 2. **Locate** — the resolved `catchment_id` is the terminal atom.
 3. **Traverse** — BFS over `graph.arrow` from the terminal atom. Maintain a visited set; collect all reachable upstream atom IDs. Every upstream path is followed regardless of `is_mainstem` status (inclusive mode).
 4. **Refine** (if `has_rasters = true`) — window `flow_acc.tif` and `flow_dir.tif` to the terminal atom's bbox. Snap outlet to nearest cell exceeding the accumulation threshold. Run reverse D8 trace from that cell. Convert the resulting cell mask to a polygon. Replace the terminal atom geometry with this refined sub-polygon.

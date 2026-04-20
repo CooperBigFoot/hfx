@@ -54,10 +54,11 @@ impl AreaKm2 {
     }
 }
 
-/// Snap ranking priority weight.
+/// Snap ranking weight. Higher values indicate greater hydrological dominance;
+/// adapters typically populate this with upstream drainage area in km² or cell count.
+/// Snap-aware engines rank snap candidates by descending weight, using mainstem status
+/// and distance as tie-breakers.
 ///
-/// Higher values indicate preferred snap targets during outlet resolution.
-/// Typically upstream drainage area in km² or upstream cell count.
 /// Invariant: the wrapped value is always finite and non-negative.
 ///
 /// `Eq` is intentionally not derived for the same reason as [`AreaKm2`].

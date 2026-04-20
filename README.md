@@ -36,7 +36,7 @@ An HFX dataset is a single folder containing these artifacts:
 |---|---|
 | `catchments.parquet` | Drainage unit polygons ("atoms"), Hilbert-sorted with bbox columns for row-group pruning |
 | `graph.arrow` | Upstream adjacency graph stored as Arrow IPC for zero-copy loading |
-| `snap.parquet` | Reach or node geometries used for outlet snapping with tiered ranking |
+| `snap.parquet` | Reach or node geometries used for weight-first outlet snapping with distance/mainstem tie-breakers |
 | `flow_dir.tif` | Optional COG flow-direction raster for terminal atom refinement |
 | `flow_acc.tif` | Optional COG flow-accumulation raster paired with `flow_dir.tif` |
 | `manifest.json` | Dataset metadata describing fabric identity, CRS, topology class, and raster encoding |

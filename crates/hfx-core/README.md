@@ -44,7 +44,7 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
 | `AtomId` | `id` | Strictly-positive `i64` identifier for a catchment atom; distinct from `SnapId` to prevent accidental mixing |
 | `SnapId` | `id` | Strictly-positive `i64` identifier for a snap target |
 | `AreaKm2` | `area` | Finite, non-negative `f32` area in km² |
-| `Weight` | `area` | Finite, non-negative `f32` snap ranking weight (typically upstream area or cell count) |
+| `Weight` | `area` | Finite, non-negative `f32` snap ranking weight. Higher values MUST indicate greater hydrological dominance (adapters typically write upstream drainage area in km² or cell count). |
 | `BoundingBox` | `geo` | Axis-aligned WGS84 bbox; enforces `min < max` on both axes at construction |
 | `WkbGeometry` | `geo` | Non-empty WKB byte buffer; geometry parsing is delegated to callers |
 | `CatchmentAtom` | `catchment` | One row of `catchments.parquet` — id, local area, optional upstream area, bbox, geometry |
