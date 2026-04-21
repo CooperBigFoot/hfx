@@ -1,6 +1,6 @@
 # GRIT → HFX Adapter
 
-Scratch Python adapter that compiles [GRIT](https://www.reachhydro.org/home/params/grit) hydrofabric data into HFX format.
+Scratch Python adapter that compiles [GRIT](https://zenodo.org/records/17435232) hydrofabric data into HFX format.
 
 ## Status
 
