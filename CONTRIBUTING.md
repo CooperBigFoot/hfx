@@ -23,7 +23,3 @@ If a change affects artifact shape, required fields, semantics, or validation be
 ## Validator Changes
 
 Validator behavior should follow the spec and schemas. Avoid adding validator-only policy that is not grounded in the public contract.
-
-## Early Stage Note
-
-This repository is still in initial scaffolding. Placeholder directories and documents are intentional; fill them in as the first working validator and example datasets take shape.
