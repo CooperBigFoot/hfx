@@ -1,0 +1,19 @@
+{
+  "format_version": "0.1",
+  "fabric_name": "conformance-tiny",
+  "crs": "EPSG:4326",
+  "has_up_area": false,
+  "has_rasters": false,
+  "has_snap": false,
+  "terminal_sink_id": 0,
+  "topology": "tree",
+  "bbox": [
+    -180.0,
+    -90.0,
+    180.0,
+    90.0
+  ],
+  "atom_count": 5,
+  "created_at": "2026-01-01T00:00:00Z",
+  "adapter_version": "conformance-fixture-v1"
+}
