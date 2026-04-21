@@ -63,7 +63,7 @@ This repository is organized as a spec-first monorepo:
 | [`examples/`](./examples) | Reference datasets and implementer-facing examples |
 | [`conformance/`](./conformance) | Valid and invalid fixtures for validator and interoperability work |
 | [`crates/`](./crates) | Rust toolkit crates, including shared logic and the validator CLI |
-| [`adapters/`](./adapters) | Future source-fabric compilers such as MERIT and GRIT adapters |
+| [`adapters/`](./adapters) | Source-fabric compilers (GRIT working, MERIT scaffolded) |
 | [`docs/decisions/`](./docs/decisions) | Short decision records for important spec and architecture choices |
 | [`scripts/`](./scripts) | Repo helper scripts and release support utilities |
 
@@ -74,8 +74,8 @@ The primary normative artifact is the development specification at [spec/HFX_SPE
 Supporting public interfaces live alongside it:
 
 - [schemas/manifest.schema.json](./schemas/manifest.schema.json) defines the manifest contract in machine-readable form.
-- [examples/](./examples) will hold reference datasets for implementers.
-- [conformance/](./conformance) will hold validator fixtures and intentionally invalid datasets.
+- [examples/](./examples) holds reference datasets for implementers.
+- [conformance/](./conformance) holds validator fixtures and intentionally invalid datasets.
 
 The validator and future adapters exist to serve the specification, not define it.
 
@@ -102,6 +102,6 @@ Validation behavior is defined against [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
 
 ## Status
 
-HFX is still in initial scaffolding. The repository now has stable public paths for the spec, schemas, examples, conformance fixtures, adapters, and Rust toolkit crates, but most implementation areas are still placeholders.
+HFX v0.1 is the first published spec iteration. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). The validator runs all documented check phases with a broad integration and conformance test suite, and a working [GRIT adapter](./adapters/grit/) demonstrates the end-to-end contract. Known conformance gaps (raster CRS/extent checks, reach-based snap, Hilbert parameters) are tracked in [docs/decisions/2026-04-13-post-grit-open-items.md](./docs/decisions/2026-04-13-post-grit-open-items.md).
 
-Language choice is Rust for the validator and future engine-facing tooling. Python bindings are planned later.
+Language choice is Rust for the validator and engine-facing tooling. Python bindings live in the downstream [shed](https://github.com/CooperBigFoot/shed) engine.
