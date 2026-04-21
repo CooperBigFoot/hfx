@@ -8,3 +8,7 @@ Thumbs.db
 __pycache__/
 *.egg-info/
 *.pyc
+
+# Adapter build artifacts
+adapters/*/out/
+adapters/*/*.log

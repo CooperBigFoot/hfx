@@ -1,0 +1,19 @@
+[project]
+name = "merit-hfx-adapter"
+version = "0.1.0"
+description = "MERIT-Basins -> HFX adapter. Compiles per-Pfaf-L2 basins into a conformant HFX dataset."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "geopandas>=1.1",
+  "geoparquet-io==1.0.0b2",
+  "numpy",
+  "polars>=1.30.0",
+  "pyarrow>=12,<23",
+  "pyogrio>=0.11.0",
+  "rasterio",
+  "rio-cogeo",
+  "shapely>=2",
+]
+
+[tool.uv]
+package = false
