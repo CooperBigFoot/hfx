@@ -35,7 +35,9 @@ impl std::str::FromStr for FlowDirEncoding {
         match s {
             "esri" => Ok(FlowDirEncoding::Esri),
             "taudem" => Ok(FlowDirEncoding::Taudem),
-            _ => Err(FlowDirEncodingError { value: s.to_owned() }),
+            _ => Err(FlowDirEncodingError {
+                value: s.to_owned(),
+            }),
         }
     }
 }
@@ -52,7 +54,7 @@ mod tests {
     #[test]
     fn flow_dir_encoding_clone_and_copy() {
         let original = FlowDirEncoding::Esri;
-        let cloned = original.clone();
+        let cloned = original;
         // Copy: bind by value into a second variable.
         let copied = original;
         assert_eq!(original, cloned);
@@ -77,8 +79,14 @@ mod tests {
 
     #[test]
     fn flow_dir_encoding_fromstr_valid() {
-        assert_eq!("esri".parse::<FlowDirEncoding>().unwrap(), FlowDirEncoding::Esri);
-        assert_eq!("taudem".parse::<FlowDirEncoding>().unwrap(), FlowDirEncoding::Taudem);
+        assert_eq!(
+            "esri".parse::<FlowDirEncoding>().unwrap(),
+            FlowDirEncoding::Esri
+        );
+        assert_eq!(
+            "taudem".parse::<FlowDirEncoding>().unwrap(),
+            FlowDirEncoding::Taudem
+        );
     }
 
     #[test]

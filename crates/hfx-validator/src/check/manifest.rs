@@ -46,7 +46,11 @@ pub fn check_manifest(raw: &RawManifest) -> Vec<Diagnostic> {
 /// This is best-effort: if any required field is absent or invalid, returns
 /// `None`. Field-level diagnostics are already produced by [`check_manifest`].
 pub fn try_build_manifest(raw: &RawManifest) -> Option<hfx_core::Manifest> {
-    let format_version = raw.format_version.as_deref()?.parse::<FormatVersion>().ok()?;
+    let format_version = raw
+        .format_version
+        .as_deref()?
+        .parse::<FormatVersion>()
+        .ok()?;
     let fabric_name = raw.fabric_name.as_deref()?;
     let crs = raw.crs.as_deref()?.parse::<Crs>().ok()?;
     let topology = raw.topology.as_deref()?.parse::<Topology>().ok()?;
@@ -122,7 +126,9 @@ fn check_format_version(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: format_version",
             )
-            .at(Location::Field { name: "format_version".into() }),
+            .at(Location::Field {
+                name: "format_version".into(),
+            }),
         ),
         Some(v) if v != "0.1" => diags.push(
             Diagnostic::error(
@@ -131,7 +137,9 @@ fn check_format_version(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 format!("format_version must be \"0.1\", got {v:?}"),
             )
-            .at(Location::Field { name: "format_version".into() }),
+            .at(Location::Field {
+                name: "format_version".into(),
+            }),
         ),
         _ => {}
     }
@@ -147,7 +155,9 @@ fn check_fabric_name(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: fabric_name",
             )
-            .at(Location::Field { name: "fabric_name".into() }),
+            .at(Location::Field {
+                name: "fabric_name".into(),
+            }),
         ),
         Some("") => diags.push(
             Diagnostic::error(
@@ -156,18 +166,20 @@ fn check_fabric_name(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "fabric_name must not be empty",
             )
-            .at(Location::Field { name: "fabric_name".into() }),
+            .at(Location::Field {
+                name: "fabric_name".into(),
+            }),
         ),
         Some(name) if !is_valid_fabric_name(name) => diags.push(
             Diagnostic::error(
                 "manifest.fabric_name",
                 Category::Manifest,
                 Artifact::Manifest,
-                format!(
-                    "fabric_name {name:?} does not match ^[a-z][a-z0-9_-]*$"
-                ),
+                format!("fabric_name {name:?} does not match ^[a-z][a-z0-9_-]*$"),
             )
-            .at(Location::Field { name: "fabric_name".into() }),
+            .at(Location::Field {
+                name: "fabric_name".into(),
+            }),
         ),
         _ => {}
     }
@@ -206,7 +218,9 @@ fn check_terminal_sink_id(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: terminal_sink_id",
             )
-            .at(Location::Field { name: "terminal_sink_id".into() }),
+            .at(Location::Field {
+                name: "terminal_sink_id".into(),
+            }),
         ),
         Some(v) if v != 0 => diags.push(
             Diagnostic::error(
@@ -215,7 +229,9 @@ fn check_terminal_sink_id(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 format!("terminal_sink_id must be 0, got {v}"),
             )
-            .at(Location::Field { name: "terminal_sink_id".into() }),
+            .at(Location::Field {
+                name: "terminal_sink_id".into(),
+            }),
         ),
         _ => {}
     }
@@ -230,7 +246,9 @@ fn check_topology(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: topology",
             )
-            .at(Location::Field { name: "topology".into() }),
+            .at(Location::Field {
+                name: "topology".into(),
+            }),
         ),
         Some(v) if v != "tree" && v != "dag" => diags.push(
             Diagnostic::error(
@@ -239,7 +257,9 @@ fn check_topology(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 format!("topology must be \"tree\" or \"dag\", got {v:?}"),
             )
-            .at(Location::Field { name: "topology".into() }),
+            .at(Location::Field {
+                name: "topology".into(),
+            }),
         ),
         _ => {}
     }
@@ -254,7 +274,9 @@ fn check_has_up_area(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: has_up_area",
             )
-            .at(Location::Field { name: "has_up_area".into() }),
+            .at(Location::Field {
+                name: "has_up_area".into(),
+            }),
         );
     }
 }
@@ -268,7 +290,9 @@ fn check_has_rasters(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: has_rasters",
             )
-            .at(Location::Field { name: "has_rasters".into() }),
+            .at(Location::Field {
+                name: "has_rasters".into(),
+            }),
         );
     }
 }
@@ -282,7 +306,9 @@ fn check_has_snap(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: has_snap",
             )
-            .at(Location::Field { name: "has_snap".into() }),
+            .at(Location::Field {
+                name: "has_snap".into(),
+            }),
         );
     }
 }
@@ -296,16 +322,23 @@ fn check_bbox(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: bbox",
             )
-            .at(Location::Field { name: "bbox".into() }),
+            .at(Location::Field {
+                name: "bbox".into(),
+            }),
         ),
         Some(coords) if coords.len() != 4 => diags.push(
             Diagnostic::error(
                 "manifest.bbox",
                 Category::Manifest,
                 Artifact::Manifest,
-                format!("bbox must have exactly 4 numbers [minx, miny, maxx, maxy], got {}", coords.len()),
+                format!(
+                    "bbox must have exactly 4 numbers [minx, miny, maxx, maxy], got {}",
+                    coords.len()
+                ),
             )
-            .at(Location::Field { name: "bbox".into() }),
+            .at(Location::Field {
+                name: "bbox".into(),
+            }),
         ),
         Some(coords) => {
             let (minx, miny, maxx, maxy) = (coords[0], coords[1], coords[2], coords[3]);
@@ -317,7 +350,9 @@ fn check_bbox(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                         Artifact::Manifest,
                         format!("bbox minx ({minx}) must be less than maxx ({maxx})"),
                     )
-                    .at(Location::Field { name: "bbox".into() }),
+                    .at(Location::Field {
+                        name: "bbox".into(),
+                    }),
                 );
             }
             if miny >= maxy {
@@ -328,7 +363,9 @@ fn check_bbox(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                         Artifact::Manifest,
                         format!("bbox miny ({miny}) must be less than maxy ({maxy})"),
                     )
-                    .at(Location::Field { name: "bbox".into() }),
+                    .at(Location::Field {
+                        name: "bbox".into(),
+                    }),
                 );
             }
         }
@@ -344,7 +381,9 @@ fn check_atom_count(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: atom_count",
             )
-            .at(Location::Field { name: "atom_count".into() }),
+            .at(Location::Field {
+                name: "atom_count".into(),
+            }),
         ),
         Some(0) => diags.push(
             Diagnostic::error(
@@ -353,7 +392,9 @@ fn check_atom_count(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "atom_count must be >= 1",
             )
-            .at(Location::Field { name: "atom_count".into() }),
+            .at(Location::Field {
+                name: "atom_count".into(),
+            }),
         ),
         _ => {}
     }
@@ -368,7 +409,9 @@ fn check_created_at(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: created_at",
             )
-            .at(Location::Field { name: "created_at".into() }),
+            .at(Location::Field {
+                name: "created_at".into(),
+            }),
         ),
         Some("") => diags.push(
             Diagnostic::error(
@@ -377,7 +420,9 @@ fn check_created_at(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "created_at must not be empty",
             )
-            .at(Location::Field { name: "created_at".into() }),
+            .at(Location::Field {
+                name: "created_at".into(),
+            }),
         ),
         Some(ts) if !is_valid_rfc3339(ts) => diags.push(
             Diagnostic::error(
@@ -386,7 +431,9 @@ fn check_created_at(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 format!("created_at {ts:?} is not a valid RFC 3339 timestamp"),
             )
-            .at(Location::Field { name: "created_at".into() }),
+            .at(Location::Field {
+                name: "created_at".into(),
+            }),
         ),
         _ => {}
     }
@@ -401,7 +448,9 @@ fn check_adapter_version(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "missing required field: adapter_version",
             )
-            .at(Location::Field { name: "adapter_version".into() }),
+            .at(Location::Field {
+                name: "adapter_version".into(),
+            }),
         ),
         Some("") => diags.push(
             Diagnostic::error(
@@ -410,7 +459,9 @@ fn check_adapter_version(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "adapter_version must not be empty",
             )
-            .at(Location::Field { name: "adapter_version".into() }),
+            .at(Location::Field {
+                name: "adapter_version".into(),
+            }),
         ),
         _ => {}
     }
@@ -429,7 +480,9 @@ fn check_flow_dir_encoding(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 "flow_dir_encoding is required when has_rasters is true",
             )
-            .at(Location::Field { name: "flow_dir_encoding".into() }),
+            .at(Location::Field {
+                name: "flow_dir_encoding".into(),
+            }),
         ),
         Some(enc) if enc != "esri" && enc != "taudem" => diags.push(
             Diagnostic::error(
@@ -438,7 +491,9 @@ fn check_flow_dir_encoding(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
                 Artifact::Manifest,
                 format!("flow_dir_encoding must be \"esri\" or \"taudem\", got {enc:?}"),
             )
-            .at(Location::Field { name: "flow_dir_encoding".into() }),
+            .at(Location::Field {
+                name: "flow_dir_encoding".into(),
+            }),
         ),
         _ => {}
     }
@@ -477,31 +532,47 @@ fn is_valid_rfc3339(s: &str) -> bool {
 
     // Positions: YYYY-MM-DDThh:mm:ss
     //            0123456789012345678
-    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return false;
     }
 
     // Parse numeric segments.
-    let year  = parse_digits(&bytes[0..4]);
+    let year = parse_digits(&bytes[0..4]);
     let month = parse_digits(&bytes[5..7]);
-    let day   = parse_digits(&bytes[8..10]);
-    let hour  = parse_digits(&bytes[11..13]);
-    let min   = parse_digits(&bytes[14..16]);
-    let sec   = parse_digits(&bytes[17..19]);
+    let day = parse_digits(&bytes[8..10]);
+    let hour = parse_digits(&bytes[11..13]);
+    let min = parse_digits(&bytes[14..16]);
+    let sec = parse_digits(&bytes[17..19]);
 
-    let (Some(month), Some(day), Some(hour), Some(min), Some(sec)) =
-        (month, day, hour, min, sec)
+    let (Some(month), Some(day), Some(hour), Some(min), Some(sec)) = (month, day, hour, min, sec)
     else {
         return false;
     };
-    if year.is_none() { return false; }
+    if year.is_none() {
+        return false;
+    }
 
-    if !(1..=12).contains(&month) { return false; }
-    if !(1..=31).contains(&day) { return false; }
-    if hour > 23 { return false; }
-    if min > 59 { return false; }
+    if !(1..=12).contains(&month) {
+        return false;
+    }
+    if !(1..=31).contains(&day) {
+        return false;
+    }
+    if hour > 23 {
+        return false;
+    }
+    if min > 59 {
+        return false;
+    }
     // Allow leap seconds (60).
-    if sec > 60 { return false; }
+    if sec > 60 {
+        return false;
+    }
 
     // After the seconds field (byte 19), there may be an optional fractional
     // part: `.` followed by one or more ASCII digits.

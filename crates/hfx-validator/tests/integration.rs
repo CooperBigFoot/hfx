@@ -409,8 +409,14 @@ fn binary_json_stdout_is_clean() {
         "stdout must start with '{{' for JSON mode, got first 100 chars: {:?}",
         &trimmed[..trimmed.len().min(100)]
     );
-    let parsed: serde_json::Value = serde_json::from_str(trimmed)
-        .expect("stdout must be valid JSON");
-    assert!(parsed.get("passed").is_some(), "JSON must have 'passed' field");
-    assert!(parsed.get("diagnostics").is_some(), "JSON must have 'diagnostics' field");
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("stdout must be valid JSON");
+    assert!(
+        parsed.get("passed").is_some(),
+        "JSON must have 'passed' field"
+    );
+    assert!(
+        parsed.get("diagnostics").is_some(),
+        "JSON must have 'diagnostics' field"
+    );
 }

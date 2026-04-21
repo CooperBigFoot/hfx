@@ -1,11 +1,11 @@
 //! I/O layer: reads HFX dataset files into the ParsedDataset intermediate representation.
 
-pub mod manifest;
 pub mod catchments;
 pub mod graph;
-pub mod snap;
+pub mod manifest;
 pub mod raster;
 pub mod schema;
+pub mod snap;
 
 use std::path::Path;
 

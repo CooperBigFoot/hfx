@@ -43,7 +43,7 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
 
         // B5: Row group sizes.
         for (rg_idx, &size) in catchments.row_group_sizes.iter().enumerate() {
-            if size < RG_SIZE_MIN || size > RG_SIZE_MAX {
+            if !(RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size) {
                 diags.push(Diagnostic::warning(
                     "schema.catchments.rg_size",
                     Category::Schema,
@@ -74,7 +74,7 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
         }
 
         for (rg_idx, &size) in snap.row_group_sizes.iter().enumerate() {
-            if size < RG_SIZE_MIN || size > RG_SIZE_MAX {
+            if !(RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size) {
                 diags.push(Diagnostic::warning(
                     "schema.snap.rg_size",
                     Category::Schema,
@@ -91,20 +91,20 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     // B6: atom_count in manifest matches catchments row count.
     // Use raw_manifest so a bad fabric_name (or any other unparseable field)
     // does not suppress this check.
-    if let (Some(raw), Some(catchments)) = (&dataset.raw_manifest, &dataset.catchments) {
-        if let Some(declared) = raw.atom_count {
-            let actual = catchments.row_count as u64;
-            if declared != actual {
-                diags.push(Diagnostic::error(
-                    "schema.atom_count_mismatch",
-                    Category::Schema,
-                    Artifact::CrossFile,
-                    format!(
-                        "manifest atom_count ({declared}) does not match \
-                         catchments.parquet row count ({actual})"
-                    ),
-                ));
-            }
+    if let (Some(raw), Some(catchments)) = (&dataset.raw_manifest, &dataset.catchments)
+        && let Some(declared) = raw.atom_count
+    {
+        let actual = catchments.row_count as u64;
+        if declared != actual {
+            diags.push(Diagnostic::error(
+                "schema.atom_count_mismatch",
+                Category::Schema,
+                Artifact::CrossFile,
+                format!(
+                    "manifest atom_count ({declared}) does not match \
+                     catchments.parquet row count ({actual})"
+                ),
+            ));
         }
     }
 
@@ -190,7 +190,11 @@ mod tests {
         dataset.catchments = Some(catchments_with_rg(vec![100], vec![false]));
         let diags = check_schemas(&dataset);
         assert_eq!(diags.len(), 2); // bbox_stats_missing + rg_size (100 < 4096)
-        assert!(diags.iter().any(|d| d.check_id == "schema.catchments.bbox_stats_missing"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "schema.catchments.bbox_stats_missing")
+        );
     }
 
     #[test]
@@ -241,8 +245,19 @@ mod tests {
         c.row_count = 3;
         dataset.catchments = Some(c);
         let diags = check_schemas(&dataset);
-        assert!(diags.iter().any(|d| d.check_id == "schema.atom_count_mismatch"));
-        assert_eq!(diags.iter().find(|d| d.check_id == "schema.atom_count_mismatch").unwrap().severity, Severity::Error);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "schema.atom_count_mismatch")
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .find(|d| d.check_id == "schema.atom_count_mismatch")
+                .unwrap()
+                .severity,
+            Severity::Error
+        );
     }
 
     #[test]
@@ -251,7 +266,11 @@ mod tests {
         dataset.raw_manifest = Some(raw_manifest_with_atom_count(4096));
         dataset.catchments = Some(catchments_with_rg(vec![4096], vec![true]));
         let diags = check_schemas(&dataset);
-        assert!(!diags.iter().any(|d| d.check_id == "schema.atom_count_mismatch"));
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.check_id == "schema.atom_count_mismatch")
+        );
     }
 
     #[test]
@@ -269,8 +288,12 @@ mod tests {
         dataset.catchments = Some(c);
         // manifest is intentionally None (simulating failed build)
         let diags = check_schemas(&dataset);
-        assert!(diags.iter().any(|d| d.check_id == "schema.atom_count_mismatch"),
-            "atom_count check should fire even when manifest build fails; got: {diags:#?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "schema.atom_count_mismatch"),
+            "atom_count check should fire even when manifest build fails; got: {diags:#?}"
+        );
     }
 
     #[test]
@@ -283,11 +306,15 @@ mod tests {
             weights: vec![],
             bboxes: vec![],
             geometry_wkb: vec![],
-            row_group_sizes: vec![100],       // out of range
+            row_group_sizes: vec![100],            // out of range
             row_group_has_bbox_stats: vec![false], // missing stats
         });
         let diags = check_schemas(&dataset);
-        assert!(diags.iter().any(|d| d.check_id == "schema.snap.bbox_stats_missing"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "schema.snap.bbox_stats_missing")
+        );
         assert!(diags.iter().any(|d| d.check_id == "schema.snap.rg_size"));
     }
 }

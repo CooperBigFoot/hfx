@@ -17,7 +17,10 @@ impl ValidationReport {
 
     /// True if no Error-severity diagnostics exist.
     pub fn is_valid(&self) -> bool {
-        !self.diagnostics.iter().any(|d| d.severity == Severity::Error)
+        !self
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
@@ -25,15 +28,24 @@ impl ValidationReport {
     }
 
     pub fn error_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| d.severity == Severity::Error).count()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count()
     }
 
     pub fn warning_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count()
     }
 
     pub fn info_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| d.severity == Severity::Info).count()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .count()
     }
 
     /// Promote all warnings to errors (for --strict mode).
@@ -74,7 +86,8 @@ impl ValidationReport {
             info_count: self.info_count(),
             diagnostics: self.diagnostics.iter().map(JsonDiagnostic::from).collect(),
         };
-        serde_json::to_string_pretty(&summary).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        serde_json::to_string_pretty(&summary)
+            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
     }
 }
 

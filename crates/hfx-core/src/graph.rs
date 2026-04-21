@@ -160,19 +160,19 @@ mod tests {
         let err = DrainageGraph::new(rows).unwrap_err();
         assert!(matches!(
             err,
-            GraphError::DuplicateAtomId { id: 5, first: 0, second: 1 }
+            GraphError::DuplicateAtomId {
+                id: 5,
+                first: 0,
+                second: 1
+            }
         ));
     }
 
     #[test]
     fn get_returns_correct_row() {
         let row = interior_row(10, &[11, 12]);
-        let graph = DrainageGraph::new(vec![
-            headwater_row(11),
-            headwater_row(12),
-            row.clone(),
-        ])
-        .unwrap();
+        let graph =
+            DrainageGraph::new(vec![headwater_row(11), headwater_row(12), row.clone()]).unwrap();
 
         let found = graph.get(test_atom_id(10)).unwrap();
         assert_eq!(found.id(), test_atom_id(10));

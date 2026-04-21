@@ -126,10 +126,7 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
 
     debug!(
         width,
-        height,
-        bits_per_sample,
-        is_tiled,
-        "raster metadata read complete"
+        height, bits_per_sample, is_tiled, "raster metadata read complete"
     );
 
     (Some(meta), vec![])
@@ -210,7 +207,7 @@ fn read_nodata<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Op
 mod tests {
     use std::io::Cursor;
 
-    use tiff::encoder::{colortype, TiffEncoder};
+    use tiff::encoder::{TiffEncoder, colortype};
 
     use super::*;
 

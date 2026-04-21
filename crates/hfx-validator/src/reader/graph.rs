@@ -7,10 +7,12 @@ use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader;
 use tracing::{debug, warn};
 
+use super::{
+    MAX_CONSECUTIVE_BATCH_FAILURES, MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_TOTAL_BATCH_FAILURES,
+};
 use crate::dataset::GraphData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
-use crate::reader::schema::{list_int64_field, validate_schema, ExpectedColumn};
-use super::{MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_CONSECUTIVE_BATCH_FAILURES, MAX_TOTAL_BATCH_FAILURES};
+use crate::reader::schema::{ExpectedColumn, list_int64_field, validate_schema};
 
 /// Expected schema for graph.arrow.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -61,7 +63,10 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
     // --- Schema validation ---
     let arrow_schema = reader.schema();
     let mut diags = validate_schema(&arrow_schema, &expected_columns(), Artifact::Graph);
-    if diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
+    if diags
+        .iter()
+        .any(|d| d.severity == crate::diagnostic::Severity::Error)
+    {
         warn!("graph.arrow schema has errors; skipping data extraction");
         return (None, diags);
     }
@@ -109,26 +114,31 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
         let num_rows = batch.num_rows();
 
         // id column (non-nullable)
-        if let Some(col) = batch.column_by_name("id") {
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                for i in 0..num_rows {
-                    if arr.is_null(i) {
-                        null_id_count += 1;
-                        if null_id_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
-                            diags.push(
-                                Diagnostic::error(
-                                    "graph.null_id",
-                                    Category::Schema,
-                                    Artifact::Graph,
-                                    format!("row {}: id is null in a non-nullable column", total_rows + i),
-                                )
-                                .at(Location::Row { index: total_rows + i }),
-                            );
-                        }
-                        ids.push(0); // sentinel to keep indices aligned
-                    } else {
-                        ids.push(arr.value(i));
+        if let Some(col) = batch.column_by_name("id")
+            && let Some(arr) = col.as_any().downcast_ref::<Int64Array>()
+        {
+            for i in 0..num_rows {
+                if arr.is_null(i) {
+                    null_id_count += 1;
+                    if null_id_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "graph.null_id",
+                                Category::Schema,
+                                Artifact::Graph,
+                                format!(
+                                    "row {}: id is null in a non-nullable column",
+                                    total_rows + i
+                                ),
+                            )
+                            .at(Location::Row {
+                                index: total_rows + i,
+                            }),
+                        );
                     }
+                    ids.push(0); // sentinel to keep indices aligned
+                } else {
+                    ids.push(arr.value(i));
                 }
             }
         }
@@ -145,9 +155,14 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
                                     "graph.null_upstream_ids",
                                     Category::Schema,
                                     Artifact::Graph,
-                                    format!("row {}: upstream_ids is null in a non-nullable column", total_rows + i),
+                                    format!(
+                                        "row {}: upstream_ids is null in a non-nullable column",
+                                        total_rows + i
+                                    ),
                                 )
-                                .at(Location::Row { index: total_rows + i }),
+                                .at(Location::Row {
+                                    index: total_rows + i,
+                                }),
                             );
                         }
                         upstream_ids.push(Vec::new()); // sentinel
@@ -161,7 +176,9 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
                         upstream_ids.push(int_arr);
                     }
                 }
-            } else if let Some(large_arr) = col.as_any().downcast_ref::<arrow::array::LargeListArray>() {
+            } else if let Some(large_arr) =
+                col.as_any().downcast_ref::<arrow::array::LargeListArray>()
+            {
                 for i in 0..num_rows {
                     if large_arr.is_null(i) {
                         null_upstream_ids_count += 1;
@@ -171,9 +188,14 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
                                     "graph.null_upstream_ids",
                                     Category::Schema,
                                     Artifact::Graph,
-                                    format!("row {}: upstream_ids is null in a non-nullable column", total_rows + i),
+                                    format!(
+                                        "row {}: upstream_ids is null in a non-nullable column",
+                                        total_rows + i
+                                    ),
                                 )
-                                .at(Location::Row { index: total_rows + i }),
+                                .at(Location::Row {
+                                    index: total_rows + i,
+                                }),
                             );
                         }
                         upstream_ids.push(Vec::new()); // sentinel
@@ -320,7 +342,11 @@ mod tests {
         assert_eq!(data.upstream_ids[0], vec![2, 3]);
         assert_eq!(data.upstream_ids[1], vec![] as Vec<i64>);
         assert_eq!(data.upstream_ids[2], vec![4]);
-        assert!(!diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error));
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error)
+        );
     }
 
     #[test]

@@ -232,7 +232,9 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_dir_not_tiled"),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_dir_not_tiled"),
             "expected raster.flow_dir_not_tiled, got: {diags:#?}"
         );
     }
@@ -249,7 +251,11 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(diags.iter().any(|d| d.check_id == "raster.flow_dir_dtype"));
-        assert!(diags.iter().any(|d| d.check_id == "raster.flow_dir_not_tiled"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_dir_not_tiled")
+        );
     }
 
     #[test]
@@ -273,7 +279,9 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
             "wrong nodata should produce an error, got: {diags:#?}"
         );
     }
@@ -286,7 +294,9 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
             "absent nodata should produce an error, got: {diags:#?}"
         );
     }
@@ -342,7 +352,9 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_acc_not_tiled"),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_acc_not_tiled"),
             "expected raster.flow_acc_not_tiled, got: {diags:#?}"
         );
     }
@@ -359,7 +371,11 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(diags.iter().any(|d| d.check_id == "raster.flow_acc_dtype"));
-        assert!(diags.iter().any(|d| d.check_id == "raster.flow_acc_not_tiled"));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_acc_not_tiled")
+        );
     }
 
     #[test]
@@ -383,7 +399,9 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
             "wrong nodata should produce an error, got: {diags:#?}"
         );
     }
@@ -396,7 +414,9 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
+            diags
+                .iter()
+                .any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
             "absent nodata should produce an error, got: {diags:#?}"
         );
     }

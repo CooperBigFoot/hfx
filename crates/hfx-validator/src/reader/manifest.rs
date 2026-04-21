@@ -39,7 +39,11 @@ pub struct RawManifest {
 /// - Success: both `json_value` and `raw` are Some, diagnostics is empty.
 pub fn read_manifest(
     path: &Path,
-) -> (Option<serde_json::Value>, Option<RawManifest>, Vec<Diagnostic>) {
+) -> (
+    Option<serde_json::Value>,
+    Option<RawManifest>,
+    Vec<Diagnostic>,
+) {
     debug!(path = %path.display(), "reading manifest.json");
 
     // Stage 1: read file bytes.
@@ -108,7 +112,10 @@ mod tests {
     fn write_temp(content: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.json");
-        std::fs::File::create(&path).unwrap().write_all(content).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(content)
+            .unwrap();
         (dir, path)
     }
 

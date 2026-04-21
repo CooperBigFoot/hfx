@@ -94,7 +94,10 @@ pub fn check_acyclicity(data: &GraphData) -> Vec<Diagnostic> {
 
     let total_nodes = in_degree.len();
     if processed == total_nodes {
-        debug!(nodes = total_nodes, "E1 acyclicity check passed — no cycles");
+        debug!(
+            nodes = total_nodes,
+            "E1 acyclicity check passed — no cycles"
+        );
         return vec![];
     }
 
@@ -120,9 +123,7 @@ pub fn check_acyclicity(data: &GraphData) -> Vec<Diagnostic> {
         String::new()
     };
 
-    let message = format!(
-        "{cycle_count} node(s) participate in a cycle: [{preview_str}{suffix}]"
-    );
+    let message = format!("{cycle_count} node(s) participate in a cycle: [{preview_str}{suffix}]");
 
     debug!(
         cycle_nodes = cycle_count,
@@ -206,10 +207,10 @@ mod tests {
         let graph = make_graph(
             vec![1, 2, 3, 4],
             vec![
-                vec![],       // 1 is a headwater
-                vec![],       // 2 is a headwater
-                vec![1, 2],   // 3 has upstream 1 and 2
-                vec![3],      // 4 has upstream 3
+                vec![],     // 1 is a headwater
+                vec![],     // 2 is a headwater
+                vec![1, 2], // 3 has upstream 1 and 2
+                vec![3],    // 4 has upstream 3
             ],
         );
         let diags = check_acyclicity(&graph);
@@ -269,21 +270,28 @@ mod tests {
         let graph = make_graph(
             vec![1, 2, 3, 4, 5],
             vec![
-                vec![],     // 1 headwater
-                vec![1],    // 2 ← 1
-                vec![2],    // 3 ← 2
-                vec![5],    // 4 ← 5 (cycle)
-                vec![4],    // 5 ← 4 (cycle)
+                vec![],  // 1 headwater
+                vec![1], // 2 ← 1
+                vec![2], // 3 ← 2
+                vec![5], // 4 ← 5 (cycle)
+                vec![4], // 5 ← 4 (cycle)
             ],
         );
         let diags = check_acyclicity(&graph);
-        assert!(has_cycle_diag(&diags), "should detect cycle among nodes 4 and 5");
+        assert!(
+            has_cycle_diag(&diags),
+            "should detect cycle among nodes 4 and 5"
+        );
         // Only one diagnostic for the whole cycle.
         let cycle_diags: Vec<_> = diags
             .iter()
             .filter(|d| d.check_id == "graph.cycle_detected")
             .collect();
-        assert_eq!(cycle_diags.len(), 1, "should emit exactly one cycle diagnostic");
+        assert_eq!(
+            cycle_diags.len(),
+            1,
+            "should emit exactly one cycle diagnostic"
+        );
         // The message should mention 2 cycle nodes, not 5.
         assert!(
             cycle_diags[0].message.contains('2'),

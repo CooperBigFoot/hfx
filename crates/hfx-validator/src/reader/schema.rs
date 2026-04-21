@@ -15,7 +15,11 @@ pub struct ExpectedColumn {
 impl ExpectedColumn {
     /// Create a new expected column descriptor.
     pub fn new(name: &'static str, dtype: DataType, nullable: bool) -> Self {
-        Self { name, dtype, nullable }
+        Self {
+            name,
+            dtype,
+            nullable,
+        }
     }
 }
 
@@ -72,7 +76,9 @@ pub fn validate_schema(
                         artifact,
                         format!("missing required column '{}'", col.name),
                     )
-                    .at(Location::Column { name: col.name.to_string() }),
+                    .at(Location::Column {
+                        name: col.name.to_string(),
+                    }),
                 );
             }
             Ok(field) => {
@@ -99,7 +105,9 @@ pub fn validate_schema(
                                 col.dtype
                             ),
                         )
-                        .at(Location::Column { name: col.name.to_string() }),
+                        .at(Location::Column {
+                            name: col.name.to_string(),
+                        }),
                     );
                 } else {
                     debug!(
@@ -120,7 +128,9 @@ pub fn validate_schema(
                                 col.dtype
                             ),
                         )
-                        .at(Location::Column { name: col.name.to_string() }),
+                        .at(Location::Column {
+                            name: col.name.to_string(),
+                        }),
                     );
                 }
 
@@ -159,7 +169,9 @@ pub fn validate_schema(
                             ),
                         )
                     };
-                    diags.push(diag.at(Location::Column { name: col.name.to_string() }));
+                    diags.push(diag.at(Location::Column {
+                        name: col.name.to_string(),
+                    }));
                 }
             }
         }
@@ -170,7 +182,11 @@ pub fn validate_schema(
 
 /// Build the list field type used for upstream_ids (List<Int64>).
 pub fn list_int64_field() -> DataType {
-    DataType::List(std::sync::Arc::new(Field::new("item", DataType::Int64, true)))
+    DataType::List(std::sync::Arc::new(Field::new(
+        "item",
+        DataType::Int64,
+        true,
+    )))
 }
 
 #[cfg(test)]
@@ -227,7 +243,11 @@ mod tests {
         let schema = make_schema(vec![Field::new("geometry", DataType::LargeBinary, false)]);
         let expected = vec![ExpectedColumn::new("geometry", DataType::Binary, false)];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic: {diags:#?}"
+        );
         assert_eq!(diags[0].check_id, "schema.large_variant");
         assert_eq!(diags[0].severity, Severity::Error);
     }
@@ -235,20 +255,37 @@ mod tests {
     #[test]
     fn binary_instead_of_large_binary_produces_error() {
         let schema = make_schema(vec![Field::new("geometry", DataType::Binary, false)]);
-        let expected = vec![ExpectedColumn::new("geometry", DataType::LargeBinary, false)];
+        let expected = vec![ExpectedColumn::new(
+            "geometry",
+            DataType::LargeBinary,
+            false,
+        )];
         let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic: {diags:#?}"
+        );
         assert_eq!(diags[0].check_id, "schema.large_variant");
         assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]
     fn large_list_instead_of_list_produces_error() {
-        let large_list_field = DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
+        let large_list_field =
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
         let schema = make_schema(vec![Field::new("upstream_ids", large_list_field, false)]);
-        let expected = vec![ExpectedColumn::new("upstream_ids", list_int64_field(), false)];
+        let expected = vec![ExpectedColumn::new(
+            "upstream_ids",
+            list_int64_field(),
+            false,
+        )];
         let diags = validate_schema(&schema, &expected, Artifact::Graph);
-        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:#?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected exactly one diagnostic: {diags:#?}"
+        );
         assert_eq!(diags[0].check_id, "schema.large_variant");
         assert_eq!(diags[0].severity, Severity::Error);
     }

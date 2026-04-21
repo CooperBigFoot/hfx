@@ -30,7 +30,13 @@ impl CatchmentAtom {
         bbox: BoundingBox,
         geometry: WkbGeometry,
     ) -> Self {
-        Self { id, area, upstream_area, bbox, geometry }
+        Self {
+            id,
+            area,
+            upstream_area,
+            bbox,
+            geometry,
+        }
     }
 
     /// Return the catchment's unique identifier.

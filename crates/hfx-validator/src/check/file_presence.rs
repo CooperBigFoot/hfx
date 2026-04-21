@@ -129,7 +129,11 @@ mod tests {
         let diags = check_file_presence(&files, None);
         assert_eq!(errors_with_id(&diags, "file_presence.manifest"), 1);
         // no other errors beyond manifest
-        assert_eq!(diags.len(), 1, "expected only manifest error, got: {diags:#?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only manifest error, got: {diags:#?}"
+        );
     }
 
     #[test]
@@ -251,7 +255,10 @@ mod tests {
         };
 
         let diags = check_file_presence(&files, Some(&raw));
-        let snap_errors: Vec<_> = diags.iter().filter(|d| d.check_id == "file_presence.snap").collect();
+        let snap_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.check_id == "file_presence.snap")
+            .collect();
         assert!(snap_errors.is_empty());
     }
 
@@ -398,6 +405,9 @@ mod tests {
 
         // raw_manifest is None but manifest_path is present — raster files are optional
         let diags = check_file_presence(&files, None);
-        assert!(diags.is_empty(), "expected no diagnostics when raw manifest is None");
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics when raw manifest is None"
+        );
     }
 }

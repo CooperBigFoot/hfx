@@ -30,7 +30,9 @@ impl FromStr for Topology {
         match s {
             "tree" => Ok(Topology::Tree),
             "dag" => Ok(Topology::Dag),
-            _ => Err(ManifestError::UnsupportedTopology { value: s.to_owned() }),
+            _ => Err(ManifestError::UnsupportedTopology {
+                value: s.to_owned(),
+            }),
         }
     }
 }
@@ -56,7 +58,9 @@ impl FromStr for FormatVersion {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "0.1" => Ok(FormatVersion::V0_1),
-            _ => Err(ManifestError::UnsupportedFormatVersion { value: s.to_owned() }),
+            _ => Err(ManifestError::UnsupportedFormatVersion {
+                value: s.to_owned(),
+            }),
         }
     }
 }
@@ -82,7 +86,9 @@ impl FromStr for Crs {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "EPSG:4326" => Ok(Crs::Epsg4326),
-            _ => Err(ManifestError::UnsupportedCrs { value: s.to_owned() }),
+            _ => Err(ManifestError::UnsupportedCrs {
+                value: s.to_owned(),
+            }),
         }
     }
 }
@@ -353,7 +359,9 @@ impl ManifestBuilder {
         let adapter_version = adapter_version.into();
 
         if terminal_sink_id != 0 {
-            return Err(ManifestError::InvalidTerminalSinkId { value: terminal_sink_id });
+            return Err(ManifestError::InvalidTerminalSinkId {
+                value: terminal_sink_id,
+            });
         }
         if fabric_name.is_empty() {
             return Err(ManifestError::EmptyFabricName);
@@ -568,7 +576,10 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(matches!(err, ManifestError::InvalidTerminalSinkId { value: 5 }));
+        assert!(matches!(
+            err,
+            ManifestError::InvalidTerminalSinkId { value: 5 }
+        ));
     }
 
     #[test]
@@ -643,8 +654,13 @@ mod tests {
 
     #[test]
     fn with_rasters_esri_sets_present_esri() {
-        let manifest = minimal_builder().with_rasters(FlowDirEncoding::Esri).build();
-        assert_eq!(manifest.rasters(), RasterAvailability::Present(FlowDirEncoding::Esri));
+        let manifest = minimal_builder()
+            .with_rasters(FlowDirEncoding::Esri)
+            .build();
+        assert_eq!(
+            manifest.rasters(),
+            RasterAvailability::Present(FlowDirEncoding::Esri)
+        );
     }
 
     #[test]
@@ -665,7 +681,10 @@ mod tests {
             .build();
 
         assert_eq!(manifest.up_area(), UpAreaAvailability::Precomputed);
-        assert_eq!(manifest.rasters(), RasterAvailability::Present(FlowDirEncoding::Taudem));
+        assert_eq!(
+            manifest.rasters(),
+            RasterAvailability::Present(FlowDirEncoding::Taudem)
+        );
         assert_eq!(manifest.snap(), SnapAvailability::Present);
         assert_eq!(manifest.fabric_version(), Some("v2024"));
         assert_eq!(manifest.fabric_level(), Some(8));
@@ -713,6 +732,9 @@ mod tests {
     #[test]
     fn format_version_fromstr_invalid() {
         let err = "0.2".parse::<FormatVersion>().unwrap_err();
-        assert!(matches!(err, ManifestError::UnsupportedFormatVersion { .. }));
+        assert!(matches!(
+            err,
+            ManifestError::UnsupportedFormatVersion { .. }
+        ));
     }
 }

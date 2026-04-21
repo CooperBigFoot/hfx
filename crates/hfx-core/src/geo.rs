@@ -144,7 +144,12 @@ impl BoundingBox {
             });
         }
 
-        Ok(Self { min_x, min_y, max_x, max_y })
+        Ok(Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        })
     }
 
     /// Returns the western boundary longitude.
@@ -377,7 +382,10 @@ mod tests {
 
     #[test]
     fn wkb_empty_rejected() {
-        assert!(matches!(WkbGeometry::new(vec![]), Err(GeoError::EmptyGeometry)));
+        assert!(matches!(
+            WkbGeometry::new(vec![]),
+            Err(GeoError::EmptyGeometry)
+        ));
     }
 
     #[test]

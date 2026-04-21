@@ -68,7 +68,9 @@ pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
                         "ids.catchment_duplicate",
                         Category::IdConstraint,
                         Artifact::Catchments,
-                        format!("catchment id {id} at row {i} is duplicated; all IDs must be unique"),
+                        format!(
+                            "catchment id {id} at row {i} is duplicated; all IDs must be unique"
+                        ),
                     )
                     .at(Location::Row { index: i }),
                 );
@@ -81,7 +83,10 @@ pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
             "ids.catchment_zero",
             Category::IdConstraint,
             Artifact::Catchments,
-            format!("... and {} more zero catchment ID violations (only first {MAX_VIOLATIONS} shown)", zero_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more zero catchment ID violations (only first {MAX_VIOLATIONS} shown)",
+                zero_count - MAX_VIOLATIONS
+            ),
         ));
     }
     if neg_count > MAX_VIOLATIONS {
@@ -137,7 +142,10 @@ pub fn check_catchment_bboxes(data: &CatchmentsData) -> Vec<Diagnostic> {
             "ids.catchment_bbox",
             Category::IdConstraint,
             Artifact::Catchments,
-            format!("... and {} more bbox violations (only first {MAX_VIOLATIONS} shown)", violation_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more bbox violations (only first {MAX_VIOLATIONS} shown)",
+                violation_count - MAX_VIOLATIONS
+            ),
         ));
     }
 
@@ -156,9 +164,13 @@ pub fn check_catchment_areas(data: &CatchmentsData) -> Vec<Diagnostic> {
 
     for (i, &area) in data.areas_km2.iter().enumerate() {
         let ok = if !area.is_finite() {
-            Some(format!("area_km2 at row {i} is not finite ({area}); must be a finite non-negative number"))
+            Some(format!(
+                "area_km2 at row {i} is not finite ({area}); must be a finite non-negative number"
+            ))
         } else if area < 0.0 {
-            Some(format!("area_km2 {area} at row {i} is negative; must be >= 0"))
+            Some(format!(
+                "area_km2 {area} at row {i} is negative; must be >= 0"
+            ))
         } else {
             None
         };
@@ -184,7 +196,10 @@ pub fn check_catchment_areas(data: &CatchmentsData) -> Vec<Diagnostic> {
             "ids.catchment_area",
             Category::IdConstraint,
             Artifact::Catchments,
-            format!("... and {} more area_km2 violations (only first {MAX_VIOLATIONS} shown)", violation_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more area_km2 violations (only first {MAX_VIOLATIONS} shown)",
+                violation_count - MAX_VIOLATIONS
+            ),
         ));
     }
 
@@ -253,7 +268,10 @@ pub fn check_graph_ids(data: &GraphData) -> Vec<Diagnostic> {
             "ids.graph_zero",
             Category::IdConstraint,
             Artifact::Graph,
-            format!("... and {} more zero graph ID violations (only first {MAX_VIOLATIONS} shown)", zero_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more zero graph ID violations (only first {MAX_VIOLATIONS} shown)",
+                zero_count - MAX_VIOLATIONS
+            ),
         ));
     }
     if neg_count > MAX_VIOLATIONS {
@@ -261,7 +279,10 @@ pub fn check_graph_ids(data: &GraphData) -> Vec<Diagnostic> {
             "ids.graph_negative",
             Category::IdConstraint,
             Artifact::Graph,
-            format!("... and {} more negative graph ID violations (only first {MAX_VIOLATIONS} shown)", neg_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more negative graph ID violations (only first {MAX_VIOLATIONS} shown)",
+                neg_count - MAX_VIOLATIONS
+            ),
         ));
     }
     if dup_count > MAX_VIOLATIONS {
@@ -269,7 +290,10 @@ pub fn check_graph_ids(data: &GraphData) -> Vec<Diagnostic> {
             "ids.graph_duplicate",
             Category::IdConstraint,
             Artifact::Graph,
-            format!("... and {} more duplicate graph ID violations (only first {MAX_VIOLATIONS} shown)", dup_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more duplicate graph ID violations (only first {MAX_VIOLATIONS} shown)",
+                dup_count - MAX_VIOLATIONS
+            ),
         ));
     }
 
@@ -324,7 +348,10 @@ pub fn check_upstream_ids(data: &GraphData) -> Vec<Diagnostic> {
             "ids.upstream_zero",
             Category::IdConstraint,
             Artifact::Graph,
-            format!("... and {} more zero upstream ID violations (only first {MAX_VIOLATIONS} shown)", zero_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more zero upstream ID violations (only first {MAX_VIOLATIONS} shown)",
+                zero_count - MAX_VIOLATIONS
+            ),
         ));
     }
     if neg_count > MAX_VIOLATIONS {
@@ -383,7 +410,9 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
                         "ids.snap_duplicate",
                         Category::IdConstraint,
                         Artifact::Snap,
-                        format!("snap id {id} at row {i} is duplicated; all snap IDs must be unique"),
+                        format!(
+                            "snap id {id} at row {i} is duplicated; all snap IDs must be unique"
+                        ),
                     )
                     .at(Location::Row { index: i }),
                 );
@@ -412,7 +441,9 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
         let bad = if !w.is_finite() {
             Some(format!("snap weight at row {i} is not finite ({w})"))
         } else if w < 0.0 {
-            Some(format!("snap weight {w} at row {i} is negative; must be >= 0"))
+            Some(format!(
+                "snap weight {w} at row {i} is negative; must be >= 0"
+            ))
         } else {
             None
         };
@@ -449,7 +480,10 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             "ids.snap_id",
             Category::IdConstraint,
             Artifact::Snap,
-            format!("... and {} more snap ID violations (only first {MAX_VIOLATIONS} shown)", id_violation - MAX_VIOLATIONS),
+            format!(
+                "... and {} more snap ID violations (only first {MAX_VIOLATIONS} shown)",
+                id_violation - MAX_VIOLATIONS
+            ),
         ));
     }
     if dup_count > MAX_VIOLATIONS {
@@ -457,7 +491,10 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             "ids.snap_duplicate",
             Category::IdConstraint,
             Artifact::Snap,
-            format!("... and {} more duplicate snap ID violations (only first {MAX_VIOLATIONS} shown)", dup_count - MAX_VIOLATIONS),
+            format!(
+                "... and {} more duplicate snap ID violations (only first {MAX_VIOLATIONS} shown)",
+                dup_count - MAX_VIOLATIONS
+            ),
         ));
     }
     if cid_violation > MAX_VIOLATIONS {
@@ -465,7 +502,10 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             "ids.snap_catchment_id",
             Category::IdConstraint,
             Artifact::Snap,
-            format!("... and {} more snap catchment_id violations (only first {MAX_VIOLATIONS} shown)", cid_violation - MAX_VIOLATIONS),
+            format!(
+                "... and {} more snap catchment_id violations (only first {MAX_VIOLATIONS} shown)",
+                cid_violation - MAX_VIOLATIONS
+            ),
         ));
     }
     if weight_violation > MAX_VIOLATIONS {
@@ -473,7 +513,10 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             "ids.snap_weight",
             Category::IdConstraint,
             Artifact::Snap,
-            format!("... and {} more snap weight violations (only first {MAX_VIOLATIONS} shown)", weight_violation - MAX_VIOLATIONS),
+            format!(
+                "... and {} more snap weight violations (only first {MAX_VIOLATIONS} shown)",
+                weight_violation - MAX_VIOLATIONS
+            ),
         ));
     }
     if bbox_violation > MAX_VIOLATIONS {
@@ -481,7 +524,10 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
             "ids.snap_bbox",
             Category::IdConstraint,
             Artifact::Snap,
-            format!("... and {} more snap bbox violations (only first {MAX_VIOLATIONS} shown)", bbox_violation - MAX_VIOLATIONS),
+            format!(
+                "... and {} more snap bbox violations (only first {MAX_VIOLATIONS} shown)",
+                bbox_violation - MAX_VIOLATIONS
+            ),
         ));
     }
 
@@ -515,7 +561,12 @@ fn validate_bbox_f32(
     };
 
     // Finite check
-    for (name, val) in [("minx", minx), ("miny", miny), ("maxx", maxx), ("maxy", maxy)] {
+    for (name, val) in [
+        ("minx", minx),
+        ("miny", miny),
+        ("maxx", maxx),
+        ("maxy", maxy),
+    ] {
         if !val.is_finite() {
             out.push(
                 Diagnostic::error(
@@ -586,7 +637,9 @@ fn validate_bbox_f32(
                         check_id,
                         Category::IdConstraint,
                         artifact,
-                        format!("bbox at row {row} is degenerate in x: minx ({minx}) >= maxx ({maxx})"),
+                        format!(
+                            "bbox at row {row} is degenerate in x: minx ({minx}) >= maxx ({maxx})"
+                        ),
                     )
                     .at(Location::Row { index: row }),
                 );
@@ -597,7 +650,9 @@ fn validate_bbox_f32(
                         check_id,
                         Category::IdConstraint,
                         artifact,
-                        format!("bbox at row {row} is degenerate in y: miny ({miny}) >= maxy ({maxy})"),
+                        format!(
+                            "bbox at row {row} is degenerate in y: miny ({miny}) >= maxy ({maxy})"
+                        ),
                     )
                     .at(Location::Row { index: row }),
                 );
@@ -609,7 +664,9 @@ fn validate_bbox_f32(
                         check_id,
                         Category::IdConstraint,
                         artifact,
-                        format!("bbox at row {row} is inverted in x: minx ({minx}) > maxx ({maxx})"),
+                        format!(
+                            "bbox at row {row} is inverted in x: minx ({minx}) > maxx ({maxx})"
+                        ),
                     )
                     .at(Location::Row { index: row }),
                 );
@@ -620,7 +677,9 @@ fn validate_bbox_f32(
                         check_id,
                         Category::IdConstraint,
                         artifact,
-                        format!("bbox at row {row} is inverted in y: miny ({miny}) > maxy ({maxy})"),
+                        format!(
+                            "bbox at row {row} is inverted in y: miny ({miny}) > maxy ({maxy})"
+                        ),
                     )
                     .at(Location::Row { index: row }),
                 );
@@ -917,7 +976,12 @@ mod tests {
 
     #[test]
     fn c7_valid_snap_data_produces_no_errors() {
-        let data = make_snap(vec![1, 2], vec![10, 20], vec![0.5, 0.5], vec![valid_bbox(); 2]);
+        let data = make_snap(
+            vec![1, 2],
+            vec![10, 20],
+            vec![0.5, 0.5],
+            vec![valid_bbox(); 2],
+        );
         let diags = check_snap_data(&data);
         assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
     }
@@ -974,7 +1038,12 @@ mod tests {
 
     #[test]
     fn c7_duplicate_snap_id_produces_error() {
-        let data = make_snap(vec![1, 2, 1], vec![10, 20, 30], vec![0.5; 3], vec![valid_bbox(); 3]);
+        let data = make_snap(
+            vec![1, 2, 1],
+            vec![10, 20, 30],
+            vec![0.5; 3],
+            vec![valid_bbox(); 3],
+        );
         let diags = check_snap_data(&data);
         assert_eq!(count_id(&diags, "ids.snap_duplicate"), 1);
         assert!(diags[0].location == Location::Row { index: 2 });
@@ -994,7 +1063,12 @@ mod tests {
 
     #[test]
     fn c7_unique_snap_ids_produce_no_duplicate_errors() {
-        let data = make_snap(vec![1, 2, 3], vec![10, 20, 30], vec![0.5; 3], vec![valid_bbox(); 3]);
+        let data = make_snap(
+            vec![1, 2, 3],
+            vec![10, 20, 30],
+            vec![0.5; 3],
+            vec![valid_bbox(); 3],
+        );
         let diags = check_snap_data(&data);
         assert_eq!(count_id(&diags, "ids.snap_duplicate"), 0);
     }
@@ -1006,7 +1080,7 @@ mod tests {
             vec![1],
             vec![10],
             vec![0.5],
-            vec![[5.0, -5.0, 5.0, 5.0]],  // minx == maxx
+            vec![[5.0, -5.0, 5.0, 5.0]], // minx == maxx
         );
         let diags = check_snap_data(&data);
         assert!(
@@ -1022,7 +1096,7 @@ mod tests {
             vec![1],
             vec![10],
             vec![0.5],
-            vec![[-10.0, 5.0, 10.0, 5.0]],  // miny == maxy
+            vec![[-10.0, 5.0, 10.0, 5.0]], // miny == maxy
         );
         let diags = check_snap_data(&data);
         assert!(
@@ -1036,7 +1110,7 @@ mod tests {
         // Catchment bbox with minx == maxx should still error (polygon must have area)
         let data = make_catchments(
             vec![1],
-            vec![[5.0, -5.0, 5.0, 5.0]],  // minx == maxx
+            vec![[5.0, -5.0, 5.0, 5.0]], // minx == maxx
             vec![1.0],
         );
         let diags = check_catchment_bboxes(&data);

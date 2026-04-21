@@ -34,10 +34,7 @@ pub fn check_id_coverage(catchments: &CatchmentsData, graph: &GraphData) -> Vec<
     let graph_set: HashSet<i64> = graph.ids.iter().copied().collect();
 
     // IDs in catchments but not in graph.
-    let mut in_catchments_only: Vec<i64> = catchment_set
-        .difference(&graph_set)
-        .copied()
-        .collect();
+    let mut in_catchments_only: Vec<i64> = catchment_set.difference(&graph_set).copied().collect();
     in_catchments_only.sort_unstable();
 
     let catchment_overflow = in_catchments_only.len().saturating_sub(MAX_VIOLATIONS);
@@ -61,10 +58,7 @@ pub fn check_id_coverage(catchments: &CatchmentsData, graph: &GraphData) -> Vec<
     }
 
     // IDs in graph but not in catchments.
-    let mut in_graph_only: Vec<i64> = graph_set
-        .difference(&catchment_set)
-        .copied()
-        .collect();
+    let mut in_graph_only: Vec<i64> = graph_set.difference(&catchment_set).copied().collect();
     in_graph_only.sort_unstable();
 
     let graph_overflow = in_graph_only.len().saturating_sub(MAX_VIOLATIONS);
@@ -340,9 +334,7 @@ mod tests {
             "expected 1 upstream_not_in_catchments diagnostic"
         );
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("999")),
+            diags.iter().any(|d| d.message.contains("999")),
             "message should mention the missing id 999"
         );
     }
@@ -360,7 +352,10 @@ mod tests {
         let catchments = make_catchments_with_ids(vec![1]);
         let graph = make_graph(vec![2], vec![vec![888, 999]]);
         let diags = check_upstream_refs(&catchments, &graph);
-        assert_eq!(count_id(&diags, "referential.upstream_not_in_catchments"), 2);
+        assert_eq!(
+            count_id(&diags, "referential.upstream_not_in_catchments"),
+            2
+        );
     }
 
     // ========================
@@ -386,9 +381,7 @@ mod tests {
             "expected 1 snap_catchment_not_in_catchments diagnostic"
         );
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("777")),
+            diags.iter().any(|d| d.message.contains("777")),
             "message should mention the missing id 777"
         );
     }
@@ -430,8 +423,7 @@ mod tests {
         // Summary message contains "more".
         let summary = diags
             .iter()
-            .filter(|d| d.check_id == "referential.catchment_not_in_graph")
-            .last()
+            .rfind(|d| d.check_id == "referential.catchment_not_in_graph")
             .unwrap();
         assert!(
             summary.message.contains("more"),

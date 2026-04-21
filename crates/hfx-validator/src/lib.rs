@@ -1,10 +1,10 @@
 //! HFX dataset validator library.
 
-pub mod diagnostic;
-pub mod report;
-pub mod dataset;
-pub mod reader;
 pub mod check;
+pub mod dataset;
+pub mod diagnostic;
+pub mod reader;
+pub mod report;
 
 use std::path::Path;
 

@@ -17,7 +17,10 @@ use crate::reader::manifest::RawManifest;
 ///
 /// If `manifest.has_up_area == true` then every row must carry a non-null
 /// `up_area_km2` value, i.e. `up_area_null_count` must be 0.
-pub fn check_up_area_consistency(raw_manifest: &RawManifest, data: &CatchmentsData) -> Vec<Diagnostic> {
+pub fn check_up_area_consistency(
+    raw_manifest: &RawManifest,
+    data: &CatchmentsData,
+) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
 
     let has_up_area = match raw_manifest.has_up_area {
@@ -38,11 +41,16 @@ pub fn check_up_area_consistency(raw_manifest: &RawManifest, data: &CatchmentsDa
                     data.up_area_null_count, data.up_area_total,
                 ),
             )
-            .at(Location::Column { name: "up_area_km2".into() }),
+            .at(Location::Column {
+                name: "up_area_km2".into(),
+            }),
         );
     }
 
-    debug!(count = diags.len(), "C4 up_area consistency checks complete");
+    debug!(
+        count = diags.len(),
+        "C4 up_area consistency checks complete"
+    );
     diags
 }
 
@@ -181,10 +189,7 @@ mod tests {
 
     // --- helpers ---
 
-    fn make_catchments(
-        bboxes: Vec<[f32; 4]>,
-        up_area_null_count: usize,
-    ) -> CatchmentsData {
+    fn make_catchments(bboxes: Vec<[f32; 4]>, up_area_null_count: usize) -> CatchmentsData {
         let row_count = bboxes.len().max(1);
         CatchmentsData {
             row_count,
@@ -253,7 +258,10 @@ mod tests {
         let mut data = make_catchments(vec![[-10.0, -5.0, 10.0, 5.0]], 1);
         data.up_area_null_count = 1; // nulls present but has_up_area is false
         let diags = check_up_area_consistency(&raw, &data);
-        assert!(diags.is_empty(), "has_up_area=false; nulls are not an error");
+        assert!(
+            diags.is_empty(),
+            "has_up_area=false; nulls are not an error"
+        );
     }
 
     #[test]
@@ -262,7 +270,10 @@ mod tests {
         let mut data = make_catchments(vec![[-10.0, -5.0, 10.0, 5.0]], 1);
         data.up_area_null_count = 99;
         let diags = check_up_area_consistency(&raw, &data);
-        assert!(diags.is_empty(), "when has_up_area is absent, check should be skipped");
+        assert!(
+            diags.is_empty(),
+            "when has_up_area is absent, check should be skipped"
+        );
     }
 
     // ========================
@@ -326,7 +337,10 @@ mod tests {
         let raw = raw_with_up_area(Some(false), Some(vec![-20.0, -10.0, 20.0, 10.0]));
         let data = make_catchments(vec![[f32::NAN, f32::NAN, f32::NAN, f32::NAN]], 0);
         let diags = check_bbox_enclosure(&raw, &data);
-        assert!(diags.is_empty(), "no finite catchment bboxes → check skipped");
+        assert!(
+            diags.is_empty(),
+            "no finite catchment bboxes → check skipped"
+        );
     }
 
     #[test]
@@ -334,28 +348,19 @@ mod tests {
         // Two catchments whose union is [-15, -8, 15, 8].
         // Manifest covers exactly that → no error.
         let raw = raw_with_up_area(Some(false), Some(vec![-15.0, -8.0, 15.0, 8.0]));
-        let data = make_catchments(
-            vec![
-                [-15.0, -8.0, 0.0, 0.0],
-                [0.0, 0.0, 15.0, 8.0],
-            ],
-            0,
-        );
+        let data = make_catchments(vec![[-15.0, -8.0, 0.0, 0.0], [0.0, 0.0, 15.0, 8.0]], 0);
         let diags = check_bbox_enclosure(&raw, &data);
-        assert!(diags.is_empty(), "manifest exactly matches union — no error expected");
+        assert!(
+            diags.is_empty(),
+            "manifest exactly matches union — no error expected"
+        );
     }
 
     #[test]
     fn d4_multiple_catchments_union_exceeds_manifest_produces_errors() {
         // Catchment union is [-15, -8, 15, 8] but manifest only covers [-10, -5, 10, 5].
         let raw = raw_with_up_area(Some(false), Some(vec![-10.0, -5.0, 10.0, 5.0]));
-        let data = make_catchments(
-            vec![
-                [-15.0, -8.0, 0.0, 0.0],
-                [0.0, 0.0, 15.0, 8.0],
-            ],
-            0,
-        );
+        let data = make_catchments(vec![[-15.0, -8.0, 0.0, 0.0], [0.0, 0.0, 15.0, 8.0]], 0);
         let diags = check_bbox_enclosure(&raw, &data);
         // All four dimensions violated
         assert_eq!(count_id(&diags, "values.bbox_enclosure"), 4);

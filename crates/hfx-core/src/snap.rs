@@ -58,7 +58,14 @@ impl SnapTarget {
         bbox: BoundingBox,
         geometry: WkbGeometry,
     ) -> Self {
-        Self { id, catchment_id, weight, mainstem_status, bbox, geometry }
+        Self {
+            id,
+            catchment_id,
+            weight,
+            mainstem_status,
+            bbox,
+            geometry,
+        }
     }
 
     /// Return the snap target's unique identifier.

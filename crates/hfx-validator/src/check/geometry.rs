@@ -220,11 +220,11 @@ fn is_point_or_linestring_type(type_code: u32) -> bool {
 }
 
 /// Return `true` when `wkb` can be parsed by geozero without error.
-fn is_valid_wkb(wkb: &[u8]) -> bool {
+fn is_valid_wkb(mut wkb: &[u8]) -> bool {
     struct NullProcessor;
     impl GeomProcessor for NullProcessor {}
 
-    process_wkb_geom(&mut wkb.as_ref(), &mut NullProcessor).is_ok()
+    process_wkb_geom(&mut wkb, &mut NullProcessor).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -557,11 +557,7 @@ mod tests {
     #[test]
     fn snap_checks_all_rows() {
         // Two valid points and one polygon (wrong type) — all three rows checked.
-        let data = make_snap_data(vec![
-            make_wkb_point(),
-            make_wkb_polygon(),
-            make_wkb_point(),
-        ]);
+        let data = make_snap_data(vec![make_wkb_point(), make_wkb_polygon(), make_wkb_point()]);
         let diags = check_snap_geometries(&data);
         let wrong_type_count = diags
             .iter()
