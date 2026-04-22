@@ -13,7 +13,7 @@ name = "hfx"
 path = "src/main.rs"
 
 [dependencies]
-hfx-core = { path = "../hfx-core", version = "=0.2.11" }
+hfx-core = { path = "../hfx-core", version = "=0.2.12" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

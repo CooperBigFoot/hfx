@@ -236,10 +236,42 @@ The manifest describes **what the data is**, not how the engine should use it. T
 | `terminal_sink_id` | int | Yes | The ID value used to indicate no downstream neighbor. Must be `0` |
 | `topology` | string | Yes | Graph topology class. `"tree"` for strictly convergent fabrics where each atom has at most one downstream neighbor. `"dag"` for fabrics with bifurcations (one atom draining to multiple downstream atoms). Informational — the engine handles both, but MAY use this for optimization hints |
 | `region` | string | No | Geographic region label. Informational |
-| `bbox` | float[4] | Yes | `[minx, miny, maxx, maxy]` covering all atoms. Used by engine for fast pre-filtering |
+| `bbox` | float[4] | Yes | `[minx, miny, maxx, maxy]` covering all atoms. For global datasets this is the full source-fabric extent; for partial-fabric datasets it is the subset extent. Used by engine for fast pre-filtering |
 | `atom_count` | int | Yes | Total number of rows in `catchments.parquet`. Sanity check |
 | `created_at` | string | Yes | ISO 8601 / RFC 3339 timestamp of ETL run |
 | `adapter_version` | string | Yes | Version of the adapter that produced this dataset |
+
+---
+
+## Deployment Patterns
+
+An HFX dataset is the artifact bundle a single `manifest.json` describes. Every dataset covers a contiguous extent of its source fabric. That extent may be the fabric in full, or a named subset. Two deployment patterns are conformant with v0.1: **global** and **partial-fabric**. Both use the same artifact schemas and pass the same validator checks.
+
+The deployment pattern is inferred from the manifest, not signalled by a dedicated field. The engine treats both patterns identically at query time.
+
+### Global datasets
+
+A global dataset covers the full extent of its source fabric. For a planetary fabric this is the whole planet; for a fabric that is inherently bounded at source (e.g., a continental hydrofabric) it is the full source extent.
+
+- `region` **should** be omitted.
+- `bbox` spans the full source-fabric extent. For a planetary dataset this is `[-180, -90, 180, 90]`; these boundary values are exact in EPSG:4326 and **must not** be padded beyond them.
+- `fabric_name` and `fabric_version` identify the slice unambiguously; no further qualifier is needed.
+
+This is the recommended pattern when callers must delineate at arbitrary query points without knowing in advance which regional slice contains the outlet.
+
+### Partial-fabric datasets
+
+A partial-fabric dataset covers a named subset of the source fabric. The subset boundary is an adapter concern — a continent, a Pfafstetter level-2 basin, an administrative region, a test harness fixture.
+
+- `region` **should** be populated with a free-form label identifying the subset (e.g., `"europe"`, `"pfaf27"`, `"conus"`).
+- `bbox` spans the subset extent.
+- The subset **must** be closed under upstream traversal: every atom's `upstream_ids` **must** resolve to an atom present in the same dataset. Adapters producing a partial-fabric dataset are responsible for clipping the graph and dropping cross-boundary edges.
+
+HFX does not prescribe a controlled vocabulary for `region`; the label is informational and exists to disambiguate datasets from the same source fabric.
+
+### Format invariance
+
+**Neither pattern changes the artifact schema or the validator contract.** Schema checks, referential integrity, and graph invariants apply identically to global and partial-fabric datasets. `region` presence or absence is the only manifest-level distinction, and it is advisory rather than schema-enforced. Engines **must not** switch behaviour based on deployment pattern.
 
 ---
 
