@@ -89,6 +89,10 @@ Both pass `rio_cogeo.cog_validate` post-write.
 
 For HFX adapter authoring guidance generally, see [`docs/ADAPTER_GUIDE.md`](../../docs/ADAPTER_GUIDE.md).
 
+## Batch runs
+
+[`run_missing_basins.py`](run_missing_basins.py) is the Phase 2 batch orchestrator. It downloads any missing raw inputs and runs `build_adapter.py build` for all 61 Pfaf-L2 basins with bounded parallelism (`ProcessPoolExecutor`, default `-j 3`). Output datasets land at `~/Desktop/merit-hfx/per-basin/merit-hfx-pfaf<NN>/`. Per-run logs (including `summary.json` and `summary.txt`) are written to `adapters/merit/batch_logs/<run-id>/` (gitignored). See the [Batch build all basins](WORKFLOW.md#batch-build-all-basins) section in `WORKFLOW.md` for the full runbook.
+
 ## Citations
 
 - Lin, P., Pan, M., Beck, H. E., et al. (2019). Global reconstruction of naturalized river flows at 2.94 million reaches. *Water Resources Research*, 55(8), 6499–6516. (MERIT-Basins)

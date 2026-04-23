@@ -12,3 +12,4 @@ __pycache__/
 # Adapter build artifacts
 adapters/*/out/
 adapters/*/*.log
+adapters/*/batch_logs/
