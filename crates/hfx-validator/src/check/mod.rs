@@ -98,20 +98,28 @@ pub fn run_checks(
 
     // Phase 7: raster (skipped if skip_rasters is true)
     if !skip_rasters {
-        let has_rasters = raw_manifest_ref
-            .and_then(|m| m.has_rasters)
-            .unwrap_or(false);
+        let manifest_ref = dataset.manifest.as_ref();
 
         if let Some(ref flow_dir_meta) = dataset.flow_dir {
             all.extend(raster::check_flow_dir(flow_dir_meta));
+            if let Some(manifest) = manifest_ref {
+                all.extend(raster::check_spatial_consistency(
+                    flow_dir_meta,
+                    manifest,
+                    crate::diagnostic::Artifact::FlowDir,
+                ));
+            }
         }
 
         if let Some(ref flow_acc_meta) = dataset.flow_acc {
             all.extend(raster::check_flow_acc(flow_acc_meta));
-        }
-
-        if has_rasters {
-            all.extend(raster::crs_extent_not_implemented());
+            if let Some(manifest) = manifest_ref {
+                all.extend(raster::check_spatial_consistency(
+                    flow_acc_meta,
+                    manifest,
+                    crate::diagnostic::Artifact::FlowAcc,
+                ));
+            }
         }
     }
 

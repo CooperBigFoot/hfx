@@ -3,7 +3,7 @@ members = ["crates/hfx-core", "crates/hfx-validator"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.13"
+version = "0.2.14"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/CooperBigFoot/hfx"
@@ -21,3 +21,4 @@ clap = { version = "4", features = ["derive"] }
 tiff = "0.9"
 geozero = { version = "0.14", default-features = false, features = ["with-wkb"] }
 rand = "0.8"
+gdal = "0.19"

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use hfx_core::Manifest;
+use hfx_core::{BoundingBox, Manifest};
 
 use crate::diagnostic::Diagnostic;
 use crate::reader::manifest::RawManifest;
@@ -53,8 +53,9 @@ pub struct SnapData {
 }
 
 /// Raster metadata extracted from GeoTIFF headers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RasterMeta {
+    pub path: PathBuf,
     pub width: u32,
     pub height: u32,
     pub bits_per_sample: u16,
@@ -63,6 +64,10 @@ pub struct RasterMeta {
     pub tile_width: Option<u32>,
     pub tile_height: Option<u32>,
     pub nodata: Option<f64>,
+    pub spatial_ref: Option<String>,
+    pub bbox: Option<RasterBoundingBox>,
+    pub pixel_width: Option<f64>,
+    pub pixel_height: Option<f64>,
 }
 
 /// Raster sample format.
@@ -72,6 +77,55 @@ pub enum RasterSampleFormat {
     SignedInt,
     Float,
     Unknown(u16),
+}
+
+/// Raster bounding box derived from GDAL geotransform metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterBoundingBox {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+impl RasterBoundingBox {
+    /// Build a raster bbox from raw coordinate values.
+    pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
+    }
+
+    /// Convert an HFX manifest bbox into the raster bbox representation.
+    pub fn from_manifest_bbox(bbox: &BoundingBox) -> Self {
+        Self {
+            min_x: f64::from(bbox.min_x().get()),
+            min_y: f64::from(bbox.min_y().get()),
+            max_x: f64::from(bbox.max_x().get()),
+            max_y: f64::from(bbox.max_y().get()),
+        }
+    }
+
+    /// Return true when `self` fully contains `other` within `epsilon`.
+    pub fn contains_with_epsilon(&self, other: &Self, epsilon: f64) -> bool {
+        self.min_x <= other.min_x + epsilon
+            && self.min_y <= other.min_y + epsilon
+            && self.max_x >= other.max_x - epsilon
+            && self.max_y >= other.max_y - epsilon
+    }
+}
+
+impl std::fmt::Display for RasterBoundingBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{:.6}, {:.6}, {:.6}, {:.6}]",
+            self.min_x, self.min_y, self.max_x, self.max_y
+        )
+    }
 }
 
 /// The complete parsed dataset, ready for validation checks.

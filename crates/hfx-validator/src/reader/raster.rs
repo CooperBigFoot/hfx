@@ -1,19 +1,73 @@
 //! Raster GeoTIFF reader.
 //!
-//! Reads structural metadata from GeoTIFF headers without loading pixel data.
-//! The [read_raster_meta] function is the primary entry point.
+//! Reads structural TIFF metadata plus GDAL spatial metadata without loading
+//! full raster payloads into memory.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use gdal::spatial_ref::SpatialRef;
+use gdal::{Dataset, GeoTransformEx};
 use tracing::{debug, warn};
 
 use tiff::decoder::{ChunkType, Decoder};
 use tiff::tags::{SampleFormat, Tag};
 
-use crate::dataset::{RasterMeta, RasterSampleFormat};
+use crate::dataset::{RasterBoundingBox, RasterMeta, RasterSampleFormat};
 use crate::diagnostic::{Artifact, Category, Diagnostic};
+
+#[derive(Debug)]
+struct RasterSpatialMeta {
+    spatial_ref: String,
+    bbox: RasterBoundingBox,
+    pixel_width: f64,
+    pixel_height: f64,
+}
+
+/// Errors returned when GDAL spatial metadata cannot be extracted.
+#[derive(Debug, thiserror::Error)]
+enum RasterSpatialReadError {
+    /// Returned when GDAL cannot open a TIFF file that passed the header parser.
+    #[error("cannot open {path} with GDAL: {source}")]
+    Open {
+        /// Raster path being opened.
+        path: String,
+        /// GDAL error returned by the open call.
+        #[source]
+        source: gdal::errors::GdalError,
+    },
+
+    /// Returned when the raster has no usable spatial reference.
+    #[error("cannot read spatial reference from {path}: {source}")]
+    SpatialRef {
+        /// Raster path missing a spatial reference.
+        path: String,
+        /// GDAL error returned by the spatial reference lookup.
+        #[source]
+        source: gdal::errors::GdalError,
+    },
+
+    /// Returned when the spatial reference cannot be normalized for comparison.
+    #[error("cannot normalize spatial reference from {path}: {source}")]
+    SpatialRefNormalize {
+        /// Raster path whose spatial reference could not be normalized.
+        path: String,
+        /// GDAL error returned by normalization.
+        #[source]
+        source: gdal::errors::GdalError,
+    },
+
+    /// Returned when the raster has no geotransform.
+    #[error("cannot read geotransform from {path}: {source}")]
+    GeoTransform {
+        /// Raster path missing geotransform metadata.
+        path: String,
+        /// GDAL error returned by the geotransform lookup.
+        #[source]
+        source: gdal::errors::GdalError,
+    },
+}
 
 /// Read basic structural metadata from a GeoTIFF file without loading pixel data.
 ///
@@ -26,8 +80,9 @@ use crate::diagnostic::{Artifact, Category, Diagnostic};
 /// |---|---|
 /// | File cannot be opened | `"raster.open"` |
 /// | File is not a valid TIFF | `"raster.parse"` |
+#[tracing::instrument(skip_all, fields(path = %path.display(), file_label))]
 pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, Vec<Diagnostic>) {
-    debug!(path = %path.display(), file_label, "reading raster metadata");
+    debug!("reading raster metadata");
 
     let artifact = artifact_for_label(file_label);
 
@@ -79,7 +134,6 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         }
     };
 
-    // Determine bits_per_sample from the ColorType.
     let bits_per_sample = match decoder.colortype() {
         Ok(ct) => bits_from_colortype(ct),
         Err(err) => {
@@ -96,10 +150,8 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         }
     };
 
-    // Determine sample format via the SampleFormat tag.
     let sample_format = read_sample_format(&mut decoder);
 
-    // Determine tiling.
     let chunk_type = decoder.get_chunk_type();
     let is_tiled = chunk_type == ChunkType::Tile;
 
@@ -110,10 +162,36 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         (None, None)
     };
 
-    // Read the GDAL nodata value (ASCII tag 42113).
     let nodata = read_nodata(&mut decoder);
 
+    let (spatial_ref, bbox, pixel_width, pixel_height, diagnostics) = match read_spatial_meta(path)
+    {
+        Ok(spatial) => (
+            Some(spatial.spatial_ref),
+            Some(spatial.bbox),
+            Some(spatial.pixel_width),
+            Some(spatial.pixel_height),
+            vec![],
+        ),
+        Err(err) => {
+            warn!(path = %path.display(), error = %err, "cannot read GDAL spatial metadata");
+            (
+                None,
+                None,
+                None,
+                None,
+                vec![Diagnostic::error(
+                    "raster.parse",
+                    Category::Raster,
+                    artifact,
+                    format!("cannot read GDAL spatial metadata from {file_label}: {err}"),
+                )],
+            )
+        }
+    };
+
     let meta = RasterMeta {
+        path: path.to_path_buf(),
         width,
         height,
         bits_per_sample,
@@ -122,19 +200,114 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         tile_width,
         tile_height,
         nodata,
+        spatial_ref,
+        bbox,
+        pixel_width,
+        pixel_height,
     };
 
     debug!(
         width,
-        height, bits_per_sample, is_tiled, "raster metadata read complete"
+        height,
+        bits_per_sample,
+        is_tiled,
+        has_spatial_ref = meta.spatial_ref.is_some(),
+        has_bbox = meta.bbox.is_some(),
+        "raster metadata read complete"
     );
 
-    (Some(meta), vec![])
+    (Some(meta), diagnostics)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn read_spatial_meta(path: &Path) -> Result<RasterSpatialMeta, RasterSpatialReadError> {
+    let path_display = path.display().to_string();
+    let dataset = Dataset::open(path).map_err(|source| RasterSpatialReadError::Open {
+        path: path_display.clone(),
+        source,
+    })?;
+
+    let spatial_ref =
+        dataset
+            .spatial_ref()
+            .map_err(|source| RasterSpatialReadError::SpatialRef {
+                path: path_display.clone(),
+                source,
+            })?;
+    let spatial_ref = normalize_spatial_ref(&spatial_ref).map_err(|source| {
+        RasterSpatialReadError::SpatialRefNormalize {
+            path: path_display.clone(),
+            source,
+        }
+    })?;
+
+    let geo_transform =
+        dataset
+            .geo_transform()
+            .map_err(|source| RasterSpatialReadError::GeoTransform {
+                path: path_display,
+                source,
+            })?;
+    let bbox = bbox_from_geo_transform(&geo_transform, dataset.raster_size());
+    let pixel_width = geo_transform[1].hypot(geo_transform[4]);
+    let pixel_height = geo_transform[2].hypot(geo_transform[5]);
+
+    Ok(RasterSpatialMeta {
+        spatial_ref,
+        bbox,
+        pixel_width,
+        pixel_height,
+    })
+}
+
+fn normalize_spatial_ref(spatial_ref: &SpatialRef) -> Result<String, gdal::errors::GdalError> {
+    if let Ok(authority) = spatial_ref.authority() {
+        return Ok(authority);
+    }
+
+    if let Ok(expected) = SpatialRef::from_epsg(4326)
+        && spatial_ref == &expected
+    {
+        return Ok("EPSG:4326".to_string());
+    }
+
+    spatial_ref.to_wkt()
+}
+
+fn bbox_from_geo_transform(
+    geo_transform: &[f64; 6],
+    raster_size: (usize, usize),
+) -> RasterBoundingBox {
+    let (width, height) = (raster_size.0 as f64, raster_size.1 as f64);
+    let corners = [
+        geo_transform.apply(0.0, 0.0),
+        geo_transform.apply(width, 0.0),
+        geo_transform.apply(0.0, height),
+        geo_transform.apply(width, height),
+    ];
+
+    let min_x = corners
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = corners
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = corners
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_y = corners
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    RasterBoundingBox::new(min_x, min_y, max_x, max_y)
+}
 
 /// Map a file label to the matching [Artifact] variant.
 fn artifact_for_label(label: &str) -> Artifact {
@@ -164,8 +337,6 @@ fn bits_from_colortype(ct: tiff::ColorType) -> u16 {
 fn read_sample_format<R: std::io::Read + std::io::Seek>(
     decoder: &mut Decoder<R>,
 ) -> RasterSampleFormat {
-    // find_tag returns the first value of the tag; SampleFormat is a per-sample
-    // list but we only support homogenous single-band rasters here.
     match decoder.find_tag(Tag::SampleFormat) {
         Ok(Some(val)) => match val.into_u16() {
             Ok(raw) => match SampleFormat::from_u16(raw) {
@@ -176,7 +347,6 @@ fn read_sample_format<R: std::io::Read + std::io::Seek>(
             },
             Err(_) => RasterSampleFormat::UnsignedInt,
         },
-        // Tag absent: TIFF default is unsigned integer.
         Ok(None) => RasterSampleFormat::UnsignedInt,
         Err(_) => RasterSampleFormat::UnsignedInt,
     }
@@ -205,34 +375,61 @@ fn read_nodata<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Op
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use tiff::encoder::{TiffEncoder, colortype};
+    use gdal::DriverManager;
+    use gdal::raster::{Buffer, RasterCreationOptions};
+    use gdal::spatial_ref::SpatialRef;
 
     use super::*;
 
-    /// Write a minimal strip-based Gray8 TIFF into a Vec<u8>.
-    fn make_gray8_strip_tiff(width: u32, height: u32) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut enc = TiffEncoder::new(&mut buf).unwrap();
-            let data: Vec<u8> = vec![0u8; (width * height) as usize];
-            enc.write_image::<colortype::Gray8>(width, height, &data)
-                .unwrap();
-        }
-        buf.into_inner()
+    fn write_test_raster_u8(path: &Path, size: (usize, usize), geo_transform: [f64; 6], epsg: u32) {
+        let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+        let options = RasterCreationOptions::from_iter([
+            "TILED=YES",
+            "BLOCKXSIZE=32",
+            "BLOCKYSIZE=32",
+            "COMPRESS=DEFLATE",
+            "INTERLEAVE=BAND",
+        ]);
+        let mut dataset = driver
+            .create_with_band_type_with_options::<u8, _>(path, size.0, size.1, 1, &options)
+            .unwrap();
+        dataset
+            .set_spatial_ref(&SpatialRef::from_epsg(epsg).unwrap())
+            .unwrap();
+        dataset.set_geo_transform(&geo_transform).unwrap();
+
+        let mut band = dataset.rasterband(1).unwrap();
+        band.set_no_data_value(Some(255.0)).unwrap();
+        let mut buffer = Buffer::new(size, vec![1_u8; size.0 * size.1]);
+        band.write((0, 0), size, &mut buffer).unwrap();
     }
 
-    /// Write a minimal strip-based Gray32Float TIFF into a Vec<u8>.
-    fn make_gray32float_strip_tiff(width: u32, height: u32) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut enc = TiffEncoder::new(&mut buf).unwrap();
-            let data: Vec<f32> = vec![0.0f32; (width * height) as usize];
-            enc.write_image::<colortype::Gray32Float>(width, height, &data)
-                .unwrap();
-        }
-        buf.into_inner()
+    fn write_test_raster_f32(
+        path: &Path,
+        size: (usize, usize),
+        geo_transform: [f64; 6],
+        epsg: u32,
+    ) {
+        let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+        let options = RasterCreationOptions::from_iter([
+            "TILED=YES",
+            "BLOCKXSIZE=32",
+            "BLOCKYSIZE=32",
+            "COMPRESS=DEFLATE",
+            "INTERLEAVE=BAND",
+        ]);
+        let mut dataset = driver
+            .create_with_band_type_with_options::<f32, _>(path, size.0, size.1, 1, &options)
+            .unwrap();
+        dataset
+            .set_spatial_ref(&SpatialRef::from_epsg(epsg).unwrap())
+            .unwrap();
+        dataset.set_geo_transform(&geo_transform).unwrap();
+
+        let mut band = dataset.rasterband(1).unwrap();
+        band.set_no_data_value(Some(-1.0)).unwrap();
+        let mut buffer = Buffer::new(size, vec![42.0_f32; size.0 * size.1]);
+        band.write((0, 0), size, &mut buffer).unwrap();
     }
 
     #[test]
@@ -259,36 +456,48 @@ mod tests {
     }
 
     #[test]
-    fn gray8_strip_tiff_reads_correctly() {
-        let tiff_bytes = make_gray8_strip_tiff(64, 64);
+    fn gray8_geotiff_reads_structural_and_spatial_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flow_dir.tif");
-        std::fs::write(&path, &tiff_bytes).unwrap();
+        write_test_raster_u8(&path, (64, 64), [10.0, 0.5, 0.0, 20.0, 0.0, -0.5], 4326);
 
         let (meta, diags) = read_raster_meta(&path, "flow_dir.tif");
-        let meta = meta.expect("should read Gray8 strip TIFF");
+        let meta = meta.expect("should read Gray8 GeoTIFF");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:#?}");
         assert_eq!(meta.width, 64);
         assert_eq!(meta.height, 64);
         assert_eq!(meta.bits_per_sample, 8);
         assert_eq!(meta.sample_format, RasterSampleFormat::UnsignedInt);
-        assert!(!meta.is_tiled, "strip TIFF must not be flagged as tiled");
-        assert!(meta.tile_width.is_none());
-        assert!(meta.tile_height.is_none());
+        assert!(meta.is_tiled);
+        assert_eq!(meta.tile_width, Some(32));
+        assert_eq!(meta.tile_height, Some(32));
+        assert_eq!(meta.nodata, Some(255.0));
+        assert_eq!(meta.spatial_ref.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            meta.bbox,
+            Some(RasterBoundingBox::new(10.0, -12.0, 42.0, 20.0))
+        );
+        assert_eq!(meta.pixel_width, Some(0.5));
+        assert_eq!(meta.pixel_height, Some(0.5));
     }
 
     #[test]
-    fn gray32float_strip_tiff_reads_correctly() {
-        let tiff_bytes = make_gray32float_strip_tiff(32, 32);
+    fn gray32float_geotiff_reads_structural_and_spatial_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flow_acc.tif");
-        std::fs::write(&path, &tiff_bytes).unwrap();
+        write_test_raster_f32(&path, (32, 32), [100.0, 0.25, 0.0, 50.0, 0.0, -0.25], 4326);
 
         let (meta, diags) = read_raster_meta(&path, "flow_acc.tif");
-        let meta = meta.expect("should read Gray32Float strip TIFF");
+        let meta = meta.expect("should read Gray32Float GeoTIFF");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:#?}");
         assert_eq!(meta.bits_per_sample, 32);
         assert_eq!(meta.sample_format, RasterSampleFormat::Float);
-        assert!(!meta.is_tiled);
+        assert!(meta.is_tiled);
+        assert_eq!(meta.nodata, Some(-1.0));
+        assert_eq!(meta.spatial_ref.as_deref(), Some("EPSG:4326"));
+        assert_eq!(
+            meta.bbox,
+            Some(RasterBoundingBox::new(100.0, 42.0, 108.0, 50.0))
+        );
     }
 }

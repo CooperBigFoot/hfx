@@ -12,6 +12,9 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
+use gdal::DriverManager;
+use gdal::raster::{Buffer, RasterCreationOptions};
+use gdal::spatial_ref::SpatialRef;
 use parquet::arrow::ArrowWriter;
 
 use arrow::array::{BinaryArray, Float32Array};
@@ -123,6 +126,22 @@ fn write_graph_arrow(dir: &Path, ids: &[i64], upstream_ids: &[Vec<i64>]) {
 
 /// Write a valid `manifest.json` with the given options.
 fn write_manifest(dir: &Path, atom_count: u64, has_snap: bool, has_rasters: bool) {
+    write_manifest_with_bbox(
+        dir,
+        atom_count,
+        has_snap,
+        has_rasters,
+        [-180.0, -90.0, 180.0, 90.0],
+    );
+}
+
+fn write_manifest_with_bbox(
+    dir: &Path,
+    atom_count: u64,
+    has_snap: bool,
+    has_rasters: bool,
+    bbox: [f64; 4],
+) {
     let manifest = serde_json::json!({
         "format_version": "0.1",
         "fabric_name": "test-fabric",
@@ -132,8 +151,8 @@ fn write_manifest(dir: &Path, atom_count: u64, has_snap: bool, has_rasters: bool
         "has_snap": has_snap,
         "terminal_sink_id": 0,
         "topology": "tree",
-        // bbox large enough to enclose catchments at [0,0,1,1]
-        "bbox": [-180.0, -90.0, 180.0, 90.0],
+        "flow_dir_encoding": has_rasters.then_some("esri"),
+        "bbox": bbox,
         "atom_count": atom_count,
         "created_at": "2026-01-01T00:00:00Z",
         "adapter_version": "v1.0"
@@ -143,6 +162,52 @@ fn write_manifest(dir: &Path, atom_count: u64, has_snap: bool, has_rasters: bool
         serde_json::to_string_pretty(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+fn write_flow_dir_raster(path: &Path, size: (usize, usize), geo_transform: [f64; 6], epsg: u32) {
+    let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+    let options = RasterCreationOptions::from_iter([
+        "TILED=YES",
+        "BLOCKXSIZE=32",
+        "BLOCKYSIZE=32",
+        "COMPRESS=DEFLATE",
+        "INTERLEAVE=BAND",
+    ]);
+    let mut dataset = driver
+        .create_with_band_type_with_options::<u8, _>(path, size.0, size.1, 1, &options)
+        .unwrap();
+    dataset
+        .set_spatial_ref(&SpatialRef::from_epsg(epsg).unwrap())
+        .unwrap();
+    dataset.set_geo_transform(&geo_transform).unwrap();
+
+    let mut band = dataset.rasterband(1).unwrap();
+    band.set_no_data_value(Some(255.0)).unwrap();
+    let mut buffer = Buffer::new(size, vec![1_u8; size.0 * size.1]);
+    band.write((0, 0), size, &mut buffer).unwrap();
+}
+
+fn write_flow_acc_raster(path: &Path, size: (usize, usize), geo_transform: [f64; 6], epsg: u32) {
+    let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+    let options = RasterCreationOptions::from_iter([
+        "TILED=YES",
+        "BLOCKXSIZE=32",
+        "BLOCKYSIZE=32",
+        "COMPRESS=DEFLATE",
+        "INTERLEAVE=BAND",
+    ]);
+    let mut dataset = driver
+        .create_with_band_type_with_options::<f32, _>(path, size.0, size.1, 1, &options)
+        .unwrap();
+    dataset
+        .set_spatial_ref(&SpatialRef::from_epsg(epsg).unwrap())
+        .unwrap();
+    dataset.set_geo_transform(&geo_transform).unwrap();
+
+    let mut band = dataset.rasterband(1).unwrap();
+    band.set_no_data_value(Some(-1.0)).unwrap();
+    let mut buffer = Buffer::new(size, vec![42.0_f32; size.0 * size.1]);
+    band.write((0, 0), size, &mut buffer).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +361,118 @@ fn skip_rasters_true_with_valid_dataset_passes() {
     assert!(
         report.is_valid(),
         "skip_rasters=true with valid dataset should pass; got:\n{}",
+        report.display_text()
+    );
+}
+
+#[test]
+fn strict_mode_with_valid_rasters_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids: Vec<i64> = (1..=4096).collect();
+    let upstream: Vec<Vec<i64>> = (1..=4096)
+        .map(|id| {
+            if id == 1 {
+                vec![]
+            } else {
+                vec![i64::from(id - 1)]
+            }
+        })
+        .collect();
+    let manifest_bbox = [0.0, 0.0, 1.0, 1.0];
+    let geo_transform = [-0.1, 0.02, 0.0, 1.1, 0.0, -0.02];
+
+    write_manifest_with_bbox(dir.path(), 4096, false, true, manifest_bbox);
+    write_catchments_parquet(dir.path(), &ids);
+    write_graph_arrow(dir.path(), &ids, &upstream);
+    write_flow_dir_raster(
+        &dir.path().join("flow_dir.tif"),
+        (60, 60),
+        geo_transform,
+        4326,
+    );
+    write_flow_acc_raster(
+        &dir.path().join("flow_acc.tif"),
+        (60, 60),
+        geo_transform,
+        4326,
+    );
+
+    let report = hfx_validator::validate(dir.path(), true, false, 1.0);
+    assert!(
+        report.is_valid(),
+        "valid raster dataset should pass strict mode; got:\n{}",
+        report.display_text()
+    );
+}
+
+#[test]
+fn raster_crs_mismatch_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = &[1_i64, 2, 3];
+    let upstream = vec![vec![], vec![1_i64], vec![2_i64]];
+    let manifest_bbox = [0.0, 0.0, 1.0, 1.0];
+    let geo_transform = [-0.1, 0.02, 0.0, 1.1, 0.0, -0.02];
+
+    write_manifest_with_bbox(dir.path(), 3, false, true, manifest_bbox);
+    write_catchments_parquet(dir.path(), ids);
+    write_graph_arrow(dir.path(), ids, &upstream);
+    write_flow_dir_raster(
+        &dir.path().join("flow_dir.tif"),
+        (60, 60),
+        geo_transform,
+        3857,
+    );
+    write_flow_acc_raster(
+        &dir.path().join("flow_acc.tif"),
+        (60, 60),
+        geo_transform,
+        4326,
+    );
+
+    let report = hfx_validator::validate(dir.path(), false, false, 100.0);
+    assert!(!report.is_valid(), "CRS mismatch should fail");
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|d| d.check_id == "raster.crs_mismatch"),
+        "expected raster.crs_mismatch diagnostic, got:\n{}",
+        report.display_text()
+    );
+}
+
+#[test]
+fn raster_extent_not_contained_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = &[1_i64, 2, 3];
+    let upstream = vec![vec![], vec![1_i64], vec![2_i64]];
+    let manifest_bbox = [0.0, 0.0, 1.0, 1.0];
+    let small_geo_transform = [0.1, 0.02, 0.0, 0.9, 0.0, -0.02];
+
+    write_manifest_with_bbox(dir.path(), 3, false, true, manifest_bbox);
+    write_catchments_parquet(dir.path(), ids);
+    write_graph_arrow(dir.path(), ids, &upstream);
+    write_flow_dir_raster(
+        &dir.path().join("flow_dir.tif"),
+        (40, 40),
+        small_geo_transform,
+        4326,
+    );
+    write_flow_acc_raster(
+        &dir.path().join("flow_acc.tif"),
+        (40, 40),
+        small_geo_transform,
+        4326,
+    );
+
+    let report = hfx_validator::validate(dir.path(), false, false, 100.0);
+    assert!(!report.is_valid(), "extent mismatch should fail");
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|d| d.check_id == "raster.extent_not_contained"),
+        "expected raster.extent_not_contained diagnostic, got:\n{}",
         report.display_text()
     );
 }

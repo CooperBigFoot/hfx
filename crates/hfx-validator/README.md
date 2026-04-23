@@ -33,7 +33,7 @@ Use `--strict` to promote warnings to errors. Exit code `0` means valid; exit co
 
 Two layers are decoupled by `ParsedDataset`:
 
-- **`reader/`** reads Parquet, Arrow IPC, TIFF, and JSON into lightweight intermediate representations (`CatchmentsData`, `GraphData`, `SnapData`, `RasterMeta`). These hold raw column arrays (`Vec<i64>`, `Vec<f32>`) so the validator can report ALL errors instead of failing fast on the first bad value.
+- **`reader/`** reads Parquet, Arrow IPC, TIFF, and JSON into lightweight intermediate representations (`CatchmentsData`, `GraphData`, `SnapData`, `RasterMeta`). TIFF structural tags are parsed with `tiff`, while CRS and geotransform metadata are read via GDAL so raster CRS/extent checks can run without loading pixel data.
 - **`check/`** contains pure validation logic. Each module is free functions that take `&`-references to intermediate data and return `Vec<Diagnostic>`. No I/O, no trait objects.
 
 ## Key Types
@@ -56,7 +56,7 @@ Checks run in dependency order inside `check/mod.rs::run_checks()`:
 5. Cross-file referential integrity (graph-catchment coverage, upstream refs, snap FKs, bbox enclosure)
 6. Graph acyclicity (Kahn's algorithm)
 7. Geometry spot-check (WKB type + geozero validity, 1% sample for catchments)
-8. Raster structural checks (dtype, tiling, nodata)
+8. Raster checks (dtype, tiling, nodata, CRS, manifest-bbox containment)
 
 ## Usage
 
@@ -79,11 +79,13 @@ The following spec-required checks are **not implemented** and will emit warning
 
 | Spec Rule | Status | Reason | Tracking |
 |---|---|---|---|
-| Raster CRS must match manifest CRS | Not implemented | Requires GeoTIFF metadata parsing beyond what `tiff` 0.9 provides; needs GDAL or a GeoKeys parser | `raster.crs_extent_not_implemented` |
-| Raster extent must contain manifest bbox | Not implemented | Same as above | `raster.crs_extent_not_implemented` |
 | Hilbert sort order on catchments/snap rows | Deferred | Curve parameters not yet specified in the spec | Deferred |
 | Polygon self-intersection / geometric validity | Partial | `geozero` checks WKB structural validity, not topological validity | Partial |
 | Snap bbox strictness (`<=` for line features) | Fixed | Snap bboxes now correctly use `<=` rather than `<` for line-feature bbox enclosure | — |
 | Parquet compression codecs (zstd, snappy, lz4, gzip) | Fixed | All four codecs are now supported; codec detection errors are reported via diagnostic capping | — |
 
 A dataset that passes this validator with `--strict` is conformant on all checked rules. The unchecked rules above mean a passing result does **not** guarantee full spec conformance.
+
+## Build Requirement
+
+`hfx-validator` now requires GDAL at build/runtime for raster CRS and extent validation. The validator links against the system GDAL installed on the host.

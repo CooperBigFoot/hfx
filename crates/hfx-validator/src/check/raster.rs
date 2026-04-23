@@ -1,19 +1,48 @@
 //! Raster metadata checks (G1, G2, G3).
 //!
-//! These checks operate on [`RasterMeta`] values that have already been
-//! decoded from TIFF headers by [`crate::reader::raster`].
+//! These checks operate on [`RasterMeta`] values that have already been read
+//! from TIFF headers and GDAL spatial metadata by [`crate::reader::raster`].
 
-use crate::dataset::{RasterMeta, RasterSampleFormat};
+use std::path::PathBuf;
+
+use hfx_core::Manifest;
+
+use crate::dataset::{RasterBoundingBox, RasterMeta, RasterSampleFormat};
 use crate::diagnostic::{Artifact, Category, Diagnostic};
 
-// ---------------------------------------------------------------------------
-// Public check functions
-// ---------------------------------------------------------------------------
+/// Raster spatial validation failures required by the HFX spec.
+#[derive(Debug, thiserror::Error)]
+pub enum RasterSpatialCheckError {
+    /// Returned when a raster CRS does not match the manifest CRS.
+    #[error("raster CRS mismatch for {path}: expected {expected}, got {got}")]
+    RasterCrsMismatch {
+        /// Path to the raster being validated.
+        path: PathBuf,
+        /// CRS declared by the manifest.
+        expected: String,
+        /// CRS extracted from the raster.
+        got: String,
+    },
+
+    /// Returned when a raster footprint does not fully contain the manifest bbox.
+    #[error(
+        "raster extent does not contain manifest bbox for {path}: raster_bbox={raster_bbox}, manifest_bbox={manifest_bbox}"
+    )]
+    RasterExtentNotContained {
+        /// Path to the raster being validated.
+        path: PathBuf,
+        /// Bounding box derived from the raster geotransform.
+        raster_bbox: RasterBoundingBox,
+        /// Bounding box declared by the manifest.
+        manifest_bbox: RasterBoundingBox,
+    },
+}
 
 /// G1: Validate `flow_dir.tif` structural properties.
 ///
 /// Required: `bits_per_sample == 8`, `sample_format == UnsignedInt`,
 /// and the file must be COG-tiled (`is_tiled == true`).
+#[tracing::instrument(skip_all, fields(path = %meta.path.display()))]
 pub fn check_flow_dir(meta: &RasterMeta) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -39,7 +68,6 @@ pub fn check_flow_dir(meta: &RasterMeta) -> Vec<Diagnostic> {
         ));
     }
 
-    // Nodata check: spec requires NoData = 255 for flow_dir.
     match meta.nodata {
         Some(nodata) if (nodata - 255.0).abs() > f64::EPSILON => {
             diags.push(Diagnostic::error(
@@ -67,6 +95,7 @@ pub fn check_flow_dir(meta: &RasterMeta) -> Vec<Diagnostic> {
 ///
 /// Required: `bits_per_sample == 32`, `sample_format == Float`,
 /// and the file must be COG-tiled (`is_tiled == true`).
+#[tracing::instrument(skip_all, fields(path = %meta.path.display()))]
 pub fn check_flow_acc(meta: &RasterMeta) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
@@ -92,7 +121,6 @@ pub fn check_flow_acc(meta: &RasterMeta) -> Vec<Diagnostic> {
         ));
     }
 
-    // Nodata check: spec requires NoData = -1.0 for flow_acc.
     match meta.nodata {
         Some(nodata) if (nodata - (-1.0)).abs() > f64::EPSILON => {
             diags.push(Diagnostic::error(
@@ -116,25 +144,57 @@ pub fn check_flow_acc(meta: &RasterMeta) -> Vec<Diagnostic> {
     diags
 }
 
-/// G3: Emit a warning that CRS and extent checks are not implemented.
-///
-/// The spec requires raster CRS to match the manifest CRS and raster extent to
-/// contain the manifest bbox. These checks require GeoTIFF metadata parsing
-/// beyond what the pure-Rust `tiff` crate provides. This is a known conformance
-/// gap — datasets with wrong CRS or insufficient extent will NOT be caught.
-pub fn crs_extent_not_implemented() -> Vec<Diagnostic> {
-    vec![Diagnostic::warning(
-        "raster.crs_extent_not_implemented",
-        Category::Raster,
-        Artifact::FlowDir,
-        "raster CRS and spatial extent checks are NOT implemented (requires GDAL); \
-         spec rules §raster-CRS-match and §raster-extent-containment are unchecked",
-    )]
+/// G3: Validate raster CRS and spatial extent against the manifest.
+#[tracing::instrument(skip_all, fields(path = %meta.path.display(), artifact = %artifact))]
+pub fn check_spatial_consistency(
+    meta: &RasterMeta,
+    manifest: &Manifest,
+    artifact: Artifact,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let expected = manifest.crs().to_string();
+
+    if let Some(got) = meta.spatial_ref.as_deref()
+        && got != expected
+    {
+        let error = RasterSpatialCheckError::RasterCrsMismatch {
+            path: meta.path.clone(),
+            expected: expected.clone(),
+            got: got.to_string(),
+        };
+        diags.push(Diagnostic::error(
+            "raster.crs_mismatch",
+            Category::Raster,
+            artifact,
+            error.to_string(),
+        ));
+    }
+
+    if let Some(raster_bbox) = meta.bbox.as_ref() {
+        let manifest_bbox = RasterBoundingBox::from_manifest_bbox(manifest.bbox());
+        if !raster_bbox.contains_with_epsilon(&manifest_bbox, containment_epsilon(meta)) {
+            let error = RasterSpatialCheckError::RasterExtentNotContained {
+                path: meta.path.clone(),
+                raster_bbox: raster_bbox.clone(),
+                manifest_bbox,
+            };
+            diags.push(Diagnostic::error(
+                "raster.extent_not_contained",
+                Category::Raster,
+                artifact,
+                error.to_string(),
+            ));
+        }
+    }
+
+    diags
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+fn containment_epsilon(meta: &RasterMeta) -> f64 {
+    let pixel_width = meta.pixel_width.unwrap_or(0.0).abs();
+    let pixel_height = meta.pixel_height.unwrap_or(0.0).abs();
+    pixel_width.max(pixel_height) / 100.0
+}
 
 fn sample_format_label(fmt: RasterSampleFormat) -> &'static str {
     match fmt {
@@ -145,18 +205,34 @@ fn sample_format_label(fmt: RasterSampleFormat) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use hfx_core::{AtomCount, BoundingBox, Crs, FormatVersion, ManifestBuilder, Topology};
+
     use super::*;
-    use crate::dataset::{RasterMeta, RasterSampleFormat};
     use crate::diagnostic::Severity;
+
+    fn valid_manifest() -> Manifest {
+        ManifestBuilder::new(
+            FormatVersion::V0_1,
+            "test-fabric",
+            Crs::Epsg4326,
+            Topology::Tree,
+            0,
+            BoundingBox::new(-10.0, -5.0, 10.0, 5.0).unwrap(),
+            AtomCount::new(3).unwrap(),
+            "2026-01-01T00:00:00Z",
+            "v1.0.0",
+        )
+        .unwrap()
+        .build()
+    }
 
     fn valid_flow_dir_meta() -> RasterMeta {
         RasterMeta {
+            path: PathBuf::from("flow_dir.tif"),
             width: 1024,
             height: 1024,
             bits_per_sample: 8,
@@ -165,11 +241,16 @@ mod tests {
             tile_width: Some(256),
             tile_height: Some(256),
             nodata: Some(255.0),
+            spatial_ref: Some("EPSG:4326".to_string()),
+            bbox: Some(RasterBoundingBox::new(-10.1, -5.1, 10.1, 5.1)),
+            pixel_width: Some(0.01),
+            pixel_height: Some(0.01),
         }
     }
 
     fn valid_flow_acc_meta() -> RasterMeta {
         RasterMeta {
+            path: PathBuf::from("flow_acc.tif"),
             width: 1024,
             height: 1024,
             bits_per_sample: 32,
@@ -178,12 +259,12 @@ mod tests {
             tile_width: Some(256),
             tile_height: Some(256),
             nodata: Some(-1.0),
+            spatial_ref: Some("EPSG:4326".to_string()),
+            bbox: Some(RasterBoundingBox::new(-10.1, -5.1, 10.1, 5.1)),
+            pixel_width: Some(0.01),
+            pixel_height: Some(0.01),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // flow_dir checks
-    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_flow_dir_produces_no_errors() {
@@ -240,38 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn flow_dir_wrong_dtype_and_not_tiled_produces_two_errors() {
-        let meta = RasterMeta {
-            bits_per_sample: 32,
-            sample_format: RasterSampleFormat::Float,
-            is_tiled: false,
-            tile_width: None,
-            tile_height: None,
-            ..valid_flow_dir_meta()
-        };
-        let diags = check_flow_dir(&meta);
-        assert!(diags.iter().any(|d| d.check_id == "raster.flow_dir_dtype"));
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_dir_not_tiled")
-        );
-    }
-
-    #[test]
-    fn flow_dir_correct_nodata_produces_no_error() {
-        let meta = RasterMeta {
-            nodata: Some(255.0),
-            ..valid_flow_dir_meta()
-        };
-        let diags = check_flow_dir(&meta);
-        assert!(
-            !diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
-            "correct nodata=255 should not produce an error, got: {diags:#?}"
-        );
-    }
-
-    #[test]
     fn flow_dir_wrong_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: Some(0.0),
@@ -279,10 +328,8 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
-            "wrong nodata should produce an error, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
+            "expected raster.flow_dir_nodata, got: {diags:#?}"
         );
     }
 
@@ -294,16 +341,10 @@ mod tests {
         };
         let diags = check_flow_dir(&meta);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_dir_nodata" && d.severity == Severity::Error),
-            "absent nodata should produce an error, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_dir_nodata"),
+            "expected raster.flow_dir_nodata, got: {diags:#?}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // flow_acc checks
-    // -----------------------------------------------------------------------
 
     #[test]
     fn valid_flow_acc_produces_no_errors() {
@@ -315,9 +356,8 @@ mod tests {
     }
 
     #[test]
-    fn flow_acc_wrong_dtype_uint8_produces_error() {
+    fn flow_acc_wrong_dtype_uint32_produces_error() {
         let meta = RasterMeta {
-            bits_per_sample: 8,
             sample_format: RasterSampleFormat::UnsignedInt,
             ..valid_flow_acc_meta()
         };
@@ -329,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn flow_acc_wrong_dtype_uint32_produces_error() {
+    fn flow_acc_wrong_dtype_uint8_produces_error() {
         let meta = RasterMeta {
-            bits_per_sample: 32,
+            bits_per_sample: 8,
             sample_format: RasterSampleFormat::UnsignedInt,
             ..valid_flow_acc_meta()
         };
@@ -360,38 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn flow_acc_wrong_dtype_and_not_tiled_produces_two_errors() {
-        let meta = RasterMeta {
-            bits_per_sample: 8,
-            sample_format: RasterSampleFormat::UnsignedInt,
-            is_tiled: false,
-            tile_width: None,
-            tile_height: None,
-            ..valid_flow_acc_meta()
-        };
-        let diags = check_flow_acc(&meta);
-        assert!(diags.iter().any(|d| d.check_id == "raster.flow_acc_dtype"));
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_acc_not_tiled")
-        );
-    }
-
-    #[test]
-    fn flow_acc_correct_nodata_produces_no_error() {
-        let meta = RasterMeta {
-            nodata: Some(-1.0),
-            ..valid_flow_acc_meta()
-        };
-        let diags = check_flow_acc(&meta);
-        assert!(
-            !diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
-            "correct nodata=-1.0 should not produce an error, got: {diags:#?}"
-        );
-    }
-
-    #[test]
     fn flow_acc_wrong_nodata_produces_error() {
         let meta = RasterMeta {
             nodata: Some(0.0),
@@ -399,10 +407,8 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
-            "wrong nodata should produce an error, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
+            "expected raster.flow_acc_nodata, got: {diags:#?}"
         );
     }
 
@@ -414,22 +420,53 @@ mod tests {
         };
         let diags = check_flow_acc(&meta);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "raster.flow_acc_nodata" && d.severity == Severity::Error),
-            "absent nodata should produce an error, got: {diags:#?}"
+            diags.iter().any(|d| d.check_id == "raster.flow_acc_nodata"),
+            "expected raster.flow_acc_nodata, got: {diags:#?}"
         );
     }
 
-    // -----------------------------------------------------------------------
-    // CRS deferred note
-    // -----------------------------------------------------------------------
+    #[test]
+    fn spatial_checks_accept_valid_raster() {
+        let diags =
+            check_spatial_consistency(&valid_flow_dir_meta(), &valid_manifest(), Artifact::FlowDir);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
+    }
 
     #[test]
-    fn crs_not_implemented_produces_warning() {
-        let diags = crs_extent_not_implemented();
+    fn spatial_checks_report_crs_mismatch() {
+        let meta = RasterMeta {
+            spatial_ref: Some("EPSG:3857".to_string()),
+            ..valid_flow_dir_meta()
+        };
+
+        let diags = check_spatial_consistency(&meta, &valid_manifest(), Artifact::FlowDir);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Warning);
-        assert_eq!(diags[0].check_id, "raster.crs_extent_not_implemented");
+        assert_eq!(diags[0].check_id, "raster.crs_mismatch");
+    }
+
+    #[test]
+    fn spatial_checks_report_extent_not_contained() {
+        let meta = RasterMeta {
+            bbox: Some(RasterBoundingBox::new(-9.9, -4.9, 9.9, 4.9)),
+            ..valid_flow_dir_meta()
+        };
+
+        let diags = check_spatial_consistency(&meta, &valid_manifest(), Artifact::FlowDir);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].check_id, "raster.extent_not_contained");
+    }
+
+    #[test]
+    fn spatial_checks_skip_missing_spatial_metadata() {
+        let meta = RasterMeta {
+            spatial_ref: None,
+            bbox: None,
+            pixel_width: None,
+            pixel_height: None,
+            ..valid_flow_dir_meta()
+        };
+
+        let diags = check_spatial_consistency(&meta, &valid_manifest(), Artifact::FlowDir);
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
     }
 }

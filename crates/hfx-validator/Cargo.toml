@@ -13,7 +13,7 @@ name = "hfx"
 path = "src/main.rs"
 
 [dependencies]
-hfx-core = { path = "../hfx-core", version = "=0.2.13" }
+hfx-core = { path = "../hfx-core", version = "=0.2.14" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
@@ -24,6 +24,8 @@ clap.workspace = true
 tiff.workspace = true
 geozero.workspace = true
 rand.workspace = true
+gdal.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
