@@ -642,6 +642,8 @@ def stage_7_write_graph(
     for comid, nxt in zip(comids, next_down):
         comid = int(comid)
         nxt = int(nxt)
+        if nxt == comid:
+            continue  # degenerate MERIT terminal sink; no parent
         if nxt == 0:
             continue  # terminal outlet; no parent
         if nxt not in upstream:
