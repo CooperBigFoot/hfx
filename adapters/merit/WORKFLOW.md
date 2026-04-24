@@ -196,84 +196,70 @@ After that `list` will show pfaf-27 as complete at the canonical location.
 
 ## 6. Build the global raster mosaic (Phase 2 only)
 
-`build_global_rasters.py` assembles all MERIT Hydro 5-degree tiles into two
-planet-wide Cloud-Optimized GeoTIFFs:
+`build_global_rasters.py` mosaics the 60 mghydro per-basin TIFs (the same
+rasters used by `build_adapter.py`) into two planet-wide Cloud-Optimized
+GeoTIFFs:
 
 - `<output-dir>/flow_dir.tif` — uint8, ESRI D8, NoData=255
-- `<output-dir>/flow_acc.tif` — float32, upstream area km², NoData=-1.0
+- `<output-dir>/flow_acc.tif` — float32, upstream pixel count, NoData=-1.0
+
+**Why polygon-masking before VRT-stitching**: mghydro's per-basin rasters are
+clipped to each basin's bounding box, not its polygon.  Adjacent basins overlap
+in their bboxes and encode `0` both for "outside polygon" and for valid D8 sinks.
+The script rasterizes each basin's catchment polygon to disambiguate before
+stitching, so `gdalbuildvrt` sees strictly non-overlapping valid data.
 
 This script does **not** touch `catchments.parquet`, `graph.arrow`,
 `snap.parquet`, or `manifest.json`. Those belong to `build_adapter.py` /
 `run_missing_basins.py`. After the two TIFs land, re-run `merge_basins.py`
 with `--rasters-ready --force` to flip `has_rasters=true` in the manifest.
 
-### 6.1 Register and download MERIT Hydro 5° tiles
+### Inputs
 
-1. Visit https://global-hydrodynamics.github.io/MERIT_Hydro/ and fill in the
-   Google Form to register. You will receive a download password by email.
-2. Download the `dir_*.tar` and `upa_*.tar` tile packages using the provided
-   link and password.
-3. Unpack into a flat directory layout (no subdirectories inside `dir/` or
-   `upa/`):
+The inputs are the same data already on disk from §1–2:
 
-   ```bash
-   mkdir -p ~/data/merit_hydro_5deg/{dir,upa}
+- Vectors: `~/data/merit_basins/pfaf_level_02/cat_pfaf_<NN>_*.shp`
+- Rasters: `~/data/merit_hydro_rasters/flow_dir_basins/flowdir<NN>.tif` and
+  `~/data/merit_hydro_rasters/accum_basins/accum<NN>.tif`
 
-   for t in ~/Downloads/merit_hydro/dir_*.tar; do
-     tar -xf "$t" -C ~/data/merit_hydro_5deg/dir/ --strip-components=1
-   done
+No additional registration or download step is required.
 
-   for t in ~/Downloads/merit_hydro/upa_*.tar; do
-     tar -xf "$t" -C ~/data/merit_hydro_5deg/upa/ --strip-components=1
-   done
-   ```
+### 6.1 Run the mosaic build
 
-   Expected result: ~400 `*_dir.tif` tiles under `dir/` and ~400 `*_upa.tif`
-   tiles under `upa/`. Ocean-only 5° boxes are not distributed by the authors,
-   so the exact count is lower than the full 72×36 global grid.
-
-4. Verify the layout:
-
-   ```bash
-   ls ~/data/merit_hydro_5deg/dir/ | head -5
-   # n00e005_dir.tif  n00e010_dir.tif  ...
-   ls ~/data/merit_hydro_5deg/upa/ | head -5
-   # n00e005_upa.tif  n00e010_upa.tif  ...
-   ```
-
-### 6.2 Run the mosaic build
-
-**Smoke-test first** (validates tool setup against 4 tiles; exits before COG
-translate — safe to run even without all tiles downloaded):
+**Smoke-test first** (single basin, ~30 s; confirms tool setup without touching
+the full ~90 GB of intermediate data):
 
 ```bash
 cd adapters/merit
 uv run python build_global_rasters.py \
-  --source-dir ~/data/merit_hydro_5deg \
-  --output-dir ./out/hfx-merit-global \
-  --smoke-test \
-  --dry-run
+  --output-dir /tmp/hfx-merit-global-smoke \
+  --basins 27 \
+  --skip-overviews
 ```
 
-**Full build** (~1 hour, ~60 GB peak disk; ensure sufficient free space first):
+**Full build** (~2 hours, ~90 GB peak disk; ensure sufficient free space first):
 
 ```bash
 uv run python build_global_rasters.py \
-  --source-dir ~/data/merit_hydro_5deg \
   --output-dir ./out/hfx-merit-global
 ```
 
-**Optional flags:**
+**Key flags:**
 
-| Flag | Effect |
-|---|---|
-| `--tmp-dir PATH` | Scratch space (default: `<output-dir>/_tmp_rasters`) |
-| `--reference-dir PATH` | Sanity-check global COGs against a known pfaf region |
-| `--skip-overviews` | Skip overview pyramid (faster, not fully spatially indexed) |
-| `--gdal-cachemax MB` | GDAL cache in MB (default: 4096) |
-| `--log-level LEVEL` | DEBUG / INFO / WARNING / ERROR (default: INFO) |
+| Flag | Default | Effect |
+|---|---|---|
+| `--raster-root PATH` | `~/data/merit_hydro_rasters` | mghydro rasters root |
+| `--merit-basins-root PATH` | `~/data/merit_basins/pfaf_level_02` | Catchment shapefiles |
+| `--tmp-dir PATH` | `<output-dir>/_tmp_rasters` | Scratch space for masked TIFs |
+| `--reference-dir PATH` | per-basin pfaf42 dir | Sanity-check reference |
+| `--basins LIST` | all 60 | Comma-separated subset, e.g. `27` |
+| `--parallelism` / `-j` | `4` | Parallel masking workers |
+| `--skip-overviews` | off | Skip COG overview pyramid |
+| `--skip-sanity-check` | off | Skip sanity check against reference |
+| `--gdal-cachemax MB` | `4096` | GDAL cache in MB |
+| `--log-level LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
-### 6.3 Integrate with merge_basins.py
+### 6.2 Integrate with merge_basins.py
 
 `build_global_rasters.py` writes **only** the two TIFs. After they land
 adjacent to a manifest previously written by `merge_basins.py` (with
@@ -288,17 +274,18 @@ uv run python merge_basins.py \
 
 This flips `has_rasters=true` without re-running the full basin merge.
 
-### 6.4 Troubleshooting
+### 6.3 Troubleshooting
 
-- **`Source directory does not exist` or `No *_dir.tif tiles found`** — The
-  registration / untar step (§6.1) has not been completed. Follow §6.1 exactly.
-- **`Grid alignment check FAILED`** — The tiles may be from a different MERIT
-  Hydro version or were unpacked with subdirectory stripping missing. Verify
-  the tile origins with `gdalinfo <tile>` and compare to another tile. Redownload
-  if in doubt.
-- **`COG validation failed`** — Capture the GDAL version (`gdalinfo --version`)
-  and re-run with `--log-level DEBUG` to see the full gdal_translate stderr.
-  Requires GDAL ≥ 3.5.
+- **`Required input directory missing`** — Verify that `~/data/merit_hydro_rasters`
+  and `~/data/merit_basins/pfaf_level_02` exist (from §1–2). Pass explicit paths
+  via `--raster-root` and `--merit-basins-root` if they live elsewhere.
+- **`flowdir TIF missing` or `accum TIF missing`** — The mghydro curl step (§2)
+  has not been completed for that basin. Run `run_missing_basins.py download`.
+- **`COG validation failed`** — Capture `gdalinfo --version` and re-run with
+  `--log-level DEBUG`. Requires GDAL ≥ 3.5.
 - **`sanity check FAILED`** — A pixel-offset mismatch between the global mosaic
-  and the reference sub-region. Run `gdalinfo` on both files and compare `Origin`
-  and `Pixel Size` fields to detect a systematic shift.
+  and the reference. Run `gdalinfo` on both files and compare `Origin` and
+  `Pixel Size`. If the reference was built by an older adapter version (without
+  matching NoData handling), pass `--skip-sanity-check`.
+- **pfaf-35 skipped** — Expected. pfaf-35 wraps past 180°E and mghydro clips
+  to 180°E; the script detects the extent mismatch and skips with a WARN.
