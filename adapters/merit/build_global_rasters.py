@@ -19,12 +19,12 @@ Inputs (from build_adapter.py docstring)
 -----------------------------------------
 Vectors:
   ~/data/merit_basins/pfaf_level_02/cat_pfaf_<NN>_*.shp
-  (rclone'd from the Google Drive share — see WORKFLOW.md §1)
+  (rclone'd from the Google Drive share — see README.md §2)
 
 Rasters:
   ~/data/merit_hydro_rasters/flow_dir_basins/flowdir<NN>.tif
   ~/data/merit_hydro_rasters/accum_basins/accum<NN>.tif
-  (curl'd from mghydro.com — see WORKFLOW.md §2)
+  (curl'd from mghydro.com — see README.md §3)
 
 Why polygon-masking before VRT-stitching
 -----------------------------------------
@@ -155,7 +155,7 @@ def _check_directories(raster_root: Path, basins_root: Path) -> None:
         if not path.is_dir():
             logger.error(
                 "Required input directory missing: %s (arg %s). "
-                "Download inputs per WORKFLOW.md §1–2.",
+                "Download inputs per README.md §2–3.",
                 path,
                 label,
             )
@@ -704,7 +704,7 @@ def _parse_args() -> argparse.Namespace:
             "Mosaic mghydro per-basin TIFs into global COGs after polygon-masking "
             "each tile.  Produces flow_dir.tif (uint8, ESRI D8, NoData=255) and "
             "flow_acc.tif (float32 pixel counts, NoData=-1.0).  "
-            "See WORKFLOW.md §6 for integration instructions."
+            "See README.md § Global raster mosaic for integration instructions."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

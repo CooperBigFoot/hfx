@@ -100,6 +100,43 @@ hfx --format json ./path/to/dataset
 
 Validation behavior is defined against [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
 
+## Datasets
+
+### `merit_basins` — Global MERIT-Basins HFX (Pfafstetter Level-2)
+
+The first complete global HFX dataset, compiled from MERIT-Basins v0.7 / v1.0_bugfix1 and the mghydro per-basin raster rehost.
+
+| Property | Value |
+|---|---|
+| Adapter version | `0.1.0` |
+| Format version | `0.1` |
+| Atom count | 2,876,771 across 60 of 61 Pfaf-L2 basins |
+| Bounding box | `[-178.03, -55.57, 179.89, 83.65]` (planetary) |
+
+**Files:**
+
+| Artifact | Size |
+|---|---|
+| `manifest.json` | 428 B |
+| `graph.arrow` | 54 MB |
+| `catchments.parquet` | 6.1 GB |
+| `snap.parquet` | 1.7 GB |
+| `flow_dir.tif` | 12 GB |
+| `flow_acc.tif` | 45 GB |
+| **Total** | **~65 GB** |
+
+**Known gaps:** pfaf-35 (anti-meridian wrap — mghydro clips at 180°E); pfaf-87/88 (Antarctic sub-basins — absent from mghydro's distribution).
+
+**Local path:** `~/Desktop/merit-hfx/global/hfx/` (operator-local; not yet hosted remotely).
+
+**R2 hosting:** pending shed's `object_store` integration. See TODO.md Phase 4.
+
+**Validate:**
+
+```bash
+hfx ~/Desktop/merit-hfx/global/hfx/ --strict --sample-pct 100
+```
+
 ## Status
 
 HFX v0.1 is the first published spec iteration. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). The validator runs all documented check phases with a broad integration and conformance test suite, and a working [GRIT adapter](./adapters/grit/) demonstrates the end-to-end contract. Known conformance gaps (raster CRS/extent checks, reach-based snap, Hilbert parameters) are tracked in [docs/decisions/2026-04-13-post-grit-open-items.md](./docs/decisions/2026-04-13-post-grit-open-items.md).
