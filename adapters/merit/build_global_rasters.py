@@ -524,7 +524,18 @@ def _validate_cog(path: Path, *, skip_overviews: bool = False) -> None:
         raise SystemExit(4)
 
     if not skip_overviews:
-        overview_count = info_result.stdout.count("Overview ")
+        # gdalinfo prints overviews on a single line of the form
+        # "  Overviews: 216000x87000, 108000x43500, 54000x21750, ..."
+        # — count comma-separated resolutions on that line.
+        overview_line = next(
+            (
+                ln
+                for ln in info_result.stdout.splitlines()
+                if ln.strip().startswith("Overviews:")
+            ),
+            "",
+        )
+        overview_count = overview_line.count(",") + 1 if overview_line.strip() else 0
         if overview_count < 4:
             logger.error(
                 "COG %s has only %d overview levels (expected >= 4).",
