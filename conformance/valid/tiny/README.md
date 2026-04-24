@@ -28,7 +28,7 @@ Five-atom Y-tree. IDs 1–5.
 
 This is the canonical valid fixture. It exercises the full validator happy path:
 
-- Expected `check_id`: **PASS** (no errors; one tolerated `schema.catchments.rg_size` WARNING because 5 rows < 4096)
+- Expected `check_id`: **PASS** (no errors; the 5-row file is fully clean under the small-file row-group rule)
 - CRS: `EPSG:4326`
 - `has_up_area: false`, `has_rasters: false`, `has_snap: false`
 
@@ -38,11 +38,10 @@ This is the canonical valid fixture. It exercises the full validator happy path:
 Exit code: 0
 Result:    VALID
 Diagnostics:
-  [WARN] catchments.parquet (schema.catchments.rg_size): catchments.parquet row group 0
-         has 5 rows; recommended range is [4096, 8192]
+  none
 ```
 
-The rg_size WARNING is expected and tolerated in non-strict mode.
+No `schema.catchments.rg_size` warning is expected.
 
 ## Regenerate
 

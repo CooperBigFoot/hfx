@@ -99,7 +99,7 @@ gdf["hilbert_index"] = centroids.hilbert_distance(total_bounds=gdf.total_bounds)
 gdf = gdf.sort_values(["hilbert_index", "id"], kind="mergesort").reset_index(drop=True)
 ```
 
-Row groups must be 4,096–8,192 rows. Use `balanced_row_group_bounds` (see §GeoParquet section) to distribute rows evenly. The four `bbox_*` columns must be `float32` with `write_statistics=True`. Do not use `write_geoparquet_table` — it controls row-group splitting internally and can violate the [4,096, 8,192] bound. Use `pq.ParquetWriter` with hand-crafted GeoParquet metadata (§GeoParquet). After writing, call `validate_geoparquet(path, target_version="1.1")` as a build-time assertion.
+Files with fewer than 4,096 rows must be written as exactly one row group containing all rows. Files with 4,096 or more rows must use row groups of 4,096–8,192 rows each; use `balanced_row_group_bounds` (see §GeoParquet section) to distribute rows evenly. The four `bbox_*` columns must be `float32` with `write_statistics=True`. Do not use `write_geoparquet_table` — it controls row-group splitting internally and can violate the required layout. Use `pq.ParquetWriter` with hand-crafted GeoParquet metadata (§GeoParquet). After writing, call `validate_geoparquet(path, target_version="1.1")` as a build-time assertion.
 
 Validator does not check Hilbert sort order — curve parameters are not yet specified in the spec. Adapter owns correct ordering. See [open item 1](decisions/2026-04-13-post-grit-open-items.md).
 
@@ -221,7 +221,7 @@ The `hfx` validator does not check every spec requirement. For each gap, the ada
 - [ ] CRS is EPSG:4326; reprojection complete.
 - [ ] Rows Hilbert-sorted by centroid coordinates.
 - [ ] `bbox_*` columns are `float32`, non-null; `minx < maxx` and `miny < maxy` for every row.
-- [ ] Row groups 4,096–8,192 rows; `balanced_row_group_bounds` used.
+- [ ] Files with fewer than 4,096 rows have one row group containing all rows; larger files use 4,096–8,192 rows per group with `balanced_row_group_bounds`.
 - [ ] `write_statistics=True` on `pq.ParquetWriter`; bbox stats verified post-write.
 - [ ] GeoParquet 1.1 `geo` metadata hand-crafted and attached before writer opens.
 - [ ] `validate_geoparquet(path, target_version="1.1")` passes after write.
@@ -240,7 +240,7 @@ The `hfx` validator does not check every spec requirement. For each gap, the ada
 - [ ] `is_mainstem` is `bool`, non-null.
 - [ ] Degenerate snap bboxes inflated by epsilon.
 - [ ] All `catchment_id` values exist in `catchments.parquet`.
-- [ ] Row groups 4,096–8,192 rows; GeoParquet metadata attached; `validate_geoparquet` passes.
+- [ ] Row-group layout follows the same small-file/larger-file rule as catchments; GeoParquet metadata attached; `validate_geoparquet` passes.
 
 ### Rasters (if `has_rasters = true`)
 

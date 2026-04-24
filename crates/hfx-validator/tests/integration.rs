@@ -16,8 +16,10 @@ use gdal::DriverManager;
 use gdal::raster::{Buffer, RasterCreationOptions};
 use gdal::spatial_ref::SpatialRef;
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 
 use arrow::array::{BinaryArray, Float32Array};
+use hfx_validator::diagnostic::Severity;
 
 // ---------------------------------------------------------------------------
 // WKB factory helpers
@@ -44,6 +46,14 @@ fn make_wkb_polygon() -> Vec<u8> {
 /// Write a valid `catchments.parquet` with the given IDs and bbox-enclosing
 /// bounding boxes. Each row gets the same polygon WKB as geometry.
 fn write_catchments_parquet(dir: &Path, ids: &[i64]) {
+    write_catchments_parquet_impl(dir, ids, None);
+}
+
+fn write_catchments_parquet_with_rg(dir: &Path, ids: &[i64], max_row_group_size: usize) {
+    write_catchments_parquet_impl(dir, ids, Some(max_row_group_size));
+}
+
+fn write_catchments_parquet_impl(dir: &Path, ids: &[i64], max_row_group_size: Option<usize>) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("area_km2", DataType::Float32, false),
@@ -76,7 +86,12 @@ fn write_catchments_parquet(dir: &Path, ids: &[i64]) {
     .unwrap();
 
     let file = std::fs::File::create(dir.join("catchments.parquet")).unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    let props = max_row_group_size.map(|n| {
+        WriterProperties::builder()
+            .set_max_row_group_size(n)
+            .build()
+    });
+    let mut writer = ArrowWriter::try_new(file, schema, props).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
@@ -228,6 +243,34 @@ fn create_valid_dataset(dir: &Path) {
     write_graph_arrow(dir, ids, &upstream);
 }
 
+fn create_valid_linear_dataset(dir: &Path, row_count: i64) {
+    let ids: Vec<i64> = (1..=row_count).collect();
+    let upstream: Vec<Vec<i64>> = ids
+        .iter()
+        .map(|&id| if id == 1 { vec![] } else { vec![id - 1] })
+        .collect();
+
+    write_manifest(dir, row_count as u64, false, false);
+    write_catchments_parquet(dir, &ids);
+    write_graph_arrow(dir, &ids, &upstream);
+}
+
+fn create_valid_linear_dataset_with_catchment_rg(
+    dir: &Path,
+    row_count: i64,
+    max_row_group_size: usize,
+) {
+    let ids: Vec<i64> = (1..=row_count).collect();
+    let upstream: Vec<Vec<i64>> = ids
+        .iter()
+        .map(|&id| if id == 1 { vec![] } else { vec![id - 1] })
+        .collect();
+
+    write_manifest(dir, row_count as u64, false, false);
+    write_catchments_parquet_with_rg(dir, &ids, max_row_group_size);
+    write_graph_arrow(dir, &ids, &upstream);
+}
+
 /// Create a minimal invalid dataset: the manifest has wrong format_version type.
 fn create_invalid_manifest_dataset(dir: &Path) {
     // Write a manifest with a clearly wrong format_version value that fails
@@ -344,12 +387,45 @@ fn strict_mode_does_not_break_valid_dataset() {
     let dir = tempfile::tempdir().unwrap();
     create_valid_dataset(dir.path());
 
-    // With strict=true warnings are promoted to errors.  A truly minimal valid
-    // dataset should still produce no warnings that get promoted (small parquet
-    // row-group warning may or may not fire; either outcome is acceptable so
-    // long as the function doesn't panic).
-    let _report = hfx_validator::validate(dir.path(), true, true, 100.0);
-    // Just verifying no panic.
+    let report = hfx_validator::validate(dir.path(), true, true, 100.0);
+    assert!(
+        report.is_valid(),
+        "valid dataset should pass strict mode; got:\n{}",
+        report.display_text()
+    );
+}
+
+#[test]
+fn small_file_single_rg_passes_strict() {
+    let dir = tempfile::tempdir().unwrap();
+    create_valid_linear_dataset(dir.path(), 12);
+
+    let report = hfx_validator::validate(dir.path(), true, true, 100.0);
+    assert!(
+        report.is_valid(),
+        "12-row single-row-group dataset should pass strict mode; got:\n{}",
+        report.display_text()
+    );
+}
+
+#[test]
+fn small_file_multi_rg_fails_strict() {
+    let dir = tempfile::tempdir().unwrap();
+    create_valid_linear_dataset_with_catchment_rg(dir.path(), 12, 6);
+
+    let report = hfx_validator::validate(dir.path(), true, true, 100.0);
+    assert!(
+        !report.is_valid(),
+        "12-row multi-row-group dataset should fail strict mode; got:\n{}",
+        report.display_text()
+    );
+    assert!(
+        report.diagnostics().iter().any(|d| {
+            d.check_id == "schema.catchments.rg_count" && d.severity == Severity::Error
+        }),
+        "expected strict schema.catchments.rg_count error; got:\n{}",
+        report.display_text()
+    );
 }
 
 #[test]

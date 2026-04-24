@@ -72,6 +72,7 @@ This file is a running log of concrete findings while wrangling the Europe `EPSG
 - Reproduced on `2026-04-13`
 - Observed behavior:
   - `schema.*.rg_size` diagnostics are warnings in normal mode
+  - `schema.*.rg_count` diagnostics cover small files split into multiple row groups
   - `--strict` upgrades them into blocking failures
 - Why this matters:
   - in practice, row-group sizing becomes part of required producer behavior for any “strictly valid” dataset

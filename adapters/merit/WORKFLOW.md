@@ -67,11 +67,9 @@ hfx ./out/hfx --strict --sample-pct 100 --format text
 
 Expected advisories on small basins (pfaf-27 and similar):
 
-- `schema.catchments.rg_size` — row group below the 4,096 strict-mode floor because the basin is small.
-- `schema.snap.rg_size` — same reason for the snap table.
 - `raster.crs_extent_not_implemented` — validator gap for GeoTIFF GeoKey parsing (see `docs/decisions/2026-04-13-post-grit-open-items.md`, open item 2).
 
-All three are advisory and do not fail the build. Any other warning or error is a real issue.
+This advisory does not fail the build. Any other warning or error is a real issue.
 
 ## 5. Try it with pyshed
 
@@ -93,7 +91,7 @@ print(f"drainage area: {result.area_km2:.1f} km2")
 ## When you are done
 
 - [ ] All three artifacts (`catchments.parquet`, `graph.arrow`, `manifest.json`) plus the two optional pairs (`snap.parquet`, `flow_dir.tif`, `flow_acc.tif`) are in `./out/hfx/`.
-- [ ] `hfx --strict --sample-pct 100` exits zero with only the three expected advisories for small basins.
+- [ ] `hfx --strict --sample-pct 100` exits zero with only the expected raster advisory for small basins.
 - [ ] Citations in [`README.md`](README.md) still match the source versions you downloaded (MERIT-Basins v0.7 / v1.0_bugfix1, MERIT Hydro via mghydro).
 
 ## Troubleshooting

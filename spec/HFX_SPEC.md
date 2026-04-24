@@ -51,7 +51,10 @@ One row per catchment atom.
 ### Spatial Partitioning
 
 - Rows **must** be sorted by Hilbert curve index computed on centroid coordinates.
-- Row group size: 4,096–8,192 rows.
+- Row-group layout:
+  - Files with fewer than 4,096 rows **must** contain exactly one row group containing all rows.
+  - Files with 4,096 or more rows **must** use row groups of 4,096–8,192 rows each.
+  - Row-group sizing violations are WARN diagnostics in the reference validator and are promoted to ERROR under `--strict`.
 - Parquet row group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, `bbox_maxy` **must** be written. This enables the engine to eliminate row groups via column statistics before deserializing any geometry.
 
 ### Notes

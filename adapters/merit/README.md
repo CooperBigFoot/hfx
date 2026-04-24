@@ -84,7 +84,7 @@ Both pass `rio_cogeo.cog_validate` post-write.
 
 - `snap.parquet` **is** Hilbert-sorted in MERIT. This closes the conformance gap flagged for GRIT in `adapters/grit/WORKFLOW.md`.
 - Reach-based snap is out of scope by construction: MERIT-Basins reaches are 1:1 with catchments, so the GRIT segment-vs-reach distinction does not apply. Each catchment has exactly one snap LineString.
-- Small basins (fewer than 4,096 atoms, e.g. pfaf-27 at 1,973) trigger advisory `schema.catchments.rg_size` and `schema.snap.rg_size` warnings because a single row group falls below the strict-mode floor. This is unavoidable given the Pfaf-L2 granularity and is accepted as a known deviation.
+- Small basins (fewer than 4,096 atoms, e.g. pfaf-27 at 1,973) ship as a single row group and are fully conformant under HFX v0.2.17+.
 - Raster CRS and extent containment are checked by the adapter but not by the validator (see [`docs/decisions/2026-04-13-post-grit-open-items.md`](../../docs/decisions/2026-04-13-post-grit-open-items.md), open item 2). The validator emits `raster.crs_extent_not_implemented` as an info-level advisory.
 
 For HFX adapter authoring guidance generally, see [`docs/ADAPTER_GUIDE.md`](../../docs/ADAPTER_GUIDE.md).

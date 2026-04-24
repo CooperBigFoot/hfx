@@ -9,6 +9,18 @@ use crate::diagnostic::{Artifact, Category, Diagnostic};
 const RG_SIZE_MIN: usize = 4096;
 const RG_SIZE_MAX: usize = 8192;
 
+#[derive(Debug, PartialEq, Eq)]
+enum RgLayoutVerdict {
+    /// A small file is represented by one row group.
+    SmallFileSingleRg,
+    /// A small file is split across multiple row groups.
+    SmallFileMultipleRgs { rg_count: usize },
+    /// A large file has all row groups within the recommended size range.
+    LargeFileInRange,
+    /// A large file has at least one row group outside the recommended size range.
+    LargeFileOutOfRange { rg_idx: usize, size: usize },
+}
+
 /// Run schema-level checks B1–B6 on a parsed dataset.
 ///
 /// # Checks
@@ -16,7 +28,7 @@ const RG_SIZE_MAX: usize = 8192;
 /// - B2: graph schema (diagnostics already collected by reader)
 /// - B3: snap schema (diagnostics already collected by reader, if present)
 /// - B4: all bbox columns in every row group have statistics
-/// - B5: row group sizes are in `[4096, 8192]` (warning, not error)
+/// - B5: row-group layout follows small-file and large-file size rules
 /// - B6: `atom_count` in manifest matches catchments row count
 pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
@@ -42,19 +54,15 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
         }
 
         // B5: Row group sizes.
-        for (rg_idx, &size) in catchments.row_group_sizes.iter().enumerate() {
-            if !(RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size) {
-                diags.push(Diagnostic::warning(
-                    "schema.catchments.rg_size",
-                    Category::Schema,
-                    Artifact::Catchments,
-                    format!(
-                        "catchments.parquet row group {rg_idx} has {size} rows; \
-                         recommended range is [{RG_SIZE_MIN}, {RG_SIZE_MAX}]"
-                    ),
-                ));
-            }
-        }
+        emit_row_group_diag(
+            classify_row_groups(catchments.row_count, &catchments.row_group_sizes),
+            catchments.row_count,
+            Artifact::Catchments,
+            "catchments.parquet",
+            "schema.catchments.rg_size",
+            "schema.catchments.rg_count",
+            &mut diags,
+        );
     }
 
     // B4/B5: Same checks for snap.parquet when present.
@@ -73,19 +81,15 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
             }
         }
 
-        for (rg_idx, &size) in snap.row_group_sizes.iter().enumerate() {
-            if !(RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size) {
-                diags.push(Diagnostic::warning(
-                    "schema.snap.rg_size",
-                    Category::Schema,
-                    Artifact::Snap,
-                    format!(
-                        "snap.parquet row group {rg_idx} has {size} rows; \
-                         recommended range is [{RG_SIZE_MIN}, {RG_SIZE_MAX}]"
-                    ),
-                ));
-            }
-        }
+        emit_row_group_diag(
+            classify_row_groups(snap.row_count, &snap.row_group_sizes),
+            snap.row_count,
+            Artifact::Snap,
+            "snap.parquet",
+            "schema.snap.rg_size",
+            "schema.snap.rg_count",
+            &mut diags,
+        );
     }
 
     // B6: atom_count in manifest matches catchments row count.
@@ -110,6 +114,63 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
 
     debug!(count = diags.len(), "schema checks complete");
     diags
+}
+
+fn classify_row_groups(row_count: usize, sizes: &[usize]) -> RgLayoutVerdict {
+    if row_count < RG_SIZE_MIN {
+        return if sizes.len() > 1 {
+            RgLayoutVerdict::SmallFileMultipleRgs {
+                rg_count: sizes.len(),
+            }
+        } else {
+            RgLayoutVerdict::SmallFileSingleRg
+        };
+    }
+
+    sizes
+        .iter()
+        .enumerate()
+        .find_map(|(rg_idx, &size)| {
+            (!((RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size)))
+                .then_some(RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size })
+        })
+        .unwrap_or(RgLayoutVerdict::LargeFileInRange)
+}
+
+fn emit_row_group_diag(
+    verdict: RgLayoutVerdict,
+    row_count: usize,
+    artifact: Artifact,
+    file_label: &str,
+    rg_size_check_id: &'static str,
+    rg_count_check_id: &'static str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match verdict {
+        RgLayoutVerdict::SmallFileSingleRg | RgLayoutVerdict::LargeFileInRange => {}
+        RgLayoutVerdict::SmallFileMultipleRgs { rg_count } => {
+            diags.push(Diagnostic::warning(
+                rg_count_check_id,
+                Category::Schema,
+                artifact,
+                format!(
+                    "{file_label} has {row_count} rows split across {rg_count} row groups; \
+                     files with fewer than {RG_SIZE_MIN} rows must be written as a single row group"
+                ),
+            ));
+        }
+        RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size } => {
+            diags.push(Diagnostic::warning(
+                rg_size_check_id,
+                Category::Schema,
+                artifact,
+                format!(
+                    "{file_label} row group {rg_idx} has {size} rows; \
+                     recommended range is [{RG_SIZE_MIN}, {RG_SIZE_MAX}]"
+                ),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +217,20 @@ mod tests {
         }
     }
 
+    fn snap_with_rg(sizes: Vec<usize>, has_bbox_stats: Vec<bool>) -> SnapData {
+        let row_count: usize = sizes.iter().sum();
+        SnapData {
+            row_count,
+            ids: (0..row_count as i64).collect(),
+            catchment_ids: (0..row_count as i64).collect(),
+            weights: vec![1.0; row_count],
+            bboxes: vec![[0.0, 0.0, 1.0, 1.0]; row_count],
+            geometry_wkb: vec![vec![]; row_count],
+            row_group_sizes: sizes,
+            row_group_has_bbox_stats: has_bbox_stats,
+        }
+    }
+
     fn raw_manifest_with_atom_count(count: u64) -> RawManifest {
         RawManifest {
             format_version: Some("0.1".into()),
@@ -187,9 +262,9 @@ mod tests {
     #[test]
     fn b4_bbox_stats_missing_produces_warning() {
         let mut dataset = empty_dataset();
-        dataset.catchments = Some(catchments_with_rg(vec![100], vec![false]));
+        dataset.catchments = Some(catchments_with_rg(vec![4096], vec![false]));
         let diags = check_schemas(&dataset);
-        assert_eq!(diags.len(), 2); // bbox_stats_missing + rg_size (100 < 4096)
+        assert_eq!(diags.len(), 1);
         assert!(
             diags
                 .iter()
@@ -207,14 +282,49 @@ mod tests {
     }
 
     #[test]
-    fn b5_rg_size_out_of_range_produces_warning() {
+    fn b5_large_file_trailing_small_rg_produces_rg_size_warning() {
         let mut dataset = empty_dataset();
-        // 100 < 4096 → out of range
-        dataset.catchments = Some(catchments_with_rg(vec![100], vec![true]));
+        dataset.catchments = Some(catchments_with_rg(vec![4096, 500], vec![true, true]));
         let diags = check_schemas(&dataset);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].check_id, "schema.catchments.rg_size");
         assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn b5_small_file_single_rg_no_warning() {
+        let mut dataset = empty_dataset();
+        dataset.catchments = Some(catchments_with_rg(vec![12], vec![true]));
+        let diags = check_schemas(&dataset);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn b5_small_file_711_rows_no_warning() {
+        let mut dataset = empty_dataset();
+        dataset.catchments = Some(catchments_with_rg(vec![711], vec![true]));
+        let diags = check_schemas(&dataset);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn b5_small_file_multiple_rgs_produces_rg_count_warning() {
+        let mut dataset = empty_dataset();
+        dataset.catchments = Some(catchments_with_rg(vec![6, 6], vec![true, true]));
+        let diags = check_schemas(&dataset);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].check_id, "schema.catchments.rg_count");
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert!(diags[0].message.contains("12 rows"));
+        assert!(diags[0].message.contains("2 row groups"));
+    }
+
+    #[test]
+    fn b5_large_file_in_range_multiple_rgs_no_warning() {
+        let mut dataset = empty_dataset();
+        dataset.catchments = Some(catchments_with_rg(vec![4251; 16], vec![true; 16]));
+        let diags = check_schemas(&dataset);
+        assert!(diags.is_empty());
     }
 
     #[test]
@@ -299,22 +409,78 @@ mod tests {
     #[test]
     fn snap_b4_b5_checks_work() {
         let mut dataset = empty_dataset();
-        dataset.snap = Some(SnapData {
-            row_count: 100,
-            ids: vec![],
-            catchment_ids: vec![],
-            weights: vec![],
-            bboxes: vec![],
-            geometry_wkb: vec![],
-            row_group_sizes: vec![100],            // out of range
-            row_group_has_bbox_stats: vec![false], // missing stats
-        });
+        dataset.snap = Some(snap_with_rg(vec![4096], vec![false]));
         let diags = check_schemas(&dataset);
         assert!(
             diags
                 .iter()
                 .any(|d| d.check_id == "schema.snap.bbox_stats_missing")
         );
-        assert!(diags.iter().any(|d| d.check_id == "schema.snap.rg_size"));
+        assert!(!diags.iter().any(|d| d.check_id == "schema.snap.rg_size"));
+    }
+
+    #[test]
+    fn snap_small_single_rg_no_warning() {
+        let mut dataset = empty_dataset();
+        dataset.snap = Some(snap_with_rg(vec![12], vec![true]));
+        let diags = check_schemas(&dataset);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn snap_small_multi_rg_produces_rg_count_warning() {
+        let mut dataset = empty_dataset();
+        dataset.snap = Some(snap_with_rg(vec![6, 6], vec![true, true]));
+        let diags = check_schemas(&dataset);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].check_id, "schema.snap.rg_count");
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert!(diags[0].message.contains("12 rows"));
+        assert!(diags[0].message.contains("2 row groups"));
+    }
+
+    #[test]
+    fn classify_row_groups_truth_table() {
+        assert_eq!(
+            classify_row_groups(100, &[100]),
+            RgLayoutVerdict::SmallFileSingleRg
+        );
+        assert_eq!(
+            classify_row_groups(711, &[711]),
+            RgLayoutVerdict::SmallFileSingleRg
+        );
+        assert_eq!(
+            classify_row_groups(12, &[6, 6]),
+            RgLayoutVerdict::SmallFileMultipleRgs { rg_count: 2 }
+        );
+        assert_eq!(
+            classify_row_groups(4096, &[4096]),
+            RgLayoutVerdict::LargeFileInRange
+        );
+        assert_eq!(
+            classify_row_groups(8192, &[4096, 4096]),
+            RgLayoutVerdict::LargeFileInRange
+        );
+        assert_eq!(
+            classify_row_groups(4096, &[2048, 2048]),
+            RgLayoutVerdict::LargeFileOutOfRange {
+                rg_idx: 0,
+                size: 2048
+            }
+        );
+        assert_eq!(
+            classify_row_groups(4596, &[4096, 500]),
+            RgLayoutVerdict::LargeFileOutOfRange {
+                rg_idx: 1,
+                size: 500
+            }
+        );
+        assert_eq!(
+            classify_row_groups(9000, &[9000]),
+            RgLayoutVerdict::LargeFileOutOfRange {
+                rg_idx: 0,
+                size: 9000
+            }
+        );
     }
 }
