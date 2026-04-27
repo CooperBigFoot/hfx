@@ -60,15 +60,15 @@ Two independent workstreams that can run in parallel:
 - Stream geometries through dissolve where possible.
 - Add a leaner Python result path that returns WKB or area metadata without the full GeoJSON inflation.
 
-## Phase 4 — Discovery and ship
+## Phase 4 — Discovery and ship ✓ COMPLETE (2026-04-27)
 
 Goal: put the global dataset on R2, address it from a user's machine, prove the whole stack end-to-end.
 
 Deliverables:
-- Pick a discovery mechanism. Cheapest: a `--dataset-url` CLI flag. Slightly nicer: a small `hfx-registry.toml` shipped with shed mapping fabric names to canonical URLs. Avoid a network-served registry until there is a reason.
-- Upload Phase 2 global MERIT-Basins HFX dataset to R2.
-- End-to-end smoke test: cold cache, single delineation against R2, measure bytes downloaded, peak RSS, wall time. Compare against the local-disk baseline in the memory-footprint bug doc.
-- Document the deployment in shed's README.
+- ✓ Pick a discovery mechanism. `--dataset-url` flag shipped, no registry needed yet.
+- ✓ Upload Phase 2 global MERIT-Basins HFX dataset to R2. Live at `https://basin-delineations-public.upstream.tech/merit-basins/0.1.0/manifest.json`.
+- ✓ End-to-end smoke test: cold cache, single delineation against R2, measure bytes downloaded, peak RSS, wall time. See `../shed/scratchpad/benchmarks/20260427-phase4-r2-smoke.md` (cold 37 s / warm 32 s, peak RSS 1.05× local).
+- ✓ Document the deployment in shed's README. See the shed README "Canonical hosted dataset" section.
 
 ---
 
