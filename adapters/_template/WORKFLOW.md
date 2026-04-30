@@ -11,7 +11,7 @@ This document describes the steps to run an adapter built from the HFX template.
 - [ ] Decide `HAS_SNAP`: set `True` if the adapter produces `snap.parquet`; otherwise the engine falls back to point-in-polygon on `catchments.parquet`
 - [ ] Decide `HAS_RASTERS`: set `True` if `flow_dir.tif` and `flow_acc.tif` are included
 - [ ] Implement stages 1 through 9 (replace each `raise NotImplementedError(...)`)
-- [ ] Vendor `balanced_row_group_bounds` from `adapters/grit/build_grit_eu_hfx.py` if your dataset has more than 4096 atoms — stage 6 requires it
+- [ ] Vendor `balanced_row_group_bounds` from `adapters/grit/build_adapter.py` if your dataset has more than 4096 atoms — stage 6 requires it
 
 ## Commands
 
@@ -42,7 +42,7 @@ The second layer is GeoParquet 1.1 structural validation via `validate_geoparque
 
 - **`hfx: command not found`** — install the validator with `cargo install hfx-validator`, or run it from the repo root with `cargo run -p hfx-validator -- <dataset-path> --strict`.
 
-- **Row-group size outside `[4096, 8192]`** — vendor the `balanced_row_group_bounds` helper from `adapters/grit/build_grit_eu_hfx.py`.  It computes evenly distributed row-group boundaries that satisfy the strict-mode size constraint.
+- **Row-group size outside `[4096, 8192]`** — vendor the `balanced_row_group_bounds` helper from `adapters/grit/build_adapter.py`.  It computes evenly distributed row-group boundaries that satisfy the strict-mode size constraint.
 
 - **`validate_geoparquet` complains about geometry column metadata** — verify that `build_geo_metadata(...)` was called and the result was attached to the Arrow schema via `schema.with_metadata(...)` *before* `pq.ParquetWriter` is opened.  Attaching metadata after the writer is open, or per-chunk, does not update the file-level schema metadata.
 
@@ -53,4 +53,4 @@ The second layer is GeoParquet 1.1 structural validation via `validate_geoparque
 - Remove all `TODO` comments and placeholder values (`"todo-fabric-name"`, `"todo-adapter-version"`).
 - Replace `ADAPTER_VERSION` with the actual release version of your adapter.
 - If you deviated from the spec intentionally (e.g. a different snap weight convention, a known conformance gap), document the deviation in your adapter's `README.md` with a link to the relevant entry in `docs/decisions/`.
-- Add a `WORKFLOW.md` specific to your adapter describing its inputs, source-specific mapping decisions, and any known workarounds — following the pattern in `adapters/grit/WORKFLOW.md`.
+- Document adapter-specific inputs, source mapping decisions, and known workarounds in your adapter's `README.md`.

@@ -11,6 +11,7 @@ Strategic direction (settled 2026-04-22): **one global HFX dataset per fabric, s
   - GDAL on COG over `/vsis3/` issues `Range:` HTTP requests for only intersecting tiles. R2 supported via `AWS_S3_ENDPOINT` + `AWS_VIRTUAL_HOSTING=FALSE`. (`port/cpl_vsil_curl.cpp:2017`, `frmts/gtiff/gtiffdataset_read.cpp:6780`, `port/cpl_aws.cpp:2321,2392`.)
   - Rust `parquet` `ParquetObjectReader::with_row_groups` against `AmazonS3` (R2) issues range requests for only selected row groups, ~1–5 MB per query. (`parquet/src/arrow/async_reader/store.rs:190`, `object_store/src/util.rs` 1 MiB coalesce default.)
 - **MERIT global merge is mechanically safe**: zero cross-basin `NextDownID` references in pfaf-27 (1,973 atoms) or pfaf-31 (81,443 atoms). Structural reason: Pfaf-L2 boundaries are drainage divides; COMID prefix encodes basin code; concatenation requires no ID translation.
+- **GRIT global adapter is complete**: all seven regions built and merged into `/Users/nicolaslazaro/Desktop/grit-hfx/global/grit-hfx-global`; strict validation and sanity checks passed with 1,767,065 atoms.
 
 ## Settled facts that anchor the plan
 
@@ -77,7 +78,6 @@ Deliverables:
 - **`pfaf-35` anti-meridian wrap** — catchment bbox maxx=190.3° wraps past 180°E; mghydro raster is clipped to 180°E. Basin excluded from the global mosaic. Revisit when MERIT Hydro 5° source tiles or a wrap-aware raster assembly is on the table.
 - **`pfaf-87` / `pfaf-88` missing from mghydro** — Antarctic sub-basins, HTTP 404 for both flowdir and accum at mghydro's directory. Vector shapefiles may still exist in the Lin et al. 2019 release; the global dataset excludes these two basins.
 - **`flow_acc.tif` encoding** — the global raster is 45 GB because raw float32 upstream pixel counts compress poorly. A km² conversion (the adapter already has `_compute_area_row_km2` for per-row cosine-weighted pixel area) or int32 encoding would roughly halve the file. Revisit once a shed consumer profiles query cost.
-- **GRIT filename parity** — `adapters/grit/build_grit_eu_hfx.py` doesn't match the `_template/build_adapter.py` convention that MERIT follows. Rename during the next GRIT touchup. Same review should consider folding GRIT's `WORKFLOW.md` into `README.md` for consistency with MERIT.
 - **Cross-region edges silently dropped.** Largely defused by the global-dataset direction — within a single global HFX there are no regions to cross. Keep the warn-log in the adapter as a defensive check; consider promoting to a hard error so a future partial-fabric adapter doesn't ship truncated graphs without anyone noticing.
   - Adapter: `adapters/merit/build_adapter.py:647-655`
   - Engine: `../shed/crates/core/src/engine.rs` (BFS terminates at missing IDs without surfacing the truncation)

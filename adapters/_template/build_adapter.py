@@ -193,7 +193,7 @@ def stage_6_write_catchments(gdf: gpd.GeoDataFrame, out_dir: Path) -> None:
        ``pq.ParquetWriter`` is opened, not per chunk.
     3. Open ``pq.ParquetWriter(out_path, schema, write_statistics=True)``.
     4. Compute ``balanced_row_group_bounds(len(gdf))`` (vendor this helper
-       from ``adapters/grit/build_grit_eu_hfx.py`` if needed) and write each
+       from ``adapters/grit/build_adapter.py`` if needed) and write each
        chunk as a separate row group via ``writer.write_table(table)``.
     5. Close the writer, then call
        ``validate_geoparquet(out_path, target_version="1.1")``.

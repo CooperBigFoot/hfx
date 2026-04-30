@@ -150,7 +150,7 @@ Two distinct bbox mechanisms coexist in HFX Parquet files. Confusing them is a c
 
 **GeoParquet 1.1 `covering.bbox` is a separate optional struct column.** Defined by the GeoParquet 1.1 spec for GeoParquet-aware readers. Not required by HFX. Both mechanisms may coexist in the same file.
 
-The GRIT adapter (`adapters/grit/build_grit_eu_hfx.py`) uses this hand-crafted metadata pattern instead of `write_geoparquet_table`:
+The GRIT adapter (`adapters/grit/build_adapter.py`) uses this hand-crafted metadata pattern instead of `write_geoparquet_table`:
 
 ```python
 import json
@@ -265,7 +265,7 @@ The `hfx` validator does not check every spec requirement. For each gap, the ada
 ## Reference and Next Steps
 
 - **Template**: `adapters/_template/` — skeleton adapter with stub functions for each stage.
-- **Canonical worked example**: `adapters/grit/` — GRIT Europe is the reference implementation. `adapters/grit/build_grit_eu_hfx.py` contains `build_geo_metadata`, `balanced_row_group_bounds`, `inflate_degenerate_bounds`, `build_catchments`, `build_snap`, and `build_manifest`. `adapters/grit/WORKFLOW.md` has step-by-step commands.
+- **Canonical worked example**: `adapters/grit/` — GRIT is the reference implementation. `adapters/grit/build_adapter.py` contains `build_geo_metadata`, `balanced_row_group_bounds`, `inflate_degenerate_bounds`, `build_catchments`, `build_snap`, and `build_manifest`; its README has step-by-step commands.
 - **Validator**: `crates/hfx-validator/README.md` — validation phases, conformance gaps, CLI flags.
 - **Spec**: [`spec/HFX_SPEC.md`](../spec/HFX_SPEC.md) — the authoritative contract.
 

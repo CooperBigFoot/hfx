@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""GRIT Europe -> HFX v0.2 adapter.
+"""GRIT regional -> HFX v0.2 adapter.
 
 This is the canonical worked example that mirrors the nine-stage shape from
 ``adapters/_template/build_adapter.py`` verbatim.  A reader doing
 
-    grep -n '^def stage_' adapters/grit/build_grit_eu_hfx.py
+    grep -n '^def stage_' adapters/grit/build_adapter.py
 
 should see all nine template stages in order.  GRIT-specific prep (unzip the
 outer archive, read the GPKG layers, preprocess the polars segments table)
@@ -43,28 +43,38 @@ from shapely.geometry.base import BaseGeometry
 
 FABRIC_NAME = "grit"
 FABRIC_VERSION = "v1.0"
-ADAPTER_VERSION = "grit-eu-scratch-2026-04-13"
+ADAPTER_VERSION = "grit-regional-scratch-2026-04-30"
 TOPOLOGY = "dag"
-REGION = "europe"
 CRS = "EPSG:4326"
 HAS_UP_AREA = False
 HAS_RASTERS = False
 HAS_SNAP = True
 
-DEFAULT_ROOT = Path("/tmp/grit-hfx-eu")
+DEFAULT_ROOT = Path("/Users/nicolaslazaro/Desktop/grit-hfx")
+REGION_CODES = ("AF", "AS", "EU", "NA", "SA", "SI", "SP")
+REGION_NAMES = {
+    "AF": "africa",
+    "AS": "asia",
+    "EU": "europe",
+    "NA": "north america",
+    "SA": "south america",
+    "SI": "siberia",
+    "SP": "south pacific",
+}
 
-EU_INPUTS = {
-    "segments": "GRITv1.0_segments_EU_EPSG4326.gpkg.zip",
-    "segment_catchments": "GRITv1.0_segment_catchments_EU_EPSG4326.gpkg.zip",
-    "reaches": "GRITv1.0_reaches_EU_EPSG4326.gpkg.zip",
+REGION_INPUTS = {
+    code: {
+        "segments": f"GRITv1.0_segments_{code}_EPSG4326.gpkg.zip",
+        "segment_catchments": f"GRITv1.0_segment_catchments_{code}_EPSG4326.gpkg.zip",
+        "reaches": f"GRITv1.0_reaches_{code}_EPSG4326.gpkg.zip",
+    }
+    for code in REGION_CODES
 }
 
 SEGMENTS_LAYER = "lines"
 SEGMENT_CATCHMENTS_LAYER = "segment_catchments__1"
 REACHES_LAYER = "lines"
 
-EXPECTED_SEGMENT_COUNT = 150_325
-EXPECTED_REACH_COUNT = 1_922_187
 ROW_GROUP_SIZE = 4_096
 ROW_GROUP_MIN = 4_096
 ROW_GROUP_MAX = 8_192
@@ -83,7 +93,7 @@ def log(message: str) -> None:
 
 @dataclass(frozen=True)
 class SourceData:
-    """Holds raw inputs loaded from the GRIT Europe hydrofabric.
+    """Holds raw inputs loaded from one GRIT regional hydrofabric.
 
     Attributes
     ----------
@@ -97,8 +107,7 @@ class SourceData:
         Segment-catchment polygons with ``global_id`` and ``area`` columns.
     snap_lines:
         Segment-line GeoDataFrame used for the snap layer (reach layer is
-        rejected in the Europe slice because ``is_mainstem`` and
-        drainage-area columns are null).
+        extracted for availability but not used by this build).
     """
 
     inputs: dict[str, Path]
@@ -203,6 +212,11 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def decode_region_code(id: int) -> str | None:
+    """Decode a GRIT identifier to a region code when encoded metadata exists."""
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pre-stage helpers: unzip the outer archive and read source tables
 # ---------------------------------------------------------------------------
@@ -236,12 +250,12 @@ def _extract_inner_gpkg(inner_zip_path: Path) -> Path:
         return out_path
 
 
-def _extract_inputs(root: Path, outer_archive: Path) -> dict[str, Path]:
-    """Unzip the Europe GPKGs from the outer GRIT archive and return their paths."""
+def _extract_inputs(root: Path, outer_archive: Path, region_code: str) -> dict[str, Path]:
+    """Unzip regional GPKGs from the outer GRIT archive and return their paths."""
     input_dir = root / "input"
     ensure_dir(input_dir)
     outputs: dict[str, Path] = {}
-    for key, member_name in EU_INPUTS.items():
+    for key, member_name in REGION_INPUTS[region_code].items():
         out_path = input_dir / member_name
         _extract_member(outer_archive, member_name, out_path)
         outputs[key] = _extract_inner_gpkg(out_path)
@@ -290,51 +304,29 @@ def _parse_csv_int_lists(values: pl.Series) -> list[list[int]]:
 # Nine stage functions (mirror adapters/_template/build_adapter.py)
 # ---------------------------------------------------------------------------
 
-def stage_1_inspect_source(input_path: Path) -> SourceData:
-    """Load GRIT Europe inputs and validate expected row counts.
+def stage_1_inspect_source(
+    input_path: Path,
+    work_root: Path,
+    region_code: str,
+) -> SourceData:
+    """Load GRIT regional inputs and log row counts.
 
-    ``input_path`` is the outer GRIT archive zip (``17435232.zip`` for the
-    Europe slice).  This stage unzips the three Europe GPKGs, reads the
+    ``input_path`` is the outer GRIT archive zip. This stage unzips the
+    three regional GPKGs, reads the
     polars segments table, reads the segment-catchments GeoDataFrame, and
     reads the segment-lines GeoDataFrame used for the snap layer.
 
-    The reach layer is inspected via :data:`EU_INPUTS` but not loaded here
-    because its ``is_mainstem`` and drainage-area columns are null in the
-    Europe slice — we fall back to segment-line snap targets.
+    The reach layer is extracted via :data:`REGION_INPUTS` but not loaded by
+    this build; segment lines remain the snap targets.
     """
     if not input_path.exists():
         raise FileNotFoundError(f"outer archive missing: {input_path}")
 
-    root = input_path.parent
-    # Convention from the existing CLI: extracted inputs live in ``<root>/input``
-    # where ``root`` is ``--root``, not the archive's parent.  The caller
-    # passes the outer archive as ``input_path`` and the working ``root``
-    # separately; here we defer the extract directory to whoever invoked us
-    # by resolving it from the global passed through the CLI.  To keep the
-    # stage signature aligned with the template, extraction is done in the
-    # CLI dispatcher before stage_1 runs, and the inputs map is passed via
-    # module-level state on the outer archive file.  See ``main``.
-    #
-    # In practice this stage is always called after ``_extract_inputs`` has
-    # populated ``<work_root>/input``; ``input_path`` here points at the
-    # outer archive and we resolve the already-extracted inputs relative to
-    # the working root stored in ``_CURRENT_WORK_ROOT``.
-    work_root = _CURRENT_WORK_ROOT
-    if work_root is None:
-        raise RuntimeError(
-            "stage_1_inspect_source called before the working root was set; "
-            "use main() to drive the pipeline."
-        )
-
-    inputs = _extract_inputs(work_root, input_path)
+    inputs = _extract_inputs(work_root, input_path, region_code)
 
     log("read segments table (polars)")
     segments = _read_segments_table(inputs["segments"])
-    if segments.height != EXPECTED_SEGMENT_COUNT:
-        raise ValueError(
-            f"expected {EXPECTED_SEGMENT_COUNT} Europe segment rows, "
-            f"found {segments.height}"
-        )
+    log(f"region {region_code} loaded {segments.height} segments")
 
     log("read segment catchments (geopandas)")
     catchments = pyogrio.read_dataframe(
@@ -344,11 +336,7 @@ def stage_1_inspect_source(input_path: Path) -> SourceData:
         read_geometry=True,
         use_arrow=True,
     )
-    if len(catchments) != EXPECTED_SEGMENT_COUNT:
-        raise ValueError(
-            f"expected {EXPECTED_SEGMENT_COUNT} Europe segment catchments, "
-            f"found {len(catchments)}"
-        )
+    log(f"region {region_code} loaded {len(catchments)} segment catchments")
 
     log("read segment lines for snap layer (geopandas)")
     snap_lines = pyogrio.read_dataframe(
@@ -358,11 +346,7 @@ def stage_1_inspect_source(input_path: Path) -> SourceData:
         read_geometry=True,
         use_arrow=True,
     )
-    if len(snap_lines) != EXPECTED_SEGMENT_COUNT:
-        raise ValueError(
-            f"expected {EXPECTED_SEGMENT_COUNT} segment snap rows, "
-            f"found {len(snap_lines)}"
-        )
+    log(f"region {region_code} loaded {len(snap_lines)} segment snap lines")
 
     return SourceData(
         inputs=inputs,
@@ -391,10 +375,10 @@ def stage_2_assign_ids(source: SourceData) -> gpd.GeoDataFrame:
 
 
 def stage_3_reproject(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Assert the GRIT Europe GPKGs are already in EPSG:4326 — no reprojection."""
+    """Assert the GRIT GPKGs are already in EPSG:4326; no reprojection is needed."""
     if gdf.crs is not None and gdf.crs.to_epsg() not in (4326, None):
         raise ValueError(
-            f"GRIT Europe inputs are expected to be EPSG:4326 already, got {gdf.crs}"
+            f"GRIT inputs are expected to be EPSG:4326 already, got {gdf.crs}"
         )
     return gdf
 
@@ -592,8 +576,8 @@ def stage_8_write_snap(
 ) -> int:
     """Write ``snap.parquet`` from segment-line features.
 
-    GRIT reaches are rejected in the Europe slice (null ``is_mainstem`` and
-    drainage-area columns); segment lines are the validated fallback.
+    GRIT reaches are extracted for availability but not used by this build;
+    segment lines are the snap targets.
 
     ``weight = drainage_area_out`` satisfies the v0.2 requirement that
     ``weight`` be monotonically increasing in drainage dominance.
@@ -665,8 +649,9 @@ def stage_9_write_manifest(
     out_dir: Path,
     bbox: tuple[float, float, float, float],
     atom_count: int,
+    region_code: str,
 ) -> None:
-    """Write ``manifest.json`` with the GRIT Europe v0.2 fields."""
+    """Write ``manifest.json`` with GRIT v0.2 fields."""
     manifest = {
         "format_version": "0.1",
         "fabric_name": FABRIC_NAME,
@@ -677,7 +662,7 @@ def stage_9_write_manifest(
         "has_snap": HAS_SNAP,
         "terminal_sink_id": 0,
         "topology": TOPOLOGY,
-        "region": REGION,
+        "region": REGION_NAMES[region_code],
         "bbox": outward_bbox(bbox),
         "atom_count": atom_count,
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -692,8 +677,8 @@ def stage_9_write_manifest(
 # Validate helper
 # ---------------------------------------------------------------------------
 
-def validate(out_dir: Path, strict: bool = True, sample_pct: float = 100.0) -> int:
-    """Validate the built HFX dataset at ``out_dir/hfx``.
+def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0) -> int:
+    """Validate the built HFX dataset at ``dataset_path``.
 
     Layer 1 — authoritative HFX validator via ``cargo run -p hfx-validator``
     (text + json output, json saved as ``validator-report.json`` beside
@@ -705,7 +690,6 @@ def validate(out_dir: Path, strict: bool = True, sample_pct: float = 100.0) -> i
 
     Returns the worst (max) exit code from the two validator invocations.
     """
-    dataset_path = out_dir / "hfx"
     if not dataset_path.exists():
         raise FileNotFoundError(f"dataset path missing: {dataset_path}")
 
@@ -750,9 +734,9 @@ def validate(out_dir: Path, strict: bool = True, sample_pct: float = 100.0) -> i
         capture_output=True,
         text=True,
     )
-    (out_dir / "validator-report.json").write_text(json_run.stdout)
+    (dataset_path / "validator-report.json").write_text(json_run.stdout)
     if json_run.stderr:
-        (out_dir / "validator-report.stderr").write_text(json_run.stderr)
+        (dataset_path / "validator-report.stderr").write_text(json_run.stderr)
 
     catchments_path = dataset_path / "catchments.parquet"
     assert_geoparquet_valid(catchments_path)
@@ -766,19 +750,19 @@ def validate(out_dir: Path, strict: bool = True, sample_pct: float = 100.0) -> i
 # CLI
 # ---------------------------------------------------------------------------
 
-# Working root for the current pipeline invocation.  ``stage_1_inspect_source``
-# reads this to resolve the ``<work_root>/input`` directory where the outer
-# archive is unpacked.  It is set by ``main`` before the pipeline runs.
-_CURRENT_WORK_ROOT: Path | None = None
-
-
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scratch GRIT Europe -> HFX wrangler.")
+    parser = argparse.ArgumentParser(description="Scratch GRIT regional -> HFX wrangler.")
+    parser.add_argument(
+        "--region",
+        choices=REGION_CODES,
+        required=True,
+        help="GRIT region code to extract, build, or validate",
+    )
     parser.add_argument(
         "--root",
         type=Path,
         default=DEFAULT_ROOT,
-        help="working directory for extracted inputs and generated HFX output",
+        help="base working directory for extracted inputs and generated HFX output",
     )
     parser.add_argument(
         "--outer-archive",
@@ -795,11 +779,11 @@ def _parse_args() -> argparse.Namespace:
 
     subparsers.add_parser(
         "extract",
-        help="extract the Europe inputs from the outer GRIT archive",
+        help="extract regional inputs from the outer GRIT archive",
     )
     subparsers.add_parser(
         "build",
-        help="build the scratch HFX dataset into <root>/hfx",
+        help="build the scratch HFX dataset into <root>/per-region/grit-hfx-<region_lower>",
     )
 
     validate_parser = subparsers.add_parser(
@@ -831,56 +815,48 @@ def _require_outer_archive(args: argparse.Namespace) -> Path:
     return archive
 
 
-def _build_dataset(root: Path, outer_archive: Path) -> None:
+def _region_work_root(root: Path, region_code: str) -> Path:
+    """Return the per-region working directory under the root."""
+    return root / "per-region" / f"grit-hfx-{region_code.lower()}"
+
+
+def _build_dataset(root: Path, outer_archive: Path, region_code: str) -> None:
     """Drive the nine stages end-to-end."""
-    global _CURRENT_WORK_ROOT
-    _CURRENT_WORK_ROOT = root
+    ensure_dir(root)
 
-    hfx_dir = root / "hfx"
-    ensure_dir(hfx_dir)
-
-    source = stage_1_inspect_source(outer_archive)
+    source = stage_1_inspect_source(outer_archive, root, region_code)
     gdf = stage_2_assign_ids(source)
     gdf = stage_3_reproject(gdf)
     gdf = stage_4_make_valid(gdf)
     gdf = stage_5_hilbert_sort(gdf)
 
-    catchment_ids, bbox = stage_6_write_catchments(gdf, hfx_dir)
-    if len(catchment_ids) != EXPECTED_SEGMENT_COUNT:
-        raise ValueError(
-            f"expected {EXPECTED_SEGMENT_COUNT} catchment ids, found {len(catchment_ids)}"
-        )
+    catchment_ids, bbox = stage_6_write_catchments(gdf, root)
+    log(f"region {region_code} wrote {len(catchment_ids)} catchments")
 
     # Release the polygon GeoDataFrame before loading the snap lines again;
     # peak memory is dominated by holding both at once.
     del gdf
     gc.collect()
 
-    stage_7_write_graph(source.segments, catchment_ids, hfx_dir)
+    stage_7_write_graph(source.segments, catchment_ids, root)
 
     catchment_id_set = set(catchment_ids)
-    snap_rows = stage_8_write_snap(source.snap_lines, catchment_id_set, hfx_dir)
-    if snap_rows != EXPECTED_SEGMENT_COUNT:
-        raise ValueError(
-            f"expected {EXPECTED_SEGMENT_COUNT} snap rows, found {snap_rows}"
-        )
+    snap_rows = stage_8_write_snap(source.snap_lines, catchment_id_set, root)
+    log(f"region {region_code} wrote {snap_rows} snap rows")
 
-    stage_9_write_manifest(hfx_dir, bbox, len(catchment_ids))
+    stage_9_write_manifest(root, bbox, len(catchment_ids), region_code)
 
 
 def main() -> int:
     """Dispatch subcommands and orchestrate the build pipeline."""
-    global _CURRENT_WORK_ROOT
-
     args = _parse_args()
-    root = args.root.resolve()
-    _CURRENT_WORK_ROOT = root
+    root = _region_work_root(args.root.resolve(), args.region)
 
     if args.command == "extract":
-        _extract_inputs(root, _require_outer_archive(args))
+        _extract_inputs(root, _require_outer_archive(args), args.region)
         return 0
     if args.command == "build":
-        _build_dataset(root, _require_outer_archive(args))
+        _build_dataset(root, _require_outer_archive(args), args.region)
         return 0
     if args.command == "validate":
         return validate(root, strict=args.strict, sample_pct=args.sample_pct)

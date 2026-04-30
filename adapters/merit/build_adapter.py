@@ -141,7 +141,7 @@ class SourceData:
 
 
 # ---------------------------------------------------------------------------
-# Implemented helpers (vendored verbatim from adapters/grit/build_grit_eu_hfx.py)
+# Implemented helpers (vendored verbatim from adapters/grit/build_adapter.py)
 # ---------------------------------------------------------------------------
 
 def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:

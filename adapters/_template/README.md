@@ -31,7 +31,7 @@ flowchart TD
 - Raster stages: if your fabric requires `flow_dir.tif` / `flow_acc.tif`, set `HAS_RASTERS = True` and add raster-copy or raster-conversion logic after stage 5.
 - Source-specific ID mapping logic: only your adapter knows how to map source keys to stable `int64 > 0` HFX IDs.
 - `up_area_km2` computation: if `HAS_UP_AREA = True`, stage 6 must populate the column; otherwise it is written as null and the engine computes it from graph traversal.
-- `balanced_row_group_bounds` helper: adapters that ship more than 4096 atoms must implement or vendor this helper from `adapters/grit/build_grit_eu_hfx.py`. It distributes rows evenly across row groups whose size falls in `[ROW_GROUP_MIN, ROW_GROUP_MAX]` = `[4096, 8192]`.
+- `balanced_row_group_bounds` helper: adapters that ship more than 4096 atoms must implement or vendor this helper from `adapters/grit/build_adapter.py`. It distributes rows evenly across row groups whose size falls in `[ROW_GROUP_MIN, ROW_GROUP_MAX]` = `[4096, 8192]`.
 
 ## Getting started
 
