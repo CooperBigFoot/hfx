@@ -63,7 +63,7 @@ This repository is organized as a spec-first monorepo:
 | [`examples/`](./examples) | Reference datasets and implementer-facing examples |
 | [`conformance/`](./conformance) | Valid and invalid fixtures for validator and interoperability work |
 | [`crates/`](./crates) | Rust toolkit crates, including shared logic and the validator CLI |
-| [`adapters/`](./adapters) | Source-fabric compilers (GRIT working, MERIT scaffolded) |
+| [`adapters/`](./adapters) | Source-fabric compilers (GRIT and MERIT, both working) |
 | [`docs/decisions/`](./docs/decisions) | Short decision records for important spec and architecture choices |
 | [`scripts/`](./scripts) | Repo helper scripts and release support utilities |
 
@@ -102,16 +102,20 @@ Validation behavior is defined against [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
 
 ## Datasets
 
+Both reference datasets are hosted on Cloudflare R2 (kindly donated by [Upstream Tech](https://upstream.tech/)) and readable directly over HTTPS via range requests, so engines do not have to download them in full.
+
 ### `merit_basins` — Global MERIT-Basins HFX (Pfafstetter Level-2)
 
-The first complete global HFX dataset, compiled from MERIT-Basins v0.7 / v1.0_bugfix1 and the mghydro per-basin raster rehost.
+Compiled from MERIT-Basins v0.7 / v1.0_bugfix1 and the mghydro per-basin raster rehost.
 
 | Property | Value |
 |---|---|
 | Adapter version | `0.1.0` |
 | Format version | `0.1` |
+| Topology | tree |
 | Atom count | 2,876,771 across 60 of 61 Pfaf-L2 basins |
 | Bounding box | `[-178.03, -55.57, 179.89, 83.65]` (planetary) |
+| Manifest | <https://basin-delineations-public.upstream.tech/merit-basins/0.1.0/manifest.json> |
 
 **Files:**
 
@@ -127,18 +131,38 @@ The first complete global HFX dataset, compiled from MERIT-Basins v0.7 / v1.0_bu
 
 **Known gaps:** pfaf-35 (anti-meridian wrap — mghydro clips at 180°E); pfaf-87/88 (Antarctic sub-basins — absent from mghydro's distribution).
 
-**Local path:** `~/Desktop/merit-hfx/global/hfx/` (operator-local; not yet hosted remotely).
+### `grit` — Global GRIT HFX
 
-**R2 hosting:** pending shed's `object_store` integration. See TODO.md Phase 4.
+Compiled from the seven published [GRIT](https://zenodo.org/records/17435232) regions (`AF`, `AS`, `EU`, `NA`, `SA`, `SI`, `SP`) merged into one strict-valid dataset. Vector-only — GRIT does not ship paired rasters.
 
-**Validate:**
+| Property | Value |
+|---|---|
+| Fabric version | `1.0.0` |
+| Adapter version | `grit-regional-scratch-2026-04-30` |
+| Format version | `0.1` |
+| Topology | DAG (handles braiding and distributaries) |
+| Atom count | 1,767,065 |
+| Bounding box | global |
+| Manifest | <https://basin-delineations-public.upstream.tech/grit/1.0.0/manifest.json> |
+
+**Files:**
+
+| Artifact | Size |
+|---|---|
+| `manifest.json` | 446 B |
+| `graph.arrow` | 34 MB |
+| `snap.parquet` | 3.4 GB |
+| `catchments.parquet` | 9.6 GB |
+| **Total** | **~13 GB** |
+
+**Validate** any local copy of either dataset:
 
 ```bash
-hfx ~/Desktop/merit-hfx/global/hfx/ --strict --sample-pct 100
+hfx ./path/to/dataset --strict
 ```
 
 ## Status
 
-HFX v0.1 is the first published spec iteration. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). The validator runs all documented check phases with a broad integration and conformance test suite, and a working [GRIT adapter](./adapters/grit/) demonstrates the end-to-end contract. Known conformance gaps (raster CRS/extent checks, reach-based snap, Hilbert parameters) are tracked in [docs/decisions/2026-04-13-post-grit-open-items.md](./docs/decisions/2026-04-13-post-grit-open-items.md).
+HFX v0.1 is the first published spec iteration. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). The validator runs all documented check phases with a broad integration and conformance test suite, and working [GRIT](./adapters/grit/) and [MERIT](./adapters/merit/) adapters have produced strict-valid global datasets that demonstrate the end-to-end contract. Known conformance gaps (raster CRS/extent checks, reach-based snap, Hilbert parameters) are tracked in [docs/decisions/2026-04-13-post-grit-open-items.md](./docs/decisions/2026-04-13-post-grit-open-items.md).
 
 Language choice is Rust for the validator and engine-facing tooling. Python bindings live in the downstream [shed](https://github.com/CooperBigFoot/shed) engine.
