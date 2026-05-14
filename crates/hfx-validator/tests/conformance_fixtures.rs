@@ -13,14 +13,16 @@ fn fixture_path(category: &str, name: &str) -> PathBuf {
 }
 
 #[test]
-fn conformance_valid_tiny_passes() {
-    let p = fixture_path("valid", "tiny");
-    let report = validate(&p, false, true, 100.0);
-    assert!(
-        report.is_valid(),
-        "expected valid, diagnostics: {:#?}",
-        report.diagnostics()
-    );
+fn conformance_valid_fixtures_pass() {
+    for name in ["tiny", "tiny-with-aux-d8"] {
+        let p = fixture_path("valid", name);
+        let report = validate(&p, false, true, 100.0);
+        assert!(
+            report.is_valid(),
+            "expected {name} to be valid, diagnostics: {:#?}",
+            report.diagnostics()
+        );
+    }
 }
 
 #[test]
@@ -37,6 +39,7 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
             "legacy-format-version",
             "manifest.unsupported_format_version",
         ),
+        ("legacy-graph-arrow", "graph.legacy_arrow_format"),
     ];
 
     for (name, expected) in cases {

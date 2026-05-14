@@ -138,7 +138,13 @@ def write_graph(out_dir: Path, upstream: dict[int, list[int]]) -> None:
         writer.write_table(table)
 
 
-def write_manifest(out_dir: Path, *, crs: str = "EPSG:4326", version: str = "0.2") -> None:
+def write_manifest(
+    out_dir: Path,
+    *,
+    crs: str = "EPSG:4326",
+    version: str = "0.2",
+    auxiliary: list[dict] | None = None,
+) -> None:
     manifest = {
         "format_version": version,
         "fabric_name": FABRIC_NAME,
@@ -150,11 +156,18 @@ def write_manifest(out_dir: Path, *, crs: str = "EPSG:4326", version: str = "0.2
         "created_at": CREATED_AT,
         "adapter_version": ADAPTER_VERSION,
     }
+    if auxiliary is not None:
+        manifest["auxiliary"] = auxiliary
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def write_readme(out_dir: Path, title: str, expected: str) -> None:
     (out_dir / "README.md").write_text(f"# {title}\n\nExpected diagnostic: `{expected}`.\n")
+
+
+def write_placeholder_rasters(out_dir: Path) -> None:
+    (out_dir / "flow_dir.tif").write_bytes(b"placeholder flow_dir for skip-raster conformance\n")
+    (out_dir / "flow_acc.tif").write_bytes(b"placeholder flow_acc for skip-raster conformance\n")
 
 
 def generate_valid_tiny() -> None:
@@ -164,6 +177,30 @@ def generate_valid_tiny() -> None:
     write_graph(out, VALID_UPSTREAM)
     write_manifest(out)
     write_readme(out, "Valid tiny v0.2 fixture", "none")
+
+
+def generate_valid_tiny_with_aux_d8() -> None:
+    out = SCRIPT_DIR / "valid" / "tiny-with-aux-d8"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_placeholder_rasters(out)
+    write_manifest(
+        out,
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v1",
+                "artifacts": {
+                    "flow_dir": "flow_dir.tif",
+                    "flow_acc": "flow_acc.tif",
+                },
+                "metadata": {
+                    "flow_dir_encoding": "esri",
+                },
+            }
+        ],
+    )
+    write_readme(out, "Valid tiny v0.2 fixture with D8 auxiliary rasters", "none")
 
 
 def generate_invalid_dangling() -> None:
@@ -225,13 +262,24 @@ def generate_legacy_format_version() -> None:
     write_readme(out, "Legacy v0.1 manifest", "manifest.unsupported_format_version")
 
 
+def generate_legacy_graph_arrow() -> None:
+    out = SCRIPT_DIR / "invalid" / "legacy-graph-arrow"
+    reset_dir(out)
+    write_catchments(out)
+    (out / "graph.arrow").write_bytes(b"legacy graph placeholder\n")
+    write_manifest(out)
+    write_readme(out, "Legacy graph.arrow file", "graph.legacy_arrow_format")
+
+
 def main() -> None:
     generate_valid_tiny()
+    generate_valid_tiny_with_aux_d8()
     generate_invalid_dangling()
     generate_invalid_crs()
     generate_invalid_parent_cycle()
     generate_invalid_parent_level()
     generate_legacy_format_version()
+    generate_legacy_graph_arrow()
     print("[generate_fixtures] Wrote HFX v0.2 conformance fixtures")
 
 

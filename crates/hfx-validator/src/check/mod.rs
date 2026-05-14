@@ -57,6 +57,7 @@ pub fn run_checks(
         all.extend(ids::check_unit_ids(catchments));
         all.extend(ids::check_catchment_bboxes(catchments));
         all.extend(ids::check_catchment_areas(catchments));
+        all.extend(values::check_outlet_coords(catchments));
 
         if let Some(raw) = raw_manifest_ref {
             all.extend(values::check_up_area_consistency(raw, catchments));
@@ -110,7 +111,7 @@ pub fn run_checks(
     }
 
     // Phase 7: raster (skipped if skip_rasters is true)
-    if !skip_rasters {
+    if !skip_rasters && declares_d8_raster_aux(dataset) {
         let manifest_ref = dataset.manifest.as_ref();
 
         if let Some(ref flow_dir_meta) = dataset.flow_dir {
@@ -137,4 +138,16 @@ pub fn run_checks(
     }
 
     all
+}
+
+fn declares_d8_raster_aux(dataset: &ParsedDataset) -> bool {
+    dataset
+        .raw_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.auxiliary.as_ref())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
+        })
 }

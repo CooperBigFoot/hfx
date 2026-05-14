@@ -55,6 +55,77 @@ pub fn check_up_area_consistency(
 }
 
 // ---------------------------------------------------------------------------
+// C5: outlet coordinate domain
+// ---------------------------------------------------------------------------
+
+/// C5 — Check outlet coordinates are finite WGS84 lon/lat values.
+pub fn check_outlet_coords(data: &CatchmentsData) -> Vec<Diagnostic> {
+    let mut diags: Vec<Diagnostic> = Vec::new();
+
+    for (idx, (&lon, &lat)) in data
+        .outlet_lons
+        .iter()
+        .zip(data.outlet_lats.iter())
+        .enumerate()
+    {
+        if !lon.is_finite() {
+            diags.push(
+                Diagnostic::error(
+                    "values.outlet_lon",
+                    Category::ValueConsistency,
+                    Artifact::Catchments,
+                    format!(
+                        "outlet_lon at row {idx} is not finite; outlet longitude must be finite"
+                    ),
+                )
+                .at(Location::Row { index: idx }),
+            );
+        } else if !(-180.0..=180.0).contains(&lon) {
+            diags.push(
+                Diagnostic::error(
+                    "values.outlet_lon",
+                    Category::ValueConsistency,
+                    Artifact::Catchments,
+                    format!(
+                        "outlet_lon at row {idx} is {lon}; outlet longitude must be in [-180, 180]"
+                    ),
+                )
+                .at(Location::Row { index: idx }),
+            );
+        }
+
+        if !lat.is_finite() {
+            diags.push(
+                Diagnostic::error(
+                    "values.outlet_lat",
+                    Category::ValueConsistency,
+                    Artifact::Catchments,
+                    format!(
+                        "outlet_lat at row {idx} is not finite; outlet latitude must be finite"
+                    ),
+                )
+                .at(Location::Row { index: idx }),
+            );
+        } else if !(-90.0..=90.0).contains(&lat) {
+            diags.push(
+                Diagnostic::error(
+                    "values.outlet_lat",
+                    Category::ValueConsistency,
+                    Artifact::Catchments,
+                    format!(
+                        "outlet_lat at row {idx} is {lat}; outlet latitude must be in [-90, 90]"
+                    ),
+                )
+                .at(Location::Row { index: idx }),
+            );
+        }
+    }
+
+    debug!(count = diags.len(), "C5 outlet coordinate checks complete");
+    diags
+}
+
+// ---------------------------------------------------------------------------
 // D4: Manifest bbox enclosure
 // ---------------------------------------------------------------------------
 

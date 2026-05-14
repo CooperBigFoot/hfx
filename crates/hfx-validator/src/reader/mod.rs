@@ -30,6 +30,14 @@ use crate::dataset::{FilePresenceMap, ParsedDataset};
 /// This function never panics. All I/O errors become diagnostics.
 #[tracing::instrument(skip_all, fields(dir = %dir.display()))]
 pub fn read_dataset(dir: &Path) -> ParsedDataset {
+    read_dataset_with_options(dir, false)
+}
+
+/// Read all files from a dataset directory with validator read options.
+///
+/// This function never panics. All I/O errors become diagnostics.
+#[tracing::instrument(skip_all, fields(dir = %dir.display(), skip_rasters))]
+pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDataset {
     let files = discover_files(dir);
     let mut read_diagnostics: Vec<crate::diagnostic::Diagnostic> = Vec::new();
 
@@ -81,7 +89,7 @@ pub fn read_dataset(dir: &Path) -> ParsedDataset {
     let mut flow_dir = None;
     let mut flow_acc = None;
 
-    if has_d8_aux {
+    if has_d8_aux && !skip_rasters {
         if let Some(ref path) = files.flow_dir_path {
             let (meta, diags) = raster::read_raster_meta(path, "flow_dir.tif");
             read_diagnostics.extend(diags);
