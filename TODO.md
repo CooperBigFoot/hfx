@@ -1,5 +1,21 @@
 # HFX TODO
 
+## HFX v0.2 spec and validator split
+
+PR A - spec and schemas:
+- [ ] Rewrite `spec/HFX_SPEC.md` for v0.2 drainage units, levels, parents, outlets, `graph.parquet`, optional `snap.parquet`, and manifest-declared auxiliary artifacts.
+- [ ] Add the blessed `hfx.aux.d8_raster.v1` schema documentation and JSON Schema.
+- [ ] Replace `schemas/manifest.schema.json` with the v0.2 hard-cut manifest contract.
+- [ ] Rewrite `docs/ADAPTER_GUIDE.md` around v0.2 producer responsibilities without touching adapter code.
+- [ ] Flip the v0.2 decision record to Accepted.
+
+PR B - Rust validator and fixtures:
+- [ ] Rename core `Atom*` types to `Unit*` types and add `Level`, `OutletCoord`, and auxiliary declarations.
+- [ ] Rewrite validator readers for `graph.parquet`, v0.2 catchments, v0.2 snap, and hard-cut v0.1 diagnostics.
+- [ ] Add parent, level, nesting, outlet, and auxiliary check modules.
+- [ ] Regenerate conformance fixtures for v0.2 valid, invalid, legacy, and auxiliary cases.
+- [ ] Run `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check`, and fixture regeneration checks.
+
 Strategic direction (settled 2026-04-22): **one global HFX dataset per fabric, served from object storage (R2), with cloud-native lazy reads via HTTP byte ranges.** shed reads from local paths or remote URLs through a single code path (`object_store` Rust crate).
 
 ## Settled decisions

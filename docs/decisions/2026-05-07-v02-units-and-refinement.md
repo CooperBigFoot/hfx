@@ -1,8 +1,11 @@
 # HFX v0.2 Units and Refinement Direction
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-05-07
+
+**Follow-up:** Validator implementation is tracked in the v0.2 validator PR
+after the spec and JSON Schemas are frozen.
 
 ## Decision
 

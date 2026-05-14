@@ -34,18 +34,23 @@ An HFX dataset is a single folder containing these artifacts:
 
 | Artifact | Purpose |
 |---|---|
-| `catchments.parquet` | Drainage unit polygons ("atoms"), Hilbert-sorted with bbox columns for row-group pruning |
-| `graph.arrow` | Upstream adjacency graph stored as Arrow IPC for zero-copy loading |
-| `snap.parquet` | Reach or node geometries used for weight-first outlet snapping with distance/mainstem tie-breakers |
-| `flow_dir.tif` | Optional COG flow-direction raster for terminal atom refinement |
-| `flow_acc.tif` | Optional COG flow-accumulation raster paired with `flow_dir.tif` |
-| `manifest.json` | Dataset metadata describing fabric identity, CRS, topology class, and raster encoding |
+| `catchments.parquet` | Drainage-unit polygons, levels, parent links, outlets, and bbox columns for row-group pruning |
+| `graph.parquet` | Same-level upstream adjacency graph |
+| `snap.parquet` | Optional reach or node geometries used for outlet snapping |
+| `manifest.json` | Dataset metadata describing fabric identity, CRS, topology class, counts, and auxiliary declarations |
 
-## v0.1 Scope
+Auxiliary data such as paired D8 rasters is declared in `manifest.json`, for
+example with `hfx.aux.d8_raster.v1` entries pointing at `flow_dir.tif` and
+`flow_acc.tif`.
 
-Current design boundaries for HFX v0.1:
+## v0.2 Scope
 
-- Inclusive upstream accumulation only.
+Current design boundaries for HFX v0.2:
+
+- Multi-level drainage units with explicit parent relationships.
+- Same-level graph traversal only; cross-level hierarchy lives in `parent_id`.
+- Optional snap features are separate from required unit outlets.
+- Auxiliary artifacts are manifest-declared, not first-class core files.
 - EPSG:4326 is required.
 - Each dataset is self-contained in a single folder.
 - The manifest describes the data, not engine traversal policy.
@@ -122,7 +127,7 @@ Compiled from MERIT-Basins v0.7 / v1.0_bugfix1 and the mghydro per-basin raster 
 | Artifact | Size |
 |---|---|
 | `manifest.json` | 428 B |
-| `graph.arrow` | 54 MB |
+| `graph.parquet` | Pending v0.2 republish; hosted v0.1 dataset uses the legacy graph artifact |
 | `catchments.parquet` | 6.1 GB |
 | `snap.parquet` | 1.7 GB |
 | `flow_dir.tif` | 12 GB |
@@ -150,7 +155,7 @@ Compiled from the seven published [GRIT](https://zenodo.org/records/17435232) re
 | Artifact | Size |
 |---|---|
 | `manifest.json` | 446 B |
-| `graph.arrow` | 34 MB |
+| `graph.parquet` | Pending v0.2 republish; hosted v0.1 dataset uses the legacy graph artifact |
 | `snap.parquet` | 3.4 GB |
 | `catchments.parquet` | 9.6 GB |
 | **Total** | **~13 GB** |
@@ -163,6 +168,6 @@ hfx ./path/to/dataset --strict
 
 ## Status
 
-HFX v0.1 is the first published spec iteration. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). The validator runs all documented check phases with a broad integration and conformance test suite, and working [GRIT](./adapters/grit/) and [MERIT](./adapters/merit/) adapters have produced strict-valid global datasets that demonstrate the end-to-end contract. Known conformance gaps (raster CRS/extent checks, reach-based snap, Hilbert parameters) are tracked in [docs/decisions/2026-04-13-post-grit-open-items.md](./docs/decisions/2026-04-13-post-grit-open-items.md).
+HFX v0.2 is the active spec direction. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). Existing hosted GRIT and MERIT datasets are v0.1 examples until their adapters are updated to the v0.2 contract.
 
 Language choice is Rust for the validator and engine-facing tooling. Python bindings live in the downstream [shed](https://github.com/CooperBigFoot/shed) engine.

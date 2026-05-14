@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hfx.dev/schemas/manifest.schema.json",
   "title": "HFX Manifest",
-  "description": "Schema for the HFX dataset manifest defined by the HFX v0.1 specification.",
+  "description": "Schema for the HFX dataset manifest defined by the HFX v0.2 specification.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,19 +10,16 @@
     "fabric_name",
     "crs",
     "has_up_area",
-    "has_rasters",
-    "has_snap",
-    "terminal_sink_id",
     "topology",
     "bbox",
-    "atom_count",
+    "unit_count",
     "created_at",
     "adapter_version"
   ],
   "properties": {
     "format_version": {
       "type": "string",
-      "const": "0.1"
+      "const": "0.2"
     },
     "fabric_name": {
       "type": "string",
@@ -33,30 +30,12 @@
       "type": "string",
       "minLength": 1
     },
-    "fabric_level": {
-      "type": "integer",
-      "minimum": 0
-    },
     "crs": {
       "type": "string",
       "const": "EPSG:4326"
     },
     "has_up_area": {
       "type": "boolean"
-    },
-    "has_rasters": {
-      "type": "boolean"
-    },
-    "has_snap": {
-      "type": "boolean"
-    },
-    "flow_dir_encoding": {
-      "type": "string",
-      "enum": ["esri", "taudem"]
-    },
-    "terminal_sink_id": {
-      "type": "integer",
-      "const": 0
     },
     "topology": {
       "type": "string",
@@ -74,7 +53,7 @@
       "minItems": 4,
       "maxItems": 4
     },
-    "atom_count": {
+    "unit_count": {
       "type": "integer",
       "minimum": 1
     },
@@ -85,21 +64,40 @@
     "adapter_version": {
       "type": "string",
       "minLength": 1
-    }
-  },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "has_rasters": {
-            "const": true
-          }
-        },
-        "required": ["has_rasters"]
-      },
-      "then": {
-        "required": ["flow_dir_encoding"]
+    },
+    "auxiliary": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/auxiliaryEntry"
       }
     }
-  ]
+  },
+  "$defs": {
+    "auxiliaryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "artifacts", "metadata"],
+      "properties": {
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifacts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    }
+  }
 }

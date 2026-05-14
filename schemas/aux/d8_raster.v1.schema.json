@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hfx.dev/schemas/aux/d8_raster.v1.schema.json",
+  "title": "HFX D8 Raster Auxiliary Metadata v1",
+  "description": "Metadata schema for hfx.aux.d8_raster.v1 auxiliary declarations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["flow_dir_encoding"],
+  "properties": {
+    "flow_dir_encoding": {
+      "type": "string",
+      "enum": ["esri", "taudem"]
+    }
+  }
+}
