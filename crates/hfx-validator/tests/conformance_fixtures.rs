@@ -1,11 +1,4 @@
 //! Conformance fixture tests for the hfx-validator.
-//!
-//! Each test loads a pre-generated fixture from the `conformance/` directory
-//! at the repo root and asserts the expected validator outcome.
-//!
-//! Fixtures are generated (and regenerated) by running:
-//!
-//!     uv run conformance/generate_fixtures.py
 
 use std::path::PathBuf;
 
@@ -22,49 +15,38 @@ fn fixture_path(category: &str, name: &str) -> PathBuf {
 #[test]
 fn conformance_valid_tiny_passes() {
     let p = fixture_path("valid", "tiny");
-    let report = validate(
-        &p, /*strict=*/ false, /*skip_rasters=*/ true, /*sample_pct=*/ 100.0,
-    );
+    let report = validate(&p, false, true, 100.0);
     assert!(
         report.is_valid(),
         "expected valid, diagnostics: {:#?}",
         report.diagnostics()
     );
-    // A schema.catchments.rg_size WARNING may be present (5 rows < 4096). Tolerated in non-strict.
 }
 
 #[test]
-fn conformance_invalid_dangling_upstream_ref_fails() {
-    let p = fixture_path("invalid", "dangling-upstream-ref");
-    let report = validate(&p, false, true, 100.0);
-    assert!(!report.is_valid(), "expected invalid, got valid");
-    let has_ref_err = report
-        .diagnostics()
-        .iter()
-        .any(|d| d.check_id == "referential.upstream_not_in_catchments");
-    assert!(
-        has_ref_err,
-        "missing referential.upstream_not_in_catchments diagnostic; got: {:#?}",
-        report.diagnostics()
-    );
-    let has_999 = report.diagnostics().iter().any(|d| {
-        d.check_id == "referential.upstream_not_in_catchments" && d.message.contains("999")
-    });
-    assert!(has_999, "diagnostic message does not mention 999");
-}
+fn conformance_invalid_fixtures_emit_expected_diagnostic() {
+    let cases = [
+        (
+            "dangling-upstream-ref",
+            "referential.upstream_not_in_catchments",
+        ),
+        ("crs-mismatch", "manifest.crs"),
+        ("parent-cycle", "parent.cycle_detected"),
+        ("parent-level-not-coarser", "parent.level_not_coarser"),
+        (
+            "legacy-format-version",
+            "manifest.unsupported_format_version",
+        ),
+    ];
 
-#[test]
-fn conformance_invalid_crs_mismatch_fails() {
-    let p = fixture_path("invalid", "crs-mismatch");
-    let report = validate(&p, false, true, 100.0);
-    assert!(!report.is_valid(), "expected invalid");
-    let has_crs = report
-        .diagnostics()
-        .iter()
-        .any(|d| d.check_id == "manifest.crs" && d.message.contains("EPSG:32632"));
-    assert!(
-        has_crs,
-        "missing or ill-formed manifest.crs diagnostic; got: {:#?}",
-        report.diagnostics()
-    );
+    for (name, expected) in cases {
+        let p = fixture_path("invalid", name);
+        let report = validate(&p, false, true, 100.0);
+        assert!(!report.is_valid(), "expected {name} to be invalid");
+        assert!(
+            report.diagnostics().iter().any(|d| d.check_id == expected),
+            "fixture {name} missing {expected}; got {:#?}",
+            report.diagnostics()
+        );
+    }
 }

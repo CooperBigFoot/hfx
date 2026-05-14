@@ -2,46 +2,71 @@
 
 use crate::area::Weight;
 use crate::geo::{BoundingBox, WkbGeometry};
-use crate::id::{AtomId, SnapId};
+use crate::id::{SnapId, UnitId};
 
-/// Indicates whether a snap target lies on the mainstem channel or a
-/// tributary/distributary of the drainage network.
-///
-/// Using an enum rather than a `bool` makes call sites self-documenting and
-/// prevents accidental inversion of the flag.
+/// Errors from constructing snap-target domain values.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapError {
+    /// Returned when a stem role string is not supported by HFX v0.2.
+    #[error("unsupported stem role: {value:?}")]
+    UnsupportedStemRole {
+        /// The unsupported raw value.
+        value: String,
+    },
+}
+
+/// Indicates whether a snap target lies on the mainstem channel, a tributary,
+/// or an unknown stem role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MainstemStatus {
+pub enum StemRole {
     /// This feature is on the mainstem channel.
     Mainstem,
     /// This feature is on a tributary or distributary.
     Tributary,
+    /// The producer does not know or does not declare the stem role.
+    Unknown,
 }
 
-impl std::fmt::Display for MainstemStatus {
+impl std::fmt::Display for StemRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MainstemStatus::Mainstem => write!(f, "mainstem"),
-            MainstemStatus::Tributary => write!(f, "tributary"),
+            StemRole::Mainstem => write!(f, "mainstem"),
+            StemRole::Tributary => write!(f, "tributary"),
+            StemRole::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::str::FromStr for StemRole {
+    type Err = SnapError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mainstem" => Ok(StemRole::Mainstem),
+            "tributary" => Ok(StemRole::Tributary),
+            "unknown" => Ok(StemRole::Unknown),
+            _ => Err(SnapError::UnsupportedStemRole {
+                value: s.to_owned(),
+            }),
         }
     }
 }
 
 /// A candidate location to which a pour point may be snapped.
 ///
-/// Each `SnapTarget` belongs to exactly one [`CatchmentAtom`] (via
-/// `catchment_id`) and carries a proportional [`Weight`] used when multiple
-/// targets compete within the same catchment. The [`MainstemStatus`] lets
-/// snapping algorithms prefer mainstem reaches over tributaries.
+/// Each `SnapTarget` belongs to exactly one drainage unit and carries a
+/// proportional [`Weight`] used when multiple targets compete within the same
+/// unit.
 ///
 /// All fields are validated at construction time via their primitive newtypes;
 /// `SnapTarget` itself performs no additional validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapTarget {
     id: SnapId,
-    catchment_id: AtomId,
+    unit_id: UnitId,
     weight: Weight,
-    mainstem_status: MainstemStatus,
-    bbox: BoundingBox,
+    stem_role: Option<StemRole>,
+    bbox: Option<BoundingBox>,
     geometry: WkbGeometry,
 }
 
@@ -52,17 +77,17 @@ impl SnapTarget {
     /// performed here — invalid states are unrepresentable by construction.
     pub fn new(
         id: SnapId,
-        catchment_id: AtomId,
+        unit_id: UnitId,
         weight: Weight,
-        mainstem_status: MainstemStatus,
-        bbox: BoundingBox,
+        stem_role: Option<StemRole>,
+        bbox: Option<BoundingBox>,
         geometry: WkbGeometry,
     ) -> Self {
         Self {
             id,
-            catchment_id,
+            unit_id,
             weight,
-            mainstem_status,
+            stem_role,
             bbox,
             geometry,
         }
@@ -73,9 +98,9 @@ impl SnapTarget {
         self.id
     }
 
-    /// Return the identifier of the catchment atom this target belongs to.
-    pub fn catchment_id(&self) -> AtomId {
-        self.catchment_id
+    /// Return the identifier of the drainage unit this target belongs to.
+    pub fn unit_id(&self) -> UnitId {
+        self.unit_id
     }
 
     /// Return the proportional weight used for allocation across competing targets.
@@ -83,14 +108,14 @@ impl SnapTarget {
         self.weight
     }
 
-    /// Return whether this target lies on the mainstem or a tributary.
-    pub fn mainstem_status(&self) -> MainstemStatus {
-        self.mainstem_status
+    /// Return the optional stem role for this target.
+    pub fn stem_role(&self) -> Option<StemRole> {
+        self.stem_role
     }
 
-    /// Return a reference to the axis-aligned bounding box of this snap target.
-    pub fn bbox(&self) -> &BoundingBox {
-        &self.bbox
+    /// Return a reference to the optional axis-aligned bounding box.
+    pub fn bbox(&self) -> Option<&BoundingBox> {
+        self.bbox.as_ref()
     }
 
     /// Return a reference to the WKB geometry of this snap target (typically a
@@ -104,8 +129,8 @@ impl SnapTarget {
 mod tests {
     use super::*;
 
-    fn test_atom_id(raw: i64) -> AtomId {
-        AtomId::new(raw).unwrap()
+    fn test_unit_id(raw: i64) -> UnitId {
+        UnitId::new(raw).unwrap()
     }
 
     fn test_snap_id(raw: i64) -> SnapId {
@@ -125,59 +150,79 @@ mod tests {
     }
 
     #[test]
-    fn mainstem_status_variants_are_not_equal() {
-        assert_ne!(MainstemStatus::Mainstem, MainstemStatus::Tributary);
+    fn stem_role_variants_are_not_equal() {
+        assert_ne!(StemRole::Mainstem, StemRole::Tributary);
+        assert_ne!(StemRole::Mainstem, StemRole::Unknown);
     }
 
     #[test]
-    fn mainstem_status_can_be_copied_and_compared() {
-        let status = MainstemStatus::Mainstem;
+    fn stem_role_can_be_copied_and_compared() {
+        let status = StemRole::Mainstem;
         let copy = status;
         assert_eq!(status, copy);
 
-        let tributary = MainstemStatus::Tributary;
+        let tributary = StemRole::Tributary;
         let copy2 = tributary;
         assert_eq!(tributary, copy2);
     }
 
     #[test]
+    fn stem_role_parse_accepts_supported_values() {
+        assert_eq!("mainstem".parse::<StemRole>().unwrap(), StemRole::Mainstem);
+        assert_eq!(
+            "tributary".parse::<StemRole>().unwrap(),
+            StemRole::Tributary
+        );
+        assert_eq!("unknown".parse::<StemRole>().unwrap(), StemRole::Unknown);
+    }
+
+    #[test]
+    fn stem_role_parse_rejects_unknown_value() {
+        assert!(matches!(
+            "primary".parse::<StemRole>(),
+            Err(SnapError::UnsupportedStemRole { value }) if value == "primary"
+        ));
+    }
+
+    #[test]
     fn snap_target_getters_return_expected_values() {
         let snap_id = test_snap_id(7);
-        let catchment_id = test_atom_id(3);
+        let unit_id = test_unit_id(3);
         let weight = test_weight(0.75);
-        let mainstem_status = MainstemStatus::Mainstem;
+        let stem_role = Some(StemRole::Mainstem);
         let bbox = test_bbox();
         let geometry = test_wkb();
 
         let target = SnapTarget::new(
             snap_id,
-            catchment_id,
+            unit_id,
             weight,
-            mainstem_status,
-            bbox,
+            stem_role,
+            Some(bbox),
             geometry.clone(),
         );
 
         assert_eq!(target.id(), snap_id);
-        assert_eq!(target.catchment_id(), catchment_id);
+        assert_eq!(target.unit_id(), unit_id);
         assert_eq!(target.weight(), weight);
-        assert_eq!(target.mainstem_status(), MainstemStatus::Mainstem);
-        assert_eq!(target.bbox(), &bbox);
+        assert_eq!(target.stem_role(), Some(StemRole::Mainstem));
+        assert_eq!(target.bbox(), Some(&bbox));
         assert_eq!(target.geometry(), &geometry);
     }
 
     #[test]
-    fn catchment_id_returns_atom_id_passed_to_constructor() {
-        let catchment_id = test_atom_id(99);
+    fn unit_id_returns_unit_id_passed_to_constructor() {
+        let unit_id = test_unit_id(99);
         let target = SnapTarget::new(
             test_snap_id(1),
-            catchment_id,
+            unit_id,
             test_weight(1.0),
-            MainstemStatus::Tributary,
-            test_bbox(),
+            Some(StemRole::Tributary),
+            None,
             test_wkb(),
         );
 
-        assert_eq!(target.catchment_id(), catchment_id);
+        assert_eq!(target.unit_id(), unit_id);
+        assert_eq!(target.bbox(), None);
     }
 }

@@ -71,7 +71,7 @@ impl fmt::Display for Artifact {
         match self {
             Artifact::Manifest => write!(f, "manifest.json"),
             Artifact::Catchments => write!(f, "catchments.parquet"),
-            Artifact::Graph => write!(f, "graph.arrow"),
+            Artifact::Graph => write!(f, "graph.parquet"),
             Artifact::Snap => write!(f, "snap.parquet"),
             Artifact::FlowDir => write!(f, "flow_dir.tif"),
             Artifact::FlowAcc => write!(f, "flow_acc.tif"),

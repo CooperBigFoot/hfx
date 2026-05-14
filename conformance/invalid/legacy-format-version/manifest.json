@@ -1,5 +1,5 @@
 {
-  "format_version": "0.2",
+  "format_version": "0.1",
   "fabric_name": "conformance-tiny",
   "crs": "EPSG:4326",
   "has_up_area": false,

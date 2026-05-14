@@ -2,13 +2,13 @@
 
 use std::str::FromStr;
 
+use crate::auxiliary::AuxiliaryDecl;
 use crate::geo::BoundingBox;
-use crate::raster::FlowDirEncoding;
 
 /// Graph topology class declared in the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Topology {
-    /// Strictly convergent: each atom has at most one downstream neighbor.
+    /// Strictly convergent: each unit has at most one downstream neighbor.
     Tree,
     /// Directed acyclic graph with possible bifurcations.
     Dag,
@@ -42,12 +42,15 @@ impl FromStr for Topology {
 pub enum FormatVersion {
     /// HFX specification version 0.1.
     V0_1,
+    /// HFX specification version 0.2.
+    V0_2,
 }
 
 impl std::fmt::Display for FormatVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FormatVersion::V0_1 => write!(f, "0.1"),
+            FormatVersion::V0_2 => write!(f, "0.2"),
         }
     }
 }
@@ -58,6 +61,7 @@ impl FromStr for FormatVersion {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "0.1" => Ok(FormatVersion::V0_1),
+            "0.2" => Ok(FormatVersion::V0_2),
             _ => Err(ManifestError::UnsupportedFormatVersion {
                 value: s.to_owned(),
             }),
@@ -65,10 +69,10 @@ impl FromStr for FormatVersion {
     }
 }
 
-/// Coordinate reference system for all HFX vector and raster data.
+/// Coordinate reference system for all HFX vector data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Crs {
-    /// WGS84 geographic coordinates. The only CRS supported in HFX v0.1.
+    /// WGS84 geographic coordinates. The only CRS supported in HFX v0.2.
     Epsg4326,
 }
 
@@ -96,39 +100,18 @@ impl FromStr for Crs {
 /// Whether upstream area values are precomputed in catchments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UpAreaAvailability {
-    /// `up_area_km2` column is populated for all atoms.
+    /// `up_area_km2` column is populated for applicable units.
     Precomputed,
     /// `up_area_km2` is null; engine computes from graph traversal.
     NotAvailable,
 }
 
-/// Whether optional raster artifacts are present.
-///
-/// When rasters are present, the flow direction encoding is guaranteed to
-/// be specified — this invariant is encoded in the type system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RasterAvailability {
-    /// Both `flow_dir.tif` and `flow_acc.tif` are present.
-    Present(FlowDirEncoding),
-    /// No rasters. Engine skips raster refinement.
-    Absent,
-}
-
-/// Whether the optional snap artifact is present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SnapAvailability {
-    /// `snap.parquet` is present. Engine uses tiered snap ranking.
-    Present,
-    /// No snap file. Engine uses point-in-polygon on catchments.
-    Absent,
-}
-
 /// Errors from constructing a [`Manifest`].
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    /// Returned when atom count is zero.
-    #[error("atom count must be at least 1")]
-    ZeroAtomCount,
+    /// Returned when unit count is zero.
+    #[error("unit count must be at least 1")]
+    ZeroUnitCount,
 
     /// Returned when fabric name is empty.
     #[error("fabric name must not be empty")]
@@ -141,13 +124,6 @@ pub enum ManifestError {
     /// Returned when created_at timestamp is empty.
     #[error("created_at timestamp must not be empty")]
     EmptyCreatedAt,
-
-    /// Returned when terminal_sink_id is not 0.
-    #[error("terminal_sink_id must be 0, got {value}")]
-    InvalidTerminalSinkId {
-        /// The non-zero value.
-        value: i64,
-    },
 
     /// Returned when fabric_name contains uppercase characters.
     #[error("fabric name must be lowercase, got {value:?}")]
@@ -164,7 +140,7 @@ pub enum ManifestError {
     },
 
     /// Returned when an unsupported format version is provided.
-    #[error("unsupported format version: {value:?}, expected \"0.1\"")]
+    #[error("unsupported format version: {value:?}, expected \"0.2\"")]
     UnsupportedFormatVersion {
         /// The unrecognized version string.
         value: String,
@@ -178,26 +154,26 @@ pub enum ManifestError {
     },
 }
 
-/// Non-zero count of catchment atoms in a dataset.
+/// Non-zero count of drainage units in a dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AtomCount(u64);
+pub struct UnitCount(u64);
 
-impl AtomCount {
-    /// Constructs an `AtomCount` from a raw `u64`, rejecting zero.
+impl UnitCount {
+    /// Constructs a `UnitCount` from a raw `u64`, rejecting zero.
     ///
     /// # Errors
     ///
     /// | Variant | Condition |
     /// |---|---|
-    /// | [`ManifestError::ZeroAtomCount`] | `raw` is 0 |
+    /// | [`ManifestError::ZeroUnitCount`] | `raw` is 0 |
     pub fn new(raw: u64) -> Result<Self, ManifestError> {
         if raw == 0 {
-            return Err(ManifestError::ZeroAtomCount);
+            return Err(ManifestError::ZeroUnitCount);
         }
         Ok(Self(raw))
     }
 
-    /// Returns the raw atom count value.
+    /// Returns the raw unit count value.
     pub fn get(self) -> u64 {
         self.0
     }
@@ -212,18 +188,15 @@ pub struct Manifest {
     format_version: FormatVersion,
     fabric_name: String,
     fabric_version: Option<String>,
-    fabric_level: Option<u32>,
     crs: Crs,
     up_area: UpAreaAvailability,
-    rasters: RasterAvailability,
-    snap: SnapAvailability,
     topology: Topology,
-    terminal_sink_id: i64,
     region: Option<String>,
     bbox: BoundingBox,
-    atom_count: AtomCount,
+    unit_count: UnitCount,
     created_at: String,
     adapter_version: String,
+    auxiliary: Vec<AuxiliaryDecl>,
 }
 
 impl Manifest {
@@ -242,11 +215,6 @@ impl Manifest {
         self.fabric_version.as_deref()
     }
 
-    /// Returns the optional hierarchical subdivision level of the fabric, if declared.
-    pub fn fabric_level(&self) -> Option<u32> {
-        self.fabric_level
-    }
-
     /// Returns the coordinate reference system for this dataset.
     pub fn crs(&self) -> Crs {
         self.crs
@@ -257,24 +225,9 @@ impl Manifest {
         self.up_area
     }
 
-    /// Returns the raster artifact availability for this dataset.
-    pub fn rasters(&self) -> RasterAvailability {
-        self.rasters
-    }
-
-    /// Returns the snap artifact availability for this dataset.
-    pub fn snap(&self) -> SnapAvailability {
-        self.snap
-    }
-
     /// Returns the declared graph topology of this dataset.
     pub fn topology(&self) -> Topology {
         self.topology
-    }
-
-    /// Returns the terminal sink ID for this dataset (always `0` in v0.1).
-    pub fn terminal_sink_id(&self) -> i64 {
-        self.terminal_sink_id
     }
 
     /// Returns the optional region label for this dataset, if declared.
@@ -287,9 +240,9 @@ impl Manifest {
         &self.bbox
     }
 
-    /// Returns the non-zero count of catchment atoms in this dataset.
-    pub fn atom_count(&self) -> AtomCount {
-        self.atom_count
+    /// Returns the non-zero count of drainage units in this dataset.
+    pub fn unit_count(&self) -> UnitCount {
+        self.unit_count
     }
 
     /// Returns the ISO 8601 creation timestamp string.
@@ -304,6 +257,11 @@ impl Manifest {
     pub fn adapter_version(&self) -> &str {
         &self.adapter_version
     }
+
+    /// Returns manifest-declared auxiliary artifact blocks.
+    pub fn auxiliary(&self) -> &[AuxiliaryDecl] {
+        &self.auxiliary
+    }
 }
 
 /// Builder for [`Manifest`].
@@ -317,17 +275,14 @@ pub struct ManifestBuilder {
     fabric_name: String,
     crs: Crs,
     topology: Topology,
-    terminal_sink_id: i64,
     bbox: BoundingBox,
-    atom_count: AtomCount,
+    unit_count: UnitCount,
     created_at: String,
     adapter_version: String,
     up_area: UpAreaAvailability,
-    rasters: RasterAvailability,
-    snap: SnapAvailability,
     fabric_version: Option<String>,
-    fabric_level: Option<u32>,
     region: Option<String>,
+    auxiliary: Vec<AuxiliaryDecl>,
 }
 
 impl ManifestBuilder {
@@ -337,7 +292,6 @@ impl ManifestBuilder {
     ///
     /// | Variant | Condition |
     /// |---|---|
-    /// | [`ManifestError::InvalidTerminalSinkId`] | `terminal_sink_id` is not 0 |
     /// | [`ManifestError::EmptyFabricName`] | `fabric_name` is empty |
     /// | [`ManifestError::NonLowercaseFabricName`] | `fabric_name` contains uppercase characters |
     /// | [`ManifestError::EmptyAdapterVersion`] | `adapter_version` is empty |
@@ -348,9 +302,8 @@ impl ManifestBuilder {
         fabric_name: impl Into<String>,
         crs: Crs,
         topology: Topology,
-        terminal_sink_id: i64,
         bbox: BoundingBox,
-        atom_count: AtomCount,
+        unit_count: UnitCount,
         created_at: impl Into<String>,
         adapter_version: impl Into<String>,
     ) -> Result<Self, ManifestError> {
@@ -358,11 +311,6 @@ impl ManifestBuilder {
         let created_at = created_at.into();
         let adapter_version = adapter_version.into();
 
-        if terminal_sink_id != 0 {
-            return Err(ManifestError::InvalidTerminalSinkId {
-                value: terminal_sink_id,
-            });
-        }
         if fabric_name.is_empty() {
             return Err(ManifestError::EmptyFabricName);
         }
@@ -381,36 +329,20 @@ impl ManifestBuilder {
             fabric_name,
             crs,
             topology,
-            terminal_sink_id,
             bbox,
-            atom_count,
+            unit_count,
             created_at,
             adapter_version,
             up_area: UpAreaAvailability::NotAvailable,
-            rasters: RasterAvailability::Absent,
-            snap: SnapAvailability::Absent,
             fabric_version: None,
-            fabric_level: None,
             region: None,
+            auxiliary: Vec::new(),
         })
     }
 
-    /// Declares that `up_area_km2` is precomputed for all atoms in this dataset.
+    /// Declares that `up_area_km2` is precomputed for applicable units.
     pub fn with_up_area(mut self) -> Self {
         self.up_area = UpAreaAvailability::Precomputed;
-        self
-    }
-
-    /// Declares that `flow_dir.tif` and `flow_acc.tif` are present, using the
-    /// given `encoding` convention.
-    pub fn with_rasters(mut self, encoding: FlowDirEncoding) -> Self {
-        self.rasters = RasterAvailability::Present(encoding);
-        self
-    }
-
-    /// Declares that `snap.parquet` is present for tiered snap ranking.
-    pub fn with_snap(mut self) -> Self {
-        self.snap = SnapAvailability::Present;
         self
     }
 
@@ -420,15 +352,15 @@ impl ManifestBuilder {
         self
     }
 
-    /// Sets the optional hierarchical subdivision level of the source fabric.
-    pub fn with_fabric_level(mut self, level: u32) -> Self {
-        self.fabric_level = Some(level);
-        self
-    }
-
     /// Sets the optional region label for this dataset.
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    /// Appends a manifest-declared auxiliary artifact block.
+    pub fn with_auxiliary(mut self, auxiliary: AuxiliaryDecl) -> Self {
+        self.auxiliary.push(auxiliary);
         self
     }
 
@@ -440,18 +372,15 @@ impl ManifestBuilder {
             format_version: self.format_version,
             fabric_name: self.fabric_name,
             fabric_version: self.fabric_version,
-            fabric_level: self.fabric_level,
             crs: self.crs,
             up_area: self.up_area,
-            rasters: self.rasters,
-            snap: self.snap,
             topology: self.topology,
-            terminal_sink_id: self.terminal_sink_id,
             region: self.region,
             bbox: self.bbox,
-            atom_count: self.atom_count,
+            unit_count: self.unit_count,
             created_at: self.created_at,
             adapter_version: self.adapter_version,
+            auxiliary: self.auxiliary,
         }
     }
 }
@@ -459,49 +388,49 @@ impl ManifestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auxiliary::{AuxiliarySchemaId, BlessedAuxSchema};
     use crate::geo::BoundingBox;
-    use crate::raster::FlowDirEncoding;
+    use std::collections::BTreeMap;
 
     fn test_bbox() -> BoundingBox {
         BoundingBox::new(-10.0, -5.0, 10.0, 5.0).unwrap()
     }
 
-    fn test_atom_count(n: u64) -> AtomCount {
-        AtomCount::new(n).unwrap()
+    fn test_unit_count(n: u64) -> UnitCount {
+        UnitCount::new(n).unwrap()
     }
 
     fn minimal_builder() -> ManifestBuilder {
         ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(100),
+            test_unit_count(100),
             "2026-01-01T00:00:00Z",
             "hfx-adapter-v1",
         )
         .unwrap()
     }
 
-    // --- AtomCount ---
+    // --- UnitCount ---
 
     #[test]
-    fn atom_count_new_one_succeeds() {
-        let count = AtomCount::new(1).unwrap();
+    fn unit_count_new_one_succeeds() {
+        let count = UnitCount::new(1).unwrap();
         assert_eq!(count.get(), 1);
     }
 
     #[test]
-    fn atom_count_new_zero_fails_with_zero_atom_count() {
-        let err = AtomCount::new(0).unwrap_err();
-        assert!(matches!(err, ManifestError::ZeroAtomCount));
+    fn unit_count_new_zero_fails_with_zero_unit_count() {
+        let err = UnitCount::new(0).unwrap_err();
+        assert!(matches!(err, ManifestError::ZeroUnitCount));
     }
 
     #[test]
-    fn atom_count_new_u64_max_succeeds() {
-        let count = AtomCount::new(u64::MAX).unwrap();
+    fn unit_count_new_u64_max_succeeds() {
+        let count = UnitCount::new(u64::MAX).unwrap();
         assert_eq!(count.get(), u64::MAX);
     }
 
@@ -510,13 +439,12 @@ mod tests {
     #[test]
     fn builder_empty_fabric_name_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(1),
+            test_unit_count(1),
             "2026-01-01T00:00:00Z",
             "v1",
         )
@@ -528,13 +456,12 @@ mod tests {
     #[test]
     fn builder_empty_adapter_version_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(1),
+            test_unit_count(1),
             "2026-01-01T00:00:00Z",
             "",
         )
@@ -546,13 +473,12 @@ mod tests {
     #[test]
     fn builder_empty_created_at_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(1),
+            test_unit_count(1),
             "",
             "v1",
         )
@@ -562,36 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_sink_id_nonzero_fails() {
-        let err = ManifestBuilder::new(
-            FormatVersion::V0_1,
-            "testfabric",
-            Crs::Epsg4326,
-            Topology::Tree,
-            5,
-            test_bbox(),
-            test_atom_count(1),
-            "2026-01-01T00:00:00Z",
-            "v1",
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(
-            err,
-            ManifestError::InvalidTerminalSinkId { value: 5 }
-        ));
-    }
-
-    #[test]
     fn fabric_name_uppercase_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "HydroBASINS",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(1),
+            test_unit_count(1),
             "2026-01-01T00:00:00Z",
             "v1",
         )
@@ -603,13 +507,12 @@ mod tests {
     #[test]
     fn fabric_name_lowercase_succeeds() {
         let result = ManifestBuilder::new(
-            FormatVersion::V0_1,
+            FormatVersion::V0_2,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
-            0,
             test_bbox(),
-            test_atom_count(1),
+            test_unit_count(1),
             "2026-01-01T00:00:00Z",
             "v1",
         );
@@ -623,13 +526,11 @@ mod tests {
         let manifest = minimal_builder().build();
 
         assert_eq!(manifest.up_area(), UpAreaAvailability::NotAvailable);
-        assert_eq!(manifest.rasters(), RasterAvailability::Absent);
-        assert_eq!(manifest.snap(), SnapAvailability::Absent);
-        assert_eq!(manifest.format_version(), FormatVersion::V0_1);
+        assert_eq!(manifest.format_version(), FormatVersion::V0_2);
         assert_eq!(manifest.crs(), Crs::Epsg4326);
         assert_eq!(manifest.fabric_version(), None);
-        assert_eq!(manifest.fabric_level(), None);
         assert_eq!(manifest.region(), None);
+        assert_eq!(manifest.auxiliary(), &[]);
     }
 
     #[test]
@@ -639,9 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_sink_id_getter_returns_zero() {
+    fn unit_count_getter_returns_unit_count() {
         let manifest = minimal_builder().build();
-        assert_eq!(manifest.terminal_sink_id(), 0);
+        assert_eq!(manifest.unit_count(), test_unit_count(100));
     }
 
     // --- Optional field builders ---
@@ -653,43 +554,28 @@ mod tests {
     }
 
     #[test]
-    fn with_rasters_esri_sets_present_esri() {
-        let manifest = minimal_builder()
-            .with_rasters(FlowDirEncoding::Esri)
-            .build();
-        assert_eq!(
-            manifest.rasters(),
-            RasterAvailability::Present(FlowDirEncoding::Esri)
-        );
-    }
-
-    #[test]
-    fn with_snap_sets_present() {
-        let manifest = minimal_builder().with_snap().build();
-        assert_eq!(manifest.snap(), SnapAvailability::Present);
-    }
-
-    #[test]
     fn all_optional_fields_set_come_through() {
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert("flow_dir".to_string(), "flow_dir.tif".to_string());
+        artifacts.insert("flow_acc".to_string(), "flow_acc.tif".to_string());
+        let auxiliary = AuxiliaryDecl::new(
+            AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV1),
+            artifacts,
+        )
+        .unwrap();
+
         let manifest = minimal_builder()
             .with_up_area()
-            .with_rasters(FlowDirEncoding::Taudem)
-            .with_snap()
             .with_fabric_version("v2024")
-            .with_fabric_level(8)
             .with_region("North America")
+            .with_auxiliary(auxiliary.clone())
             .build();
 
         assert_eq!(manifest.up_area(), UpAreaAvailability::Precomputed);
-        assert_eq!(
-            manifest.rasters(),
-            RasterAvailability::Present(FlowDirEncoding::Taudem)
-        );
-        assert_eq!(manifest.snap(), SnapAvailability::Present);
         assert_eq!(manifest.fabric_version(), Some("v2024"));
-        assert_eq!(manifest.fabric_level(), Some(8));
         assert_eq!(manifest.region(), Some("North America"));
-        assert_eq!(manifest.format_version(), FormatVersion::V0_1);
+        assert_eq!(manifest.auxiliary(), &[auxiliary]);
+        assert_eq!(manifest.format_version(), FormatVersion::V0_2);
         assert_eq!(manifest.crs(), Crs::Epsg4326);
     }
 
@@ -707,6 +593,8 @@ mod tests {
     fn format_version_display_roundtrip() {
         assert_eq!(FormatVersion::V0_1.to_string(), "0.1");
         assert_eq!("0.1".parse::<FormatVersion>().unwrap(), FormatVersion::V0_1);
+        assert_eq!(FormatVersion::V0_2.to_string(), "0.2");
+        assert_eq!("0.2".parse::<FormatVersion>().unwrap(), FormatVersion::V0_2);
     }
 
     #[test]
@@ -731,7 +619,7 @@ mod tests {
 
     #[test]
     fn format_version_fromstr_invalid() {
-        let err = "0.2".parse::<FormatVersion>().unwrap_err();
+        let err = "1.0".parse::<FormatVersion>().unwrap_err();
         assert!(matches!(
             err,
             ManifestError::UnsupportedFormatVersion { .. }

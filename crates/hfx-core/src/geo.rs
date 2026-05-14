@@ -38,6 +38,34 @@ pub enum GeoError {
         /// The non-finite value.
         value: f32,
     },
+
+    /// Returned when an outlet longitude is NaN or infinite.
+    #[error("outlet longitude must be finite, got {value}")]
+    NonFiniteOutletLongitude {
+        /// The non-finite value.
+        value: f64,
+    },
+
+    /// Returned when an outlet latitude is NaN or infinite.
+    #[error("outlet latitude must be finite, got {value}")]
+    NonFiniteOutletLatitude {
+        /// The non-finite value.
+        value: f64,
+    },
+
+    /// Returned when an outlet longitude is outside [-180, 180].
+    #[error("outlet longitude out of range [-180, 180]: {value}")]
+    OutletLongitudeOutOfRange {
+        /// The invalid longitude value.
+        value: f64,
+    },
+
+    /// Returned when an outlet latitude is outside [-90, 90].
+    #[error("outlet latitude out of range [-90, 90]: {value}")]
+    OutletLatitudeOutOfRange {
+        /// The invalid latitude value.
+        value: f64,
+    },
 }
 
 /// A validated WGS84 longitude in the range [-180.0, 180.0].
@@ -188,6 +216,51 @@ impl BoundingBox {
             && self.max_x.get() >= other.min_x.get()
             && self.min_y.get() <= other.max_y.get()
             && self.max_y.get() >= other.min_y.get()
+    }
+}
+
+/// A unit outlet coordinate in EPSG:4326.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutletCoord {
+    lon: f64,
+    lat: f64,
+}
+
+impl OutletCoord {
+    /// Construct an [`OutletCoord`] from longitude and latitude.
+    ///
+    /// # Errors
+    ///
+    /// | Condition | Error variant |
+    /// |---|---|
+    /// | `lon` is NaN or infinite | [`GeoError::NonFiniteOutletLongitude`] |
+    /// | `lat` is NaN or infinite | [`GeoError::NonFiniteOutletLatitude`] |
+    /// | `lon` is outside [-180, 180] | [`GeoError::OutletLongitudeOutOfRange`] |
+    /// | `lat` is outside [-90, 90] | [`GeoError::OutletLatitudeOutOfRange`] |
+    pub fn new(lon: f64, lat: f64) -> Result<Self, GeoError> {
+        if !lon.is_finite() {
+            return Err(GeoError::NonFiniteOutletLongitude { value: lon });
+        }
+        if !lat.is_finite() {
+            return Err(GeoError::NonFiniteOutletLatitude { value: lat });
+        }
+        if !(-180.0..=180.0).contains(&lon) {
+            return Err(GeoError::OutletLongitudeOutOfRange { value: lon });
+        }
+        if !(-90.0..=90.0).contains(&lat) {
+            return Err(GeoError::OutletLatitudeOutOfRange { value: lat });
+        }
+        Ok(Self { lon, lat })
+    }
+
+    /// Return the outlet longitude.
+    pub fn lon(self) -> f64 {
+        self.lon
+    }
+
+    /// Return the outlet latitude.
+    pub fn lat(self) -> f64 {
+        self.lat
     }
 }
 
@@ -361,6 +434,47 @@ mod tests {
         let a = BoundingBox::new(-10.0, -5.0, 0.0, 5.0).unwrap();
         let b = BoundingBox::new(5.0, -5.0, 10.0, 5.0).unwrap();
         assert!(!a.intersects(&b));
+    }
+
+    // --- OutletCoord ---
+
+    #[test]
+    fn outlet_coord_valid_boundaries() {
+        let outlet = OutletCoord::new(-180.0, 90.0).unwrap();
+        assert_eq!(outlet.lon(), -180.0);
+        assert_eq!(outlet.lat(), 90.0);
+    }
+
+    #[test]
+    fn outlet_coord_rejects_non_finite_lon() {
+        assert!(matches!(
+            OutletCoord::new(f64::NAN, 0.0),
+            Err(GeoError::NonFiniteOutletLongitude { .. })
+        ));
+    }
+
+    #[test]
+    fn outlet_coord_rejects_non_finite_lat() {
+        assert!(matches!(
+            OutletCoord::new(0.0, f64::INFINITY),
+            Err(GeoError::NonFiniteOutletLatitude { .. })
+        ));
+    }
+
+    #[test]
+    fn outlet_coord_rejects_out_of_range_lon() {
+        assert!(matches!(
+            OutletCoord::new(180.1, 0.0),
+            Err(GeoError::OutletLongitudeOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn outlet_coord_rejects_out_of_range_lat() {
+        assert!(matches!(
+            OutletCoord::new(0.0, -90.1),
+            Err(GeoError::OutletLatitudeOutOfRange { .. })
+        ));
     }
 
     #[test]

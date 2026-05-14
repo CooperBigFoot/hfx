@@ -2,34 +2,45 @@
 
 use std::collections::HashMap;
 
-use crate::id::AtomId;
+use crate::id::UnitId;
+use crate::level::Level;
 
 /// A single row in the upstream adjacency graph.
 ///
-/// Represents one catchment atom and the set of atoms directly upstream of it.
+/// Represents one drainage unit and the set of same-level units directly upstream of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjacencyRow {
-    id: AtomId,
-    upstream_ids: Vec<AtomId>,
+    id: UnitId,
+    level: Level,
+    upstream_ids: Vec<UnitId>,
 }
 
 impl AdjacencyRow {
-    /// Construct an [`AdjacencyRow`] from an atom ID and its upstream neighbours.
-    pub fn new(id: AtomId, upstream_ids: Vec<AtomId>) -> Self {
-        Self { id, upstream_ids }
+    /// Construct an [`AdjacencyRow`] from a unit ID, level, and upstream neighbours.
+    pub fn new(id: UnitId, level: Level, upstream_ids: Vec<UnitId>) -> Self {
+        Self {
+            id,
+            level,
+            upstream_ids,
+        }
     }
 
-    /// Return the atom ID for this row.
-    pub fn id(&self) -> AtomId {
+    /// Return the unit ID for this row.
+    pub fn id(&self) -> UnitId {
         self.id
     }
 
-    /// Return the slice of upstream atom IDs.
-    pub fn upstream_ids(&self) -> &[AtomId] {
+    /// Return the dataset-local level for this row.
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
+    /// Return the slice of upstream unit IDs.
+    pub fn upstream_ids(&self) -> &[UnitId] {
         &self.upstream_ids
     }
 
-    /// Return `true` if this atom has no upstream neighbours (i.e. it is a headwater).
+    /// Return `true` if this unit has no upstream neighbours.
     pub fn is_headwater(&self) -> bool {
         self.upstream_ids.is_empty()
     }
@@ -42,9 +53,9 @@ pub enum GraphError {
     #[error("drainage graph must contain at least one atom")]
     EmptyGraph,
 
-    /// Returned when the same atom ID appears in more than one row.
-    #[error("duplicate atom id {id} at row indices {first} and {second}")]
-    DuplicateAtomId {
+    /// Returned when the same unit ID appears in more than one row.
+    #[error("duplicate unit id {id} at row indices {first} and {second}")]
+    DuplicateUnitId {
         /// The raw i64 value of the duplicated ID.
         id: i64,
         /// Index of the first occurrence.
@@ -54,11 +65,11 @@ pub enum GraphError {
     },
 }
 
-/// The complete upstream adjacency graph over catchment atoms.
+/// The complete upstream adjacency graph over drainage units.
 ///
-/// This is the canonical in-memory representation of `graph.arrow` for
+/// This is the canonical in-memory representation of `graph.parquet` for
 /// validation and construction purposes. The HashMap-based index provides
-/// O(1) lookup by atom ID.
+/// O(1) lookup by unit ID.
 ///
 /// **Note for engine implementors:** this representation is optimized for
 /// validation and random access, not traversal. A delineation engine will
@@ -67,7 +78,7 @@ pub enum GraphError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrainageGraph {
     rows: Vec<AdjacencyRow>,
-    index: HashMap<AtomId, usize>,
+    index: HashMap<UnitId, usize>,
 }
 
 impl DrainageGraph {
@@ -80,7 +91,7 @@ impl DrainageGraph {
     /// | Condition | Error variant |
     /// |-----------|---------------|
     /// | `rows` is empty | [`GraphError::EmptyGraph`] |
-    /// | The same [`AtomId`] appears in two or more rows | [`GraphError::DuplicateAtomId`] |
+    /// | The same [`UnitId`] appears in two or more rows | [`GraphError::DuplicateUnitId`] |
     pub fn new(rows: Vec<AdjacencyRow>) -> Result<Self, GraphError> {
         if rows.is_empty() {
             return Err(GraphError::EmptyGraph);
@@ -89,7 +100,7 @@ impl DrainageGraph {
         let mut index = HashMap::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             if let Some(&first) = index.get(&row.id) {
-                return Err(GraphError::DuplicateAtomId {
+                return Err(GraphError::DuplicateUnitId {
                     id: row.id.get(),
                     first,
                     second: i,
@@ -116,10 +127,10 @@ impl DrainageGraph {
         self.rows.is_empty()
     }
 
-    /// Look up a row by [`AtomId`] in O(1) time.
+    /// Look up a row by [`UnitId`] in O(1) time.
     ///
     /// Returns `None` if no row with the given ID exists in the graph.
-    pub fn get(&self, id: AtomId) -> Option<&AdjacencyRow> {
+    pub fn get(&self, id: UnitId) -> Option<&AdjacencyRow> {
         self.index.get(&id).map(|&i| &self.rows[i])
     }
 }
@@ -128,17 +139,21 @@ impl DrainageGraph {
 mod tests {
     use super::*;
 
-    fn test_atom_id(raw: i64) -> AtomId {
-        AtomId::new(raw).unwrap()
+    fn test_unit_id(raw: i64) -> UnitId {
+        UnitId::new(raw).unwrap()
+    }
+
+    fn test_level(raw: i16) -> Level {
+        Level::new(raw).unwrap()
     }
 
     fn headwater_row(id: i64) -> AdjacencyRow {
-        AdjacencyRow::new(test_atom_id(id), vec![])
+        AdjacencyRow::new(test_unit_id(id), test_level(0), vec![])
     }
 
     fn interior_row(id: i64, upstream: &[i64]) -> AdjacencyRow {
-        let upstream_ids = upstream.iter().map(|&r| test_atom_id(r)).collect();
-        AdjacencyRow::new(test_atom_id(id), upstream_ids)
+        let upstream_ids = upstream.iter().map(|&r| test_unit_id(r)).collect();
+        AdjacencyRow::new(test_unit_id(id), test_level(0), upstream_ids)
     }
 
     #[test]
@@ -155,12 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_atom_id_fails_with_duplicate_error() {
+    fn duplicate_unit_id_fails_with_duplicate_error() {
         let rows = vec![headwater_row(5), headwater_row(5)];
         let err = DrainageGraph::new(rows).unwrap_err();
         assert!(matches!(
             err,
-            GraphError::DuplicateAtomId {
+            GraphError::DuplicateUnitId {
                 id: 5,
                 first: 0,
                 second: 1
@@ -174,15 +189,16 @@ mod tests {
         let graph =
             DrainageGraph::new(vec![headwater_row(11), headwater_row(12), row.clone()]).unwrap();
 
-        let found = graph.get(test_atom_id(10)).unwrap();
-        assert_eq!(found.id(), test_atom_id(10));
+        let found = graph.get(test_unit_id(10)).unwrap();
+        assert_eq!(found.id(), test_unit_id(10));
+        assert_eq!(found.level(), test_level(0));
         assert_eq!(found.upstream_ids().len(), 2);
     }
 
     #[test]
     fn get_with_nonexistent_id_returns_none() {
         let graph = DrainageGraph::new(vec![headwater_row(1)]).unwrap();
-        assert!(graph.get(test_atom_id(999)).is_none());
+        assert!(graph.get(test_unit_id(999)).is_none());
     }
 
     #[test]

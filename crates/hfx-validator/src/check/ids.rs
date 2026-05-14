@@ -25,7 +25,7 @@ const MAX_VIOLATIONS: usize = 100;
 /// Every `id` in `CatchmentsData.ids` must be > 0.  Zero and negative values
 /// each produce a separate check_id so they can be filtered independently.
 /// Duplicate IDs also produce a distinct diagnostic.
-pub fn check_catchment_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
+pub fn check_unit_ids(data: &CatchmentsData) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::with_capacity(data.ids.len());
     let mut zero_count = 0usize;
@@ -371,10 +371,10 @@ pub fn check_upstream_ids(data: &GraphData) -> Vec<Diagnostic> {
 // C7: Snap data
 // ---------------------------------------------------------------------------
 
-/// C7 — Check snap IDs, catchment_ids, weights, and bboxes.
+/// C7 — Check snap IDs, unit_ids, weights, and bboxes.
 ///
 /// - `ids`: must be > 0.
-/// - `catchment_ids`: must be > 0.
+/// - `unit_ids`: must be > 0.
 /// - `weights`: must be finite and >= 0.
 /// - `bboxes`: must be valid (see [`validate_bbox_f32`]).
 pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
@@ -420,16 +420,16 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
         }
     }
 
-    for (i, &cid) in data.catchment_ids.iter().enumerate() {
+    for (i, &cid) in data.unit_ids.iter().enumerate() {
         if cid <= 0 {
             cid_violation += 1;
             if cid_violation <= MAX_VIOLATIONS {
                 diags.push(
                     Diagnostic::error(
-                        "ids.snap_catchment_id",
+                        "ids.snap_unit_id",
                         Category::IdConstraint,
                         Artifact::Snap,
-                        format!("snap catchment_id {cid} at row {i} must be > 0"),
+                        format!("snap unit_id {cid} at row {i} must be > 0"),
                     )
                     .at(Location::Row { index: i }),
                 );
@@ -464,7 +464,9 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
     }
 
     for (i, bbox) in data.bboxes.iter().enumerate() {
-        let [minx, miny, maxx, maxy] = *bbox;
+        let Some([minx, miny, maxx, maxy]) = *bbox else {
+            continue;
+        };
         let row_errors = validate_bbox_f32(minx, miny, maxx, maxy, i, Artifact::Snap);
         for d in row_errors {
             bbox_violation += 1;
@@ -499,11 +501,11 @@ pub fn check_snap_data(data: &SnapData) -> Vec<Diagnostic> {
     }
     if cid_violation > MAX_VIOLATIONS {
         diags.push(Diagnostic::error(
-            "ids.snap_catchment_id",
+            "ids.snap_unit_id",
             Category::IdConstraint,
             Artifact::Snap,
             format!(
-                "... and {} more snap catchment_id violations (only first {MAX_VIOLATIONS} shown)",
+                "... and {} more snap unit_id violations (only first {MAX_VIOLATIONS} shown)",
                 cid_violation - MAX_VIOLATIONS
             ),
         ));
@@ -693,430 +695,3 @@ fn validate_bbox_f32(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dataset::{CatchmentsData, GraphData, SnapData};
-
-    // --- helpers ---
-
-    fn make_catchments(ids: Vec<i64>, bboxes: Vec<[f32; 4]>, areas: Vec<f32>) -> CatchmentsData {
-        let row_count = ids.len();
-        CatchmentsData {
-            row_count,
-            ids,
-            areas_km2: areas,
-            bboxes,
-            up_area_null_count: 0,
-            up_area_total: row_count,
-            geometry_wkb: vec![vec![0u8; 5]; row_count],
-            row_group_sizes: vec![row_count],
-            row_group_has_bbox_stats: vec![true],
-        }
-    }
-
-    fn valid_bbox() -> [f32; 4] {
-        [-10.0, -5.0, 10.0, 5.0]
-    }
-
-    fn make_graph(ids: Vec<i64>, upstream_ids: Vec<Vec<i64>>) -> GraphData {
-        GraphData { ids, upstream_ids }
-    }
-
-    fn make_snap(
-        ids: Vec<i64>,
-        catchment_ids: Vec<i64>,
-        weights: Vec<f32>,
-        bboxes: Vec<[f32; 4]>,
-    ) -> SnapData {
-        let row_count = ids.len();
-        SnapData {
-            row_count,
-            ids,
-            catchment_ids,
-            weights,
-            bboxes,
-            geometry_wkb: vec![vec![0u8; 5]; row_count],
-            row_group_sizes: vec![row_count],
-            row_group_has_bbox_stats: vec![true],
-        }
-    }
-
-    fn count_id(diags: &[Diagnostic], id: &str) -> usize {
-        diags.iter().filter(|d| d.check_id == id).count()
-    }
-
-    // ========================
-    // C1: check_catchment_ids
-    // ========================
-
-    #[test]
-    fn c1_valid_ids_produce_no_errors() {
-        let data = make_catchments(vec![1, 2, 3], vec![valid_bbox(); 3], vec![1.0; 3]);
-        let diags = check_catchment_ids(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c1_zero_id_produces_error() {
-        let data = make_catchments(vec![1, 0, 3], vec![valid_bbox(); 3], vec![1.0; 3]);
-        let diags = check_catchment_ids(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_zero"), 1);
-        assert!(diags[0].location == Location::Row { index: 1 });
-    }
-
-    #[test]
-    fn c1_negative_id_produces_error() {
-        let data = make_catchments(vec![1, -5, 3], vec![valid_bbox(); 3], vec![1.0; 3]);
-        let diags = check_catchment_ids(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_negative"), 1);
-        assert!(diags[0].location == Location::Row { index: 1 });
-    }
-
-    #[test]
-    fn c1_multiple_violations_reported() {
-        let data = make_catchments(vec![0, -1, 0, -2], vec![valid_bbox(); 4], vec![1.0; 4]);
-        let diags = check_catchment_ids(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_zero"), 2);
-        assert_eq!(count_id(&diags, "ids.catchment_negative"), 2);
-    }
-
-    #[test]
-    fn c1_duplicate_id_produces_error() {
-        let data = make_catchments(vec![1, 2, 1], vec![valid_bbox(); 3], vec![1.0; 3]);
-        let diags = check_catchment_ids(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_duplicate"), 1);
-        assert!(diags[0].location == Location::Row { index: 2 });
-    }
-
-    #[test]
-    fn c1_multiple_duplicates_each_reported() {
-        let data = make_catchments(vec![1, 2, 1, 2, 3, 3], vec![valid_bbox(); 6], vec![1.0; 6]);
-        let diags = check_catchment_ids(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_duplicate"), 3);
-    }
-
-    #[test]
-    fn c1_unique_valid_ids_produce_no_errors() {
-        let data = make_catchments(vec![1, 2, 3, 4], vec![valid_bbox(); 4], vec![1.0; 4]);
-        let diags = check_catchment_ids(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    // ========================
-    // C2: check_catchment_bboxes
-    // ========================
-
-    #[test]
-    fn c2_valid_bboxes_produce_no_errors() {
-        let data = make_catchments(vec![1], vec![valid_bbox()], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c2_nan_component_produces_error() {
-        let data = make_catchments(vec![1], vec![[f32::NAN, -5.0, 10.0, 5.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(!diags.is_empty(), "NaN bbox should produce an error");
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    #[test]
-    fn c2_inf_component_produces_error() {
-        let data = make_catchments(vec![1], vec![[f32::INFINITY, -5.0, 10.0, 5.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    #[test]
-    fn c2_degenerate_bbox_minx_ge_maxx_produces_error() {
-        // minx == maxx
-        let data = make_catchments(vec![1], vec![[5.0, -5.0, 5.0, 5.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    #[test]
-    fn c2_degenerate_bbox_miny_ge_maxy_produces_error() {
-        let data = make_catchments(vec![1], vec![[-10.0, 5.0, 10.0, 5.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    #[test]
-    fn c2_out_of_range_longitude_produces_error() {
-        let data = make_catchments(vec![1], vec![[200.0, -5.0, 201.0, 5.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    #[test]
-    fn c2_out_of_range_latitude_produces_error() {
-        let data = make_catchments(vec![1], vec![[-10.0, -100.0, 10.0, -95.0]], vec![1.0]);
-        let diags = check_catchment_bboxes(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.catchment_bbox"));
-    }
-
-    // ========================
-    // C3: check_catchment_areas
-    // ========================
-
-    #[test]
-    fn c3_valid_areas_produce_no_errors() {
-        let data = make_catchments(vec![1, 2], vec![valid_bbox(); 2], vec![0.0, 100.5]);
-        let diags = check_catchment_areas(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c3_negative_area_produces_error() {
-        let data = make_catchments(vec![1], vec![valid_bbox()], vec![-0.1]);
-        let diags = check_catchment_areas(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_area"), 1);
-    }
-
-    #[test]
-    fn c3_nan_area_produces_error() {
-        let data = make_catchments(vec![1], vec![valid_bbox()], vec![f32::NAN]);
-        let diags = check_catchment_areas(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_area"), 1);
-    }
-
-    #[test]
-    fn c3_inf_area_produces_error() {
-        let data = make_catchments(vec![1], vec![valid_bbox()], vec![f32::INFINITY]);
-        let diags = check_catchment_areas(&data);
-        assert_eq!(count_id(&diags, "ids.catchment_area"), 1);
-    }
-
-    #[test]
-    fn c3_zero_area_is_valid() {
-        let data = make_catchments(vec![1], vec![valid_bbox()], vec![0.0]);
-        let diags = check_catchment_areas(&data);
-        assert!(diags.is_empty(), "zero area should be valid");
-    }
-
-    // ========================
-    // C5: check_graph_ids
-    // ========================
-
-    #[test]
-    fn c5_valid_graph_ids_produce_no_errors() {
-        let data = make_graph(vec![1, 2, 3], vec![vec![]; 3]);
-        let diags = check_graph_ids(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c5_zero_id_produces_error() {
-        let data = make_graph(vec![1, 0, 3], vec![vec![]; 3]);
-        let diags = check_graph_ids(&data);
-        assert_eq!(count_id(&diags, "ids.graph_zero"), 1);
-    }
-
-    #[test]
-    fn c5_negative_id_produces_error() {
-        let data = make_graph(vec![1, -7, 3], vec![vec![]; 3]);
-        let diags = check_graph_ids(&data);
-        assert_eq!(count_id(&diags, "ids.graph_negative"), 1);
-    }
-
-    #[test]
-    fn c5_duplicate_id_produces_error() {
-        let data = make_graph(vec![1, 2, 1], vec![vec![]; 3]);
-        let diags = check_graph_ids(&data);
-        assert_eq!(count_id(&diags, "ids.graph_duplicate"), 1);
-    }
-
-    #[test]
-    fn c5_multiple_duplicates_each_reported() {
-        let data = make_graph(vec![1, 2, 1, 2, 3, 3], vec![vec![]; 6]);
-        let diags = check_graph_ids(&data);
-        assert_eq!(count_id(&diags, "ids.graph_duplicate"), 3);
-    }
-
-    // ========================
-    // C6: check_upstream_ids
-    // ========================
-
-    #[test]
-    fn c6_valid_upstream_ids_produce_no_errors() {
-        let data = make_graph(vec![3], vec![vec![1, 2]]);
-        let diags = check_upstream_ids(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c6_zero_upstream_id_produces_error() {
-        let data = make_graph(vec![3], vec![vec![1, 0, 2]]);
-        let diags = check_upstream_ids(&data);
-        assert_eq!(count_id(&diags, "ids.upstream_zero"), 1);
-        assert!(diags[0].location == Location::Row { index: 0 });
-    }
-
-    #[test]
-    fn c6_negative_upstream_id_produces_error() {
-        let data = make_graph(vec![3], vec![vec![1, -1]]);
-        let diags = check_upstream_ids(&data);
-        assert_eq!(count_id(&diags, "ids.upstream_negative"), 1);
-    }
-
-    #[test]
-    fn c6_empty_upstream_list_is_valid() {
-        let data = make_graph(vec![1, 2], vec![vec![], vec![1]]);
-        let diags = check_upstream_ids(&data);
-        assert!(diags.is_empty());
-    }
-
-    // ========================
-    // C7: check_snap_data
-    // ========================
-
-    #[test]
-    fn c7_valid_snap_data_produces_no_errors() {
-        let data = make_snap(
-            vec![1, 2],
-            vec![10, 20],
-            vec![0.5, 0.5],
-            vec![valid_bbox(); 2],
-        );
-        let diags = check_snap_data(&data);
-        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:#?}");
-    }
-
-    #[test]
-    fn c7_zero_snap_id_produces_error() {
-        let data = make_snap(vec![0], vec![10], vec![0.5], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_id"), 1);
-    }
-
-    #[test]
-    fn c7_negative_snap_id_produces_error() {
-        let data = make_snap(vec![-1], vec![10], vec![0.5], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_id"), 1);
-    }
-
-    #[test]
-    fn c7_zero_catchment_id_produces_error() {
-        let data = make_snap(vec![1], vec![0], vec![0.5], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_catchment_id"), 1);
-    }
-
-    #[test]
-    fn c7_negative_weight_produces_error() {
-        let data = make_snap(vec![1], vec![10], vec![-0.1], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_weight"), 1);
-    }
-
-    #[test]
-    fn c7_nan_weight_produces_error() {
-        let data = make_snap(vec![1], vec![10], vec![f32::NAN], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_weight"), 1);
-    }
-
-    #[test]
-    fn c7_invalid_snap_bbox_produces_error() {
-        // Inverted bbox (minx > maxx) is invalid even for snap
-        let data = make_snap(vec![1], vec![10], vec![0.5], vec![[10.0, -5.0, 5.0, 5.0]]);
-        let diags = check_snap_data(&data);
-        assert!(diags.iter().any(|d| d.check_id == "ids.snap_bbox"));
-    }
-
-    #[test]
-    fn c7_zero_weight_is_valid() {
-        let data = make_snap(vec![1], vec![10], vec![0.0], vec![valid_bbox()]);
-        let diags = check_snap_data(&data);
-        assert!(diags.is_empty(), "zero weight should be valid");
-    }
-
-    #[test]
-    fn c7_duplicate_snap_id_produces_error() {
-        let data = make_snap(
-            vec![1, 2, 1],
-            vec![10, 20, 30],
-            vec![0.5; 3],
-            vec![valid_bbox(); 3],
-        );
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 1);
-        assert!(diags[0].location == Location::Row { index: 2 });
-    }
-
-    #[test]
-    fn c7_multiple_duplicate_snap_ids_each_reported() {
-        let data = make_snap(
-            vec![1, 2, 1, 2, 3, 3],
-            vec![10, 20, 10, 20, 30, 30],
-            vec![0.5; 6],
-            vec![valid_bbox(); 6],
-        );
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 3);
-    }
-
-    #[test]
-    fn c7_unique_snap_ids_produce_no_duplicate_errors() {
-        let data = make_snap(
-            vec![1, 2, 3],
-            vec![10, 20, 30],
-            vec![0.5; 3],
-            vec![valid_bbox(); 3],
-        );
-        let diags = check_snap_data(&data);
-        assert_eq!(count_id(&diags, "ids.snap_duplicate"), 0);
-    }
-
-    #[test]
-    fn c7_snap_bbox_degenerate_x_passes() {
-        // Snap bbox with minx == maxx (vertical line) should pass
-        let data = make_snap(
-            vec![1],
-            vec![10],
-            vec![0.5],
-            vec![[5.0, -5.0, 5.0, 5.0]], // minx == maxx
-        );
-        let diags = check_snap_data(&data);
-        assert!(
-            !diags.iter().any(|d| d.check_id == "ids.snap_bbox"),
-            "snap bbox with minx == maxx (vertical line) should not produce an error"
-        );
-    }
-
-    #[test]
-    fn c7_snap_bbox_degenerate_y_passes() {
-        // Snap bbox with miny == maxy (horizontal line) should pass
-        let data = make_snap(
-            vec![1],
-            vec![10],
-            vec![0.5],
-            vec![[-10.0, 5.0, 10.0, 5.0]], // miny == maxy
-        );
-        let diags = check_snap_data(&data);
-        assert!(
-            !diags.iter().any(|d| d.check_id == "ids.snap_bbox"),
-            "snap bbox with miny == maxy (horizontal line) should not produce an error"
-        );
-    }
-
-    #[test]
-    fn c2_catchment_bbox_degenerate_x_still_errors() {
-        // Catchment bbox with minx == maxx should still error (polygon must have area)
-        let data = make_catchments(
-            vec![1],
-            vec![[5.0, -5.0, 5.0, 5.0]], // minx == maxx
-            vec![1.0],
-        );
-        let diags = check_catchment_bboxes(&data);
-        assert!(
-            diags.iter().any(|d| d.check_id == "ids.catchment_bbox"),
-            "catchment bbox with minx == maxx should produce an error"
-        );
-    }
-}

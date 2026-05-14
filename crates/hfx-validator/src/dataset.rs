@@ -13,6 +13,7 @@ pub struct FilePresenceMap {
     pub manifest_path: Option<PathBuf>,
     pub catchments_path: Option<PathBuf>,
     pub graph_path: Option<PathBuf>,
+    pub legacy_graph_arrow_path: Option<PathBuf>,
     pub snap_path: Option<PathBuf>,
     pub flow_dir_path: Option<PathBuf>,
     pub flow_acc_path: Option<PathBuf>,
@@ -23,7 +24,11 @@ pub struct FilePresenceMap {
 pub struct CatchmentsData {
     pub row_count: usize,
     pub ids: Vec<i64>,
+    pub levels: Vec<i16>,
+    pub parent_ids: Vec<Option<i64>>,
     pub areas_km2: Vec<f32>,
+    pub outlet_lons: Vec<f64>,
+    pub outlet_lats: Vec<f64>,
     pub bboxes: Vec<[f32; 4]>,
     pub up_area_null_count: usize,
     pub up_area_total: usize,
@@ -32,10 +37,11 @@ pub struct CatchmentsData {
     pub row_group_has_bbox_stats: Vec<bool>,
 }
 
-/// Column-level data extracted from graph.arrow.
+/// Column-level data extracted from graph.parquet.
 #[derive(Debug)]
 pub struct GraphData {
     pub ids: Vec<i64>,
+    pub levels: Vec<i16>,
     pub upstream_ids: Vec<Vec<i64>>,
 }
 
@@ -44,9 +50,10 @@ pub struct GraphData {
 pub struct SnapData {
     pub row_count: usize,
     pub ids: Vec<i64>,
-    pub catchment_ids: Vec<i64>,
+    pub unit_ids: Vec<i64>,
     pub weights: Vec<f32>,
-    pub bboxes: Vec<[f32; 4]>,
+    pub stem_roles: Vec<Option<String>>,
+    pub bboxes: Vec<Option<[f32; 4]>>,
     pub geometry_wkb: Vec<Vec<u8>>,
     pub row_group_sizes: Vec<usize>,
     pub row_group_has_bbox_stats: Vec<bool>,

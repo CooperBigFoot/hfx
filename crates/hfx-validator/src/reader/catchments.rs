@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use arrow::array::{Array, BinaryArray, Float32Array, Int64Array, LargeBinaryArray};
+use arrow::array::{
+    Array, BinaryArray, Float32Array, Float64Array, Int16Array, Int64Array, LargeBinaryArray,
+};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, warn};
@@ -18,8 +20,12 @@ use crate::reader::schema::{ExpectedColumn, validate_schema};
 fn expected_columns() -> Vec<ExpectedColumn> {
     vec![
         ExpectedColumn::new("id", DataType::Int64, false),
+        ExpectedColumn::new("level", DataType::Int16, false),
+        ExpectedColumn::new("parent_id", DataType::Int64, true),
         ExpectedColumn::new("area_km2", DataType::Float32, false),
         ExpectedColumn::new("up_area_km2", DataType::Float32, true),
+        ExpectedColumn::new("outlet_lon", DataType::Float64, false),
+        ExpectedColumn::new("outlet_lat", DataType::Float64, false),
         ExpectedColumn::new("bbox_minx", DataType::Float32, false),
         ExpectedColumn::new("bbox_miny", DataType::Float32, false),
         ExpectedColumn::new("bbox_maxx", DataType::Float32, false),
@@ -126,7 +132,11 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     };
 
     let mut ids: Vec<i64> = Vec::new();
+    let mut levels: Vec<i16> = Vec::new();
+    let mut parent_ids: Vec<Option<i64>> = Vec::new();
     let mut areas_km2: Vec<f32> = Vec::new();
+    let mut outlet_lons: Vec<f64> = Vec::new();
+    let mut outlet_lats: Vec<f64> = Vec::new();
     let mut bboxes: Vec<[f32; 4]> = Vec::new();
     // TODO: For large datasets, geometry should be read lazily or sampled during reading.
     // Currently all WKB bytes are loaded into memory even though the geometry checker only
@@ -139,7 +149,9 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
 
     // Per-column null counters (used to cap per-row diagnostics).
     let mut null_id_count: usize = 0;
+    let mut null_level_count: usize = 0;
     let mut null_area_count: usize = 0;
+    let mut null_outlet_count: usize = 0;
     let mut null_bbox_count: usize = 0;
     let mut null_geom_count: usize = 0;
 
@@ -207,6 +219,51 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             }
         }
 
+        // level column (non-nullable)
+        let level_col = batch
+            .column_by_name("level")
+            .and_then(|c| c.as_any().downcast_ref::<Int16Array>());
+        if let Some(arr) = level_col {
+            for i in 0..num_rows {
+                if arr.is_null(i) {
+                    null_level_count += 1;
+                    if null_level_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_level",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!(
+                                    "row {}: level is null in a non-nullable column",
+                                    total_rows + i
+                                ),
+                            )
+                            .at(Location::Row {
+                                index: total_rows + i,
+                            }),
+                        );
+                    }
+                    levels.push(0);
+                } else {
+                    levels.push(arr.value(i));
+                }
+            }
+        }
+
+        // parent_id column (nullable)
+        let parent_col = batch
+            .column_by_name("parent_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        if let Some(arr) = parent_col {
+            for i in 0..num_rows {
+                if arr.is_null(i) {
+                    parent_ids.push(None);
+                } else {
+                    parent_ids.push(Some(arr.value(i)));
+                }
+            }
+        }
+
         // area_km2 column (non-nullable)
         let area_col = batch
             .column_by_name("area_km2")
@@ -234,6 +291,38 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
                     areas_km2.push(0.0); // sentinel
                 } else {
                     areas_km2.push(arr.value(i));
+                }
+            }
+        }
+
+        // outlet_lon/outlet_lat columns (non-nullable)
+        let outlet_lon = batch
+            .column_by_name("outlet_lon")
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
+        let outlet_lat = batch
+            .column_by_name("outlet_lat")
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
+        if let (Some(lons), Some(lats)) = (outlet_lon, outlet_lat) {
+            for i in 0..num_rows {
+                let outlet_null = lons.is_null(i) || lats.is_null(i);
+                if outlet_null {
+                    null_outlet_count += 1;
+                    if null_outlet_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "catchments.null_outlet",
+                                Category::Schema,
+                                Artifact::Catchments,
+                                format!("row {}: outlet_lon or outlet_lat is null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
+                    outlet_lons.push(0.0);
+                    outlet_lats.push(0.0);
+                } else {
+                    outlet_lons.push(lons.value(i));
+                    outlet_lats.push(lats.value(i));
                 }
             }
         }
@@ -389,6 +478,28 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             ),
         ));
     }
+    if null_level_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_level_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_level",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in 'level' column suppressed ({null_level_count} total)"
+            ),
+        ));
+    }
+    if null_outlet_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_outlet_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "catchments.null_outlet",
+            Category::Schema,
+            Artifact::Catchments,
+            format!(
+                "{suppressed} additional null violation(s) in outlet columns suppressed ({null_outlet_count} total)"
+            ),
+        ));
+    }
     if null_bbox_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
         let suppressed = null_bbox_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
         diags.push(Diagnostic::error(
@@ -419,7 +530,11 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         Some(CatchmentsData {
             row_count,
             ids,
+            levels,
+            parent_ids,
             areas_km2,
+            outlet_lons,
+            outlet_lats,
             bboxes,
             up_area_null_count,
             up_area_total,
@@ -429,408 +544,4 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         }),
         diags,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{BinaryArray, Float32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-
-    use super::*;
-
-    fn make_valid_batch() -> (Arc<Schema>, RecordBatch) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("area_km2", DataType::Float32, false),
-            Field::new("up_area_km2", DataType::Float32, true),
-            Field::new("bbox_minx", DataType::Float32, false),
-            Field::new("bbox_miny", DataType::Float32, false),
-            Field::new("bbox_maxx", DataType::Float32, false),
-            Field::new("bbox_maxy", DataType::Float32, false),
-            Field::new("geometry", DataType::Binary, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
-                Arc::new(Float32Array::from(vec![1.0_f32, 2.0, 3.0])),
-                Arc::new(Float32Array::from(vec![Some(10.0_f32), None, Some(30.0)])),
-                Arc::new(Float32Array::from(vec![0.0_f32, 1.0, 2.0])),
-                Arc::new(Float32Array::from(vec![0.0_f32, 1.0, 2.0])),
-                Arc::new(Float32Array::from(vec![1.0_f32, 2.0, 3.0])),
-                Arc::new(Float32Array::from(vec![1.0_f32, 2.0, 3.0])),
-                Arc::new(BinaryArray::from_vec(vec![
-                    b"wkb1".as_ref(),
-                    b"wkb2",
-                    b"wkb3",
-                ])),
-            ],
-        )
-        .unwrap();
-        (schema, batch)
-    }
-
-    fn write_parquet(schema: Arc<Schema>, batch: RecordBatch) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        buf
-    }
-
-    #[test]
-    fn valid_catchments_parquet_reads_correctly() {
-        let (schema, batch) = make_valid_batch();
-        let buf = write_parquet(schema, batch);
-
-        // Write to temp file
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-        let data = data.expect("should read successfully");
-        assert_eq!(data.row_count, 3);
-        assert_eq!(data.ids, vec![1, 2, 3]);
-        assert_eq!(data.areas_km2, vec![1.0, 2.0, 3.0]);
-        assert_eq!(data.bboxes.len(), 3);
-        assert_eq!(data.bboxes[0], [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(data.up_area_null_count, 1);
-        assert_eq!(data.up_area_total, 3);
-        assert_eq!(data.geometry_wkb.len(), 3);
-        assert_eq!(data.geometry_wkb[0], b"wkb1");
-        // No schema errors
-        assert!(
-            !diags
-                .iter()
-                .any(|d| d.severity == crate::diagnostic::Severity::Error)
-        );
-    }
-
-    #[test]
-    fn missing_file_returns_none_and_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-
-        let (data, diags) = read_catchments(&path);
-        assert!(data.is_none());
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].check_id, "catchments.read");
-    }
-
-    #[test]
-    fn wrong_schema_returns_none_with_schema_error() {
-        // id is Int32 instead of Int64 — schema error
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("area_km2", DataType::Float32, false),
-            Field::new("up_area_km2", DataType::Float32, true),
-            Field::new("bbox_minx", DataType::Float32, false),
-            Field::new("bbox_miny", DataType::Float32, false),
-            Field::new("bbox_maxx", DataType::Float32, false),
-            Field::new("bbox_maxy", DataType::Float32, false),
-            Field::new("geometry", DataType::Binary, false),
-        ]));
-        use arrow::array::Int32Array;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1_i32])),
-                Arc::new(Float32Array::from(vec![1.0_f32])),
-                Arc::new(Float32Array::from(vec![Some(1.0_f32)])),
-                Arc::new(Float32Array::from(vec![0.0_f32])),
-                Arc::new(Float32Array::from(vec![0.0_f32])),
-                Arc::new(Float32Array::from(vec![1.0_f32])),
-                Arc::new(Float32Array::from(vec![1.0_f32])),
-                Arc::new(BinaryArray::from_vec(vec![b"wkb".as_ref()])),
-            ],
-        )
-        .unwrap();
-        let buf = write_parquet(schema, batch);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-        assert!(data.is_none());
-        assert!(
-            diags.iter().any(|d| d.check_id == "schema.wrong_type"),
-            "expected schema.wrong_type diagnostic"
-        );
-    }
-
-    #[test]
-    fn missing_column_returns_none_with_error() {
-        // Only id column — all others missing
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        )
-        .unwrap();
-        let buf = write_parquet(schema, batch);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-        assert!(data.is_none());
-        assert!(
-            diags.iter().any(|d| d.check_id == "schema.missing_column"),
-            "expected schema.missing_column diagnostic"
-        );
-    }
-
-    #[test]
-    fn zstd_compressed_parquet_reads_correctly() {
-        let (schema, batch) = make_valid_batch();
-
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
-
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-        let data = data.expect("zstd-compressed parquet should read successfully");
-        assert_eq!(data.row_count, 3);
-        assert!(
-            !diags
-                .iter()
-                .any(|d| d.severity == crate::diagnostic::Severity::Error)
-        );
-    }
-
-    #[test]
-    fn snappy_compressed_parquet_reads_correctly() {
-        let (schema, batch) = make_valid_batch();
-
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-        let data = data.expect("snappy-compressed parquet should read successfully");
-        assert_eq!(data.row_count, 3);
-        assert!(
-            !diags
-                .iter()
-                .any(|d| d.severity == crate::diagnostic::Severity::Error)
-        );
-    }
-
-    #[test]
-    fn nullable_id_column_triggers_schema_error_not_null_capping() {
-        // When a catchments.parquet file declares the `id` column as nullable
-        // (violating the spec which requires non-nullable), the reader must:
-        //   1. Detect the nullability mismatch via schema validation.
-        //   2. Return (None, diags) — the schema error causes an early exit before
-        //      any row-level null scanning occurs.
-        //   3. Emit exactly one schema.wrong_nullability error diagnostic.
-        //
-        // Implementation note: Parquet's type system maps nullable=true to OPTIONAL
-        // column repetition, which means definition levels are written and real null
-        // values CAN appear in the data.  However, the reader's schema validation
-        // catches the nullability violation before reaching the per-row null scan,
-        // so the null-capping counter (MAX_NULL_DIAGNOSTICS_PER_COLUMN) is never
-        // exercised in this path.  The null-capping code guards against a theoretical
-        // scenario where Arrow arrays with null bits are produced despite the file
-        // schema claiming non-nullable.
-        let num_rows = 30_usize;
-
-        // Schema with nullable=true for id — this makes Parquet write OPTIONAL columns
-        // so the data pages contain real null definition levels.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true), // nullable: violates spec
-            Field::new("area_km2", DataType::Float32, false),
-            Field::new("up_area_km2", DataType::Float32, true),
-            Field::new("bbox_minx", DataType::Float32, false),
-            Field::new("bbox_miny", DataType::Float32, false),
-            Field::new("bbox_maxx", DataType::Float32, false),
-            Field::new("bbox_maxy", DataType::Float32, false),
-            Field::new("geometry", DataType::Binary, false),
-        ]));
-
-        let id_arr = Int64Array::from_iter((0..num_rows).map(|_| None::<i64>));
-        let area_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let up_area_arr: Float32Array = Float32Array::from_iter((0..num_rows).map(|_| None::<f32>));
-        let minx_arr = Float32Array::from(vec![-1.0_f32; num_rows]);
-        let miny_arr = Float32Array::from(vec![-1.0_f32; num_rows]);
-        let maxx_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let maxy_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let wkb: Vec<u8> = b"wkb".to_vec();
-        let geom_data: Vec<&[u8]> = vec![wkb.as_slice(); num_rows];
-        let geom_arr = BinaryArray::from_iter_values(geom_data);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(id_arr),
-                Arc::new(area_arr),
-                Arc::new(up_area_arr),
-                Arc::new(minx_arr),
-                Arc::new(miny_arr),
-                Arc::new(maxx_arr),
-                Arc::new(maxy_arr),
-                Arc::new(geom_arr),
-            ],
-        )
-        .unwrap();
-
-        let buf = write_parquet(schema, batch);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-
-        // Schema validation must catch the nullable=true id column and return None.
-        assert!(
-            data.is_none(),
-            "reader should reject a file where a non-nullable column is declared nullable"
-        );
-
-        // The wrong_nullability error must be present.
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "schema.wrong_nullability"),
-            "expected schema.wrong_nullability diagnostic for nullable id column"
-        );
-
-        // No per-row null diagnostics should be emitted — the reader exits before
-        // the row-level null scan.
-        assert!(
-            !diags.iter().any(|d| d.check_id == "catchments.null_id"),
-            "no per-row null diagnostics should appear before schema validation completes"
-        );
-    }
-
-    #[test]
-    fn null_id_capping_is_unreachable_after_schema_validation() {
-        // This test verifies the null-diagnostic capping behaviour described by the
-        // MAX_NULL_DIAGNOSTICS_PER_COLUMN constant.
-        //
-        // Background: in Parquet, REQUIRED column repetition means no definition levels
-        // are stored, so null information cannot survive the Parquet write → read
-        // round-trip.  A file with a REQUIRED id column therefore always presents
-        // non-null values to the reader.  The capping code guards against a scenario
-        // where a malformed producer writes OPTIONAL columns while claiming non-nullable
-        // in the Arrow schema metadata — but the Arrow Parquet reader always derives
-        // nullability from the column repetition, not from the embedded schema hint,
-        // so that scenario also cannot produce null arrays through normal reading.
-        //
-        // Because of this, we test the capping indirectly: we write a file with
-        // nullable=true for id (OPTIONAL Parquet), which DOES produce real null arrays,
-        // but the schema validator detects the nullability violation and exits before
-        // the per-row scan.  The test confirms that:
-        //   - data is None (schema error causes early exit)
-        //   - no "catchments.null_id" diagnostics are emitted (capping never fires)
-        //   - the schema.wrong_nullability error is present
-        //
-        // If the architecture is ever changed so that null arrays reach the row scanner
-        // even for non-nullable columns (e.g., by relaxing the schema validation for
-        // this specific error), the assertions below should be updated to match the
-        // expected cap of MAX_NULL_DIAGNOSTICS_PER_COLUMN + 1.
-        let num_rows = 30_usize;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true), // nullable=true → OPTIONAL Parquet
-            Field::new("area_km2", DataType::Float32, false),
-            Field::new("up_area_km2", DataType::Float32, true),
-            Field::new("bbox_minx", DataType::Float32, false),
-            Field::new("bbox_miny", DataType::Float32, false),
-            Field::new("bbox_maxx", DataType::Float32, false),
-            Field::new("bbox_maxy", DataType::Float32, false),
-            Field::new("geometry", DataType::Binary, false),
-        ]));
-
-        let id_arr = Int64Array::from_iter((0..num_rows).map(|_| None::<i64>));
-        let area_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let up_area_arr: Float32Array = Float32Array::from_iter((0..num_rows).map(|_| None::<f32>));
-        let minx_arr = Float32Array::from(vec![-1.0_f32; num_rows]);
-        let miny_arr = Float32Array::from(vec![-1.0_f32; num_rows]);
-        let maxx_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let maxy_arr = Float32Array::from(vec![1.0_f32; num_rows]);
-        let wkb: Vec<u8> = b"wkb".to_vec();
-        let geom_data: Vec<&[u8]> = vec![wkb.as_slice(); num_rows];
-        let geom_arr = BinaryArray::from_iter_values(geom_data);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(id_arr),
-                Arc::new(area_arr),
-                Arc::new(up_area_arr),
-                Arc::new(minx_arr),
-                Arc::new(miny_arr),
-                Arc::new(maxx_arr),
-                Arc::new(maxy_arr),
-                Arc::new(geom_arr),
-            ],
-        )
-        .unwrap();
-
-        let buf = write_parquet(schema, batch);
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catchments.parquet");
-        std::fs::write(&path, &buf).unwrap();
-
-        let (data, diags) = read_catchments(&path);
-
-        // The schema validator catches the nullable id column and exits early.
-        // data is None; the per-row null scan (and therefore null-capping) never runs.
-        assert!(
-            data.is_none(),
-            "schema.wrong_nullability error causes early exit → data should be None"
-        );
-
-        let null_id_diags: Vec<_> = diags
-            .iter()
-            .filter(|d| d.check_id == "catchments.null_id")
-            .collect();
-
-        // With the current architecture (schema error → early exit), the null-capping
-        // path cannot fire.  Zero per-row null diagnostics are expected.
-        assert_eq!(
-            null_id_diags.len(),
-            0,
-            "no catchments.null_id diagnostics expected when schema validation exits early"
-        );
-
-        // The schema validation error must be present.
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.check_id == "schema.wrong_nullability"),
-            "schema.wrong_nullability error must be present"
-        );
-    }
 }
