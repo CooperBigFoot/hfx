@@ -373,11 +373,21 @@ A conformant HFX v0.2 dataset must pass the following validation classes.
 
 - Same-level graphs are acyclic.
 - The parent relation is an acyclic forest.
-- Finer units nest within parent units within validator tolerance.
-- Sibling units have disjoint interiors within validator tolerance.
-- Unit outlets satisfy their topology-role rule within validator tolerance.
+- Finer units must nest within parent units within validator tolerance.
+- Sibling units must have disjoint interiors within validator tolerance.
+- Unit outlets must satisfy their topology-role rule within validator tolerance.
 - Geometry samples are structurally valid WKB Polygon or MultiPolygon values.
 - Snap geometries are WKB Point or LineString values.
+
+### Reference Validator Coverage
+
+The v0.2 reference validator enforces the manifest, schema, ID/value,
+referential-integrity, parent-forest, same-level graph, WKB geometry, snap, and
+auxiliary checks listed above. Expensive geometry-topology checks are
+conformance requirements but may be implemented incrementally by validators:
+perfect nesting, sibling interior disjointness, and outlet topology-role
+position checks are reserved for follow-up validator releases. Producers should
+still enforce these invariants during ETL.
 
 ### Auxiliary Validation
 
