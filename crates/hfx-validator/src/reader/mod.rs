@@ -60,33 +60,28 @@ pub fn read_dataset(dir: &Path) -> ParsedDataset {
         None
     };
 
-    // --- Snap (optional — only read if has_snap is true or file present) ---
-    let has_snap = raw_manifest
-        .as_ref()
-        .and_then(|r| r.has_snap)
-        .unwrap_or(false);
-    let snap = if has_snap {
-        if let Some(path) = &files.snap_path {
-            let (data, diags) = snap::read_snap(path);
-            read_diagnostics.extend(diags);
-            data
-        } else {
-            None
-        }
+    // --- Snap (optional; read when present) ---
+    let snap = if let Some(path) = &files.snap_path {
+        let (data, diags) = snap::read_snap(path);
+        read_diagnostics.extend(diags);
+        data
     } else {
         None
     };
 
-    // --- Rasters (only read if manifest declares has_rasters = true) ---
-    let has_rasters = raw_manifest
+    // --- Blessed D8 raster auxiliary (read when declared or legacy files present) ---
+    let has_d8_aux = raw_manifest
         .as_ref()
-        .and_then(|m| m.has_rasters)
-        .unwrap_or(false);
-
+        .and_then(|m| m.auxiliary.as_ref())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
+        });
     let mut flow_dir = None;
     let mut flow_acc = None;
 
-    if has_rasters {
+    if has_d8_aux {
         if let Some(ref path) = files.flow_dir_path {
             let (meta, diags) = raster::read_raster_meta(path, "flow_dir.tif");
             read_diagnostics.extend(diags);
@@ -122,7 +117,8 @@ fn discover_files(dir: &Path) -> FilePresenceMap {
     FilePresenceMap {
         manifest_path: check("manifest.json"),
         catchments_path: check("catchments.parquet"),
-        graph_path: check("graph.arrow"),
+        graph_path: check("graph.parquet"),
+        legacy_graph_arrow_path: check("graph.arrow"),
         snap_path: check("snap.parquet"),
         flow_dir_path: check("flow_dir.tif"),
         flow_acc_path: check("flow_acc.tif"),

@@ -1,10 +1,13 @@
 //! Validation check modules.
 
+pub mod auxiliary;
 pub mod file_presence;
 pub mod geometry;
 pub mod graph;
 pub mod ids;
+pub mod levels;
 pub mod manifest;
+pub mod parent;
 pub mod raster;
 pub mod referential;
 pub mod schema;
@@ -39,6 +42,11 @@ pub fn run_checks(
     // Phase 1b: manifest field validation (only when successfully deserialized)
     if let Some(raw) = raw_manifest_ref {
         all.extend(manifest::check_manifest(raw));
+        if let Some(manifest_path) = &dataset.files.manifest_path
+            && let Some(root) = manifest_path.parent()
+        {
+            all.extend(auxiliary::check_auxiliary(raw, root));
+        }
     }
 
     // Phase 2: schema checks (B4-B6)
@@ -46,7 +54,7 @@ pub fn run_checks(
 
     // Phase 3: ID + value checks
     if let Some(ref catchments) = dataset.catchments {
-        all.extend(ids::check_catchment_ids(catchments));
+        all.extend(ids::check_unit_ids(catchments));
         all.extend(ids::check_catchment_bboxes(catchments));
         all.extend(ids::check_catchment_areas(catchments));
 
@@ -68,6 +76,11 @@ pub fn run_checks(
     if let (Some(catchments), Some(graph)) = (&dataset.catchments, &dataset.graph) {
         all.extend(referential::check_id_coverage(catchments, graph));
         all.extend(referential::check_upstream_refs(catchments, graph));
+        all.extend(levels::check_level_consistency(catchments, graph));
+    }
+
+    if let Some(catchments) = &dataset.catchments {
+        all.extend(parent::check_parent_forest(catchments));
     }
 
     // D3 snap refs — only needs catchments + snap, not graph

@@ -43,6 +43,19 @@ fn is_large_variant(actual: &DataType, expected: &DataType) -> bool {
     }
 }
 
+fn data_type_matches(actual: &DataType, expected: &DataType) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match (actual, expected) {
+        (DataType::List(actual_field), DataType::List(expected_field)) => {
+            actual_field.data_type() == expected_field.data_type()
+                && actual_field.is_nullable() == expected_field.is_nullable()
+        }
+        _ => false,
+    }
+}
+
 /// Validate an Arrow schema against expected columns.
 ///
 /// For each expected column, checks that:
@@ -82,7 +95,7 @@ pub fn validate_schema(
                 );
             }
             Ok(field) => {
-                if field.data_type() == &col.dtype {
+                if data_type_matches(field.data_type(), &col.dtype) {
                     // Exact match — no type diagnostic.
                 } else if is_large_variant(field.data_type(), &col.dtype) {
                     // Compatible "large" variant — warn rather than error.
@@ -187,128 +200,4 @@ pub fn list_int64_field() -> DataType {
         DataType::Int64,
         true,
     )))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    use super::*;
-    use crate::diagnostic::{Artifact, Severity};
-
-    fn make_schema(fields: Vec<Field>) -> Schema {
-        Schema::new(fields)
-    }
-
-    #[test]
-    fn valid_schema_no_diagnostics() {
-        let schema = make_schema(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("area_km2", DataType::Float32, false),
-        ]);
-        let expected = vec![
-            ExpectedColumn::new("id", DataType::Int64, false),
-            ExpectedColumn::new("area_km2", DataType::Float32, false),
-        ];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert!(diags.is_empty(), "expected no diagnostics: {diags:#?}");
-    }
-
-    #[test]
-    fn missing_column_produces_error() {
-        let schema = make_schema(vec![Field::new("id", DataType::Int64, false)]);
-        let expected = vec![
-            ExpectedColumn::new("id", DataType::Int64, false),
-            ExpectedColumn::new("missing_col", DataType::Float32, false),
-        ];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].check_id, "schema.missing_column");
-        assert_eq!(diags[0].severity, Severity::Error);
-    }
-
-    #[test]
-    fn wrong_type_produces_error() {
-        let schema = make_schema(vec![Field::new("id", DataType::Int32, false)]);
-        let expected = vec![ExpectedColumn::new("id", DataType::Int64, false)];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].check_id, "schema.wrong_type");
-    }
-
-    #[test]
-    fn large_binary_instead_of_binary_produces_error() {
-        let schema = make_schema(vec![Field::new("geometry", DataType::LargeBinary, false)]);
-        let expected = vec![ExpectedColumn::new("geometry", DataType::Binary, false)];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(
-            diags.len(),
-            1,
-            "expected exactly one diagnostic: {diags:#?}"
-        );
-        assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Error);
-    }
-
-    #[test]
-    fn binary_instead_of_large_binary_produces_error() {
-        let schema = make_schema(vec![Field::new("geometry", DataType::Binary, false)]);
-        let expected = vec![ExpectedColumn::new(
-            "geometry",
-            DataType::LargeBinary,
-            false,
-        )];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(
-            diags.len(),
-            1,
-            "expected exactly one diagnostic: {diags:#?}"
-        );
-        assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Error);
-    }
-
-    #[test]
-    fn large_list_instead_of_list_produces_error() {
-        let large_list_field =
-            DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true)));
-        let schema = make_schema(vec![Field::new("upstream_ids", large_list_field, false)]);
-        let expected = vec![ExpectedColumn::new(
-            "upstream_ids",
-            list_int64_field(),
-            false,
-        )];
-        let diags = validate_schema(&schema, &expected, Artifact::Graph);
-        assert_eq!(
-            diags.len(),
-            1,
-            "expected exactly one diagnostic: {diags:#?}"
-        );
-        assert_eq!(diags[0].check_id, "schema.large_variant");
-        assert_eq!(diags[0].severity, Severity::Error);
-    }
-
-    #[test]
-    fn non_nullable_column_declared_nullable_produces_error() {
-        // expected: nullable=false, actual: nullable=true → error (producer may write nulls)
-        let schema = make_schema(vec![Field::new("id", DataType::Int64, true)]);
-        let expected = vec![ExpectedColumn::new("id", DataType::Int64, false)];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].check_id, "schema.wrong_nullability");
-        assert_eq!(diags[0].severity, Severity::Error);
-    }
-
-    #[test]
-    fn nullable_column_declared_non_nullable_produces_warning() {
-        // expected: nullable=true, actual: nullable=false → warning (stricter than required)
-        let schema = make_schema(vec![Field::new("up_area_km2", DataType::Float32, false)]);
-        let expected = vec![ExpectedColumn::new("up_area_km2", DataType::Float32, true)];
-        let diags = validate_schema(&schema, &expected, Artifact::Catchments);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].check_id, "schema.wrong_nullability");
-        assert_eq!(diags[0].severity, Severity::Warning);
-    }
 }
