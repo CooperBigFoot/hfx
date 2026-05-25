@@ -5,7 +5,7 @@
 #   "pyarrow>=12.0.0,<23.0.0",
 # ]
 # ///
-"""Generate HFX v0.2 conformance fixtures.
+"""Generate HFX v0.2.1 conformance fixtures.
 
 Run with:
     uv run conformance/generate_fixtures.py
@@ -150,7 +150,7 @@ def write_manifest(
     out_dir: Path,
     *,
     crs: str = "EPSG:4326",
-    version: str = "0.2",
+    version: str = "0.2.1",
     auxiliary: list[dict] | None = None,
 ) -> None:
     manifest = {
@@ -184,7 +184,7 @@ def generate_valid_tiny() -> None:
     write_catchments(out)
     write_graph(out, VALID_UPSTREAM)
     write_manifest(out)
-    write_readme(out, "Valid tiny v0.2 fixture", "none")
+    write_readme(out, "Valid tiny v0.2.1 fixture", "none")
 
 
 def generate_valid_tiny_with_aux_d8() -> None:
@@ -208,7 +208,7 @@ def generate_valid_tiny_with_aux_d8() -> None:
             }
         ],
     )
-    write_readme(out, "Valid tiny v0.2 fixture with D8 auxiliary rasters", "none")
+    write_readme(out, "Valid tiny v0.2.1 fixture with D8 auxiliary rasters", "none")
 
 
 def generate_invalid_dangling() -> None:
@@ -288,7 +288,7 @@ def main() -> None:
     generate_invalid_parent_level()
     generate_legacy_format_version()
     generate_legacy_graph_arrow()
-    print("[generate_fixtures] Wrote HFX v0.2 conformance fixtures")
+    print("[generate_fixtures] Wrote HFX v0.2.1 conformance fixtures")
 
 
 if __name__ == "__main__":

@@ -42,15 +42,15 @@ impl FromStr for Topology {
 pub enum FormatVersion {
     /// HFX specification version 0.1.
     V0_1,
-    /// HFX specification version 0.2.
-    V0_2,
+    /// HFX specification version 0.2.1.
+    V0_2_1,
 }
 
 impl std::fmt::Display for FormatVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FormatVersion::V0_1 => write!(f, "0.1"),
-            FormatVersion::V0_2 => write!(f, "0.2"),
+            FormatVersion::V0_2_1 => write!(f, "0.2.1"),
         }
     }
 }
@@ -61,7 +61,7 @@ impl FromStr for FormatVersion {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "0.1" => Ok(FormatVersion::V0_1),
-            "0.2" => Ok(FormatVersion::V0_2),
+            "0.2.1" => Ok(FormatVersion::V0_2_1),
             _ => Err(ManifestError::UnsupportedFormatVersion {
                 value: s.to_owned(),
             }),
@@ -72,7 +72,7 @@ impl FromStr for FormatVersion {
 /// Coordinate reference system for all HFX vector data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Crs {
-    /// WGS84 geographic coordinates. The only CRS supported in HFX v0.2.
+    /// WGS84 geographic coordinates. The only CRS supported in HFX v0.2.1.
     Epsg4326,
 }
 
@@ -140,7 +140,7 @@ pub enum ManifestError {
     },
 
     /// Returned when an unsupported format version is provided.
-    #[error("unsupported format version: {value:?}, expected \"0.2\"")]
+    #[error("unsupported format version: {value:?}, expected \"0.2.1\"")]
     UnsupportedFormatVersion {
         /// The unrecognized version string.
         value: String,
@@ -402,7 +402,7 @@ mod tests {
 
     fn minimal_builder() -> ManifestBuilder {
         ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn builder_empty_fabric_name_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "",
             Crs::Epsg4326,
             Topology::Tree,
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn builder_empty_adapter_version_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn builder_empty_created_at_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn fabric_name_uppercase_fails() {
         let err = ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "HydroBASINS",
             Crs::Epsg4326,
             Topology::Tree,
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn fabric_name_lowercase_succeeds() {
         let result = ManifestBuilder::new(
-            FormatVersion::V0_2,
+            FormatVersion::V0_2_1,
             "testfabric",
             Crs::Epsg4326,
             Topology::Tree,
@@ -526,7 +526,7 @@ mod tests {
         let manifest = minimal_builder().build();
 
         assert_eq!(manifest.up_area(), UpAreaAvailability::NotAvailable);
-        assert_eq!(manifest.format_version(), FormatVersion::V0_2);
+        assert_eq!(manifest.format_version(), FormatVersion::V0_2_1);
         assert_eq!(manifest.crs(), Crs::Epsg4326);
         assert_eq!(manifest.fabric_version(), None);
         assert_eq!(manifest.region(), None);
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(manifest.fabric_version(), Some("v2024"));
         assert_eq!(manifest.region(), Some("North America"));
         assert_eq!(manifest.auxiliary(), &[auxiliary]);
-        assert_eq!(manifest.format_version(), FormatVersion::V0_2);
+        assert_eq!(manifest.format_version(), FormatVersion::V0_2_1);
         assert_eq!(manifest.crs(), Crs::Epsg4326);
     }
 
@@ -593,8 +593,11 @@ mod tests {
     fn format_version_display_roundtrip() {
         assert_eq!(FormatVersion::V0_1.to_string(), "0.1");
         assert_eq!("0.1".parse::<FormatVersion>().unwrap(), FormatVersion::V0_1);
-        assert_eq!(FormatVersion::V0_2.to_string(), "0.2");
-        assert_eq!("0.2".parse::<FormatVersion>().unwrap(), FormatVersion::V0_2);
+        assert_eq!(FormatVersion::V0_2_1.to_string(), "0.2.1");
+        assert_eq!(
+            "0.2.1".parse::<FormatVersion>().unwrap(),
+            FormatVersion::V0_2_1
+        );
     }
 
     #[test]

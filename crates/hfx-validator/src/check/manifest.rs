@@ -1,4 +1,4 @@
-//! Manifest field validation for HFX v0.2.
+//! Manifest field validation for HFX v0.2.1.
 
 use std::collections::BTreeMap;
 
@@ -11,12 +11,12 @@ use tracing::debug;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::manifest::{RawAuxEntry, RawManifest};
 
-/// Check every field in `raw` against the HFX v0.2 manifest contract.
+/// Check every field in `raw` against the HFX v0.2.1 manifest contract.
 pub fn check_manifest(raw: &RawManifest) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
     check_format_version(raw, &mut diags);
-    if raw.format_version.as_deref().is_some_and(|v| v != "0.2") {
+    if raw.format_version.as_deref().is_some_and(|v| v != "0.2.1") {
         debug!(
             count = diags.len(),
             "manifest short-circuited on unsupported format"
@@ -40,7 +40,7 @@ pub fn check_manifest(raw: &RawManifest) -> Vec<Diagnostic> {
 
 /// Attempt to construct an [`hfx_core::Manifest`] from a `RawManifest`.
 pub fn try_build_manifest(raw: &RawManifest) -> Option<hfx_core::Manifest> {
-    if raw.format_version.as_deref()? != "0.2" {
+    if raw.format_version.as_deref()? != "0.2.1" {
         return None;
     }
 
@@ -108,7 +108,7 @@ fn check_format_version(raw: &RawManifest, diags: &mut Vec<Diagnostic>) {
             "format_version",
             "missing required field: format_version",
         ),
-        Some("0.2") => {}
+        Some("0.2.1") => {}
         Some(v) => diags.push(
             Diagnostic::error(
                 "manifest.unsupported_format_version",

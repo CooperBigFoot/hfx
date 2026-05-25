@@ -1,4 +1,4 @@
-//! Minimal integration tests for the v0.2 validator pipeline.
+//! Minimal integration tests for the v0.2.1 validator pipeline.
 
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ fn fixture_path(category: &str, name: &str) -> PathBuf {
 }
 
 #[test]
-fn valid_v02_fixture_has_clean_json_report() {
+fn valid_v021_fixture_has_clean_json_report() {
     let report = validate(&fixture_path("valid", "tiny"), false, true, 100.0);
     assert!(report.is_valid(), "{:#?}", report.diagnostics());
 
