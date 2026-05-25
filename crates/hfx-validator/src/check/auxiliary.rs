@@ -20,7 +20,25 @@ pub fn check_auxiliary(
         return diags;
     };
 
+    let mut snap_names = HashSet::new();
+
     for (idx, entry) in entries.iter().enumerate() {
+        if entry.schema.as_deref() == Some("hfx.aux.snap.v1")
+            && let Some(name) = snap_name(entry)
+            && !snap_names.insert(name.to_string())
+        {
+            diags.push(
+                Diagnostic::error(
+                    "aux.snap.duplicate_name",
+                    Category::Manifest,
+                    Artifact::Manifest,
+                    format!("hfx.aux.snap.v1 metadata.name {name:?} is duplicated"),
+                )
+                .at(Location::Field {
+                    name: "auxiliary".into(),
+                }),
+            );
+        }
         check_entry(idx, entry, dataset_root, catchments, &mut diags);
     }
 
@@ -37,6 +55,7 @@ fn check_entry(
     let Some(artifacts) = entry.artifacts.as_ref() else {
         return;
     };
+    let label = entry_label(idx, entry);
 
     for (key, rel_path) in artifacts {
         let path = dataset_root.join(rel_path);
@@ -46,7 +65,9 @@ fn check_entry(
                     "auxiliary.path_escape",
                     Category::FilePresence,
                     Artifact::Manifest,
-                    format!("auxiliary[{idx}] artifact {key:?} path {rel_path:?} is not a safe relative path"),
+                    format!(
+                        "{label} artifact {key:?} path {rel_path:?} is not a safe relative path"
+                    ),
                 )
                 .at(Location::Field {
                     name: "auxiliary".into(),
@@ -58,7 +79,7 @@ fn check_entry(
                     "auxiliary.missing_artifact",
                     Category::FilePresence,
                     Artifact::Manifest,
-                    format!("auxiliary[{idx}] artifact {key:?} path {rel_path:?} is missing"),
+                    format!("{label} artifact {key:?} path {rel_path:?} is missing"),
                 )
                 .at(Location::Field {
                     name: "auxiliary".into(),
@@ -149,13 +170,25 @@ fn check_snap_v1(
 }
 
 fn snap_label(idx: usize, entry: &RawAuxEntry) -> String {
+    snap_name(entry)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("auxiliary[{idx}]"))
+}
+
+fn snap_name(entry: &RawAuxEntry) -> Option<&str> {
     entry
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.get("name"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("auxiliary[{idx}]"))
+}
+
+fn entry_label(idx: usize, entry: &RawAuxEntry) -> String {
+    if entry.schema.as_deref() == Some("hfx.aux.snap.v1") {
+        snap_label(idx, entry)
+    } else {
+        format!("auxiliary[{idx}]")
+    }
 }
 
 fn references_levels(entry: &RawAuxEntry) -> HashSet<i16> {
@@ -248,7 +281,9 @@ mod tests {
     use crate::diagnostic::{Artifact, Severity};
     use crate::reader::manifest::RawAuxEntry;
 
-    use super::{check_snap_data_for_aux, check_snap_declared_levels, check_snap_stem_roles};
+    use super::{
+        check_auxiliary, check_snap_data_for_aux, check_snap_declared_levels, check_snap_stem_roles,
+    };
 
     fn snap_with_roles(stem_roles: Vec<Option<&str>>) -> SnapData {
         let row_count = stem_roles.len();
@@ -334,6 +369,43 @@ mod tests {
             diag.check_id == "aux.snap.level_not_declared"
                 && diag.severity == Severity::Error
                 && diag.artifact == Artifact::CrossFile
+        }));
+    }
+
+    #[test]
+    fn duplicate_snap_metadata_name_emits_aux_diagnostic() {
+        let raw = crate::reader::manifest::RawManifest {
+            format_version: None,
+            fabric_name: None,
+            fabric_version: None,
+            crs: None,
+            has_up_area: None,
+            topology: None,
+            region: None,
+            bbox: None,
+            unit_count: None,
+            created_at: None,
+            adapter_version: None,
+            auxiliary: Some(vec![
+                RawAuxEntry {
+                    schema: Some("hfx.aux.snap.v1".to_string()),
+                    artifacts: Some(Default::default()),
+                    metadata: Some(serde_json::json!({"name": "reach-stems"})),
+                },
+                RawAuxEntry {
+                    schema: Some("hfx.aux.snap.v1".to_string()),
+                    artifacts: Some(Default::default()),
+                    metadata: Some(serde_json::json!({"name": "reach-stems"})),
+                },
+            ]),
+        };
+
+        let diagnostics = check_auxiliary(&raw, std::path::Path::new("."), None);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "aux.snap.duplicate_name"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Manifest
         }));
     }
 }
