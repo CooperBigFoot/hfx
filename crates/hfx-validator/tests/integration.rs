@@ -40,6 +40,23 @@ fn legacy_v01_manifest_is_hard_cut() {
 }
 
 #[test]
+fn v02_manifest_is_hard_cut() {
+    let report = validate(
+        &fixture_path("invalid", "v02-format-version"),
+        false,
+        true,
+        100.0,
+    );
+    assert!(!report.is_valid());
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|d| d.check_id == "manifest.unsupported_format_version")
+    );
+}
+
+#[test]
 fn empty_directory_fails_file_presence() {
     let dir = tempfile::tempdir().unwrap();
     let report = validate(dir.path(), false, true, 100.0);

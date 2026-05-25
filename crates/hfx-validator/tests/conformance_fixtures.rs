@@ -14,7 +14,12 @@ fn fixture_path(category: &str, name: &str) -> PathBuf {
 
 #[test]
 fn conformance_valid_fixtures_pass() {
-    for name in ["tiny", "tiny-with-aux-d8"] {
+    for name in [
+        "tiny",
+        "tiny-with-aux-d8",
+        "grit-two-level",
+        "grit-two-snap",
+    ] {
         let p = fixture_path("valid", name);
         let report = validate(&p, false, true, 100.0);
         assert!(
@@ -40,6 +45,23 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
             "manifest.unsupported_format_version",
         ),
         ("legacy-graph-arrow", "graph.legacy_arrow_format"),
+        ("graph-missing-bbox-cols", "schema.missing_column"),
+        (
+            "graph-bbox-stats-missing",
+            "schema.graph.bbox_stats_missing",
+        ),
+        (
+            "catchments-multi-level-unsorted",
+            "ordering.catchments.level_unsorted",
+        ),
+        ("graph-level-unsorted", "ordering.graph.level_unsorted"),
+        ("legacy-core-snap", "file_presence.legacy_snap_parquet"),
+        ("aux-snap-bad-stem-role", "aux.snap.stem_role_invalid"),
+        ("aux-snap-level-not-declared", "aux.snap.level_not_declared"),
+        ("aux-snap-duplicate-name", "aux.snap.duplicate_name"),
+        ("aux-snap-bad-geometry", "geometry.snap_wrong_type"),
+        ("aux-snap-weight-negative", "aux.snap.weight_invalid"),
+        ("v02-format-version", "manifest.unsupported_format_version"),
     ];
 
     for (name, expected) in cases {
