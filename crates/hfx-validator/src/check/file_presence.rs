@@ -12,7 +12,7 @@ use crate::reader::manifest::RawManifest;
 /// Rules:
 /// - `catchments.parquet` is always required.
 /// - `graph.parquet` is always required.
-/// - `snap.parquet` is optional.
+/// - root-level `snap.parquet` is a legacy v0.2 artifact.
 /// - Auxiliary artifact files are required when referenced by `manifest.json`.
 pub fn check_file_presence(
     files: &FilePresenceMap,
@@ -59,6 +59,15 @@ pub fn check_file_presence(
         ));
     }
 
+    if files.snap_path.is_some() {
+        diags.push(Diagnostic::error(
+            "file_presence.legacy_snap_parquet",
+            Category::FilePresence,
+            Artifact::Snap,
+            "snap.parquet at dataset root is a v0.2 artifact; move to hfx.aux.snap.v1",
+        ));
+    }
+
     if let Some(aux_entries) = raw_manifest.and_then(|m| m.auxiliary.as_ref()) {
         for entry in aux_entries {
             if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1") {
@@ -101,3 +110,39 @@ pub fn check_file_presence(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::dataset::FilePresenceMap;
+    use crate::diagnostic::{Artifact, Severity};
+
+    use super::check_file_presence;
+
+    fn empty_files() -> FilePresenceMap {
+        FilePresenceMap {
+            manifest_path: Some(PathBuf::from("manifest.json")),
+            catchments_path: Some(PathBuf::from("catchments.parquet")),
+            graph_path: Some(PathBuf::from("graph.parquet")),
+            legacy_graph_arrow_path: None,
+            snap_path: None,
+            flow_dir_path: None,
+            flow_acc_path: None,
+        }
+    }
+
+    #[test]
+    fn root_snap_parquet_emits_legacy_error() {
+        let mut files = empty_files();
+        files.snap_path = Some(PathBuf::from("snap.parquet"));
+
+        let diagnostics = check_file_presence(&files, None);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "file_presence.legacy_snap_parquet"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Snap
+        }));
+    }
+}

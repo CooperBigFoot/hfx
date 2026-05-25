@@ -91,33 +91,6 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
         );
     }
 
-    // B4/B5: Same checks for snap.parquet when present.
-    if let Some(snap) = &dataset.snap {
-        for (rg_idx, has_stats) in snap.row_group_has_bbox_stats.iter().enumerate() {
-            if !has_stats {
-                diags.push(Diagnostic::error(
-                    "schema.snap.bbox_stats_missing",
-                    Category::Schema,
-                    Artifact::Snap,
-                    format!(
-                        "snap.parquet row group {rg_idx} is missing statistics for bbox columns; \
-                         spec requires row group statistics on bbox columns"
-                    ),
-                ));
-            }
-        }
-
-        emit_row_group_diag(
-            classify_row_groups(snap.row_count, &snap.row_group_sizes),
-            snap.row_count,
-            Artifact::Snap,
-            "snap.parquet",
-            "schema.snap.rg_size",
-            "schema.snap.rg_count",
-            &mut diags,
-        );
-    }
-
     // B6: unit_count in manifest matches catchments row count.
     // Use raw_manifest so a bad fabric_name (or any other unparseable field)
     // does not suppress this check.
@@ -201,9 +174,7 @@ fn emit_row_group_diag(
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::{
-        CatchmentsData, FilePresenceMap, GraphData, ParsedDataset, RasterMeta, SnapData,
-    };
+    use crate::dataset::{CatchmentsData, FilePresenceMap, GraphData, ParsedDataset, RasterMeta};
     use crate::diagnostic::{Artifact, Severity};
     use crate::reader::manifest::RawManifest;
 
@@ -225,7 +196,6 @@ mod tests {
             manifest: None,
             catchments: None::<CatchmentsData>,
             graph: Some(graph),
-            snap: None::<SnapData>,
             flow_dir: None::<RasterMeta>,
             flow_acc: None::<RasterMeta>,
             read_diagnostics: Vec::new(),

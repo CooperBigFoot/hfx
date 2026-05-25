@@ -68,15 +68,6 @@ pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDatase
         None
     };
 
-    // --- Snap (optional; read when present) ---
-    let snap = if let Some(path) = &files.snap_path {
-        let (data, diags) = snap::read_snap(path);
-        read_diagnostics.extend(diags);
-        data
-    } else {
-        None
-    };
-
     // --- Blessed D8 raster auxiliary (read when declared or legacy files present) ---
     let has_d8_aux = raw_manifest
         .as_ref()
@@ -109,7 +100,6 @@ pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDatase
         manifest,
         catchments,
         graph,
-        snap,
         flow_dir,
         flow_acc,
         read_diagnostics,

@@ -80,10 +80,6 @@ pub fn run_checks(
         all.extend(ids::check_upstream_ids(graph));
     }
 
-    if let Some(ref snap) = dataset.snap {
-        all.extend(ids::check_snap_data(snap));
-    }
-
     // Phase 4: referential integrity
     if let (Some(catchments), Some(graph)) = (&dataset.catchments, &dataset.graph) {
         all.extend(referential::check_id_coverage(catchments, graph));
@@ -93,11 +89,6 @@ pub fn run_checks(
 
     if let Some(catchments) = &dataset.catchments {
         all.extend(parent::check_parent_forest(catchments));
-    }
-
-    // D3 snap refs — only needs catchments + snap, not graph
-    if let (Some(catchments), Some(snap)) = (&dataset.catchments, &dataset.snap) {
-        all.extend(referential::check_snap_refs(catchments, snap));
     }
 
     // D4 bbox enclosure — only needs catchments + manifest, not graph
@@ -115,10 +106,6 @@ pub fn run_checks(
     // Phase 6: geometry
     if let Some(ref catchments) = dataset.catchments {
         all.extend(geometry::check_catchment_geometries(catchments, sample_pct));
-    }
-
-    if let Some(ref snap) = dataset.snap {
-        all.extend(geometry::check_snap_geometries(snap));
     }
 
     // Phase 7: raster (skipped if skip_rasters is true)

@@ -147,7 +147,6 @@ pub struct ParsedDataset {
     pub manifest: Option<Manifest>,
     pub catchments: Option<CatchmentsData>,
     pub graph: Option<GraphData>,
-    pub snap: Option<SnapData>,
     pub flow_dir: Option<RasterMeta>,
     pub flow_acc: Option<RasterMeta>,
     pub read_diagnostics: Vec<Diagnostic>,
