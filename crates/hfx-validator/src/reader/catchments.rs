@@ -125,6 +125,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     // checker and re-read the parquet file for just those rows, avoiding the full load.
     let mut geometry_wkb: Vec<Vec<u8>> = Vec::new();
     let mut up_area_null_count: usize = 0;
+    let mut first_up_area_non_null_row: Option<usize> = None;
     let mut up_area_total: usize = 0;
     let mut total_rows: usize = 0;
 
@@ -308,10 +309,16 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             }
         }
 
-        // up_area_km2 (nullable — existing null-counting logic is correct)
+        // up_area_km2 is nullable. Track null totals plus the first populated
+        // row for manifest consistency diagnostics.
         up_area_total += num_rows;
         if let Some(up_col) = batch.column_by_name("up_area_km2") {
             up_area_null_count += up_col.null_count();
+            if first_up_area_non_null_row.is_none() {
+                first_up_area_non_null_row = (0..num_rows)
+                    .find(|&i| !up_col.is_null(i))
+                    .map(|i| total_rows + i);
+            }
         } else {
             up_area_null_count += num_rows;
         }
@@ -518,6 +525,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             outlet_lats,
             bboxes,
             up_area_null_count,
+            first_up_area_non_null_row,
             up_area_total,
             geometry_wkb,
             row_group_sizes,

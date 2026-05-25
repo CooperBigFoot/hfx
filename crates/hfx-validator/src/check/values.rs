@@ -15,8 +15,9 @@ use crate::reader::manifest::RawManifest;
 
 /// C4 — Check `up_area_km2` consistency.
 ///
-/// If `manifest.has_up_area == true` then every row must carry a non-null
-/// `up_area_km2` value, i.e. `up_area_null_count` must be 0.
+/// If `manifest.has_up_area == true` then at least one row must carry a
+/// non-null `up_area_km2` value. If `manifest.has_up_area == false`, no row may
+/// carry a non-null `up_area_km2` value.
 pub fn check_up_area_consistency(
     raw_manifest: &RawManifest,
     data: &CatchmentsData,
@@ -30,20 +31,36 @@ pub fn check_up_area_consistency(
         None => return diags,
     };
 
-    if has_up_area && data.up_area_null_count > 0 {
+    let up_area_non_null_count = data.up_area_total.saturating_sub(data.up_area_null_count);
+
+    if has_up_area && up_area_non_null_count == 0 {
         diags.push(
             Diagnostic::error(
-                "values.up_area_consistency",
+                "values.up_area_empty",
                 Category::ValueConsistency,
                 Artifact::Catchments,
                 format!(
-                    "manifest declares has_up_area = true but {} of {} up_area_km2 values are null",
-                    data.up_area_null_count, data.up_area_total,
+                    "manifest declares has_up_area = true but all {} up_area_km2 values are null",
+                    data.up_area_total,
                 ),
             )
             .at(Location::Column {
                 name: "up_area_km2".into(),
             }),
+        );
+    } else if !has_up_area && up_area_non_null_count > 0 {
+        let first_row = data.first_up_area_non_null_row.unwrap_or(0);
+        diags.push(
+            Diagnostic::error(
+                "values.up_area_unexpected",
+                Category::ValueConsistency,
+                Artifact::Catchments,
+                format!(
+                    "manifest declares has_up_area = false but {up_area_non_null_count} of {} up_area_km2 values are non-null; first non-null row is {first_row}",
+                    data.up_area_total,
+                ),
+            )
+            .at(Location::Row { index: first_row }),
         );
     }
 
@@ -251,3 +268,74 @@ pub fn check_bbox_enclosure(raw_manifest: &RawManifest, data: &CatchmentsData) -
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::dataset::CatchmentsData;
+    use crate::reader::manifest::RawManifest;
+
+    use super::check_up_area_consistency;
+
+    fn manifest(has_up_area: bool) -> RawManifest {
+        RawManifest {
+            format_version: None,
+            fabric_name: None,
+            fabric_version: None,
+            crs: None,
+            has_up_area: Some(has_up_area),
+            topology: None,
+            region: None,
+            bbox: None,
+            unit_count: None,
+            created_at: None,
+            adapter_version: None,
+            auxiliary: None,
+        }
+    }
+
+    fn catchments(
+        row_count: usize,
+        up_area_null_count: usize,
+        first_up_area_non_null_row: Option<usize>,
+    ) -> CatchmentsData {
+        CatchmentsData {
+            row_count,
+            ids: (1..=row_count as i64).collect(),
+            levels: vec![0; row_count],
+            parent_ids: vec![None; row_count],
+            areas_km2: vec![1.0; row_count],
+            outlet_lons: vec![0.0; row_count],
+            outlet_lats: vec![0.0; row_count],
+            bboxes: vec![[0.0, 0.0, 1.0, 1.0]; row_count],
+            up_area_null_count,
+            first_up_area_non_null_row,
+            up_area_total: row_count,
+            geometry_wkb: vec![Vec::new(); row_count],
+            row_group_sizes: vec![row_count],
+            row_group_has_bbox_stats: vec![true],
+        }
+    }
+
+    #[test]
+    fn has_up_area_true_allows_partial_nulls() {
+        let diagnostics = check_up_area_consistency(&manifest(true), &catchments(3, 1, Some(0)));
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn has_up_area_true_rejects_entirely_null_column() {
+        let diagnostics = check_up_area_consistency(&manifest(true), &catchments(3, 3, None));
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].check_id, "values.up_area_empty");
+    }
+
+    #[test]
+    fn has_up_area_false_rejects_populated_values() {
+        let diagnostics = check_up_area_consistency(&manifest(false), &catchments(3, 2, Some(1)));
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].check_id, "values.up_area_unexpected");
+    }
+}

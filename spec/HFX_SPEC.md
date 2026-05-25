@@ -115,6 +115,10 @@ are promoted to ERROR under `--strict`.
 - `outlet_lon` and `outlet_lat` are finite WGS84 coordinates.
 - `up_area_km2`, when present, is the inclusive cumulative upstream area for
   same-level graph traversal. It is deliberately non-comparable across levels.
+  Producers may emit null `up_area_km2` for individual rows where computation
+  is not possible (e.g., source-data anomalies preventing the producer's chosen
+  accumulation algorithm from converging); the manifest's `has_up_area=true`
+  flag claims coverage at the column level, not every-row populated.
 
 For DAG-topology datasets, `up_area_km2` semantics at bifurcations are
 producer-defined and must be documented in the manifest or an accompanying
@@ -254,7 +258,7 @@ Traversal policies and refinement policies are engine runtime parameters.
 | `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
 | `crs` | string | Yes | Must be `"EPSG:4326"` in HFX v0.2 |
-| `has_up_area` | bool | Yes | Whether `up_area_km2` is populated where applicable |
+| `has_up_area` | bool | Yes | Whether `up_area_km2` is computed and populated. When true, the column carries computed values for rows where computation is possible; nulls are permitted for rows where computation is not possible. When false, all values are null. |
 | `topology` | string | Yes | `"tree"` or `"dag"` |
 | `region` | string | No | Geographic or source-fabric subset label |
 | `bbox` | float[4] | Yes | `[minx, miny, maxx, maxy]` covering all units |

@@ -31,6 +31,7 @@ pub struct CatchmentsData {
     pub outlet_lats: Vec<f64>,
     pub bboxes: Vec<[f32; 4]>,
     pub up_area_null_count: usize,
+    pub first_up_area_non_null_row: Option<usize>,
     pub up_area_total: usize,
     pub geometry_wkb: Vec<Vec<u8>>,
     pub row_group_sizes: Vec<usize>,

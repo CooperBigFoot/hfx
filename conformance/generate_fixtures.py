@@ -65,7 +65,18 @@ def wkb_rect(minx: float, miny: float, maxx: float, maxy: float) -> bytes:
     return shapely.wkb.dumps(box(minx, miny, maxx, maxy), byte_order=1)
 
 
-def write_catchments(out_dir: Path, rows=BASE_ROWS, *, write_statistics: bool = True) -> None:
+def write_catchments(
+    out_dir: Path,
+    rows=BASE_ROWS,
+    *,
+    up_area_values: list[float | None] | None = None,
+    write_statistics: bool = True,
+) -> None:
+    if up_area_values is None:
+        up_area_values = [None for _ in rows]
+    if len(up_area_values) != len(rows):
+        raise ValueError("up_area_values length must match rows length")
+
     schema = pa.schema(
         [
             pa.field("id", pa.int64(), nullable=False),
@@ -91,7 +102,7 @@ def write_catchments(out_dir: Path, rows=BASE_ROWS, *, write_statistics: bool = 
             "level": pa.array([r[1] for r in rows], type=pa.int16()),
             "parent_id": pa.array([r[2] for r in rows], type=pa.int64()),
             "area_km2": pa.array([4.0 if r[0] == 1 else 1.0 for r in rows], type=pa.float32()),
-            "up_area_km2": pa.array([None for _ in rows], type=pa.float32()),
+            "up_area_km2": pa.array(up_area_values, type=pa.float32()),
             "outlet_lon": pa.array([r[7] for r in rows], type=pa.float64()),
             "outlet_lat": pa.array([r[8] for r in rows], type=pa.float64()),
             "bbox_minx": pa.array([r[3] for r in rows], type=pa.float32()),
@@ -219,13 +230,14 @@ def write_manifest(
     *,
     crs: str = "EPSG:4326",
     version: str = "0.2.1",
+    has_up_area: bool = False,
     auxiliary: list[dict] | None = None,
 ) -> None:
     manifest = {
         "format_version": version,
         "fabric_name": FABRIC_NAME,
         "crs": crs,
-        "has_up_area": False,
+        "has_up_area": has_up_area,
         "topology": "tree",
         "bbox": [0.0, 0.0, 2.0, 2.0],
         "unit_count": 5,
@@ -316,6 +328,15 @@ def generate_valid_grit_two_snap() -> None:
         ],
     )
     write_readme(out, "Valid GRIT-style two-level fixture with two snap auxiliaries", "none")
+
+
+def generate_valid_up_area_partial_nulls() -> None:
+    out = SCRIPT_DIR / "valid" / "up-area-partial-nulls"
+    reset_dir(out)
+    write_catchments(out, up_area_values=[4.0, 1.0, None, 3.0, 4.0])
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(out, has_up_area=True)
+    write_readme(out, "Valid partial upstream area fixture", "none")
 
 
 def generate_invalid_dangling() -> None:
@@ -501,11 +522,30 @@ def generate_invalid_v02_format_version() -> None:
     write_readme(out, "v0.2 manifest", "manifest.unsupported_format_version")
 
 
+def generate_invalid_up_area_empty_but_claimed() -> None:
+    out = SCRIPT_DIR / "invalid" / "up-area-empty-but-claimed"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(out, has_up_area=True)
+    write_readme(out, "Upstream area empty but claimed", "values.up_area_empty")
+
+
+def generate_invalid_up_area_unexpected() -> None:
+    out = SCRIPT_DIR / "invalid" / "up-area-unexpected"
+    reset_dir(out)
+    write_catchments(out, up_area_values=[None, None, 2.0, None, None])
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(out, has_up_area=False)
+    write_readme(out, "Unexpected upstream area values", "values.up_area_unexpected")
+
+
 def main() -> None:
     generate_valid_tiny()
     generate_valid_tiny_with_aux_d8()
     generate_valid_grit_two_level()
     generate_valid_grit_two_snap()
+    generate_valid_up_area_partial_nulls()
     generate_invalid_dangling()
     generate_invalid_crs()
     generate_invalid_parent_cycle()
@@ -523,6 +563,8 @@ def main() -> None:
     generate_invalid_aux_snap_bad_geometry()
     generate_invalid_aux_snap_weight_negative()
     generate_invalid_v02_format_version()
+    generate_invalid_up_area_empty_but_claimed()
+    generate_invalid_up_area_unexpected()
     print("[generate_fixtures] Wrote HFX v0.2.1 conformance fixtures")
 
 
