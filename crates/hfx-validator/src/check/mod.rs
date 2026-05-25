@@ -66,6 +66,7 @@ pub fn run_checks(
 
     if let Some(ref graph) = dataset.graph {
         all.extend(ids::check_graph_ids(graph));
+        all.extend(ids::check_graph_bboxes(graph));
         all.extend(ids::check_upstream_ids(graph));
     }
 

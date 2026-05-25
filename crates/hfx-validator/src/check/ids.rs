@@ -301,6 +301,38 @@ pub fn check_graph_ids(data: &GraphData) -> Vec<Diagnostic> {
     diags
 }
 
+/// Check all graph bbox values are valid.
+pub fn check_graph_bboxes(data: &GraphData) -> Vec<Diagnostic> {
+    let mut diags: Vec<Diagnostic> = Vec::new();
+    let mut violation_count = 0usize;
+
+    for (i, bbox) in data.bboxes.iter().enumerate() {
+        let [minx, miny, maxx, maxy] = *bbox;
+        let row_errors = validate_bbox_f32(minx, miny, maxx, maxy, i, Artifact::Graph);
+        for d in row_errors {
+            violation_count += 1;
+            if violation_count <= MAX_VIOLATIONS {
+                diags.push(d);
+            }
+        }
+    }
+
+    if violation_count > MAX_VIOLATIONS {
+        diags.push(Diagnostic::error(
+            "ids.graph_bbox",
+            Category::IdConstraint,
+            Artifact::Graph,
+            format!(
+                "... and {} more graph bbox violations (only first {MAX_VIOLATIONS} shown)",
+                violation_count - MAX_VIOLATIONS
+            ),
+        ));
+    }
+
+    debug!(count = diags.len(), "C5b graph bbox checks complete");
+    diags
+}
+
 // ---------------------------------------------------------------------------
 // C6: Upstream IDs
 // ---------------------------------------------------------------------------
@@ -558,6 +590,7 @@ fn validate_bbox_f32(
 
     let check_id: &'static str = match artifact {
         Artifact::Catchments => "ids.catchment_bbox",
+        Artifact::Graph => "ids.graph_bbox",
         Artifact::Snap => "ids.snap_bbox",
         _ => "ids.bbox",
     };
@@ -695,3 +728,35 @@ fn validate_bbox_f32(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::dataset::GraphData;
+    use crate::diagnostic::{Artifact, Severity};
+
+    use super::check_graph_bboxes;
+
+    fn graph_with_bboxes(bboxes: Vec<[f32; 4]>) -> GraphData {
+        let row_count = bboxes.len();
+        GraphData {
+            ids: (1..=row_count as i64).collect(),
+            levels: vec![0; row_count],
+            upstream_ids: vec![Vec::new(); row_count],
+            bboxes,
+            row_group_sizes: vec![row_count],
+            row_group_has_bbox_stats: vec![true],
+        }
+    }
+
+    #[test]
+    fn graph_bbox_invalid_values_emit_graph_diagnostic() {
+        let graph = graph_with_bboxes(vec![[0.0, 0.0, f32::NAN, 1.0]]);
+        let diagnostics = check_graph_bboxes(&graph);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "ids.graph_bbox"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Graph
+        }));
+    }
+}
