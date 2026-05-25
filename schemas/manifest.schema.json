@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hfx.dev/schemas/manifest.schema.json",
   "title": "HFX Manifest",
-  "description": "Schema for the HFX dataset manifest defined by the HFX v0.2 specification.",
+  "description": "Schema for the HFX dataset manifest defined by the HFX v0.2.1 specification.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,7 +19,7 @@
   "properties": {
     "format_version": {
       "type": "string",
-      "const": "0.2"
+      "const": "0.2.1"
     },
     "fabric_name": {
       "type": "string",

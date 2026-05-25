@@ -1,6 +1,6 @@
 # HFX - HydroFabric Exchange Specification
 
-**Version 0.2**
+**Version 0.2.1**
 
 ---
 
@@ -41,13 +41,13 @@ drainage unit. The outlet is distinct from optional snap features.
 |---|---:|---|
 | `catchments.parquet` | Yes | Drainage-unit polygons, levels, parents, outlets |
 | `graph.parquet` | Yes | Same-level upstream adjacency graph |
-| `snap.parquet` | No | Reach or node features used for outlet snapping |
 | `manifest.json` | Yes | Dataset metadata and auxiliary declarations |
 
 Auxiliary artifacts such as D8 rasters are not first-class core files in v0.2.
 They are declared in `manifest.json` under `auxiliary[]` and validated according
 to their schema. HFX v0.2 blesses one auxiliary schema:
-[`hfx.aux.d8_raster.v1`](./aux/d8_raster/v1.md).
+[`hfx.aux.d8_raster.v1`](./aux/d8_raster/v1.md). HFX v0.2.1 also blesses
+optional snap features through [`hfx.aux.snap.v1`](./aux/snap/v1.md).
 
 ---
 
@@ -88,6 +88,11 @@ parse it for behavior.
 
 - Rows **must** be sorted by Hilbert curve index computed on centroid
   coordinates.
+- For datasets with multiple levels, rows **must** be sorted by
+  `(level ASC, hilbert_index ASC)`. Single-level datasets keep the Hilbert-only
+  rule.
+- `hilbert_index` is a sort key, not a stored column; no `hilbert_index` field
+  is present on `catchments.parquet`.
 - Files with fewer than 4,096 rows **must** contain exactly one row group.
 - Files with 4,096 or more rows **must** use row groups of 4,096-8,192 rows.
 - Parquet row-group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
@@ -111,6 +116,13 @@ are promoted to ERROR under `--strict`.
 - `up_area_km2`, when present, is the inclusive cumulative upstream area for
   same-level graph traversal. It is deliberately non-comparable across levels.
 
+For DAG-topology datasets, `up_area_km2` semantics at bifurcations are
+producer-defined and must be documented in the manifest or an accompanying
+README. Producers must choose and document one of: (a) area partitioned by flow
+physics at bifurcations, (b) geometric union of upstream catchments, or (c)
+mainstem-routed single-threaded accumulation. Engines comparing upstream areas
+across DAG datasets must reconcile these semantics before comparison.
+
 Perfect nesting is required within one HFX dataset. Fabrics whose levels do not
 nest cleanly should be shipped as separate HFX datasets.
 
@@ -128,6 +140,27 @@ geometry. This is what engines traverse during upstream accumulation.
 | `id` | `int64` | No | Unit ID, foreign key to `catchments.parquet` |
 | `level` | `int16` | No | Resolution tier for this graph row |
 | `upstream_ids` | `list<int64>` | No | Direct upstream unit IDs at the same level |
+| `bbox_minx` | `float32` | No | Bounding box west for the referenced unit |
+| `bbox_miny` | `float32` | No | Bounding box south for the referenced unit |
+| `bbox_maxx` | `float32` | No | Bounding box east for the referenced unit |
+| `bbox_maxy` | `float32` | No | Bounding box north for the referenced unit |
+
+### Spatial Partitioning
+
+- Rows **must** be sorted by Hilbert curve index computed on referenced unit
+  centroid coordinates.
+- For datasets with multiple levels, rows **must** be sorted by
+  `(level ASC, hilbert_index ASC)`. Single-level datasets keep the Hilbert-only
+  rule.
+- `hilbert_index` is a sort key, not a stored column; no `hilbert_index` field
+  is present on `graph.parquet`.
+- Files with fewer than 4,096 rows **must** contain exactly one row group.
+- Files with 4,096 or more rows **must** use row groups of 4,096-8,192 rows.
+- Parquet row-group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
+  `bbox_maxy` **must** be written.
+
+Row-group sizing violations are WARN diagnostics in the reference validator and
+are promoted to ERROR under `--strict`.
 
 ### Notes
 
@@ -146,45 +179,10 @@ arrays, hash maps, or any other runtime layout after loading.
 
 ---
 
-## 3. `snap.parquet`
+## 3. Snap Features
 
-Snap features are optional reach or node geometries used to attach an outlet
-point to a drainage unit. Snap features are not a replacement for unit outlets.
-Producers without reach or node features may omit `snap.parquet`.
-
-Allowed geometry types are Point and LineString.
-
-### Schema
-
-| Column | Type | Nullable | Description |
-|---|---|---:|---|
-| `id` | `int64` | No | Unique snap feature ID within this dataset |
-| `unit_id` | `int64` | No | Referenced drainage unit ID |
-| `weight` | `float32` | No | Producer-defined preference for snapping |
-| `stem_role` | `string` | Yes | One of `mainstem`, `tributary`, or `unknown` when known |
-| `bbox_minx` | `float32` | Yes | Optional bounding box west |
-| `bbox_miny` | `float32` | Yes | Optional bounding box south |
-| `bbox_maxx` | `float32` | Yes | Optional bounding box east |
-| `bbox_maxy` | `float32` | Yes | Optional bounding box north |
-| `geometry` | `binary` WKB | No | Point or LineString, EPSG:4326 |
-
-`snap.parquet` does not store a `level` column. The level is derived from the
-referenced unit, which avoids drift.
-
-### Snapping Semantics
-
-The engine may use any runtime snap strategy, but the default HFX interpretation
-is a weight-first cascade:
-
-1. Filter candidate snap features by search radius.
-2. Prefer the highest `weight`.
-3. Break ties by `stem_role = "mainstem"` when available.
-4. Break remaining ties by distance to the outlet point.
-5. Break final ties by ascending snap `id`.
-
-Snap features do not encode internal snap-to-snap connectivity. Reach routing,
-hydraulic models, and stream-order computations belong in auxiliary data or
-engine-specific inputs.
+Snap features are optional auxiliary data declared with
+[`hfx.aux.snap.v1`](./aux/snap/v1.md), not a core root-level artifact.
 
 ---
 
@@ -201,7 +199,9 @@ Outlet validation is characterized by topology role:
 - **Flow-through unit:** the outlet lies, within validator tolerance, on the
   boundary segment shared with the downstream same-level neighbor.
 - **Terminal sink:** the outlet lies inside the unit polygon for interior
-  drainage or lakes, or on the dataset boundary for a coastal terminus.
+  drainage or lakes, or on the polygon boundary at the coast -- for regional
+  datasets cut at the coastline, this is also the dataset boundary; for global
+  datasets, it is the unit polygon's coastal edge.
 - **DAG fork unit:** the outlet lies on the boundary at the fan-out node.
 
 The tolerance is a validation parameter, not a stored dataset field.
@@ -220,7 +220,7 @@ Traversal policies and refinement policies are engine runtime parameters.
 
 ```json
 {
-  "format_version": "0.2",
+  "format_version": "0.2.1",
   "fabric_name": "example-fabric",
   "fabric_version": "2026.1",
   "crs": "EPSG:4326",
@@ -250,7 +250,7 @@ Traversal policies and refinement policies are engine runtime parameters.
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
-| `format_version` | string | Yes | Must be `"0.2"` |
+| `format_version` | string | Yes | Must be `"0.2.1"` |
 | `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
 | `crs` | string | Yes | Must be `"EPSG:4326"` in HFX v0.2 |
@@ -331,18 +331,19 @@ HFX does not prescribe a controlled vocabulary for `region`.
 
 ## Validation
 
-A conformant HFX v0.2 dataset must pass the following validation classes.
+A conformant HFX v0.2.1 dataset must pass the following validation classes.
 
 ### File Presence
 
 - `manifest.json`, `catchments.parquet`, and `graph.parquet` are required.
-- `snap.parquet` is optional.
 - Auxiliary artifacts are required only when referenced by `manifest.json`.
 - `graph.arrow` is a legacy v0.1 artifact and is not valid in v0.2.
+- `snap.parquet` at the dataset root is a legacy v0.2 artifact. Producers must
+  migrate snap features to `hfx.aux.snap.v1`.
 
 ### Manifest
 
-- `format_version` must be `"0.2"`.
+- `format_version` must be `"0.2.1"`.
 - A v0.2 validator must reject v0.1 datasets with a clear unsupported-version
   diagnostic rather than attempting dual-reader compatibility.
 - Required fields must be present and well-typed.
@@ -357,8 +358,13 @@ A conformant HFX v0.2 dataset must pass the following validation classes.
 - `level` values must be non-negative.
 - `parent_id`, when present, must be positive.
 - Bounding boxes must be finite and ordered.
+- Graph bounding boxes must be finite and ordered.
 - Outlet coordinates must be finite and within WGS84 longitude/latitude range.
-- `stem_role`, when present, must be `mainstem`, `tributary`, or `unknown`.
+- `stem_role`, when present, must be `mainstem`, `tributary`,
+  `distributary`, or `unknown`.
+- `weight` values must be finite and non-negative; the "monotonically
+  increasing in drainage dominance" phrase describes the semantic intent of the
+  column, not a structural constraint enforced by validators.
 
 ### Referential Integrity
 
@@ -396,6 +402,22 @@ still enforce these invariants during ETL.
 - Unknown third-party schemas receive structural validation only.
 - `hfx.aux.d8_raster.v1` requires `flow_dir` and `flow_acc` artifacts and a
   valid metadata block as defined in [`spec/aux/d8_raster/v1.md`](./aux/d8_raster/v1.md).
+- `hfx.aux.snap.v1` requires one `snap` artifact and a valid metadata block as
+  defined in [`spec/aux/snap/v1.md`](./aux/snap/v1.md).
+
+## Migration from v0.2
+
+HFX v0.2.1 is a hard-cut manifest version. Producers migrating from v0.2 must:
+
+- Set `manifest.json::format_version` to `"0.2.1"`.
+- Add `bbox_minx`, `bbox_miny`, `bbox_maxx`, and `bbox_maxy` to
+  `graph.parquet`.
+- Move root-level `snap.parquet` into one or more `hfx.aux.snap.v1`
+  declarations.
+- Allow `stem_role = "distributary"` where snap features represent a branch
+  diverging at a bifurcation.
+- Expect validators to enforce the `stem_role` enum; invalid values that were
+  previously unchecked are non-conformant in v0.2.1.
 
 ---
 
