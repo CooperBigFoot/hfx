@@ -43,6 +43,9 @@ pub struct GraphData {
     pub ids: Vec<i64>,
     pub levels: Vec<i16>,
     pub upstream_ids: Vec<Vec<i64>>,
+    pub bboxes: Vec<[f32; 4]>,
+    pub row_group_sizes: Vec<usize>,
+    pub row_group_has_bbox_stats: Vec<bool>,
 }
 
 /// Column-level data extracted from snap.parquet.

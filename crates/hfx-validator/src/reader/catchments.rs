@@ -14,7 +14,7 @@ use super::{
 };
 use crate::dataset::CatchmentsData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
-use crate::reader::schema::{ExpectedColumn, validate_schema};
+use crate::reader::schema::{ExpectedColumn, row_group_has_bbox_stats, validate_schema};
 
 /// Expected schema for catchments.parquet.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -32,25 +32,6 @@ fn expected_columns() -> Vec<ExpectedColumn> {
         ExpectedColumn::new("bbox_maxy", DataType::Float32, false),
         ExpectedColumn::new("geometry", DataType::Binary, false),
     ]
-}
-
-/// Check whether a row-group has statistics for all four bbox columns.
-fn row_group_has_bbox_stats(meta: &parquet::file::metadata::RowGroupMetaData) -> bool {
-    let bbox_cols = ["bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"];
-    let schema_desc = meta.schema_descr();
-    for col_name in &bbox_cols {
-        // Find the column index by name.
-        let col_idx =
-            (0..schema_desc.num_columns()).find(|&i| schema_desc.column(i).name() == *col_name);
-        let Some(idx) = col_idx else {
-            return false;
-        };
-        let col_meta = meta.column(idx);
-        if col_meta.statistics().is_none() {
-            return false;
-        }
-    }
-    true
 }
 
 /// Read `catchments.parquet` and return the extracted data plus any diagnostics.

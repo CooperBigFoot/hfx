@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use arrow::array::{Array, Int16Array, Int64Array, LargeListArray, ListArray};
+use arrow::array::{Array, Float32Array, Int16Array, Int64Array, LargeListArray, ListArray};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, warn};
@@ -12,7 +12,9 @@ use super::{
 };
 use crate::dataset::GraphData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
-use crate::reader::schema::{ExpectedColumn, list_int64_field, validate_schema};
+use crate::reader::schema::{
+    ExpectedColumn, list_int64_field, row_group_has_bbox_stats, validate_schema,
+};
 
 /// Expected schema for graph.parquet.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -20,6 +22,10 @@ fn expected_columns() -> Vec<ExpectedColumn> {
         ExpectedColumn::new("id", DataType::Int64, false),
         ExpectedColumn::new("level", DataType::Int16, false),
         ExpectedColumn::new("upstream_ids", list_int64_field(), false),
+        ExpectedColumn::new("bbox_minx", DataType::Float32, false),
+        ExpectedColumn::new("bbox_miny", DataType::Float32, false),
+        ExpectedColumn::new("bbox_maxx", DataType::Float32, false),
+        ExpectedColumn::new("bbox_maxy", DataType::Float32, false),
     ]
 }
 
@@ -69,6 +75,17 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
         return (None, diags);
     }
 
+    let parquet_meta = builder.metadata().clone();
+    let num_row_groups = parquet_meta.num_row_groups();
+    let mut row_group_sizes: Vec<usize> = Vec::with_capacity(num_row_groups);
+    let mut row_group_has_bbox_stats_vec: Vec<bool> = Vec::with_capacity(num_row_groups);
+
+    for rg_idx in 0..num_row_groups {
+        let rg = parquet_meta.row_group(rg_idx);
+        row_group_sizes.push(rg.num_rows() as usize);
+        row_group_has_bbox_stats_vec.push(row_group_has_bbox_stats(rg));
+    }
+
     let reader = match builder.with_batch_size(8192).build() {
         Ok(r) => r,
         Err(err) => {
@@ -88,10 +105,12 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
     let mut ids = Vec::new();
     let mut levels = Vec::new();
     let mut upstream_ids = Vec::new();
+    let mut bboxes = Vec::new();
     let mut total_rows = 0usize;
     let mut null_id_count = 0usize;
     let mut null_level_count = 0usize;
     let mut null_upstream_ids_count = 0usize;
+    let mut null_bbox_count = 0usize;
     let mut consecutive_batch_failures = 0usize;
     let mut total_batch_failures = 0usize;
     let mut batch_read_aborted = false;
@@ -215,6 +234,43 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
             }
         }
 
+        let minx = batch
+            .column_by_name("bbox_minx")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        let miny = batch
+            .column_by_name("bbox_miny")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        let maxx = batch
+            .column_by_name("bbox_maxx")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        let maxy = batch
+            .column_by_name("bbox_maxy")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+        if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
+            for i in 0..num_rows {
+                let bbox_null =
+                    minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
+                if bbox_null {
+                    null_bbox_count += 1;
+                    if null_bbox_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                        diags.push(
+                            Diagnostic::error(
+                                "graph.null_bbox",
+                                Category::Schema,
+                                Artifact::Graph,
+                                format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
+                            )
+                            .at(Location::Row { index: total_rows + i }),
+                        );
+                    }
+                    bboxes.push([0.0, 0.0, 0.0, 0.0]);
+                } else {
+                    bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
+                }
+            }
+        }
+
         total_rows += num_rows;
     }
 
@@ -271,6 +327,17 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
             ),
         ));
     }
+    if null_bbox_count > MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+        let suppressed = null_bbox_count - MAX_NULL_DIAGNOSTICS_PER_COLUMN;
+        diags.push(Diagnostic::error(
+            "graph.null_bbox",
+            Category::Schema,
+            Artifact::Graph,
+            format!(
+                "{suppressed} additional null violation(s) in 'bbox' columns suppressed ({null_bbox_count} total)"
+            ),
+        ));
+    }
 
     debug!(row_count = ids.len(), "graph.parquet read complete");
 
@@ -279,6 +346,9 @@ pub fn read_graph(path: &Path) -> (Option<GraphData>, Vec<Diagnostic>) {
             ids,
             levels,
             upstream_ids,
+            bboxes,
+            row_group_sizes,
+            row_group_has_bbox_stats: row_group_has_bbox_stats_vec,
         }),
         diags,
     )
