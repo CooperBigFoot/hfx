@@ -46,7 +46,11 @@ pub fn run_checks(
         if let Some(manifest_path) = &dataset.files.manifest_path
             && let Some(root) = manifest_path.parent()
         {
-            all.extend(auxiliary::check_auxiliary(raw, root));
+            all.extend(auxiliary::check_auxiliary(
+                raw,
+                root,
+                dataset.catchments.as_ref(),
+            ));
         }
     }
 

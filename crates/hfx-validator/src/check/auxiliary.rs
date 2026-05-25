@@ -1,25 +1,39 @@
 //! Auxiliary declaration checks.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::check::{geometry, ids, referential};
+use crate::dataset::{CatchmentsData, SnapData};
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
+use crate::reader;
 use crate::reader::manifest::{RawAuxEntry, RawManifest};
 
 /// Validate auxiliary declarations structurally and dispatch blessed schemas.
-pub fn check_auxiliary(raw: &RawManifest, dataset_root: &Path) -> Vec<Diagnostic> {
+pub fn check_auxiliary(
+    raw: &RawManifest,
+    dataset_root: &Path,
+    catchments: Option<&CatchmentsData>,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let Some(entries) = raw.auxiliary.as_ref() else {
         return diags;
     };
 
     for (idx, entry) in entries.iter().enumerate() {
-        check_entry(idx, entry, dataset_root, &mut diags);
+        check_entry(idx, entry, dataset_root, catchments, &mut diags);
     }
 
     diags
 }
 
-fn check_entry(idx: usize, entry: &RawAuxEntry, dataset_root: &Path, diags: &mut Vec<Diagnostic>) {
+fn check_entry(
+    idx: usize,
+    entry: &RawAuxEntry,
+    dataset_root: &Path,
+    catchments: Option<&CatchmentsData>,
+    diags: &mut Vec<Diagnostic>,
+) {
     let Some(artifacts) = entry.artifacts.as_ref() else {
         return;
     };
@@ -55,6 +69,8 @@ fn check_entry(idx: usize, entry: &RawAuxEntry, dataset_root: &Path, diags: &mut
 
     if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1") {
         check_d8_raster(idx, entry, diags);
+    } else if entry.schema.as_deref() == Some("hfx.aux.snap.v1") {
+        check_snap_v1(idx, entry, dataset_root, catchments, diags);
     }
 }
 
@@ -93,5 +109,231 @@ fn check_d8_raster(idx: usize, entry: &RawAuxEntry, diags: &mut Vec<Diagnostic>)
                 name: "auxiliary".into(),
             }),
         );
+    }
+}
+
+fn check_snap_v1(
+    idx: usize,
+    entry: &RawAuxEntry,
+    dataset_root: &Path,
+    catchments: Option<&CatchmentsData>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let label = snap_label(idx, entry);
+    let Some(rel_path) = entry.artifacts.as_ref().and_then(|a| a.get("snap")) else {
+        return;
+    };
+    if rel_path.starts_with('/') || rel_path.contains("..") {
+        return;
+    }
+
+    let path = dataset_root.join(rel_path);
+    let (snap, read_diags) = reader::snap::read_snap(&path, &label);
+    diags.extend(read_diags);
+
+    let Some(snap) = snap else {
+        return;
+    };
+
+    let mut snap_diags = check_snap_data_for_aux(&snap);
+    snap_diags.extend(check_snap_stem_roles(&snap));
+    snap_diags.extend(geometry::check_snap_geometries(&snap));
+
+    if let Some(catchments) = catchments {
+        snap_diags.extend(referential::check_snap_refs(catchments, &snap));
+        snap_diags.extend(check_snap_declared_levels(catchments, &snap, entry));
+    }
+
+    prefix_diagnostics(&label, &mut snap_diags);
+    diags.extend(snap_diags);
+}
+
+fn snap_label(idx: usize, entry: &RawAuxEntry) -> String {
+    entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("auxiliary[{idx}]"))
+}
+
+fn references_levels(entry: &RawAuxEntry) -> HashSet<i16> {
+    entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("references_levels"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_i64)
+        .filter_map(|level| i16::try_from(level).ok())
+        .collect()
+}
+
+fn check_snap_stem_roles(snap: &SnapData) -> Vec<Diagnostic> {
+    snap.stem_roles
+        .iter()
+        .enumerate()
+        .filter_map(|(row, role)| {
+            let role = role.as_deref()?;
+            (!matches!(role, "mainstem" | "tributary" | "distributary" | "unknown")).then(|| {
+                Diagnostic::error(
+                    "aux.snap.stem_role_invalid",
+                    Category::IdConstraint,
+                    Artifact::Snap,
+                    format!("snap stem_role {role:?} at row {row} is not a supported value"),
+                )
+                .at(Location::Row { index: row })
+            })
+        })
+        .collect()
+}
+
+fn check_snap_data_for_aux(snap: &SnapData) -> Vec<Diagnostic> {
+    let mut diags = ids::check_snap_data(snap);
+    for diag in &mut diags {
+        if diag.check_id == "ids.snap_weight" {
+            diag.check_id = "aux.snap.weight_invalid";
+        }
+    }
+    diags
+}
+
+fn check_snap_declared_levels(
+    catchments: &CatchmentsData,
+    snap: &SnapData,
+    entry: &RawAuxEntry,
+) -> Vec<Diagnostic> {
+    let declared = references_levels(entry);
+    let levels_by_id: HashMap<i64, i16> = catchments
+        .ids
+        .iter()
+        .copied()
+        .zip(catchments.levels.iter().copied())
+        .collect();
+
+    snap.unit_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(row, unit_id)| {
+            let level = levels_by_id.get(unit_id)?;
+            (!declared.contains(level)).then(|| {
+                Diagnostic::error(
+                    "aux.snap.level_not_declared",
+                    Category::ReferentialIntegrity,
+                    Artifact::CrossFile,
+                    format!(
+                        "snap unit_id {unit_id} at row {row} references level {level}, \
+                         which is not declared in metadata.references_levels"
+                    ),
+                )
+                .at(Location::Row { index: row })
+            })
+        })
+        .collect()
+}
+
+fn prefix_diagnostics(label: &str, diags: &mut [Diagnostic]) {
+    for diag in diags {
+        if !diag.message.starts_with(label) {
+            diag.message = format!("{label}: {}", std::mem::take(&mut diag.message));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dataset::{CatchmentsData, SnapData};
+    use crate::diagnostic::{Artifact, Severity};
+    use crate::reader::manifest::RawAuxEntry;
+
+    use super::{check_snap_data_for_aux, check_snap_declared_levels, check_snap_stem_roles};
+
+    fn snap_with_roles(stem_roles: Vec<Option<&str>>) -> SnapData {
+        let row_count = stem_roles.len();
+        SnapData {
+            row_count,
+            ids: (1..=row_count as i64).collect(),
+            unit_ids: vec![1; row_count],
+            weights: vec![1.0; row_count],
+            stem_roles: stem_roles
+                .into_iter()
+                .map(|role| role.map(str::to_owned))
+                .collect(),
+            bboxes: vec![None; row_count],
+            geometry_wkb: vec![Vec::new(); row_count],
+            row_group_sizes: vec![row_count],
+            row_group_has_bbox_stats: vec![true],
+        }
+    }
+
+    fn catchments_with_levels(ids: Vec<i64>, levels: Vec<i16>) -> CatchmentsData {
+        let row_count = ids.len();
+        CatchmentsData {
+            row_count,
+            ids,
+            levels,
+            parent_ids: vec![None; row_count],
+            areas_km2: vec![1.0; row_count],
+            outlet_lons: vec![0.0; row_count],
+            outlet_lats: vec![0.0; row_count],
+            bboxes: vec![[0.0, 0.0, 1.0, 1.0]; row_count],
+            up_area_null_count: row_count,
+            up_area_total: row_count,
+            geometry_wkb: vec![Vec::new(); row_count],
+            row_group_sizes: vec![row_count],
+            row_group_has_bbox_stats: vec![true],
+        }
+    }
+
+    #[test]
+    fn unsupported_snap_stem_role_emits_aux_diagnostic() {
+        let diagnostics = check_snap_stem_roles(&snap_with_roles(vec![Some("primary")]));
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "aux.snap.stem_role_invalid"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Snap
+        }));
+    }
+
+    #[test]
+    fn invalid_snap_weight_emits_aux_diagnostic() {
+        let snap = SnapData {
+            weights: vec![-1.0],
+            ..snap_with_roles(vec![Some("mainstem")])
+        };
+        let diagnostics = check_snap_data_for_aux(&snap);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "aux.snap.weight_invalid"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Snap
+        }));
+    }
+
+    #[test]
+    fn snap_unit_referencing_undeclared_level_emits_aux_diagnostic() {
+        let snap = SnapData {
+            unit_ids: vec![2],
+            ..snap_with_roles(vec![Some("mainstem")])
+        };
+        let catchments = catchments_with_levels(vec![2], vec![1]);
+        let entry = RawAuxEntry {
+            schema: Some("hfx.aux.snap.v1".to_string()),
+            artifacts: None,
+            metadata: Some(serde_json::json!({
+                "references_levels": [0]
+            })),
+        };
+
+        let diagnostics = check_snap_declared_levels(&catchments, &snap, &entry);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "aux.snap.level_not_declared"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::CrossFile
+        }));
     }
 }
