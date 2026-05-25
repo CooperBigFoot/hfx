@@ -23,7 +23,7 @@ These were set in the planning brief and are inputs to this plan, not topics for
 | 5 | **`level_label`:** `"segment"` (level 0), `"reach"` (level 1) | Unnormalised informational column |
 | 6 | **Outlet:** downstream endpoint of the line geometry — uniform across segments, reaches, and all topology roles | No role branching; v0.2.1 outlet rules are satisfied by line directionality |
 | 7 | **`parent_id`:** NULL for segments; reach → new_id of its parent segment via `reach.segment_id → segment.global_id → new_id` | Single-coarser-level dataset, two-tier nesting |
-| 8 | **`up_area_km2`:** segments use GRIT `drainage_area_out` (km²) directly. **Reaches do NOT inherit from the parent segment**; reach `up_area_km2` is computed in a reverse-topological DP over the reach graph (see Phase 2.5). `has_up_area=true` | DAG semantics: partitioned by flow physics at bifurcations (option (a) in HFX spec §1) — documented in dataset-root `README.md` |
+| 8 | **`up_area_km2`:** segments use GRIT `drainage_area_out` (km²) directly. **Reaches do NOT simply inherit the parent segment value**; reach `up_area_km2` is computed via a per-segment chain anchor: the outlet reach inherits `segment.drainage_area_out`, then upstream reaches walk backward subtracting local `area_km2` (see Phase 2.5). `has_up_area=true` | DAG semantics: partitioned by flow physics at bifurcations (option (a) in HFX spec §1) — documented in dataset-root `README.md` |
 | 9 | **Graph:** one `graph.parquet` covering both levels; v0.2.1 bbox columns present | Reach-level upstream relation **requires source-data investigation** before implementation (see §5 risk register) |
 | 10 | **Snap:** no core `snap.parquet`; two `hfx.aux.snap.v1` artifacts (`aux/snap_segments.parquet` references_levels=[0], `aux/snap_reaches.parquet` references_levels=[1]) | Reach snap inherits `weight` + `stem_role` from parent segment |
 | 11 | **Stem-role classification:** `is_mainstem=1`→`mainstem`; `is_mainstem=0` with source-node `deg_out>1`→`distributary`; `is_mainstem=0` otherwise→`tributary`; unclassifiable→`unknown` | Distributary detection requires node-degree analysis over the segment graph |
@@ -56,7 +56,7 @@ The build runs as four sequential phases mapped onto the nine-stage template. Th
 Phase 1   — Per-region preprocess                                (stage_1 + pre-stage helpers)
 Phase 1.5 — Conditional disk-cleanup pass (only if free disk < 300 GB)
 Phase 2   — Global concat, sort, ID re-issue                     (stages 2–5)
-Phase 2.5 — Resolve graph edges + reverse-topo reach up_area_km2 (helpers consumed by stages 6 & 7)
+Phase 2.5 — Resolve graph edges + per-segment reach up_area_km2 (helpers consumed by stages 6 & 7)
 Phase 3   — Write outputs                                        (stages 6–9)
 Phase 4   — Validate                                             (separate CLI subcommand `validate`)
 ```
@@ -87,11 +87,11 @@ Per-region steps (executed via pre-stage helpers called from `stage_1_inspect_so
    - Read `global_id`, `segment_id` (parent segment), geometry, **plus any explicit upstream-relation column** the schema probe (§5 risk 1) identifies. If GRIT exposes `reach_upstream_ids` (or analogue), read it; if not, the build derives the reach graph from segment ordering (see Phase 2 §2).
    - `drainage_area_out` and `is_mainstem` are documented null/absent in at least the EU slice (GRIT_HFX_SPEC_VALIDATION.md). Do not read them on the reach layer.
    - Compute outlet from line downstream endpoint.
-   - Join to segments via `reach.segment_id == segment.global_id` to inherit `stem_role` only (used both in catchments and in the reach snap layer) and the segment's `drainage_area_out` for use as the reach **snap weight**. **Do NOT inherit `up_area_km2`** — reach `up_area_km2` is computed in Phase 2.5 from reach graph + reach `area_km2`.
-5. **Reach catchments:** read `global_id`, `area`, geometry; `make_valid`; compute bbox; inner-join to reaches on `global_id`. The reach catchment's own `area` (km²) becomes the reach row's `area_km2` and is the per-row input to the Phase 2.5 DP.
+   - Join to segments via `reach.segment_id == segment.global_id` to inherit `stem_role` only (used both in catchments and in the reach snap layer) and the segment's `drainage_area_out` for use as the reach **snap weight**. **Do NOT simply inherit `up_area_km2`** — reach `up_area_km2` is computed in Phase 2.5 by anchoring each segment's outlet reach to `segment.drainage_area_out` and walking upstream within that segment.
+5. **Reach catchments:** read `global_id`, `area`, geometry; `make_valid`; compute bbox; inner-join to reaches on `global_id`. The reach catchment's own `area` (km²) becomes the reach row's `area_km2` and is the per-row subtraction term for the Phase 2.5 per-segment chain walk.
 6. Per-region writes (snappy-compressed Parquet, schema fixed but row-group sizing left raw — these are intermediates, not final HFX artifacts):
    - `tmp/<region>/segments.parquet` — one row per segment catchment with `source_global_id`, `area_km2`, `up_area_km2` (= GRIT `drainage_area_out`), `stem_role`, `outlet_lon`, `outlet_lat`, `bbox_*`, `geometry_wkb`, `upstream_source_global_ids: list<int64>`.
-   - `tmp/<region>/reaches.parquet` — `source_global_id`, `parent_source_global_id` (== `reach.segment_id`), `area_km2` (reach catchment area), `stem_role` (inherited from parent segment), `outlet_lon`, `outlet_lat`, `bbox_*`, `geometry_wkb`, `upstream_source_global_ids: list<int64>` (either from the source column under Path A, or empty list under Path B — filled in during Phase 2.5). **No `up_area_km2` column on this shard** — that field is materialised by the DP in Phase 2.5 and joined in at Stage 6.
+   - `tmp/<region>/reaches.parquet` — `source_global_id`, `parent_source_global_id` (== `reach.segment_id`), `area_km2` (reach catchment area), `stem_role` (inherited from parent segment), `outlet_lon`, `outlet_lat`, `bbox_*`, `geometry_wkb`, `upstream_source_global_ids: list<int64>`, `downstream_source_global_ids: list<int64>` (from the source columns under Path A, or empty lists under Path B — filled in during Phase 2.5). **No `up_area_km2` column on this shard** — that field is materialised by the per-segment chain anchor in Phase 2.5 and joined in at Stage 6.
    - `tmp/<region>/segment_snap.parquet` — `source_global_id`, `weight (=drainage_area_out km²)`, `stem_role`, line `geometry_wkb`, bbox.
    - `tmp/<region>/reach_snap.parquet` — same shape; `weight` and `stem_role` are the inherited parent-segment values (this is correct for snap-weight semantics, which describe drainage *dominance* of the stem the snap targets — distinct from per-unit `up_area_km2`).
 7. Logging: per-region row counts, peak RSS hint, write durations.
@@ -128,7 +128,7 @@ After Phase 2 completes:
 - `tmp/id_map.parquet` holds the global ID assignments and the per-row Hilbert index.
 - Per-region intermediate shards from Phase 1 are still on disk; downstream write stages stream them in Hilbert order via a sort-merge index, **avoiding loading 70–100 GB into memory** (mirrors v1 `merge_regions._stream_write_parquet`).
 
-### Phase 2.5 — Resolve graph edges + reverse-topological reach `up_area_km2` DP
+### Phase 2.5 — Resolve graph edges + per-segment reach `up_area_km2`
 
 Phase 2.5 is implemented as pre-stage helpers consumed by both `stage_6_write_catchments` (which needs `up_area_km2` per reach row) and `stage_7_write_graph` (which writes the resolved edge lists). It is not a separate template stage — the executor invokes the helpers from the orchestrator between Phase 2 and Phase 3.
 
@@ -142,23 +142,28 @@ Two substeps:
   - **Path B (derive from segment topology):** for each reach, determine ordering along its parent segment's flow path; intra-segment upstream = the immediately upstream reach within the same segment; at the segment's upstream end, the upstream reaches are the outlet reaches of segments listed in the parent segment's `upstream_line_ids`.
 - Persist resolved edges as `tmp/edges_l1.parquet`.
 
-**Substep 2.5b — Reverse-topological DP to compute reach `up_area_km2`.**
+**Substep 2.5b — Per-segment chain anchor to compute reach `up_area_km2`.**
 
-- Input: `tmp/edges_l1.parquet` (reach graph) + reach `area_km2` (already in `tmp/<region>/reaches.parquet`).
-- Algorithm: standard reverse-topo accumulation. Compute reverse topological order over the level-1 DAG; iterate in that order; for each reach
-  ```
-  up_area_km2[id] = area_km2[id] + sum(up_area_km2[u] for u in upstream_ids[id])
-  ```
-  Headwater reaches (empty `upstream_ids`) get `up_area_km2 = area_km2`.
-- Implementation hints:
-  - Build CSR arrays for the level-1 graph for cache-friendly traversal (~20 M rows × small fan-in fits in a few GB).
-  - Use `numpy.float64` for accumulation, cast to `float32` at the end (preserves precision over the depth of the network).
-  - Kahn's algorithm to produce the topological order; reverse it.
-- Persist as `tmp/reach_up_area.parquet` with columns `id`, `up_area_km2 (float32)`.
+- Input: reach `area_km2`, `parent_source_global_id`, `upstream_source_global_ids`, `downstream_source_global_ids` from `tmp/<region>/reaches.parquet` + segment `up_area_km2` from `tmp/<region>/segments.parquet`.
+- GRIT invariant: bifurcations and confluences happen only at segment-boundary nodes, so reaches inside one segment form a linear chain. The adapter must not run a global additive DP over the reach DAG, because split/rejoin paths double-count shared upstream reaches and compute geometric-union semantics rather than GRIT's partitioned-flow semantics.
+- Algorithm, for each segment `S`:
+  1. Collect all reaches where `reach.segment_id == S.global_id`.
+  2. Identify the outlet reach: the reach whose `downstream_line_ids` point to reaches outside `S`, or whose `downstream_line_ids` is empty for terminal segments.
+  3. Walk `upstream_line_ids` from outlet to headwater, keeping only upstream reaches inside `S`. The walk must cover exactly all reaches in `S`.
+  4. Assign:
+     ```
+     up_area_km2[outlet] = S.drainage_area_out
+     up_area_km2[r_i]    = up_area_km2[r_{i-1}] - area_km2[r_{i-1}]
+     ```
+     where `r_i` is one step upstream of `r_{i-1}`.
+  5. Assert emitted values are finite and non-negative. Log near-zero values as a data smell, but do not fail solely on near-zero.
+- Segments with one reach are trivial: the reach gets `S.drainage_area_out`.
+- Segments whose `drainage_area_out` is null emit NULL `up_area_km2` for every reach in that segment.
+- Persist as `tmp/reach_up_area.parquet` with columns `id`, `up_area_km2 (float32 nullable)`.
 
-**Fallback.** If Path B is chosen AND derivation turns out fragile (e.g. intra-segment flow ordering cannot be reliably reconstructed from line endpoints because of multi-line reaches, zero-length reaches, or non-monotonic ordering along the segment flow path), set `up_area_km2 = NULL` for **all** reach rows instead of partially populating. Document the fallback in the dataset-root `README.md` under the DAG semantics note. **Do NOT silently inherit the segment `drainage_area_out`** — that mis-states the per-reach upstream area and silently misleads downstream consumers (within a single segment, the downstream-most reach should hold the full segment area, while the upstream reach should hold only a small fraction).
+**Fallback.** If a segment's chain walk fails (multiple outlet candidates, no outlet candidate, multiple in-segment upstream candidates at any step, partial coverage, or negative/non-finite results), set `up_area_km2 = NULL` for **that segment's reaches** and document the fallback count/examples in the dataset-root `README.md` under the DAG semantics note. **Do NOT silently inherit the segment `drainage_area_out` for every reach** — that mis-states the per-reach upstream area and silently misleads downstream consumers.
 
-The DP pass itself is tractable: at ~20 M reach rows with average fan-in ~1.x, expect 10–30 min of wall-clock for the topological sort + accumulation pass on a workstation CPU.
+The chain-anchor pass is O(total reach count), independent per segment, and parallelisable.
 
 ### Phase 3 — Write outputs (Stages 6–9)
 
@@ -166,7 +171,7 @@ All writes use the global Hilbert sort index built in Phase 2 to interleave regi
 
 - **`stage_6_write_catchments(...)`**
   - Output: `catchments.parquet`.
-  - Schema: `id int64 NN`, `level int16 NN`, `parent_id int64 nullable`, `area_km2 float32 NN`, `up_area_km2 float32 nullable` (populated for both levels — segments from GRIT `drainage_area_out`, reaches from the Phase 2.5 DP; the column is nullable only because the Phase 2.5 fallback may NULL all reach rows), `outlet_lon float64 NN`, `outlet_lat float64 NN`, `bbox_* float32 NN`, `geometry binary NN` (WKB Polygon|MultiPolygon), plus optional `source_id string nullable` (always populated), `level_label string nullable` (always populated).
+  - Schema: `id int64 NN`, `level int16 NN`, `parent_id int64 nullable`, `area_km2 float32 NN`, `up_area_km2 float32 nullable` (populated for both levels — segments from GRIT `drainage_area_out`, reaches from the Phase 2.5 per-segment chain anchor; the column is nullable because segment-local fallback may NULL affected reach rows), `outlet_lon float64 NN`, `outlet_lat float64 NN`, `bbox_* float32 NN`, `geometry binary NN` (WKB Polygon|MultiPolygon), plus optional `source_id string nullable` (always populated), `level_label string nullable` (always populated).
   - Compression: **snappy**. Not zstd.
   - For reach rows, the writer joins `tmp/reach_up_area.parquet` on `id` to attach `up_area_km2` before emitting each row group.
   - GeoParquet 1.1 metadata attached at schema construction (reuse v1 `build_geo_metadata(["Polygon", "MultiPolygon"])`).
@@ -185,7 +190,7 @@ All writes use the global Hilbert sort index built in Phase 2 to interleave regi
     - `weight = drainage_area_out (km²)`.
     - Sort by snap centroid Hilbert index against global bounds.
     - Row groups 4096–8192; bbox stats written; degenerate-bbox padding reused from v1 (`inflate_degenerate_bounds`, belt-and-suspenders since v0.2 spec uses `<=`).
-  - `aux/snap_reaches.parquet`: same schema, `unit_id` = `(level=1, source_global_id) → new_id`, `weight` and `stem_role` inherited from parent segment (already attached in Phase 1). The reach **snap** weight inherits from the parent segment because the snap layer expresses drainage *dominance* of the stem-line the snap targets — distinct from the per-unit `up_area_km2` column, which is computed via the Phase 2.5 DP.
+  - `aux/snap_reaches.parquet`: same schema, `unit_id` = `(level=1, source_global_id) → new_id`, `weight` and `stem_role` inherited from parent segment (already attached in Phase 1). The reach **snap** weight inherits from the parent segment because the snap layer expresses drainage *dominance* of the stem-line the snap targets — distinct from the per-unit `up_area_km2` column, which is computed via the Phase 2.5 per-segment chain anchor.
   - Compression: **snappy**.
 - **`stage_9_write_manifest(...)`** writes `manifest.json`:
   ```json
@@ -247,7 +252,7 @@ The table below ties stage names to phases and read/transform/write responsibili
 | `stage_3_reproject` | 2 | Sample row metadata | Assert EPSG:4326 | (none) | **S** |
 | `stage_4_make_valid` | 2 | Sample of intermediate shards | Assert sample geometries pass `is_valid` | (none) | **S** |
 | `stage_5_hilbert_sort` | 2 | `tmp/id_map.parquet` | Assert ordering | (none) | **S** |
-| **Phase 2.5 helpers** (edge resolution + reverse-topo reach DP) — invoked from the orchestrator between stages 5 and 6 | 2.5 | Segment/reach upstream lists + id_map + reach `area_km2` | Resolve upstream lists per level via id_map; Kahn topological sort over the reach DAG; accumulate `up_area_km2` in reverse-topo order; fallback to NULL on derivation failure | `tmp/edges_l0.parquet`, `tmp/edges_l1.parquet`, `tmp/reach_up_area.parquet` | **M** |
+| **Phase 2.5 helpers** (edge resolution + per-segment reach up-area chain anchor) — invoked from the orchestrator between stages 5 and 6 | 2.5 | Segment/reach upstream/downstream lists + id_map + reach `area_km2` + segment `drainage_area_out` | Resolve upstream lists per level via id_map; within each segment identify the outlet reach, walk upstream, and subtract local reach areas from the segment outlet anchor; fallback to NULL on segment chain-walk failure | `tmp/edges_l0.parquet`, `tmp/edges_l1.parquet`, `tmp/reach_up_area.parquet` | **M** |
 | `stage_6_write_catchments` | 3 | All catchment shards + id_map + `tmp/reach_up_area.parquet` (for reach rows) | Stream-merge in Hilbert order; attach reach `up_area_km2` via join; emit final rows | `catchments.parquet` | **M** |
 | `stage_7_write_graph` | 3 | `tmp/edges_l0.parquet`, `tmp/edges_l1.parquet`, catchment bboxes | Attach bboxes; sort by (level, hilbert_index); write | `graph.parquet` | **S–M** |
 | `stage_8_write_snap` | 3 | Segment/reach snap shards + id_map | Re-issue snap dense IDs (per file, in Hilbert order of snap centroid); inherit weight/stem_role for reaches (already in Phase 1) | `aux/snap_segments.parquet`, `aux/snap_reaches.parquet` | **M** |
@@ -268,7 +273,7 @@ Estimates assume the workstation budget (32–64 GB RAM, ~200 GB free disk) call
 | `stage_3_reproject` | < 100 MB | 0 | tiny | No-op |
 | `stage_4_make_valid` | < 100 MB | 0 | small sample | No-op |
 | `stage_5_hilbert_sort` | < 1 GB | 0 | `id_map.parquet` | Assertion only |
-| **Phase 2.5 helpers** (edge resolution + reach DP) | 4–8 GB (CSR arrays for level-1 graph at ~20 M nodes; float64 accumulator vector) | 1–3 GB (`tmp/edges_l*.parquet`, `tmp/reach_up_area.parquet`) | id_map + reach upstream lists | **DP wall-clock: 10–30 min** at ~20 M reach rows (Kahn topo sort + accumulation); fits comfortably in 32 GB RAM |
+| **Phase 2.5 helpers** (edge resolution + reach chain anchor) | 4–8 GB (reach grouping by parent segment plus edge lists) | 1–3 GB (`tmp/edges_l*.parquet`, `tmp/reach_up_area.parquet`) | id_map + reach upstream/downstream lists + segment drainage areas | O(total reach count); per-segment work is independent and parallelisable |
 | `stage_6_write_catchments` | 4–8 GB (row-group buffering, geometry WKB serialisation) | 50–80 GB (`catchments.parquet`) | Sum of catchment shards ~60–100 GB + `tmp/reach_up_area.parquet` | Streams row group by row group; column-oriented |
 | `stage_7_write_graph` | 4–8 GB (in-memory edge lists from `tmp/edges_l*.parquet`) | 1–3 GB (`graph.parquet`; no geometry) | Edge intermediates (~1–3 GB) | Cheapest write |
 | `stage_8_write_snap` | 4–8 GB (line WKB buffering) | 10–20 GB combined for both aux files | Snap-line shards ~10–20 GB | Two passes, one per file |
@@ -361,19 +366,20 @@ The probe's findings determine Path A vs Path B and feed into the executor brief
 
 **Owner:** executor; verify count in EU smoke build.
 
-### Risk 8 — Reach `up_area_km2` DP correctness and fallback
+### Risk 8 — Reach `up_area_km2` chain-anchor correctness and fallback
 
-**Description.** Reach-level `up_area_km2` is computed in Phase 2.5 via a reverse-topological DP over the reach graph. Correctness depends on:
+**Description.** Reach-level `up_area_km2` is computed in Phase 2.5 via a per-segment chain anchor. Correctness depends on:
 
-1. The reach graph being correct — which inherits Risk 1 directly. Path A gives a clean explicit graph; Path B derives the graph from segment topology and is fragile if intra-segment flow ordering cannot be reliably reconstructed.
-2. The graph being a true DAG (no cycles); a cycle would deadlock Kahn's algorithm.
-3. Float precision accumulating across the depth of the network (~10⁴ hops deep for major basins). Accumulate in `float64`, cast to `float32` at the end.
+1. The reach graph being correct — which inherits Risk 1 directly. Path A gives explicit upstream/downstream reach lists; Path B derives them from segment topology.
+2. GRIT's segment-internal linearity invariant holding: bifurcations and confluences happen only at segment-boundary nodes, so reaches inside one segment form a single chain.
+3. Segment `drainage_area_out` being populated for consumed segments.
 
 **Mitigation.**
 
-- Hard assert acyclicity after Phase 2.5 substep 2.5a (a cycle anywhere in the reach DAG is a build failure and must be surfaced as `MergeError` with an example cycle, not silently dropped).
-- **Fallback:** if Path B is selected AND the executor judges intra-segment ordering unreliable after running it against EU+AS smoke data, set `up_area_km2 = NULL` for **all** reach rows. The catchments schema already permits this (nullable column). Document the fallback in the dataset-root `README.md`. **Never** substitute the parent segment's `drainage_area_out` for missing reach values — within a single segment, the downstream-most reach holds the full segment area while the upstream reach holds only a small fraction, so segment inheritance silently misleads consumers.
-- Cross-check: for a sample of well-known basins (e.g. Amazon outlet, Mississippi outlet), the reach outlet `up_area_km2` should approximate the parent segment's `drainage_area_out` within float32 precision when the reach is the segment's downstream-most reach.
+- Hard assert same-level graph acyclicity after Phase 2.5 substep 2.5a for `graph.parquet` correctness.
+- For reach upstream areas, process each parent segment independently: identify one outlet reach, walk upstream within the segment, assign the outlet to `segment.drainage_area_out`, and subtract each downstream reach's local `area_km2` while walking upstream.
+- **Fallback:** if any segment's chain walk fails (multiple outlet candidates, partial coverage, multiple in-segment upstream candidates, null segment drainage, or negative/non-finite results), set `up_area_km2 = NULL` for that segment's reaches. The catchments schema already permits this (nullable column). Document fallback counts/examples in the dataset-root `README.md`. **Never** substitute the parent segment's `drainage_area_out` for every reach in the segment — within a single segment, the downstream-most reach holds the full segment area while the upstream reach should hold only a smaller upstream remainder.
+- Cross-check: sampled outlet reaches should equal their parent segment's `drainage_area_out`; sampled reaches should satisfy `area_km2 <= up_area_km2 <= parent segment drainage_area_out` when non-null.
 
 **Owner:** executor; gates Stage 6 write of any non-NULL reach `up_area_km2`.
 
@@ -421,7 +427,7 @@ Before publishing to `s3://basin-delineations-public/grit/2.0.0/`:
 | `stage_2_assign_ids` (global Hilbert + ID re-issue + id map persistence) | **M** | 2–3 d |
 | `stage_3_reproject` / `stage_4_make_valid` / `stage_5_hilbert_sort` (assertion stubs) | **S** combined | 0.5 d |
 | Phase 1.5 cleanup pass (conditional; small) | S | 0.5 d |
-| Phase 2.5 helpers (edge resolution + reverse-topo reach DP; harder under Path B) | **M** (A) or **L** (B if topology pass needed) | 3 d–1 w |
+| Phase 2.5 helpers (edge resolution + per-segment reach chain anchor; harder under Path B) | **M** (A) or **L** (B if topology pass needed) | 3 d–1 w |
 | `stage_6_write_catchments` (streamed merge writer + reach `up_area_km2` join) | **M** | 3–4 d |
 | `stage_7_write_graph` (consumes Phase 2.5 edge intermediates) | **S–M** | 2 d |
 | `stage_8_write_snap` (two aux files) | **M** | 2–3 d |
@@ -441,7 +447,7 @@ All eight open questions raised in the draft are resolved as listed below. Execu
 
 | # | Question | Resolution |
 |---|---|---|
-| 1 | Reach upstream relation | Unknown in advance. **Tier 0 schema probe is the executor's day-1 work item**, gating all stages downstream of `stage_7_write_graph` and the Phase 2.5 DP |
+| 1 | Reach upstream relation | Unknown in advance. **Tier 0 schema probe is the executor's day-1 work item**, gating all stages downstream of `stage_7_write_graph` and the Phase 2.5 chain anchor |
 | 2 | DAG `up_area_km2` semantics doc location | Dataset-root `README.md`. Manifest carries no free-form prose field for this |
 | 3 | Distributary classification node | **Source-node** check (the plan's current definition) |
 | 4 | Parquet compression | **`snappy`** throughout — per-region intermediates, all four final files |
