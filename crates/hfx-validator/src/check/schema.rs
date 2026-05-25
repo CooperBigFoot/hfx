@@ -65,6 +65,32 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
         );
     }
 
+    if let Some(graph) = &dataset.graph {
+        for (rg_idx, has_stats) in graph.row_group_has_bbox_stats.iter().enumerate() {
+            if !has_stats {
+                diags.push(Diagnostic::error(
+                    "schema.graph.bbox_stats_missing",
+                    Category::Schema,
+                    Artifact::Graph,
+                    format!(
+                        "graph.parquet row group {rg_idx} is missing statistics for bbox columns; \
+                         spec requires row group statistics on bbox columns"
+                    ),
+                ));
+            }
+        }
+
+        emit_row_group_diag(
+            classify_row_groups(graph.ids.len(), &graph.row_group_sizes),
+            graph.ids.len(),
+            Artifact::Graph,
+            "graph.parquet",
+            "schema.graph.rg_size",
+            "schema.graph.rg_count",
+            &mut diags,
+        );
+    }
+
     // B4/B5: Same checks for snap.parquet when present.
     if let Some(snap) = &dataset.snap {
         for (rg_idx, has_stats) in snap.row_group_has_bbox_stats.iter().enumerate() {
@@ -114,6 +140,92 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
 
     debug!(count = diags.len(), "schema checks complete");
     diags
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dataset::{
+        CatchmentsData, FilePresenceMap, GraphData, ParsedDataset, RasterMeta, SnapData,
+    };
+    use crate::diagnostic::{Artifact, Severity};
+    use crate::reader::manifest::RawManifest;
+
+    use super::check_schemas;
+
+    fn dataset_with_graph(graph: GraphData) -> ParsedDataset {
+        ParsedDataset {
+            files: FilePresenceMap {
+                manifest_path: None,
+                catchments_path: None,
+                graph_path: None,
+                legacy_graph_arrow_path: None,
+                snap_path: None,
+                flow_dir_path: None,
+                flow_acc_path: None,
+            },
+            manifest_json: None,
+            raw_manifest: None::<RawManifest>,
+            manifest: None,
+            catchments: None::<CatchmentsData>,
+            graph: Some(graph),
+            snap: None::<SnapData>,
+            flow_dir: None::<RasterMeta>,
+            flow_acc: None::<RasterMeta>,
+            read_diagnostics: Vec::new(),
+        }
+    }
+
+    fn graph_with_row_groups(
+        row_count: usize,
+        sizes: Vec<usize>,
+        has_stats: Vec<bool>,
+    ) -> GraphData {
+        GraphData {
+            ids: (1..=row_count as i64).collect(),
+            levels: vec![0; row_count],
+            upstream_ids: vec![Vec::new(); row_count],
+            bboxes: vec![[0.0, 0.0, 1.0, 1.0]; row_count],
+            row_group_sizes: sizes,
+            row_group_has_bbox_stats: has_stats,
+        }
+    }
+
+    #[test]
+    fn graph_bbox_stats_missing_emits_error() {
+        let dataset = dataset_with_graph(graph_with_row_groups(1, vec![1], vec![false]));
+        let diagnostics = check_schemas(&dataset);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "schema.graph.bbox_stats_missing"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::Graph
+        }));
+    }
+
+    #[test]
+    fn graph_small_file_multiple_row_groups_emits_warning() {
+        let dataset = dataset_with_graph(graph_with_row_groups(2, vec![1, 1], vec![true, true]));
+        let diagnostics = check_schemas(&dataset);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "schema.graph.rg_count"
+                && diag.severity == Severity::Warning
+                && diag.artifact == Artifact::Graph
+        }));
+    }
+
+    #[test]
+    fn graph_large_file_bad_row_group_size_emits_warning() {
+        let dataset =
+            dataset_with_graph(graph_with_row_groups(4096, vec![4095, 1], vec![true, true]));
+        let diagnostics = check_schemas(&dataset);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "schema.graph.rg_size"
+                && diag.severity == Severity::Warning
+                && diag.artifact == Artifact::Graph
+        }));
+    }
 }
 
 fn classify_row_groups(row_count: usize, sizes: &[usize]) -> RgLayoutVerdict {
