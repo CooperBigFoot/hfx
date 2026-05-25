@@ -7,9 +7,11 @@ import argparse
 import gc
 import json
 import math
+import subprocess
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 from zipfile import ZipFile
@@ -60,6 +62,7 @@ ROW_GROUP_MIN = 4_096
 ROW_GROUP_MAX = 8_192
 TMP_ROW_GROUP_SIZE = 65_536
 SNAP_BBOX_EPSILON = 1e-4
+PLANETARY_REGION_SET = set(REGION_CODES)
 
 
 class AdapterError(RuntimeError):
@@ -318,12 +321,21 @@ def _write_table(path: Path, table: pa.Table) -> None:
     )
 
 
+def _write_balanced_table(path: Path, table: pa.Table, schema: pa.Schema | None = None) -> None:
+    """Write a final artifact with strict-validator row group sizing."""
+    ensure_dir(path.parent)
+    write_schema = schema if schema is not None else table.schema
+    with pq.ParquetWriter(path, schema=write_schema, compression="snappy", write_statistics=True) as writer:
+        for start, stop in balanced_row_group_bounds(table.num_rows):
+            writer.write_table(table.slice(start, stop - start))
+
+
 def _read_table(path: Path, columns: list[str] | None = None) -> pa.Table:
     return pq.read_table(path, columns=columns)
 
 
 def _list_int64_type() -> pa.ListType:
-    return pa.list_(pa.field("item", pa.int64(), nullable=False))
+    return pa.list_(pa.field("item", pa.int64(), nullable=True))
 
 
 def _hilbert_from_bbox(df: pd.DataFrame) -> np.ndarray:
@@ -453,6 +465,10 @@ def _load_reach_area_by_id(source: SourceData, lookup: dict[int, int]) -> tuple[
     return np.array(ids, dtype="int64")[order], np.array(areas, dtype="float64")[order]
 
 
+def _region_from_shard(path: Path) -> str:
+    return path.parent.name
+
+
 def compute_reach_up_area(source: SourceData) -> Path:
     """Compute reach ``up_area_km2`` from each segment outlet back upstream."""
     id_map = _read_table(source.tmp_root / "id_map.parquet").to_pandas()
@@ -469,30 +485,32 @@ def compute_reach_up_area(source: SourceData) -> Path:
 
     reach_frames: list[pd.DataFrame] = []
     for path in source.reach_shards:
-        reach_frames.append(
-            _read_table(
-                path,
-                columns=[
-                    "source_global_id",
-                    "parent_source_global_id",
-                    "area_km2",
-                    "upstream_source_global_ids",
-                    "downstream_source_global_ids",
-                ],
-            ).to_pandas()
-        )
+        frame = _read_table(
+            path,
+            columns=[
+                "source_global_id",
+                "parent_source_global_id",
+                "area_km2",
+                "upstream_source_global_ids",
+                "downstream_source_global_ids",
+            ],
+        ).to_pandas()
+        frame["region"] = _region_from_shard(path)
+        reach_frames.append(frame)
     reaches = pd.concat(reach_frames, ignore_index=True)
     reaches["id"] = reaches["source_global_id"].map(lambda value: l1_lookup[int(value)]).astype("int64")
 
     results: dict[int, float | None] = {}
-    fallback_segments: list[int] = []
+    fallback_segments: list[tuple[str, int, int]] = []
     near_zero_count = 0
 
     for segment_id, group in reaches.groupby("parent_source_global_id", sort=False):
         segment_source_id = int(segment_id)
+        segment_region = str(group.iloc[0]["region"])
         segment_drainage = segment_up_area.get(segment_source_id)
         reach_ids = set(int(value) for value in group["source_global_id"])
         if segment_drainage is None or not np.isfinite(segment_drainage):
+            fallback_segments.append((segment_region, segment_source_id, len(group)))
             for unit_id in group["id"]:
                 results[int(unit_id)] = None
             continue
@@ -509,7 +527,7 @@ def compute_reach_up_area(source: SourceData) -> Path:
             if not [int(downstream_id) for downstream_id in row.downstream_source_global_ids if int(downstream_id) in reach_ids]
         ]
         if len(outlet_candidates) != 1:
-            fallback_segments.append(segment_source_id)
+            fallback_segments.append((segment_region, segment_source_id, len(group)))
             for row in by_source.values():
                 results[int(row.id)] = None
             continue
@@ -533,7 +551,7 @@ def compute_reach_up_area(source: SourceData) -> Path:
             current = internal_upstream[0]
 
         if len(ordered_sources) != len(reach_ids):
-            fallback_segments.append(segment_source_id)
+            fallback_segments.append((segment_region, segment_source_id, len(group)))
             for row in by_source.values():
                 results[int(row.id)] = None
             continue
@@ -551,15 +569,50 @@ def compute_reach_up_area(source: SourceData) -> Path:
             current_up_area -= float(row.area_km2)
 
         if segment_failed:
-            fallback_segments.append(segment_source_id)
+            fallback_segments.append((segment_region, segment_source_id, len(group)))
             for row in by_source.values():
                 results[int(row.id)] = None
 
     if fallback_segments:
+        by_region: dict[str, list[tuple[int, int]]] = {}
+        for region, segment_id, reach_count in fallback_segments:
+            by_region.setdefault(region, []).append((segment_id, reach_count))
+        for region, rows in sorted(by_region.items()):
+            log(
+                f"Phase 2.5 reach up_area fallback {region}: "
+                f"segments={len(rows)} reach_rows={sum(count for _, count in rows)} "
+                f"examples={[segment_id for segment_id, _ in rows[:10]]}"
+            )
+        fallback_txt = source.tmp_root / "reach_up_area_fallback_segments.txt"
+        fallback_json = source.tmp_root / "reach_up_area_fallback_summary.json"
+        fallback_txt.write_text(
+            "\n".join(f"{region},{segment_id},{reach_count}" for region, segment_id, reach_count in fallback_segments)
+            + "\n"
+        )
+        fallback_json.write_text(
+            json.dumps(
+                {
+                    "fallback_segment_count": len(fallback_segments),
+                    "fallback_reach_count": sum(count for _, _, count in fallback_segments),
+                    "by_region": {
+                        region: {
+                            "segments": len(rows),
+                            "reach_rows": sum(count for _, count in rows),
+                            "segment_ids": [segment_id for segment_id, _ in rows],
+                        }
+                        for region, rows in sorted(by_region.items())
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        if len(fallback_segments) > 100:
+            raise AdapterError(f"reach up_area fallback exceeded escalation threshold: {len(fallback_segments)} segments")
         log(
             "Phase 2.5 reach up_area fallback: "
             f"{len(fallback_segments)} segment(s) emitted NULL reach values; "
-            f"examples={fallback_segments[:10]}"
+            f"examples={[segment_id for _, segment_id, _ in fallback_segments[:10]]}"
         )
     if near_zero_count:
         log(f"Phase 2.5 reach up_area near-zero values observed: {near_zero_count}")
@@ -591,6 +644,109 @@ def compute_reach_up_area(source: SourceData) -> Path:
     _write_table(out_path, table)
     log(f"Phase 2.5 wrote {out_path.name} rows={table.num_rows}")
     return out_path
+
+
+def _load_id_map(source: SourceData) -> pd.DataFrame:
+    return _read_table(source.tmp_root / "id_map.parquet").to_pandas()
+
+
+def _load_unit_rows(source: SourceData) -> pd.DataFrame:
+    id_map = _load_id_map(source)
+    segment_frames: list[pd.DataFrame] = []
+    for path in source.segment_shards:
+        frame = _read_table(path).to_pandas()
+        frame["level"] = np.int16(0)
+        frame["parent_source_global_id"] = pd.NA
+        frame["level_label"] = "segment"
+        frame["source_id"] = "segment:" + frame["source_global_id"].astype(str)
+        segment_frames.append(frame)
+
+    reach_frames: list[pd.DataFrame] = []
+    reach_up_area = _read_table(source.tmp_root / "reach_up_area.parquet").to_pandas()
+    reach_id_map = id_map[id_map["level"] == 1][["source_global_id", "id"]]
+    reach_up_by_source = reach_id_map.merge(reach_up_area, on="id", validate="1:1")[
+        ["source_global_id", "up_area_km2"]
+    ]
+    for path in source.reach_shards:
+        frame = _read_table(
+            path,
+            columns=[
+                "source_global_id",
+                "parent_source_global_id",
+                "area_km2",
+                "stem_role",
+                "outlet_lon",
+                "outlet_lat",
+                "bbox_minx",
+                "bbox_miny",
+                "bbox_maxx",
+                "bbox_maxy",
+                "geometry_wkb",
+            ],
+        ).to_pandas()
+        frame = frame.merge(reach_up_by_source, on="source_global_id", how="left", validate="1:1")
+        frame["level"] = np.int16(1)
+        frame["level_label"] = "reach"
+        frame["source_id"] = "reach:" + frame["source_global_id"].astype(str)
+        reach_frames.append(frame)
+
+    units = pd.concat(segment_frames + reach_frames, ignore_index=True)
+    units = units.merge(
+        id_map[["level", "source_global_id", "id", "hilbert_index"]],
+        on=["level", "source_global_id"],
+        how="inner",
+        validate="1:1",
+    )
+    segment_parent_map = id_map[id_map["level"] == 0][["source_global_id", "id"]].rename(
+        columns={"source_global_id": "parent_source_global_id", "id": "parent_id"}
+    )
+    units = units.merge(segment_parent_map, on="parent_source_global_id", how="left", validate="many_to_one")
+    units.loc[units["level"] == 0, "parent_id"] = pd.NA
+    units = units.sort_values(["level", "hilbert_index", "source_global_id"], kind="mergesort").reset_index(drop=True)
+    return units
+
+
+def _dataset_bbox_from_units(units: pd.DataFrame, regions: tuple[str, ...]) -> list[float]:
+    if set(regions) == PLANETARY_REGION_SET:
+        return GLOBAL_BBOX
+    minx = float(units["bbox_minx"].min())
+    miny = float(units["bbox_miny"].min())
+    maxx = float(units["bbox_maxx"].max())
+    maxy = float(units["bbox_maxy"].max())
+    return [
+        float(np.nextafter(minx, -np.inf)),
+        float(np.nextafter(miny, -np.inf)),
+        float(np.nextafter(maxx, np.inf)),
+        float(np.nextafter(maxy, np.inf)),
+    ]
+
+
+def _fallback_summary(source: SourceData) -> dict:
+    path = source.tmp_root / "reach_up_area_fallback_summary.json"
+    if not path.exists():
+        return {"fallback_segment_count": 0, "fallback_reach_count": 0, "by_region": {}}
+    return json.loads(path.read_text())
+
+
+def _write_readme(out_dir: Path, source: SourceData, unit_count: int) -> None:
+    fallback = _fallback_summary(source)
+    fallback_reaches = int(fallback.get("fallback_reach_count", 0))
+    fallback_segments = int(fallback.get("fallback_segment_count", 0))
+    percent = (fallback_reaches / unit_count * 100.0) if unit_count else 0.0
+    percent_text = "<0.001%" if percent < 0.001 else f"{percent:.6f}%"
+    readme = f"""# GRIT HFX v2 Dataset
+
+This dataset is an HFX v0.2.1 compilation of GRIT with segment (`level=0`) and reach (`level=1`) drainage units.
+
+## Upstream Area Semantics
+
+`up_area_km2` uses GRIT's partitioned-flow semantics at DAG bifurcations. Segment rows use GRIT `drainage_area_out` directly. Reach rows are computed by anchoring each parent segment's outlet reach to the segment `drainage_area_out`, then walking upstream within that segment and subtracting local reach `area_km2`.
+
+## Known data caveats
+
+{fallback_reaches} reach rows have `up_area_km2=NULL` because the per-segment chain walk failed for {fallback_segments} segments. These are GRIT source-data anomalies (segment interior topology not strictly linear) and represent {percent_text} of rows. See `adapters/grit-v2/build_adapter.py` for the detection rule.
+"""
+    (out_dir / "README.md").write_text(readme)
 
 
 def _stage_1_region(root: Path, outer_archive: Path, region_code: str) -> tuple[Path, Path, Path, Path, int, int]:
@@ -877,22 +1033,216 @@ def stage_5_hilbert_sort(source: SourceData) -> None:
 
 def stage_6_write_catchments(source: SourceData, out_dir: Path) -> None:
     """Write final ``catchments.parquet``."""
-    raise NotImplementedError("Stage 6 depends on Stage 2 and Phase 2.5")
+    ensure_dir(out_dir)
+    units = _load_unit_rows(source)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+            pa.field("source_id", pa.string(), nullable=True),
+            pa.field("level_label", pa.string(), nullable=True),
+        ]
+    ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
+    parent_ids = [None if pd.isna(value) else int(value) for value in units["parent_id"]]
+    up_area = [None if pd.isna(value) else float(value) for value in units["up_area_km2"]]
+    table = pa.Table.from_arrays(
+        [
+            pa.array(units["id"].astype("int64").tolist(), type=pa.int64()),
+            pa.array(units["level"].astype("int16").tolist(), type=pa.int16()),
+            pa.array(parent_ids, type=pa.int64()),
+            pa.array(units["area_km2"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(up_area, type=pa.float32()),
+            pa.array(units["outlet_lon"].astype("float64").tolist(), type=pa.float64()),
+            pa.array(units["outlet_lat"].astype("float64").tolist(), type=pa.float64()),
+            pa.array(units["bbox_minx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(units["bbox_miny"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(units["bbox_maxx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(units["bbox_maxy"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(units["geometry_wkb"].tolist(), type=pa.binary()),
+            pa.array(units["source_id"].astype(str).tolist(), type=pa.string()),
+            pa.array(units["level_label"].astype(str).tolist(), type=pa.string()),
+        ],
+        schema=schema,
+    )
+    out_path = out_dir / "catchments.parquet"
+    _write_balanced_table(out_path, table, schema)
+    assert_geoparquet_valid(out_path)
+    log(f"Stage 6 wrote {out_path} rows={table.num_rows}")
 
 
 def stage_7_write_graph(source: SourceData, out_dir: Path) -> None:
     """Write final ``graph.parquet``."""
-    raise NotImplementedError("Stage 7 depends on Phase 2.5 edge resolution")
+    id_map = _load_id_map(source)
+    unit_bbox = _load_unit_rows(source)[
+        ["id", "level", "hilbert_index", "bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"]
+    ]
+    edges_l0 = _read_table(source.tmp_root / "edges_l0.parquet").to_pandas()
+    edges_l0["level"] = np.int16(0)
+    edges_l1 = _read_table(source.tmp_root / "edges_l1.parquet").to_pandas()
+    edges_l1["level"] = np.int16(1)
+    edges = pd.concat([edges_l0, edges_l1], ignore_index=True)
+    graph = edges.merge(unit_bbox, on=["id", "level"], how="inner", validate="1:1")
+    if len(graph) != len(id_map):
+        raise AdapterError(f"graph row count {len(graph)} != id map row count {len(id_map)}")
+    graph = graph.sort_values(["level", "hilbert_index", "id"], kind="mergesort").reset_index(drop=True)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("upstream_ids", _list_int64_type(), nullable=False),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [
+            pa.array(graph["id"].astype("int64").tolist(), type=pa.int64()),
+            pa.array(graph["level"].astype("int16").tolist(), type=pa.int16()),
+            pa.array(graph["upstream_ids"].tolist(), type=_list_int64_type()),
+            pa.array(graph["bbox_minx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(graph["bbox_miny"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(graph["bbox_maxx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(graph["bbox_maxy"].astype("float32").tolist(), type=pa.float32()),
+        ],
+        schema=schema,
+    )
+    out_path = out_dir / "graph.parquet"
+    _write_balanced_table(out_path, table, schema)
+    log(f"Stage 7 wrote {out_path} rows={table.num_rows}")
 
 
 def stage_8_write_snap(source: SourceData, out_dir: Path) -> None:
     """Write ``aux/snap_segments.parquet`` and ``aux/snap_reaches.parquet``."""
-    raise NotImplementedError("Stage 8 depends on Stage 2 ID assignment")
+    aux_dir = out_dir / "aux"
+    ensure_dir(aux_dir)
+    id_map = _load_id_map(source)
+    _write_snap_file(source.segment_snap_shards, id_map, 0, aux_dir / "snap_segments.parquet")
+    _write_snap_file(source.reach_snap_shards, id_map, 1, aux_dir / "snap_reaches.parquet")
 
 
-def stage_9_write_manifest(out_dir: Path) -> None:
+def stage_9_write_manifest(source: SourceData, out_dir: Path) -> None:
     """Write final HFX v0.2.1 manifest and dataset README."""
-    raise NotImplementedError("Stage 9 depends on final artifact row counts")
+    catchments_path = out_dir / "catchments.parquet"
+    unit_count = pq.read_metadata(catchments_path).num_rows
+    units_for_bbox = _load_unit_rows(source)[["bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"]]
+    bbox = _dataset_bbox_from_units(units_for_bbox, source.regions)
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "fabric_name": FABRIC_NAME,
+        "fabric_version": FABRIC_VERSION,
+        "crs": CRS,
+        "has_up_area": HAS_UP_AREA,
+        "topology": TOPOLOGY,
+        "bbox": bbox,
+        "unit_count": unit_count,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "adapter_version": ADAPTER_VERSION,
+        "auxiliary": [
+            {
+                "schema": "hfx.aux.snap.v1",
+                "artifacts": {"snap": "aux/snap_segments.parquet"},
+                "metadata": {
+                    "name": "segment-stems",
+                    "description": "Segment-scale stems for level 0 GRIT segment catchments.",
+                    "references_levels": [0],
+                    "weight_semantics": "drainage_area_km2_partitioned",
+                },
+            },
+            {
+                "schema": "hfx.aux.snap.v1",
+                "artifacts": {"snap": "aux/snap_reaches.parquet"},
+                "metadata": {
+                    "name": "reach-stems",
+                    "description": "Reach-scale stems for level 1 GRIT reach catchments. Weight inherited from parent segment.",
+                    "references_levels": [1],
+                    "weight_semantics": "drainage_area_km2_partitioned",
+                },
+            },
+        ],
+    }
+    if set(source.regions) != PLANETARY_REGION_SET:
+        manifest["region"] = "europe-smoke" if source.regions == ("EU",) else ",".join(source.regions).lower()
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    _write_readme(out_dir, source, unit_count)
+    log(f"Stage 9 wrote manifest.json unit_count={unit_count}")
+
+
+def _write_snap_file(shards: tuple[Path, ...], id_map: pd.DataFrame, level: int, out_path: Path) -> None:
+    frames: list[pd.DataFrame] = []
+    lookup = id_map[id_map["level"] == level][["source_global_id", "id"]].rename(columns={"id": "unit_id"})
+    for path in shards:
+        frame = _read_table(path).to_pandas()
+        frame = frame.merge(lookup, on="source_global_id", how="inner", validate="1:1")
+        frame["hilbert_index"] = _hilbert_from_bbox(frame)
+        frames.append(frame)
+    snap = pd.concat(frames, ignore_index=True).sort_values(
+        ["hilbert_index", "source_global_id"], kind="mergesort"
+    ).reset_index(drop=True)
+    snap["id"] = np.arange(1, len(snap) + 1, dtype="int64")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox_minx", pa.float32(), nullable=True),
+            pa.field("bbox_miny", pa.float32(), nullable=True),
+            pa.field("bbox_maxx", pa.float32(), nullable=True),
+            pa.field("bbox_maxy", pa.float32(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["LineString", "MultiLineString"]))
+    table = pa.Table.from_arrays(
+        [
+            pa.array(snap["id"].astype("int64").tolist(), type=pa.int64()),
+            pa.array(snap["unit_id"].astype("int64").tolist(), type=pa.int64()),
+            pa.array(snap["weight"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(snap["stem_role"].astype(str).tolist(), type=pa.string()),
+            pa.array(snap["bbox_minx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(snap["bbox_miny"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(snap["bbox_maxx"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(snap["bbox_maxy"].astype("float32").tolist(), type=pa.float32()),
+            pa.array(snap["geometry_wkb"].tolist(), type=pa.binary()),
+        ],
+        schema=schema,
+    )
+    _write_balanced_table(out_path, table, schema)
+    assert_geoparquet_valid(out_path)
+    log(f"Stage 8 wrote {out_path} rows={table.num_rows}")
+
+
+def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0) -> int:
+    """Run the Rust HFX validator in text mode."""
+    repo_root = Path(__file__).resolve().parents[2]
+    cmd = [
+        "cargo",
+        "run",
+        "-p",
+        "hfx-validator",
+        "--",
+        str(dataset_path),
+        "--format",
+        "text",
+        "--sample-pct",
+        str(sample_pct),
+    ]
+    if strict:
+        cmd.append("--strict")
+    log("run validator: " + " ".join(cmd))
+    proc = subprocess.run(cmd, cwd=repo_root, check=False)
+    return int(proc.returncode)
 
 
 def probe_reach_schema(root: Path) -> None:
@@ -947,7 +1297,34 @@ def _parse_args() -> argparse.Namespace:
     phase25 = subparsers.add_parser("phase25", help="resolve graph edges and compute reach upstream areas")
     phase25.add_argument("--regions", type=_parse_regions, default=REGION_CODES)
 
+    write = subparsers.add_parser("write", help="run Stages 6-9 over existing intermediates")
+    write.add_argument("--regions", type=_parse_regions, default=REGION_CODES)
+    write.add_argument("--out", type=Path, default=None)
+
+    validate_parser = subparsers.add_parser("validate", help="run the Rust HFX validator")
+    validate_parser.add_argument("--out", type=Path, default=None)
+    validate_parser.add_argument("--sample-pct", type=float, default=100.0)
+    validate_parser.add_argument("--strict", action="store_true", default=True)
+
     return parser.parse_args()
+
+
+def _source_from_existing(root: Path, regions: tuple[str, ...]) -> SourceData:
+    return SourceData(
+        root=root,
+        tmp_root=root / "tmp",
+        regions=regions,
+        segment_shards=tuple(root / "tmp" / region / "segments.parquet" for region in regions),
+        reach_shards=tuple(root / "tmp" / region / "reaches.parquet" for region in regions),
+        segment_snap_shards=tuple(root / "tmp" / region / "segment_snap.parquet" for region in regions),
+        reach_snap_shards=tuple(root / "tmp" / region / "reach_snap.parquet" for region in regions),
+        segment_rows=sum(pq.read_metadata(root / "tmp" / region / "segments.parquet").num_rows for region in regions),
+        reach_rows=sum(pq.read_metadata(root / "tmp" / region / "reaches.parquet").num_rows for region in regions),
+    )
+
+
+def _default_out_dir(root: Path, regions: tuple[str, ...]) -> Path:
+    return root / ("grit-hfx-global" if set(regions) == PLANETARY_REGION_SET else "grit-hfx-eu-smoke")
 
 
 def main() -> int:
@@ -962,17 +1339,7 @@ def main() -> int:
         return 0
     if args.command in {"stage2", "phase25"}:
         regions = args.regions
-        source = SourceData(
-            root=root,
-            tmp_root=root / "tmp",
-            regions=regions,
-            segment_shards=tuple(root / "tmp" / region / "segments.parquet" for region in regions),
-            reach_shards=tuple(root / "tmp" / region / "reaches.parquet" for region in regions),
-            segment_snap_shards=tuple(root / "tmp" / region / "segment_snap.parquet" for region in regions),
-            reach_snap_shards=tuple(root / "tmp" / region / "reach_snap.parquet" for region in regions),
-            segment_rows=sum(pq.read_metadata(root / "tmp" / region / "segments.parquet").num_rows for region in regions),
-            reach_rows=sum(pq.read_metadata(root / "tmp" / region / "reaches.parquet").num_rows for region in regions),
-        )
+        source = _source_from_existing(root, regions)
         if args.command == "stage2":
             stage_2_assign_ids(source)
             stage_5_hilbert_sort(source)
@@ -980,6 +1347,17 @@ def main() -> int:
         resolve_graph_edges(source)
         compute_reach_up_area(source)
         return 0
+    if args.command == "write":
+        source = _source_from_existing(root, args.regions)
+        out_dir = args.out.expanduser().resolve() if args.out is not None else _default_out_dir(root, args.regions)
+        stage_6_write_catchments(source, out_dir)
+        stage_7_write_graph(source, out_dir)
+        stage_8_write_snap(source, out_dir)
+        stage_9_write_manifest(source, out_dir)
+        return 0
+    if args.command == "validate":
+        out_dir = args.out.expanduser().resolve() if args.out is not None else root / "grit-hfx-eu-smoke"
+        return validate(out_dir, strict=args.strict, sample_pct=args.sample_pct)
     raise AssertionError(f"unsupported command: {args.command}")
 
 
