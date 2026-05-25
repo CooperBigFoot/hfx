@@ -79,7 +79,7 @@ The following spec-required checks are **not implemented** and will emit warning
 
 | Spec Rule | Status | Reason | Tracking |
 |---|---|---|---|
-| Hilbert sort order on catchments/snap rows | Deferred | Curve parameters not yet specified in the spec | Deferred |
+| Hilbert sort order on catchments/graph rows | Deferred | Curve parameters not yet specified in the spec; `ordering.catchments.hilbert_unsorted` and `ordering.graph.hilbert_unsorted` are registered but not emitted in v0.2.1 | Deferred |
 | Polygon self-intersection / geometric validity | Partial | `geozero` checks WKB structural validity, not topological validity | Partial |
 | Snap bbox strictness (`<=` for line features) | Fixed | Snap bboxes now correctly use `<=` rather than `<` for line-feature bbox enclosure | — |
 | Parquet compression codecs (zstd, snappy, lz4, gzip) | Fixed | All four codecs are now supported; codec detection errors are reported via diagnostic capping | — |

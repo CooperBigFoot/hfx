@@ -7,6 +7,7 @@ pub mod graph;
 pub mod ids;
 pub mod levels;
 pub mod manifest;
+pub mod ordering;
 pub mod parent;
 pub mod raster;
 pub mod referential;
@@ -51,6 +52,15 @@ pub fn run_checks(
 
     // Phase 2: schema checks (B4-B6)
     all.extend(schema::check_schemas(dataset));
+    let _deferred_hilbert_diagnostics = ordering::deferred_hilbert_diagnostics();
+
+    if let Some(ref catchments) = dataset.catchments {
+        all.extend(ordering::check_catchments_ordering(catchments));
+    }
+
+    if let Some(ref graph) = dataset.graph {
+        all.extend(ordering::check_graph_ordering(graph));
+    }
 
     // Phase 3: ID + value checks
     if let Some(ref catchments) = dataset.catchments {
