@@ -7,7 +7,7 @@ use crate::id::{SnapId, UnitId};
 /// Errors from constructing snap-target domain values.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapError {
-    /// Returned when a stem role string is not supported by HFX v0.2.
+    /// Returned when a stem role string is not supported by HFX v0.2.1.
     #[error("unsupported stem role: {value:?}")]
     UnsupportedStemRole {
         /// The unsupported raw value.
@@ -16,13 +16,15 @@ pub enum SnapError {
 }
 
 /// Indicates whether a snap target lies on the mainstem channel, a tributary,
-/// or an unknown stem role.
+/// a distributary, or an unknown stem role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StemRole {
     /// This feature is on the mainstem channel.
     Mainstem,
-    /// This feature is on a tributary or distributary.
+    /// This feature is on a tributary.
     Tributary,
+    /// This feature is on a branch diverging at a bifurcation.
+    Distributary,
     /// The producer does not know or does not declare the stem role.
     Unknown,
 }
@@ -32,6 +34,7 @@ impl std::fmt::Display for StemRole {
         match self {
             StemRole::Mainstem => write!(f, "mainstem"),
             StemRole::Tributary => write!(f, "tributary"),
+            StemRole::Distributary => write!(f, "distributary"),
             StemRole::Unknown => write!(f, "unknown"),
         }
     }
@@ -44,6 +47,7 @@ impl std::str::FromStr for StemRole {
         match s {
             "mainstem" => Ok(StemRole::Mainstem),
             "tributary" => Ok(StemRole::Tributary),
+            "distributary" => Ok(StemRole::Distributary),
             "unknown" => Ok(StemRole::Unknown),
             _ => Err(SnapError::UnsupportedStemRole {
                 value: s.to_owned(),
@@ -152,6 +156,7 @@ mod tests {
     #[test]
     fn stem_role_variants_are_not_equal() {
         assert_ne!(StemRole::Mainstem, StemRole::Tributary);
+        assert_ne!(StemRole::Tributary, StemRole::Distributary);
         assert_ne!(StemRole::Mainstem, StemRole::Unknown);
     }
 
@@ -173,7 +178,18 @@ mod tests {
             "tributary".parse::<StemRole>().unwrap(),
             StemRole::Tributary
         );
+        assert_eq!(
+            "distributary".parse::<StemRole>().unwrap(),
+            StemRole::Distributary
+        );
         assert_eq!("unknown".parse::<StemRole>().unwrap(), StemRole::Unknown);
+    }
+
+    #[test]
+    fn stem_role_distributary_roundtrips() {
+        let role: StemRole = "distributary".parse().unwrap();
+        assert_eq!(role, StemRole::Distributary);
+        assert_eq!(role.to_string(), "distributary");
     }
 
     #[test]
