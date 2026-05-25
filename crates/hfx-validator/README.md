@@ -4,7 +4,9 @@ CLI tool that validates HFX dataset directories against `spec/HFX_SPEC.md`.
 
 ## Purpose
 
-Reads an HFX dataset directory (manifest.json, catchments.parquet, graph.arrow, and optional snap.parquet / raster files) and reports all spec violations in a single pass.
+Reads an HFX dataset directory (`manifest.json`, `catchments.parquet`,
+`graph.parquet`, and declared auxiliary artifacts) and reports all spec
+violations in a single pass.
 
 ## Quickstart
 
@@ -27,13 +29,13 @@ Use `--strict` to promote warnings to errors. Exit code `0` means valid; exit co
 
 - `main.rs` provides the clap CLI and hands off to `lib.rs`.
 - `lib.rs` exposes `validate()` as the crate entry point.
-- `reader/` loads JSON, Parquet, Arrow IPC, and TIFF inputs into `ParsedDataset`.
+- `reader/` loads JSON, Parquet, and TIFF inputs into `ParsedDataset`.
 - `check/` runs pure validation passes against that parsed representation.
 - `report.rs` formats the resulting diagnostics as text or JSON.
 
 Two layers are decoupled by `ParsedDataset`:
 
-- **`reader/`** reads Parquet, Arrow IPC, TIFF, and JSON into lightweight intermediate representations (`CatchmentsData`, `GraphData`, `SnapData`, `RasterMeta`). TIFF structural tags are parsed with `tiff`, while CRS and geotransform metadata are read via GDAL so raster CRS/extent checks can run without loading pixel data.
+- **`reader/`** reads Parquet, TIFF, and JSON into lightweight intermediate representations (`CatchmentsData`, `GraphData`, `SnapData`, `RasterMeta`). TIFF structural tags are parsed with `tiff`, while CRS and geotransform metadata are read via GDAL so raster CRS/extent checks can run without loading pixel data.
 - **`check/`** contains pure validation logic. Each module is free functions that take `&`-references to intermediate data and return `Vec<Diagnostic>`. No I/O, no trait objects.
 
 ## Key Types
@@ -49,11 +51,11 @@ Two layers are decoupled by `ParsedDataset`:
 
 Checks run in dependency order inside `check/mod.rs::run_checks()`:
 
-1. File presence (manifest, catchments, graph, conditional snap/rasters)
+1. File presence (manifest, catchments, graph, declared auxiliary artifacts)
 2. Manifest field validation (13 checks)
-3. Schema validation (column types, row group stats/sizes, atom_count match)
+3. Schema validation (column types, row group stats/sizes, unit_count match)
 4. ID + value constraints (positivity, uniqueness, bbox validity, areas)
-5. Cross-file referential integrity (graph-catchment coverage, upstream refs, snap FKs, bbox enclosure)
+5. Cross-file referential integrity (graph-catchment coverage, upstream refs, snap auxiliary FKs, bbox enclosure)
 6. Graph acyclicity (Kahn's algorithm)
 7. Geometry spot-check (WKB type + geozero validity, 1% sample for catchments)
 8. Raster checks (dtype, tiling, nodata, CRS, manifest-bbox containment)
@@ -65,6 +67,22 @@ hfx <DATASET_PATH> [--format text|json] [--strict] [--skip-rasters] [--sample-pc
 ```
 
 Exit codes: `0` = valid, `1` = invalid.
+
+## v0.2.1 Changes
+
+- `manifest.json::format_version` is hard-cut to `"0.2.1"`; `"0.2"` and
+  `"0.1"` are rejected with `manifest.unsupported_format_version`.
+- `graph.parquet` now requires `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
+  `bbox_maxy`, plus row-group bbox statistics and row-group layout checks.
+- Multi-level `catchments.parquet` and `graph.parquet` must be ordered by
+  non-decreasing `level`. Hilbert ordering remains deferred until curve
+  parameters are specified.
+- Root-level `snap.parquet` is removed from the core format. Snap features move
+  to one or more `hfx.aux.snap.v1` auxiliary declarations.
+- `stem_role` now allows `distributary`, and the validator now enforces the
+  `stem_role` enum. This was unchecked in v0.2.
+- Snap auxiliary `weight` values must be finite and non-negative, and
+  `metadata.references_levels` must include every referenced catchment level.
 
 ## Diagnostic Capping
 
