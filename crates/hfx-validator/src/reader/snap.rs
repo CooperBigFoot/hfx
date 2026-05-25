@@ -32,8 +32,8 @@ fn expected_columns() -> Vec<ExpectedColumn> {
 /// Read `snap.parquet` and return the extracted data plus any diagnostics.
 ///
 /// Returns `(None, diagnostics)` on I/O or schema errors that prevent reading.
-pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
-    debug!(path = %path.display(), "reading snap.parquet");
+pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>) {
+    debug!(path = %path.display(), label, "reading snap parquet");
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -45,7 +45,7 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
                     "snap.read",
                     Category::Schema,
                     Artifact::Snap,
-                    format!("cannot open snap.parquet: {err}"),
+                    labeled_message(label, format!("cannot open snap.parquet: {err}")),
                 )],
             );
         }
@@ -61,7 +61,7 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
                     "snap.parquet_open",
                     Category::Schema,
                     Artifact::Snap,
-                    format!("cannot read snap.parquet as Parquet: {err}"),
+                    labeled_message(label, format!("cannot read snap.parquet as Parquet: {err}")),
                 )],
             );
         }
@@ -75,6 +75,7 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
         .any(|d| d.severity == crate::diagnostic::Severity::Error)
     {
         warn!("snap.parquet schema has errors; skipping data extraction");
+        label_diagnostics(label, &mut diags);
         return (None, diags);
     }
 
@@ -101,7 +102,10 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
                     "snap.reader_build",
                     Category::Schema,
                     Artifact::Snap,
-                    format!("cannot build snap record batch reader: {err}"),
+                    labeled_message(
+                        label,
+                        format!("cannot build snap record batch reader: {err}"),
+                    ),
                 )],
             );
         }
@@ -417,6 +421,7 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
 
     let row_count = ids.len();
     debug!(row_count, "snap.parquet read complete");
+    label_diagnostics(label, &mut diags);
 
     (
         Some(SnapData {
@@ -432,4 +437,16 @@ pub fn read_snap(path: &Path) -> (Option<SnapData>, Vec<Diagnostic>) {
         }),
         diags,
     )
+}
+
+fn labeled_message(label: &str, message: impl Into<String>) -> String {
+    format!("{label}: {}", message.into())
+}
+
+fn label_diagnostics(label: &str, diags: &mut [Diagnostic]) {
+    for diag in diags {
+        if !diag.message.starts_with(label) {
+            diag.message = labeled_message(label, std::mem::take(&mut diag.message));
+        }
+    }
 }
