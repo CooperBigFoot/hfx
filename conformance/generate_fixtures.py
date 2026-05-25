@@ -109,9 +109,9 @@ def write_catchments(out_dir: Path, rows=BASE_ROWS) -> None:
         writer.write_table(table)
 
 
-def write_graph(out_dir: Path, upstream: dict[int, list[int]]) -> None:
-    ids = [r[0] for r in BASE_ROWS]
-    levels_by_id = {r[0]: r[1] for r in BASE_ROWS}
+def write_graph(out_dir: Path, upstream: dict[int, list[int]], rows=BASE_ROWS) -> None:
+    ids = [r[0] for r in rows]
+    row_by_id = {r[0]: r for r in rows}
     schema = pa.schema(
         [
             pa.field("id", pa.int64(), nullable=False),
@@ -121,16 +121,24 @@ def write_graph(out_dir: Path, upstream: dict[int, list[int]]) -> None:
                 pa.list_(pa.field("item", pa.int64(), nullable=True)),
                 nullable=False,
             ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
         ]
     )
     table = pa.table(
         {
             "id": pa.array(ids, type=pa.int64()),
-            "level": pa.array([levels_by_id[i] for i in ids], type=pa.int16()),
+            "level": pa.array([row_by_id[i][1] for i in ids], type=pa.int16()),
             "upstream_ids": pa.array(
                 [upstream[i] for i in ids],
                 type=pa.list_(pa.field("item", pa.int64(), nullable=True)),
             ),
+            "bbox_minx": pa.array([row_by_id[i][3] for i in ids], type=pa.float32()),
+            "bbox_miny": pa.array([row_by_id[i][4] for i in ids], type=pa.float32()),
+            "bbox_maxx": pa.array([row_by_id[i][5] for i in ids], type=pa.float32()),
+            "bbox_maxy": pa.array([row_by_id[i][6] for i in ids], type=pa.float32()),
         },
         schema=schema,
     )
@@ -232,7 +240,7 @@ def generate_invalid_parent_cycle() -> None:
         BASE_ROWS[4],
     ]
     write_catchments(out, rows)
-    write_graph(out, VALID_UPSTREAM)
+    write_graph(out, VALID_UPSTREAM, rows)
     write_manifest(out)
     write_readme(out, "Parent cycle", "parent.cycle_detected")
 
@@ -248,7 +256,7 @@ def generate_invalid_parent_level() -> None:
         BASE_ROWS[4],
     ]
     write_catchments(out, rows)
-    write_graph(out, VALID_UPSTREAM)
+    write_graph(out, VALID_UPSTREAM, rows)
     write_manifest(out)
     write_readme(out, "Parent level not coarser", "parent.level_not_coarser")
 

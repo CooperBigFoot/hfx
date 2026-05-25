@@ -142,6 +142,63 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
     diags
 }
 
+fn classify_row_groups(row_count: usize, sizes: &[usize]) -> RgLayoutVerdict {
+    if row_count < RG_SIZE_MIN {
+        return if sizes.len() > 1 {
+            RgLayoutVerdict::SmallFileMultipleRgs {
+                rg_count: sizes.len(),
+            }
+        } else {
+            RgLayoutVerdict::SmallFileSingleRg
+        };
+    }
+
+    sizes
+        .iter()
+        .enumerate()
+        .find_map(|(rg_idx, &size)| {
+            (!((RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size)))
+                .then_some(RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size })
+        })
+        .unwrap_or(RgLayoutVerdict::LargeFileInRange)
+}
+
+fn emit_row_group_diag(
+    verdict: RgLayoutVerdict,
+    row_count: usize,
+    artifact: Artifact,
+    file_label: &str,
+    rg_size_check_id: &'static str,
+    rg_count_check_id: &'static str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match verdict {
+        RgLayoutVerdict::SmallFileSingleRg | RgLayoutVerdict::LargeFileInRange => {}
+        RgLayoutVerdict::SmallFileMultipleRgs { rg_count } => {
+            diags.push(Diagnostic::warning(
+                rg_count_check_id,
+                Category::Schema,
+                artifact,
+                format!(
+                    "{file_label} has {row_count} rows split across {rg_count} row groups; \
+                     files with fewer than {RG_SIZE_MIN} rows must be written as a single row group"
+                ),
+            ));
+        }
+        RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size } => {
+            diags.push(Diagnostic::warning(
+                rg_size_check_id,
+                Category::Schema,
+                artifact,
+                format!(
+                    "{file_label} row group {rg_idx} has {size} rows; \
+                     recommended range is [{RG_SIZE_MIN}, {RG_SIZE_MAX}]"
+                ),
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::dataset::{
@@ -225,62 +282,5 @@ mod tests {
                 && diag.severity == Severity::Warning
                 && diag.artifact == Artifact::Graph
         }));
-    }
-}
-
-fn classify_row_groups(row_count: usize, sizes: &[usize]) -> RgLayoutVerdict {
-    if row_count < RG_SIZE_MIN {
-        return if sizes.len() > 1 {
-            RgLayoutVerdict::SmallFileMultipleRgs {
-                rg_count: sizes.len(),
-            }
-        } else {
-            RgLayoutVerdict::SmallFileSingleRg
-        };
-    }
-
-    sizes
-        .iter()
-        .enumerate()
-        .find_map(|(rg_idx, &size)| {
-            (!((RG_SIZE_MIN..=RG_SIZE_MAX).contains(&size)))
-                .then_some(RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size })
-        })
-        .unwrap_or(RgLayoutVerdict::LargeFileInRange)
-}
-
-fn emit_row_group_diag(
-    verdict: RgLayoutVerdict,
-    row_count: usize,
-    artifact: Artifact,
-    file_label: &str,
-    rg_size_check_id: &'static str,
-    rg_count_check_id: &'static str,
-    diags: &mut Vec<Diagnostic>,
-) {
-    match verdict {
-        RgLayoutVerdict::SmallFileSingleRg | RgLayoutVerdict::LargeFileInRange => {}
-        RgLayoutVerdict::SmallFileMultipleRgs { rg_count } => {
-            diags.push(Diagnostic::warning(
-                rg_count_check_id,
-                Category::Schema,
-                artifact,
-                format!(
-                    "{file_label} has {row_count} rows split across {rg_count} row groups; \
-                     files with fewer than {RG_SIZE_MIN} rows must be written as a single row group"
-                ),
-            ));
-        }
-        RgLayoutVerdict::LargeFileOutOfRange { rg_idx, size } => {
-            diags.push(Diagnostic::warning(
-                rg_size_check_id,
-                Category::Schema,
-                artifact,
-                format!(
-                    "{file_label} row group {rg_idx} has {size} rows; \
-                     recommended range is [{RG_SIZE_MIN}, {RG_SIZE_MAX}]"
-                ),
-            ));
-        }
     }
 }
