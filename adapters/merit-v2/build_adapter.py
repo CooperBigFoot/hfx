@@ -56,6 +56,26 @@ OUTLET_SNAP_TOLERANCE_DEGREES = 1e-6
 DEFAULT_MERIT_BASINS_ROOT = Path("~/data/merit_basins/pfaf_level_02").expanduser()
 DEFAULT_RASTERS_ROOT = Path("~/data/merit_hydro_rasters").expanduser()
 DEFAULT_OUT = Path("/Users/nicolaslazaro/Desktop/merit-hfx-v2/tier1")
+PLANETARY_BBOX = [-180.0, -90.0, 180.0, 90.0]
+
+# Vendored from adapters/merit/run_missing_basins.py. Codes 87 and 88
+# are absent from the mghydro raster distribution; pfaf-35 is excluded
+# from planetary v2 builds because it crosses the antimeridian raster cut.
+VALID_PFAF_CODES: tuple[int, ...] = (
+    11, 12, 13, 14, 15, 16, 17, 18,
+    21, 22, 23, 24, 25, 26, 27, 28, 29,
+    31, 32, 33, 34, 35, 36,
+    41, 42, 43, 44, 45, 46, 47, 48, 49,
+    51, 52, 53, 54, 55, 56, 57,
+    61, 62, 63, 64, 65, 66, 67,
+    71, 72, 73, 74, 75, 76, 77, 78,
+    81, 82, 83, 84, 85, 86,
+    91,
+)
+EXCLUDED_PLANETARY_PFAF_CODES = frozenset({35})
+ALL_INCLUDED_PFAF_CODES = tuple(
+    code for code in VALID_PFAF_CODES if code not in EXCLUDED_PLANETARY_PFAF_CODES
+)
 
 logger = logging.getLogger("merit-v2")
 
@@ -96,6 +116,7 @@ class BuildContext:
     hilbert_monotonic: bool = False
     d8_entries_written: list[str] = field(default_factory=list)
     ids: list[int] = field(default_factory=list)
+    planetary: bool = False
 
 
 def configure_logging(level: str) -> None:
@@ -635,7 +656,7 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
     """Write manifest.json and README.md."""
     if ctx.bbox is None:
         raise AdapterError("ctx.bbox missing before manifest")
-    bbox = [float(value) for value in ctx.bbox]
+    bbox = PLANETARY_BBOX if ctx.planetary else [float(value) for value in ctx.bbox]
     pfaf_codes = ctx.pfaf_codes or (ctx.pfaf,)
     region = ",".join(f"pfaf-{pfaf:02d}" for pfaf in pfaf_codes)
     d8_entries = [
@@ -656,7 +677,6 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
         "crs": CRS,
         "has_up_area": HAS_UP_AREA,
         "topology": TOPOLOGY,
-        "region": region,
         "bbox": bbox,
         "unit_count": len(ctx.ids),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -675,8 +695,66 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
             *d8_entries,
         ],
     }
+    if not ctx.planetary:
+        manifest["region"] = region
     (ctx.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    readme = f"""# MERIT-Basins HFX v0.2.1 {region}
+    if ctx.planetary:
+        built_at = datetime.now(timezone.utc).isoformat()
+        readme = f"""# MERIT-Basins HFX v0.2.1 (global)
+
+This dataset is a global HFX v0.2.1 compilation of the MERIT-
+Basins vector hydrography (Lin et al. 2019) and MERIT Hydro
+D8 flow-direction / flow-accumulation rasters (Yamazaki et
+al. 2019), built by the MERIT v2 adapter
+(adapters/merit-v2/build_adapter.py).
+
+## Coverage
+
+This dataset covers 60 of the 63 MERIT-Basins Pfaf-L2 basins.
+The following are deliberately excluded:
+
+- pfaf-87, pfaf-88 (Antarctic): no MERIT Hydro raster
+  coverage at source (mghydro returns 404 for
+  flowdir87/88.tif). MERIT-Basins itself has no Antarctic
+  rivers.
+- pfaf-35 (New Zealand / Pacific antimeridian): the catchment
+  polygons wrap past 180\u00b0E and the per-basin D8 raster is
+  clipped at the antimeridian. Excluded to preserve the
+  invariant that every catchment has a paired D8 raster aux.
+
+The manifest declares planetary bbox [-180, -90, 180, 90] for
+catalog-discoverability; actual data coverage is the 60
+included basins listed above.
+
+## D8 Raster Layout
+
+60 hfx.aux.d8_raster.v1 auxiliary entries, one per included
+Pfaf basin, with COGs at aux/d8/pfaf_<NN>/flow_dir.tif and
+aux/d8/pfaf_<NN>/flow_acc.tif. Each raster preserves native
+MERIT Hydro grid geometry (cell-centered on 3-arcsec
+resolution; cell edges may extend half a pixel outside
+integer degree boundaries).
+
+## Snap
+
+One hfx.aux.snap.v1 entry ("stems") derived from MERIT-Basins
+reach centerlines. weight = uparea (km\u00b2). stem_role assigned
+by largest-uparea descent at each confluence.
+
+## Provenance
+
+- Source: MERIT-Basins v0.7 / v1.0_bugfix1 (Lin et al. 2019).
+  Downloaded from the Google Drive share. Licensed CC BY-NC-SA
+  4.0.
+- Source: MERIT Hydro D8 rasters basin-merged rehost by M.
+  Heberger at mghydro.com, derived from Yamazaki et al. 2019.
+  Licensed dual CC BY-NC 4.0 / ODbL 1.0.
+- Adapter version: see manifest.adapter_version.
+- HFX spec version: 0.2.1.
+- Built: {built_at}
+"""
+    else:
+        readme = f"""# MERIT-Basins HFX v0.2.1 {region}
 
 Tier smoke dataset for MERIT v2 adapter validation.
 
@@ -739,8 +817,14 @@ def write_telemetry(ctx: BuildContext) -> None:
     (ctx.out_dir / "build-telemetry.json").write_text(json.dumps(telemetry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def parse_pfaf_codes(raw: str | None, single: int | None) -> tuple[int, ...]:
+def parse_pfaf_codes(raw: str | None, single: int | None, all_basins: bool = False) -> tuple[int, ...]:
     """Parse CLI Pfaf code arguments."""
+    if all_basins:
+        if raw or single is not None:
+            raise AdapterError("--all-basins is mutually exclusive with --pfaf and --pfaf-codes")
+        return ALL_INCLUDED_PFAF_CODES
+    if raw and single is not None:
+        raise AdapterError("--pfaf and --pfaf-codes are mutually exclusive")
     if raw:
         return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
     if single is not None:
@@ -749,7 +833,11 @@ def parse_pfaf_codes(raw: str | None, single: int | None) -> tuple[int, ...]:
 
 
 def output_name_for(pfaf_codes: tuple[int, ...]) -> str:
-    """Return the canonical output directory name for the selected basin set."""
+    """Return the canonical output directory name for the selected basin set.
+
+    Planetary mode bypasses this helper and writes directly to the requested
+    output path.
+    """
     if len(pfaf_codes) == 1:
         return f"merit-hfx-pfaf{pfaf_codes[0]:02d}"
     if pfaf_codes == (27, 42, 91):
@@ -769,12 +857,19 @@ def assert_hilbert_monotonic(catchments: gpd.GeoDataFrame) -> bool:
 
 def build_dataset(args: argparse.Namespace) -> None:
     """Build a single- or multi-basin HFX v0.2.1 dataset."""
-    pfaf_codes = parse_pfaf_codes(getattr(args, "pfaf_codes", None), getattr(args, "pfaf", None))
-    dataset = args.out.expanduser() / output_name_for(pfaf_codes)
+    planetary = bool(getattr(args, "planetary", False))
+    pfaf_codes = parse_pfaf_codes(
+        getattr(args, "pfaf_codes", None),
+        getattr(args, "pfaf", None),
+        bool(getattr(args, "all_basins", False)),
+    )
+    dataset = args.out.expanduser() if planetary else args.out.expanduser() / output_name_for(pfaf_codes)
+    if planetary and dataset.exists() and any(dataset.iterdir()) and not args.force:
+        raise AdapterError(f"planetary output directory exists and is not empty: {dataset}; pass --force to replace it")
     if dataset.exists() and args.force:
         shutil.rmtree(dataset)
     ensure_dir(dataset)
-    ctx = BuildContext(pfaf=pfaf_codes[0], out_dir=dataset, tmp_dir=dataset / "tmp", pfaf_codes=pfaf_codes)
+    ctx = BuildContext(pfaf=pfaf_codes[0], out_dir=dataset, tmp_dir=dataset / "tmp", pfaf_codes=pfaf_codes, planetary=planetary)
     ctx.spec_d8_bounds_note = read_d8_spec_note()
     source = run_stage(ctx, "stage_1_inspect_source", stage_1_inspect_sources, args.merit_basins, args.rasters, pfaf_codes)
     catchments = run_stage(ctx, "stage_2_assign_ids", stage_2_assign_ids, source)
@@ -803,6 +898,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     build.add_argument("--rasters", type=Path, default=DEFAULT_RASTERS_ROOT)
     build.add_argument("--pfaf", type=int)
     build.add_argument("--pfaf-codes", help="comma-separated Pfaf-L2 codes, e.g. 27,42,91")
+    build.add_argument(
+        "--planetary",
+        action="store_true",
+        help="emit a planetary-mode dataset (literal planet bbox, no region, coverage README). Use with --all-basins for the full 60-basin global set.",
+    )
+    build.add_argument(
+        "--all-basins",
+        action="store_true",
+        help="build all 60 included basins (VALID_PFAF_CODES - {35}). Mutually exclusive with --pfaf/--pfaf-codes.",
+    )
     build.add_argument("--out", type=Path, default=DEFAULT_OUT)
     build.add_argument("--force", action="store_true")
     build.add_argument("--log-level", default="INFO")
