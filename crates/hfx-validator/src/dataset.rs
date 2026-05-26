@@ -138,6 +138,14 @@ impl RasterBoundingBox {
             && self.max_x >= other.max_x - epsilon
             && self.max_y >= other.max_y - epsilon
     }
+
+    /// Return true when `self` intersects `other` within `epsilon`.
+    pub fn overlaps_with_epsilon(&self, other: &Self, epsilon: f64) -> bool {
+        self.min_x <= other.max_x + epsilon
+            && self.max_x >= other.min_x - epsilon
+            && self.min_y <= other.max_y + epsilon
+            && self.max_y >= other.min_y - epsilon
+    }
 }
 
 impl std::fmt::Display for RasterBoundingBox {

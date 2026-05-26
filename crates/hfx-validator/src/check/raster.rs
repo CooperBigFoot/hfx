@@ -24,11 +24,11 @@ pub enum RasterSpatialCheckError {
         got: String,
     },
 
-    /// Returned when a raster footprint does not fully contain the manifest bbox.
+    /// Returned when a raster footprint does not overlap the manifest bbox.
     #[error(
-        "raster extent does not contain manifest bbox for {path}: raster_bbox={raster_bbox}, manifest_bbox={manifest_bbox}"
+        "raster extent does not overlap manifest bbox for {path}: raster_bbox={raster_bbox}, manifest_bbox={manifest_bbox}"
     )]
-    RasterExtentNotContained {
+    RasterExtentNoOverlap {
         /// Path to the raster being validated.
         path: PathBuf,
         /// Bounding box derived from the raster geotransform.
@@ -172,14 +172,14 @@ pub fn check_spatial_consistency(
 
     if let Some(raster_bbox) = meta.bbox.as_ref() {
         let manifest_bbox = RasterBoundingBox::from_manifest_bbox(manifest.bbox());
-        if !raster_bbox.contains_with_epsilon(&manifest_bbox, containment_epsilon(meta)) {
-            let error = RasterSpatialCheckError::RasterExtentNotContained {
+        if !raster_bbox.overlaps_with_epsilon(&manifest_bbox, containment_epsilon(meta)) {
+            let error = RasterSpatialCheckError::RasterExtentNoOverlap {
                 path: meta.path.clone(),
                 raster_bbox: raster_bbox.clone(),
                 manifest_bbox,
             };
             diags.push(Diagnostic::error(
-                "raster.extent_not_contained",
+                "raster.extent_no_overlap",
                 Category::Raster,
                 artifact,
                 error.to_string(),

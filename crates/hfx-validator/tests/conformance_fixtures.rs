@@ -18,6 +18,7 @@ fn conformance_valid_fixtures_pass() {
         "tiny",
         "tiny-with-aux-d8",
         "tiny-with-two-aux-d8",
+        "tiny-with-two-aux-d8-tiled",
         "grit-two-level",
         "grit-two-snap",
     ] {
@@ -33,7 +34,11 @@ fn conformance_valid_fixtures_pass() {
 
 #[test]
 fn conformance_d8_raster_fixtures_pass_with_raster_checks_enabled() {
-    for name in ["tiny-with-aux-d8", "tiny-with-two-aux-d8"] {
+    for name in [
+        "tiny-with-aux-d8",
+        "tiny-with-two-aux-d8",
+        "tiny-with-two-aux-d8-tiled",
+    ] {
         let p = fixture_path("valid", name);
         let report = validate(&p, false, false, 100.0);
         assert!(
@@ -88,6 +93,25 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
             report.diagnostics()
         );
     }
+}
+
+#[test]
+fn conformance_d8_no_overlap_fixture_emits_expected_diagnostic() {
+    let p = fixture_path("invalid", "tiny-with-aux-d8-no-overlap");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected non-overlapping D8 fixture to be invalid"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.check_id == "raster.extent_no_overlap"),
+        "expected raster.extent_no_overlap diagnostic; got {:#?}",
+        report.diagnostics()
+    );
 }
 
 #[test]

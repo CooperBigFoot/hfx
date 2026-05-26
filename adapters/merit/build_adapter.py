@@ -909,8 +909,8 @@ def stage_9_write_manifest(
     ``"merit_basins_pfaf27"``). ``flow_dir_encoding`` is required when
     ``HAS_RASTERS = True`` and is set to ``FLOW_DIR_ENCODING``. The written
     ``bbox`` is ``outward_bbox(bbox)`` clamped inward to ``raster_bbox`` when
-    provided, so the validator's ``raster.extent_not_contained`` check passes
-    on basins whose catchments reach the raster edge.
+    provided, so the validator's raster extent check passes on basins whose
+    catchments reach the raster edge.
     """
     fabric_name = FABRIC_NAME_FMT.format(pfaf=pfaf)
     manifest_bbox_padded = outward_bbox(bbox, pad=MANIFEST_BBOX_EPSILON)
