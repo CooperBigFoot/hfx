@@ -12,6 +12,7 @@ import resource
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -586,10 +587,11 @@ def _write_cog(dst_path: Path, data: np.ndarray, profile: dict, predictor: int) 
     ensure_dir(dst_path.parent)
     cog_profile = cog_profiles.get("deflate")
     cog_profile.update(blockxsize=512, blockysize=512, predictor=predictor, BIGTIFF="YES")
-    with rasterio.io.MemoryFile() as memfile:
-        with memfile.open(**profile) as tmp:
+    with tempfile.TemporaryDirectory(prefix="merit-cog-") as tmp_dir:
+        tmp_path = Path(tmp_dir) / "source.tif"
+        with rasterio.open(tmp_path, "w", **profile) as tmp:
             tmp.write(data, 1)
-        with memfile.open() as tmp:
+        with rasterio.open(tmp_path) as tmp:
             cog_translate(tmp, str(dst_path), dst_kwargs=cog_profile, nodata=profile.get("nodata"), dtype=profile["dtype"], in_memory=False, quiet=True)
     valid, errors, warnings = cog_validate(str(dst_path))
     if not valid:
