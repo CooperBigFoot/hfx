@@ -590,7 +590,7 @@ def _write_cog(dst_path: Path, data: np.ndarray, profile: dict, predictor: int) 
         with memfile.open(**profile) as tmp:
             tmp.write(data, 1)
         with memfile.open() as tmp:
-            cog_translate(tmp, str(dst_path), dst_kwargs=cog_profile, nodata=profile.get("nodata"), dtype=profile["dtype"], in_memory=True, quiet=True)
+            cog_translate(tmp, str(dst_path), dst_kwargs=cog_profile, nodata=profile.get("nodata"), dtype=profile["dtype"], in_memory=False, quiet=True)
     valid, errors, warnings = cog_validate(str(dst_path))
     if not valid:
         raise AdapterError(f"COG validation failed for {dst_path}: errors={errors} warnings={warnings}")
