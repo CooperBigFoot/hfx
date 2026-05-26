@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import resource
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from typing import Any
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rasterio
@@ -65,11 +67,13 @@ class AdapterError(RuntimeError):
 class SourceData:
     """Hold loaded MERIT-Basins inputs for one Pfaf-L2 basin."""
 
-    pfaf: int
+    pfaf: int | None
+    pfaf_codes: tuple[int, ...]
     catchments: gpd.GeoDataFrame
     rivers: gpd.GeoDataFrame
     flow_dir_path: Path
     flow_acc_path: Path
+    raster_paths: dict[int, tuple[Path, Path]] = field(default_factory=dict)
 
 
 @dataclass
@@ -79,12 +83,17 @@ class BuildContext:
     pfaf: int
     out_dir: Path
     tmp_dir: Path
+    pfaf_codes: tuple[int, ...] = field(default_factory=tuple)
     timings: dict[str, dict[str, float]] = field(default_factory=dict)
     outlet_snap_count: int = 0
     max_outlet_drift_degrees: float = 0.0
     stem_role_counts: dict[str, int] = field(default_factory=dict)
     spec_d8_bounds_note: str = ""
     bbox: tuple[float, float, float, float] | None = None
+    basin_bboxes: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)
+    per_basin_counts: dict[int, int] = field(default_factory=dict)
+    hilbert_monotonic: bool = False
+    d8_entries_written: list[str] = field(default_factory=list)
     ids: list[int] = field(default_factory=list)
 
 
@@ -99,6 +108,13 @@ def configure_logging(level: str) -> None:
 def ensure_dir(path: Path) -> None:
     """Create a directory and its parents."""
     path.mkdir(parents=True, exist_ok=True)
+
+
+def pd_concat(frames: list[gpd.GeoDataFrame]) -> pd.DataFrame:
+    """Concatenate non-empty GeoDataFrames without reindex surprises."""
+    if not frames:
+        raise AdapterError("no frames to concatenate")
+    return pd.concat(frames, ignore_index=True, copy=False)
 
 
 def peak_rss_mb() -> float:
@@ -250,7 +266,49 @@ def stage_1_inspect_source(merit_basins_root: Path, rasters_root: Path, pfaf: in
         missing = sorted(required - set(frame.columns))
         if missing:
             raise AdapterError(f"{name} missing required columns: {missing}")
-    return SourceData(pfaf=pfaf, catchments=catchments, rivers=rivers, flow_dir_path=flow_dir, flow_acc_path=flow_acc)
+    catchments["_pfaf"] = pfaf
+    rivers["_pfaf"] = pfaf
+    return SourceData(
+        pfaf=pfaf,
+        pfaf_codes=(pfaf,),
+        catchments=catchments,
+        rivers=rivers,
+        flow_dir_path=flow_dir,
+        flow_acc_path=flow_acc,
+        raster_paths={pfaf: (flow_dir, flow_acc)},
+    )
+
+
+def stage_1_inspect_sources(merit_basins_root: Path, rasters_root: Path, pfaf_codes: tuple[int, ...]) -> SourceData:
+    """Load and concatenate MERIT-Basins inputs for multiple Pfaf-L2 basins."""
+    sources = [
+        stage_1_inspect_source(merit_basins_root, rasters_root, pfaf)
+        for pfaf in pfaf_codes
+    ]
+    catchments = gpd.GeoDataFrame(
+        pd_concat([source.catchments for source in sources]),
+        geometry="geometry",
+        crs=CRS,
+    )
+    rivers = gpd.GeoDataFrame(
+        pd_concat([source.rivers for source in sources]),
+        geometry="geometry",
+        crs=CRS,
+    )
+    raster_paths = {
+        pfaf: paths
+        for source in sources
+        for pfaf, paths in source.raster_paths.items()
+    }
+    return SourceData(
+        pfaf=None,
+        pfaf_codes=pfaf_codes,
+        catchments=catchments,
+        rivers=rivers,
+        flow_dir_path=sources[0].flow_dir_path,
+        flow_acc_path=sources[0].flow_acc_path,
+        raster_paths=raster_paths,
+    )
 
 
 def stage_2_assign_ids(source: SourceData) -> gpd.GeoDataFrame:
@@ -385,6 +443,19 @@ def stage_6_write_catchments(source: SourceData, catchments: gpd.GeoDataFrame, c
         float(bounds["bbox_maxx"].astype("float32").max()) + 1e-6,
         float(bounds["bbox_maxy"].astype("float32").max()) + 1e-6,
     )
+    ctx.per_basin_counts = {
+        int(pfaf): int(count)
+        for pfaf, count in catchments.groupby("_pfaf", sort=True).size().items()
+    }
+    ctx.basin_bboxes = {}
+    for pfaf, group in catchments.groupby("_pfaf", sort=True):
+        group_bounds = _bbox_frame(group)
+        ctx.basin_bboxes[int(pfaf)] = (
+            float(group_bounds["bbox_minx"].astype("float32").min()) - 1e-6,
+            float(group_bounds["bbox_miny"].astype("float32").min()) - 1e-6,
+            float(group_bounds["bbox_maxx"].astype("float32").max()) + 1e-6,
+            float(group_bounds["bbox_maxy"].astype("float32").max()) + 1e-6,
+        )
 
 
 def stage_7_write_graph(source: SourceData, catchments: gpd.GeoDataFrame, ctx: BuildContext) -> None:
@@ -470,7 +541,7 @@ def stage_8_write_snap(source: SourceData, ctx: BuildContext) -> None:
     bounds = _bbox_frame(rivers, inflate_degenerate=True)
     rivers["_hilbert"] = rivers.geometry.centroid.hilbert_distance(total_bounds=ctx.bbox)
     rivers = rivers.sort_values(["_hilbert", "COMID"], kind="mergesort").reset_index(drop=True)
-    bounds = bounds.loc[rivers.index].reset_index(drop=True)
+    bounds = _bbox_frame(rivers, inflate_degenerate=True).reset_index(drop=True)
     row_count = len(rivers)
     schema = pa.schema(
         [
@@ -526,26 +597,31 @@ def _write_cog(dst_path: Path, data: np.ndarray, profile: dict, predictor: int) 
 
 
 def stage_8b_write_d8(source: SourceData, ctx: BuildContext) -> None:
-    """Transcode D8 rasters into aux/d8/pfaf_NN."""
-    if ctx.bbox is None:
-        raise AdapterError("ctx.bbox missing before raster transcode")
-    out_dir = ctx.out_dir / "aux" / "d8" / f"pfaf_{source.pfaf:02d}"
-    with rasterio.open(source.flow_dir_path) as src:
-        window, transform = _window_for_bbox(src, ctx.bbox)
-        data = src.read(1, window=window).astype("uint8")
-        valid_values = np.array([0, 1, 2, 4, 8, 16, 32, 64, 128, 255], dtype="uint8")
-        out = np.where(np.isin(data, valid_values), data, FLOW_DIR_NODATA_OUT)
-        out = np.where(out == MERIT_FLOWDIR_UNDEFINED_AS_UINT8, FLOW_DIR_NODATA_OUT, out).astype("uint8")
-        profile = src.profile.copy()
-        profile.update(driver="GTiff", dtype="uint8", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_DIR_NODATA_OUT, crs=src.crs)
-        _write_cog(out_dir / "flow_dir.tif", out, profile, predictor=2)
-    with rasterio.open(source.flow_acc_path) as src:
-        window, transform = _window_for_bbox(src, ctx.bbox)
-        data = src.read(1, window=window).astype("int32")
-        out = np.where(data == 0, FLOW_ACC_NODATA_OUT, data).astype("float32")
-        profile = src.profile.copy()
-        profile.update(driver="GTiff", dtype="float32", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_ACC_NODATA_OUT, crs=src.crs)
-        _write_cog(out_dir / "flow_acc.tif", out, profile, predictor=3)
+    """Transcode D8 rasters into aux/d8/pfaf_NN for every selected basin."""
+    if not ctx.basin_bboxes:
+        raise AdapterError("ctx.basin_bboxes missing before raster transcode")
+    ctx.d8_entries_written = []
+    for pfaf in source.pfaf_codes:
+        flow_dir_path, flow_acc_path = source.raster_paths[pfaf]
+        bbox = ctx.basin_bboxes[pfaf]
+        out_dir = ctx.out_dir / "aux" / "d8" / f"pfaf_{pfaf:02d}"
+        with rasterio.open(flow_dir_path) as src:
+            window, transform = _window_for_bbox(src, bbox)
+            data = src.read(1, window=window).astype("uint8")
+            valid_values = np.array([0, 1, 2, 4, 8, 16, 32, 64, 128, 255], dtype="uint8")
+            out = np.where(np.isin(data, valid_values), data, FLOW_DIR_NODATA_OUT)
+            out = np.where(out == MERIT_FLOWDIR_UNDEFINED_AS_UINT8, FLOW_DIR_NODATA_OUT, out).astype("uint8")
+            profile = src.profile.copy()
+            profile.update(driver="GTiff", dtype="uint8", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_DIR_NODATA_OUT, crs=src.crs)
+            _write_cog(out_dir / "flow_dir.tif", out, profile, predictor=2)
+        with rasterio.open(flow_acc_path) as src:
+            window, transform = _window_for_bbox(src, bbox)
+            data = src.read(1, window=window).astype("int32")
+            out = np.where(data == 0, FLOW_ACC_NODATA_OUT, data).astype("float32")
+            profile = src.profile.copy()
+            profile.update(driver="GTiff", dtype="float32", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_ACC_NODATA_OUT, crs=src.crs)
+            _write_cog(out_dir / "flow_acc.tif", out, profile, predictor=3)
+        ctx.d8_entries_written.append(f"pfaf-{pfaf:02d}")
 
 
 def stage_9_write_manifest(ctx: BuildContext) -> None:
@@ -553,6 +629,19 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
     if ctx.bbox is None:
         raise AdapterError("ctx.bbox missing before manifest")
     bbox = [float(value) for value in ctx.bbox]
+    pfaf_codes = ctx.pfaf_codes or (ctx.pfaf,)
+    region = ",".join(f"pfaf-{pfaf:02d}" for pfaf in pfaf_codes)
+    d8_entries = [
+        {
+            "schema": "hfx.aux.d8_raster.v1",
+            "artifacts": {
+                "flow_dir": f"aux/d8/pfaf_{pfaf:02d}/flow_dir.tif",
+                "flow_acc": f"aux/d8/pfaf_{pfaf:02d}/flow_acc.tif",
+            },
+            "metadata": {"flow_dir_encoding": FLOW_DIR_ENCODING, "name": f"pfaf-{pfaf:02d}"},
+        }
+        for pfaf in pfaf_codes
+    ]
     manifest = {
         "format_version": FORMAT_VERSION,
         "fabric_name": FABRIC_NAME,
@@ -560,7 +649,7 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
         "crs": CRS,
         "has_up_area": HAS_UP_AREA,
         "topology": TOPOLOGY,
-        "region": f"pfaf-{ctx.pfaf:02d}",
+        "region": region,
         "bbox": bbox,
         "unit_count": len(ctx.ids),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -576,30 +665,23 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
                     "weight_semantics": "drainage_area_km2",
                 },
             },
-            {
-                "schema": "hfx.aux.d8_raster.v1",
-                "artifacts": {
-                    "flow_dir": f"aux/d8/pfaf_{ctx.pfaf:02d}/flow_dir.tif",
-                    "flow_acc": f"aux/d8/pfaf_{ctx.pfaf:02d}/flow_acc.tif",
-                },
-                "metadata": {"flow_dir_encoding": FLOW_DIR_ENCODING, "name": f"pfaf-{ctx.pfaf:02d}"},
-            },
+            *d8_entries,
         ],
     }
     (ctx.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    readme = f"""# MERIT-Basins HFX v0.2.1 pfaf-{ctx.pfaf:02d}
+    readme = f"""# MERIT-Basins HFX v0.2.1 {region}
 
-Single-basin smoke dataset for MERIT v2 adapter validation.
+Tier smoke dataset for MERIT v2 adapter validation.
 
 ## Coverage
 
-This partial-fabric dataset covers MERIT-Basins Pfaf-L2 basin pfaf-{ctx.pfaf:02d}. The manifest region is `pfaf-{ctx.pfaf:02d}` and bbox is the source catchment union extent.
+This partial-fabric dataset covers MERIT-Basins Pfaf-L2 basin(s) {region}. The manifest region is `{region}` and bbox is the source catchment union extent.
 
 ## D8 Raster Bounds
 
 The D8 rasters preserve native MERIT Hydro grid geometry during transcode. HFX d8_raster.v1 requires EPSG:4326 COGs with declared dtype, nodata, tiling, and matching CRS; it does not impose a strict longitude/latitude domain clamp on GeoTIFF bounds.
 
-The canonical D8 artifact paths are under `aux/d8/pfaf_{ctx.pfaf:02d}/`.
+The canonical D8 artifact paths are under `aux/d8/pfaf_<NN>/`.
 """
     (ctx.out_dir / "README.md").write_text(readme, encoding="utf-8")
 
@@ -620,8 +702,10 @@ def validate_dataset(dataset: Path, report_dir: Path) -> None:
         "text": ["cargo", "run", "-p", "hfx-validator", "--", str(dataset), "--format", "text", "--strict", "--sample-pct", "100"],
         "json": ["cargo", "run", "-p", "hfx-validator", "--", str(dataset), "--format", "json", "--strict", "--sample-pct", "100"],
     }
+    env = dict(os.environ)
+    env.setdefault("RUST_LOG", "hfx_validator::reader::raster=debug")
     for kind, command in commands.items():
-        result = subprocess.run(command, cwd=Path(__file__).parents[2], capture_output=True, text=True, check=False)
+        result = subprocess.run(command, cwd=Path(__file__).parents[2], env=env, capture_output=True, text=True, check=False)
         (report_dir / f"validator-report.{kind}").write_text(result.stdout, encoding="utf-8")
         if result.stderr:
             (report_dir / f"validator-report.{kind}.stderr").write_text(result.stderr, encoding="utf-8")
@@ -639,24 +723,60 @@ def write_telemetry(ctx: BuildContext) -> None:
         "stem_role_counts": ctx.stem_role_counts,
         "spec_d8_bounds_note": ctx.spec_d8_bounds_note,
         "bbox": list(ctx.bbox or ()),
+        "basin_bboxes": {str(key): list(value) for key, value in ctx.basin_bboxes.items()},
+        "per_basin_counts": {str(key): value for key, value in ctx.per_basin_counts.items()},
+        "hilbert_monotonic": ctx.hilbert_monotonic,
+        "d8_entries_written": ctx.d8_entries_written,
         "unit_count": len(ctx.ids),
     }
     (ctx.out_dir / "build-telemetry.json").write_text(json.dumps(telemetry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def parse_pfaf_codes(raw: str | None, single: int | None) -> tuple[int, ...]:
+    """Parse CLI Pfaf code arguments."""
+    if raw:
+        return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if single is not None:
+        return (int(single),)
+    raise AdapterError("provide --pfaf or --pfaf-codes")
+
+
+def output_name_for(pfaf_codes: tuple[int, ...]) -> str:
+    """Return the canonical output directory name for the selected basin set."""
+    if len(pfaf_codes) == 1:
+        return f"merit-hfx-pfaf{pfaf_codes[0]:02d}"
+    if pfaf_codes == (27, 42, 91):
+        return "merit-hfx-3basin"
+    suffix = "-".join(f"{pfaf:02d}" for pfaf in pfaf_codes)
+    return f"merit-hfx-pfaf-{suffix}"
+
+
+def assert_hilbert_monotonic(catchments: gpd.GeoDataFrame) -> bool:
+    """Confirm the final catchments are globally Hilbert-sorted."""
+    hilbert = catchments.geometry.centroid.hilbert_distance(total_bounds=catchments.total_bounds)
+    values = hilbert.to_numpy()
+    if len(values) < 2:
+        return True
+    return bool(np.all(values[:-1] <= values[1:]))
+
+
 def build_dataset(args: argparse.Namespace) -> None:
-    """Build a single-basin HFX v0.2.1 dataset."""
-    dataset = args.out.expanduser() / f"merit-hfx-pfaf{args.pfaf:02d}"
+    """Build a single- or multi-basin HFX v0.2.1 dataset."""
+    pfaf_codes = parse_pfaf_codes(getattr(args, "pfaf_codes", None), getattr(args, "pfaf", None))
+    dataset = args.out.expanduser() / output_name_for(pfaf_codes)
     if dataset.exists() and args.force:
         shutil.rmtree(dataset)
     ensure_dir(dataset)
-    ctx = BuildContext(pfaf=args.pfaf, out_dir=dataset, tmp_dir=dataset / "tmp")
+    ctx = BuildContext(pfaf=pfaf_codes[0], out_dir=dataset, tmp_dir=dataset / "tmp", pfaf_codes=pfaf_codes)
     ctx.spec_d8_bounds_note = read_d8_spec_note()
-    source = run_stage(ctx, "stage_1_inspect_source", stage_1_inspect_source, args.merit_basins, args.rasters, args.pfaf)
+    source = run_stage(ctx, "stage_1_inspect_source", stage_1_inspect_sources, args.merit_basins, args.rasters, pfaf_codes)
     catchments = run_stage(ctx, "stage_2_assign_ids", stage_2_assign_ids, source)
     catchments = run_stage(ctx, "stage_3_reproject", stage_3_reproject, catchments)
     catchments = run_stage(ctx, "stage_4_make_valid", stage_4_make_valid, catchments)
     catchments = run_stage(ctx, "stage_5_hilbert_sort", stage_5_hilbert_sort, catchments)
+    ctx.hilbert_monotonic = assert_hilbert_monotonic(catchments)
+    if not ctx.hilbert_monotonic:
+        raise AdapterError("catchments are not globally Hilbert-monotonic after stage_5")
     run_stage(ctx, "stage_6_write_catchments", stage_6_write_catchments, source, catchments, ctx)
     run_stage(ctx, "stage_7_write_graph", stage_7_write_graph, source, catchments, ctx)
     run_stage(ctx, "stage_8_write_snap", stage_8_write_snap, source, ctx)
@@ -674,7 +794,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     build = subparsers.add_parser("build", help="build one Pfaf-L2 basin")
     build.add_argument("--merit-basins", type=Path, default=DEFAULT_MERIT_BASINS_ROOT)
     build.add_argument("--rasters", type=Path, default=DEFAULT_RASTERS_ROOT)
-    build.add_argument("--pfaf", type=int, required=True)
+    build.add_argument("--pfaf", type=int)
+    build.add_argument("--pfaf-codes", help="comma-separated Pfaf-L2 codes, e.g. 27,42,91")
     build.add_argument("--out", type=Path, default=DEFAULT_OUT)
     build.add_argument("--force", action="store_true")
     build.add_argument("--log-level", default="INFO")
