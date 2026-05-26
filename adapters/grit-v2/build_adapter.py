@@ -728,23 +728,70 @@ def _fallback_summary(source: SourceData) -> dict:
     return json.loads(path.read_text())
 
 
+def _git_head() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return result.stdout.strip()
+
+
+def _fallback_segment_lines(fallback: dict) -> str:
+    lines: list[str] = []
+    for region in REGIONS:
+        region_summary = fallback.get("by_region", {}).get(region)
+        if not region_summary:
+            continue
+        segment_ids = region_summary.get("segment_ids", [])
+        if not segment_ids:
+            continue
+        ids = ", ".join(str(int(segment_id)) for segment_id in segment_ids)
+        lines.append(f"- {region}: {ids}")
+    return "\n".join(lines) if lines else "- None"
+
+
 def _write_readme(out_dir: Path, source: SourceData, unit_count: int) -> None:
     fallback = _fallback_summary(source)
     fallback_reaches = int(fallback.get("fallback_reach_count", 0))
     fallback_segments = int(fallback.get("fallback_segment_count", 0))
     percent = (fallback_reaches / unit_count * 100.0) if unit_count else 0.0
     percent_text = "<0.001%" if percent < 0.001 else f"{percent:.6f}%"
+    fallback_lines = _fallback_segment_lines(fallback)
+    built_date = datetime.now(timezone.utc).date().isoformat()
+    bbox_text = "[-180, -90, 180, 90]" if set(source.regions) == PLANETARY_REGION_SET else "see manifest.json"
     readme = f"""# GRIT HFX v2 Dataset
 
 This dataset is an HFX v0.2.1 compilation of GRIT with segment (`level=0`) and reach (`level=1`) drainage units.
 
-## Upstream Area Semantics
+## DAG `up_area_km2` semantics
 
-`up_area_km2` uses GRIT's partitioned-flow semantics at DAG bifurcations. Segment rows use GRIT `drainage_area_out` directly. Reach rows are computed by anchoring each parent segment's outlet reach to the segment `drainage_area_out`, then walking upstream within that segment and subtracting local reach `area_km2`.
+Choice: partitioned (option a). Each segment's `up_area_km2` reflects the source-area share routed through that segment.
+
+Algorithm: per-segment chain anchor. Segment rows use GRIT `drainage_area_out` directly. Reach rows are computed by anchoring each parent segment's outlet reach to the segment `drainage_area_out`, then walking upstream within that segment and subtracting each downstream reach's local `area_km2`.
+
+Consumer caveat: in DAG split-rejoin geometry, the sum of `up_area_km2` over a flow set is not the watershed area. Consumers must use the graph plus `level=1` reaches for true watershed accumulation.
 
 ## Known data caveats
 
-{fallback_reaches} reach rows have `up_area_km2=NULL` because the per-segment chain walk failed for {fallback_segments} segments. These are GRIT source-data anomalies (segment interior topology not strictly linear) and represent {percent_text} of rows. See `adapters/grit-v2/build_adapter.py` for the detection rule.
+{fallback_reaches} reach rows have `up_area_km2=NULL`, spread across {fallback_segments} segments where the chain-anchor algorithm could not resolve the outlet. These are anomalies in the GRIT v1.0 source topology, not defects of the HFX encoding. `has_up_area` remains true; nulls are permitted per HFX v0.2.1 spec. They represent {percent_text} of rows. See `adapters/grit-v2/build_adapter.py` for the detection rule.
+
+Fallback segment IDs:
+
+{fallback_lines}
+
+## Provenance
+
+- Source: GRIT v1.0 (https://doi.org/10.5281/zenodo.17435232)
+- Adapter version: {_git_head()}
+- HFX spec version: {FORMAT_VERSION}
+- Built: {built_date}
+- Bbox: planetary {bbox_text}
+- Row count: {unit_count:,} catchments across 2 levels
 """
     (out_dir / "README.md").write_text(readme)
 
