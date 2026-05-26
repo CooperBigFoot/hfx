@@ -471,11 +471,9 @@ Before publishing to `s3://basin-delineations-public/merit/0.2.0/`:
 
 ## 8. Coordinator resolutions
 
-Coordinator fills this section in during execution as blockers arise. **Empty at plan-publish time.**
-
 | # | Question | Resolution |
 |---|---|---|
-| — | (empty) | — |
+| 1 | pfaf-81 raster bounds reported at half-pixel west of -180 in Phase 0 — false positive from over-strict bounds check, or real antimeridian/CRS issue? | False positive. MERIT Hydro uses cell-centered grids where cell EDGES extend 1/2-pixel outside the cell-center extent. -180.000417 = -180 - 1/2400 deg = exactly half a 3-arcsec pixel west. Preflight bounds check loosened to tolerate +/-1 pixel (1/1200 deg) to absorb the canonical grid offset while still catching real CRS slips. Raster passes through to Phase 1 unmodified. |
 
 ---
 
