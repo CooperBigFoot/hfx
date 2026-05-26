@@ -23,7 +23,8 @@ pub(crate) const MAX_CONSECUTIVE_BATCH_FAILURES: usize = 3;
 pub(crate) const MAX_TOTAL_BATCH_FAILURES: usize = 10;
 
 use crate::check::manifest::try_build_manifest;
-use crate::dataset::{FilePresenceMap, ParsedDataset};
+use crate::dataset::{D8RasterEntry, FilePresenceMap, ParsedDataset};
+use crate::reader::manifest::RawAuxEntry;
 
 /// Read all files from a dataset directory and produce a ParsedDataset.
 ///
@@ -68,30 +69,28 @@ pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDatase
         None
     };
 
-    // --- Blessed D8 raster auxiliary (read when declared or legacy files present) ---
-    let has_d8_aux = raw_manifest
+    let mut d8_rasters = raw_manifest
         .as_ref()
-        .and_then(|m| m.auxiliary.as_ref())
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
-        });
-    let mut flow_dir = None;
-    let mut flow_acc = None;
+        .map(|manifest| discover_d8_rasters(dir, manifest))
+        .unwrap_or_default();
 
-    if has_d8_aux && !skip_rasters {
-        if let Some(ref path) = files.flow_dir_path {
-            let (meta, diags) = raster::read_raster_meta(path, "flow_dir.tif");
-            read_diagnostics.extend(diags);
-            flow_dir = meta;
-        }
-        if let Some(ref path) = files.flow_acc_path {
-            let (meta, diags) = raster::read_raster_meta(path, "flow_acc.tif");
-            read_diagnostics.extend(diags);
-            flow_acc = meta;
+    if !skip_rasters {
+        for entry in &mut d8_rasters {
+            if let Some(ref path) = entry.flow_dir_path {
+                let (meta, diags) = raster::read_raster_meta(path, "flow_dir.tif");
+                read_diagnostics.extend(label_diagnostics(&entry.name, diags));
+                entry.flow_dir = meta;
+            }
+            if let Some(ref path) = entry.flow_acc_path {
+                let (meta, diags) = raster::read_raster_meta(path, "flow_acc.tif");
+                read_diagnostics.extend(label_diagnostics(&entry.name, diags));
+                entry.flow_acc = meta;
+            }
         }
     }
+
+    let mut files = files;
+    files.d8_rasters = d8_rasters.clone();
 
     ParsedDataset {
         files,
@@ -100,8 +99,7 @@ pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDatase
         manifest,
         catchments,
         graph,
-        flow_dir,
-        flow_acc,
+        d8_rasters,
         read_diagnostics,
     }
 }
@@ -118,7 +116,84 @@ fn discover_files(dir: &Path) -> FilePresenceMap {
         graph_path: check("graph.parquet"),
         legacy_graph_arrow_path: check("graph.arrow"),
         snap_path: check("snap.parquet"),
-        flow_dir_path: check("flow_dir.tif"),
-        flow_acc_path: check("flow_acc.tif"),
+        d8_rasters: Vec::new(),
     }
+}
+
+fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8RasterEntry> {
+    manifest
+        .auxiliary
+        .as_deref()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, entry)| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
+        .map(|(idx, entry)| {
+            let flow_dir_artifact = entry
+                .artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.get("flow_dir"))
+                .cloned();
+            let flow_acc_artifact = entry
+                .artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.get("flow_acc"))
+                .cloned();
+            let name = d8_raster_label(idx, entry, flow_dir_artifact.as_deref());
+
+            D8RasterEntry {
+                name,
+                flow_dir_path: existing_safe_artifact_path(dir, flow_dir_artifact.as_deref()),
+                flow_acc_path: existing_safe_artifact_path(dir, flow_acc_artifact.as_deref()),
+                flow_dir_artifact,
+                flow_acc_artifact,
+                flow_dir: None,
+                flow_acc: None,
+            }
+        })
+        .collect()
+}
+
+fn existing_safe_artifact_path(dir: &Path, rel_path: Option<&str>) -> Option<std::path::PathBuf> {
+    let rel_path = rel_path?;
+    if rel_path.starts_with('/') || rel_path.contains("..") {
+        return None;
+    }
+
+    let path = dir.join(rel_path);
+    path.exists().then_some(path)
+}
+
+fn d8_raster_label(idx: usize, entry: &RawAuxEntry, flow_dir_artifact: Option<&str>) -> String {
+    if let Some(name) = entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return name.to_owned();
+    }
+
+    if let Some(parent_name) = flow_dir_artifact
+        .and_then(|path| Path::new(path).parent())
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        && !parent_name.is_empty()
+    {
+        return parent_name.to_owned();
+    }
+
+    format!("auxiliary[{idx}]")
+}
+
+fn label_diagnostics(
+    label: &str,
+    mut diagnostics: Vec<crate::diagnostic::Diagnostic>,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    for diagnostic in &mut diagnostics {
+        if !diagnostic.message.starts_with(label) {
+            diagnostic.message = format!("{label}: {}", std::mem::take(&mut diagnostic.message));
+        }
+    }
+    diagnostics
 }

@@ -15,8 +15,7 @@ pub struct FilePresenceMap {
     pub graph_path: Option<PathBuf>,
     pub legacy_graph_arrow_path: Option<PathBuf>,
     pub snap_path: Option<PathBuf>,
-    pub flow_dir_path: Option<PathBuf>,
-    pub flow_acc_path: Option<PathBuf>,
+    pub d8_rasters: Vec<D8RasterEntry>,
 }
 
 /// Column-level data extracted from catchments.parquet.
@@ -90,6 +89,18 @@ pub enum RasterSampleFormat {
     Unknown(u16),
 }
 
+/// One manifest-declared D8 raster auxiliary entry.
+#[derive(Debug, Clone)]
+pub struct D8RasterEntry {
+    pub name: String,
+    pub flow_dir_artifact: Option<String>,
+    pub flow_acc_artifact: Option<String>,
+    pub flow_dir_path: Option<PathBuf>,
+    pub flow_acc_path: Option<PathBuf>,
+    pub flow_dir: Option<RasterMeta>,
+    pub flow_acc: Option<RasterMeta>,
+}
+
 /// Raster bounding box derived from GDAL geotransform metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterBoundingBox {
@@ -148,7 +159,6 @@ pub struct ParsedDataset {
     pub manifest: Option<Manifest>,
     pub catchments: Option<CatchmentsData>,
     pub graph: Option<GraphData>,
-    pub flow_dir: Option<RasterMeta>,
-    pub flow_acc: Option<RasterMeta>,
+    pub d8_rasters: Vec<D8RasterEntry>,
     pub read_diagnostics: Vec<Diagnostic>,
 }

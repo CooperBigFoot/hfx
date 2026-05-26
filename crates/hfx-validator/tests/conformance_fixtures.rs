@@ -17,6 +17,7 @@ fn conformance_valid_fixtures_pass() {
     for name in [
         "tiny",
         "tiny-with-aux-d8",
+        "tiny-with-two-aux-d8",
         "grit-two-level",
         "grit-two-snap",
     ] {
@@ -25,6 +26,19 @@ fn conformance_valid_fixtures_pass() {
         assert!(
             report.is_valid(),
             "expected {name} to be valid, diagnostics: {:#?}",
+            report.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn conformance_d8_raster_fixtures_pass_with_raster_checks_enabled() {
+    for name in ["tiny-with-aux-d8", "tiny-with-two-aux-d8"] {
+        let p = fixture_path("valid", name);
+        let report = validate(&p, false, false, 100.0);
+        assert!(
+            report.is_valid(),
+            "expected {name} to be valid with raster checks, diagnostics: {:#?}",
             report.diagnostics()
         );
     }
@@ -74,4 +88,22 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
             report.diagnostics()
         );
     }
+}
+
+#[test]
+fn conformance_bad_second_d8_fixture_reports_named_entry() {
+    let p = fixture_path("invalid", "tiny-with-bad-second-aux-d8");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected malformed D8 fixture to be invalid"
+    );
+    assert!(
+        report.diagnostics().iter().any(|diag| {
+            diag.check_id == "raster.flow_dir_dtype" && diag.message.contains("bad_second:")
+        }),
+        "expected raster.flow_dir_dtype diagnostic tagged with bad_second; got {:#?}",
+        report.diagnostics()
+    );
 }

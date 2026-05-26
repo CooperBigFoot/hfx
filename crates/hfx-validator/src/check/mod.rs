@@ -113,28 +113,42 @@ pub fn run_checks(
     }
 
     // Phase 7: raster (skipped if skip_rasters is true)
-    if !skip_rasters && declares_d8_raster_aux(dataset) {
+    if !skip_rasters && !dataset.d8_rasters.is_empty() {
         let manifest_ref = dataset.manifest.as_ref();
 
-        if let Some(ref flow_dir_meta) = dataset.flow_dir {
-            all.extend(raster::check_flow_dir(flow_dir_meta));
-            if let Some(manifest) = manifest_ref {
-                all.extend(raster::check_spatial_consistency(
-                    flow_dir_meta,
-                    manifest,
-                    crate::diagnostic::Artifact::FlowDir,
+        for entry in &dataset.d8_rasters {
+            if let Some(ref flow_dir_meta) = entry.flow_dir {
+                all.extend(label_diagnostics(
+                    &entry.name,
+                    raster::check_flow_dir(flow_dir_meta),
                 ));
+                if let Some(manifest) = manifest_ref {
+                    all.extend(label_diagnostics(
+                        &entry.name,
+                        raster::check_spatial_consistency(
+                            flow_dir_meta,
+                            manifest,
+                            crate::diagnostic::Artifact::FlowDir,
+                        ),
+                    ));
+                }
             }
-        }
 
-        if let Some(ref flow_acc_meta) = dataset.flow_acc {
-            all.extend(raster::check_flow_acc(flow_acc_meta));
-            if let Some(manifest) = manifest_ref {
-                all.extend(raster::check_spatial_consistency(
-                    flow_acc_meta,
-                    manifest,
-                    crate::diagnostic::Artifact::FlowAcc,
+            if let Some(ref flow_acc_meta) = entry.flow_acc {
+                all.extend(label_diagnostics(
+                    &entry.name,
+                    raster::check_flow_acc(flow_acc_meta),
                 ));
+                if let Some(manifest) = manifest_ref {
+                    all.extend(label_diagnostics(
+                        &entry.name,
+                        raster::check_spatial_consistency(
+                            flow_acc_meta,
+                            manifest,
+                            crate::diagnostic::Artifact::FlowAcc,
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -142,14 +156,93 @@ pub fn run_checks(
     all
 }
 
-fn declares_d8_raster_aux(dataset: &ParsedDataset) -> bool {
-    dataset
-        .raw_manifest
-        .as_ref()
-        .and_then(|manifest| manifest.auxiliary.as_ref())
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
-        })
+fn label_diagnostics(label: &str, mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    for diagnostic in &mut diagnostics {
+        if !diagnostic.message.starts_with(label) {
+            diagnostic.message = format!("{label}: {}", std::mem::take(&mut diagnostic.message));
+        }
+    }
+    diagnostics
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::dataset::{
+        D8RasterEntry, FilePresenceMap, ParsedDataset, RasterMeta, RasterSampleFormat,
+    };
+    use crate::diagnostic::{Artifact, Severity};
+
+    use super::run_checks;
+
+    fn base_dataset(d8_rasters: Vec<D8RasterEntry>) -> ParsedDataset {
+        ParsedDataset {
+            files: FilePresenceMap {
+                manifest_path: Some(PathBuf::from("manifest.json")),
+                catchments_path: Some(PathBuf::from("catchments.parquet")),
+                graph_path: Some(PathBuf::from("graph.parquet")),
+                legacy_graph_arrow_path: None,
+                snap_path: None,
+                d8_rasters: d8_rasters.clone(),
+            },
+            manifest_json: None,
+            raw_manifest: None,
+            manifest: None,
+            catchments: None,
+            graph: None,
+            d8_rasters,
+            read_diagnostics: Vec::new(),
+        }
+    }
+
+    fn flow_dir_meta(bits_per_sample: u16, sample_format: RasterSampleFormat) -> RasterMeta {
+        RasterMeta {
+            path: PathBuf::from("flow_dir.tif"),
+            width: 1,
+            height: 1,
+            bits_per_sample,
+            sample_format,
+            is_tiled: true,
+            tile_width: Some(256),
+            tile_height: Some(256),
+            nodata: Some(255.0),
+            spatial_ref: None,
+            bbox: None,
+            pixel_width: None,
+            pixel_height: None,
+        }
+    }
+
+    fn d8_entry(name: &str, flow_dir: RasterMeta) -> D8RasterEntry {
+        D8RasterEntry {
+            name: name.to_owned(),
+            flow_dir_artifact: Some(format!("aux/d8/{name}/flow_dir.tif")),
+            flow_acc_artifact: None,
+            flow_dir_path: Some(PathBuf::from(format!("aux/d8/{name}/flow_dir.tif"))),
+            flow_acc_path: None,
+            flow_dir: Some(flow_dir),
+            flow_acc: None,
+        }
+    }
+
+    #[test]
+    fn malformed_second_d8_entry_reports_that_entry_name() {
+        let dataset = base_dataset(vec![
+            d8_entry("first", flow_dir_meta(8, RasterSampleFormat::UnsignedInt)),
+            d8_entry("bad_second", flow_dir_meta(32, RasterSampleFormat::Float)),
+        ]);
+
+        let diagnostics = run_checks(&dataset, false, false, 100.0);
+
+        assert!(diagnostics.iter().any(|diag| {
+            diag.check_id == "raster.flow_dir_dtype"
+                && diag.severity == Severity::Error
+                && diag.artifact == Artifact::FlowDir
+                && diag.message.contains("bad_second:")
+        }));
+        assert!(!diagnostics.iter().any(|diag| {
+            diag.check_id == "raster.flow_dir_dtype" && diag.message.contains("first:")
+        }));
+    }
 }

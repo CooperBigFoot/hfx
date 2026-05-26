@@ -68,37 +68,29 @@ pub fn check_file_presence(
         ));
     }
 
-    if let Some(aux_entries) = raw_manifest.and_then(|m| m.auxiliary.as_ref()) {
-        for entry in aux_entries {
-            if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1") {
-                if entry
-                    .artifacts
-                    .as_ref()
-                    .and_then(|a| a.get("flow_dir"))
-                    .is_some()
-                    && files.flow_dir_path.is_none()
-                {
-                    diags.push(Diagnostic::error(
-                        "file_presence.flow_dir",
-                        Category::FilePresence,
-                        Artifact::FlowDir,
-                        "flow_dir auxiliary artifact is declared but missing",
-                    ));
-                }
-                if entry
-                    .artifacts
-                    .as_ref()
-                    .and_then(|a| a.get("flow_acc"))
-                    .is_some()
-                    && files.flow_acc_path.is_none()
-                {
-                    diags.push(Diagnostic::error(
-                        "file_presence.flow_acc",
-                        Category::FilePresence,
-                        Artifact::FlowAcc,
-                        "flow_acc auxiliary artifact is declared but missing",
-                    ));
-                }
+    if raw_manifest.and_then(|m| m.auxiliary.as_ref()).is_some() {
+        for entry in &files.d8_rasters {
+            if entry.flow_dir_artifact.is_some() && entry.flow_dir_path.is_none() {
+                diags.push(Diagnostic::error(
+                    "file_presence.flow_dir",
+                    Category::FilePresence,
+                    Artifact::FlowDir,
+                    format!(
+                        "{}: flow_dir auxiliary artifact is declared but missing",
+                        entry.name
+                    ),
+                ));
+            }
+            if entry.flow_acc_artifact.is_some() && entry.flow_acc_path.is_none() {
+                diags.push(Diagnostic::error(
+                    "file_presence.flow_acc",
+                    Category::FilePresence,
+                    Artifact::FlowAcc,
+                    format!(
+                        "{}: flow_acc auxiliary artifact is declared but missing",
+                        entry.name
+                    ),
+                ));
             }
         }
     }
@@ -127,8 +119,7 @@ mod tests {
             graph_path: Some(PathBuf::from("graph.parquet")),
             legacy_graph_arrow_path: None,
             snap_path: None,
-            flow_dir_path: None,
-            flow_acc_path: None,
+            d8_rasters: Vec::new(),
         }
     }
 

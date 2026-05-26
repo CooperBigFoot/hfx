@@ -174,7 +174,7 @@ fn emit_row_group_diag(
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::{CatchmentsData, FilePresenceMap, GraphData, ParsedDataset, RasterMeta};
+    use crate::dataset::{CatchmentsData, FilePresenceMap, GraphData, ParsedDataset};
     use crate::diagnostic::{Artifact, Severity};
     use crate::reader::manifest::RawManifest;
 
@@ -188,16 +188,14 @@ mod tests {
                 graph_path: None,
                 legacy_graph_arrow_path: None,
                 snap_path: None,
-                flow_dir_path: None,
-                flow_acc_path: None,
+                d8_rasters: Vec::new(),
             },
             manifest_json: None,
             raw_manifest: None::<RawManifest>,
             manifest: None,
             catchments: None::<CatchmentsData>,
             graph: Some(graph),
-            flow_dir: None::<RasterMeta>,
-            flow_acc: None::<RasterMeta>,
+            d8_rasters: Vec::new(),
             read_diagnostics: Vec::new(),
         }
     }
