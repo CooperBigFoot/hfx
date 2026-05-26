@@ -546,11 +546,6 @@ def stage_8b_write_d8(source: SourceData, ctx: BuildContext) -> None:
         profile = src.profile.copy()
         profile.update(driver="GTiff", dtype="float32", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_ACC_NODATA_OUT, crs=src.crs)
         _write_cog(out_dir / "flow_acc.tif", out, profile, predictor=3)
-    # Validator v0.2.1 still discovers D8 rasters at dataset root even when
-    # manifest aux paths point under aux/d8/. Keep aux paths canonical and add
-    # root copies for strict smoke validation; never symlink.
-    shutil.copy2(out_dir / "flow_dir.tif", ctx.out_dir / "flow_dir.tif")
-    shutil.copy2(out_dir / "flow_acc.tif", ctx.out_dir / "flow_acc.tif")
 
 
 def stage_9_write_manifest(ctx: BuildContext) -> None:
@@ -604,7 +599,7 @@ This partial-fabric dataset covers MERIT-Basins Pfaf-L2 basin pfaf-{ctx.pfaf:02d
 
 The D8 rasters preserve native MERIT Hydro grid geometry during transcode. HFX d8_raster.v1 requires EPSG:4326 COGs with declared dtype, nodata, tiling, and matching CRS; it does not impose a strict longitude/latitude domain clamp on GeoTIFF bounds.
 
-The canonical D8 artifact paths are under `aux/d8/pfaf_{ctx.pfaf:02d}/`. Root-level raster copies are present only to satisfy the current v0.2.1 validator's root-level D8 discovery path during smoke validation.
+The canonical D8 artifact paths are under `aux/d8/pfaf_{ctx.pfaf:02d}/`.
 """
     (ctx.out_dir / "README.md").write_text(readme, encoding="utf-8")
 

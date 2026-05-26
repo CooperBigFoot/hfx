@@ -474,6 +474,7 @@ Before publishing to `s3://basin-delineations-public/merit/0.2.0/`:
 | # | Question | Resolution |
 |---|---|---|
 | 1 | pfaf-81 raster bounds reported at half-pixel west of -180 in Phase 0 — false positive from over-strict bounds check, or real antimeridian/CRS issue? | False positive. MERIT Hydro uses cell-centered grids where cell EDGES extend 1/2-pixel outside the cell-center extent. -180.000417 = -180 - 1/2400 deg = exactly half a 3-arcsec pixel west. Preflight bounds check loosened to tolerate +/-1 pixel (1/1200 deg) to absorb the canonical grid offset while still catching real CRS slips. Raster passes through to Phase 1 unmodified. |
+| 2 | Tier 1 validator passed only with root-level d8 file copies; adapter manifest paths point under aux/d8/pfaf_<NN>/ but validator's reader/mod.rs only probes hardcoded root flow_dir.tif/flow_acc.tif and has singleton path slots that cannot represent multiple d8 aux entries. | Confirmed validator bug, not adapter issue. Bug only happened to pass Tier 1 because the validator probed the root copy. Will not scale to multi-basin (only 1 of N rasters would be structurally validated). Validator is being fixed in a parallel workstream to (a) drive d8 path discovery from manifest aux entries' artifacts.flow_dir/flow_acc, (b) support multiple d8 entries in the parsed dataset, (c) run per-entry structural checks. Adapter reverts to canonical aux/d8/pfaf_<NN>/ layout only — no root copies. Tier 1 will be re-validated against the fixed validator. |
 
 ---
 
