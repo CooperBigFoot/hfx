@@ -609,17 +609,22 @@ def stage_8b_write_d8(source: SourceData, ctx: BuildContext) -> None:
         out_dir = ctx.out_dir / "aux" / "d8" / f"pfaf_{pfaf:02d}"
         with rasterio.open(flow_dir_path) as src:
             window, transform = _window_for_bbox(src, bbox)
-            data = src.read(1, window=window).astype("uint8")
-            valid_values = np.array([0, 1, 2, 4, 8, 16, 32, 64, 128, 255], dtype="uint8")
-            out = np.where(np.isin(data, valid_values), data, FLOW_DIR_NODATA_OUT)
-            out = np.where(out == MERIT_FLOWDIR_UNDEFINED_AS_UINT8, FLOW_DIR_NODATA_OUT, out).astype("uint8")
+            data = src.read(1, window=window)
+            if data.dtype != np.uint8:
+                data = data.astype("uint8")
+            valid_mask = np.isin(data, [0, 1, 2, 4, 8, 16, 32, 64, 128, 255])
+            data[~valid_mask] = FLOW_DIR_NODATA_OUT
+            data[data == MERIT_FLOWDIR_UNDEFINED_AS_UINT8] = FLOW_DIR_NODATA_OUT
+            out = data
             profile = src.profile.copy()
             profile.update(driver="GTiff", dtype="uint8", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_DIR_NODATA_OUT, crs=src.crs)
             _write_cog(out_dir / "flow_dir.tif", out, profile, predictor=2)
         with rasterio.open(flow_acc_path) as src:
             window, transform = _window_for_bbox(src, bbox)
-            data = src.read(1, window=window).astype("int32")
-            out = np.where(data == 0, FLOW_ACC_NODATA_OUT, data).astype("float32")
+            data = src.read(1, window=window)
+            out = data.astype("float32", copy=True)
+            del data
+            out[out == 0.0] = FLOW_ACC_NODATA_OUT
             profile = src.profile.copy()
             profile.update(driver="GTiff", dtype="float32", count=1, width=out.shape[1], height=out.shape[0], transform=transform, nodata=FLOW_ACC_NODATA_OUT, crs=src.crs)
             _write_cog(out_dir / "flow_acc.tif", out, profile, predictor=3)
