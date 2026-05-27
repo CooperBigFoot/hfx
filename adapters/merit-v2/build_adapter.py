@@ -489,7 +489,7 @@ def stage_7_write_graph(source: SourceData, catchments: gpd.GeoDataFrame, ctx: B
         nxt = int(next_down)
         if nxt <= 0 or nxt == cid:
             continue
-        if nxt in id_set:
+        if nxt in id_set and cid in id_set:
             upstream[nxt].append(cid)
 
     bounds = _bbox_frame(catchments)
