@@ -7,7 +7,7 @@
 ## Overview
 
 HFX is the canonical data contract consumed by watershed delineation engines.
-It is not a native hydrofabric format. Every source fabric must be compiled into
+It is not a native hydrofabric format. Every source fabric MUST be compiled into
 HFX by an adapter before an engine sees it.
 
 The engine operates on HFX exclusively. It contains no fabric-specific logic.
@@ -16,6 +16,10 @@ features, and manifest-declared auxiliary artifacts. It does not specify a
 delineation algorithm, level-selection strategy, refinement strategy, engine
 return type, or runtime composition across datasets.
 
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
+
 ### Terminology
 
 A **drainage unit** is one polygonal hydrologic unit at one dataset-local
@@ -23,11 +27,11 @@ resolution level. Every row in `catchments.parquet` is a drainage unit.
 
 A **level** identifies a resolution tier within one HFX dataset. Level values
 are dataset-local and have no cross-dataset meaning. `level = 0` is the
-recommended coarsest tier; higher values should represent progressively finer
+recommended coarsest tier; higher values SHOULD represent progressively finer
 tiers.
 
 A **parent** is the containing coarser drainage unit named by `parent_id`.
-Following `parent_id` from any unit must reach a root unit with null
+Following `parent_id` from any unit MUST reach a root unit with null
 `parent_id` in finitely many steps.
 
 A **unit outlet** is the single EPSG:4326 coordinate where water exits the
@@ -81,29 +85,29 @@ Allowed optional columns:
 
 `source_id` is qualified by the manifest's `fabric_name` and
 `fabric_version`. It is not part of the normalized HFX identity model.
-`level_label` is unnormalized and not validated beyond type; engines must not
+`level_label` is unnormalized and not validated beyond type; engines MUST NOT
 parse it for behavior.
 
 ### Spatial Partitioning
 
-- Rows **must** be sorted by Hilbert curve index computed on centroid
+- Rows MUST be sorted by Hilbert curve index computed on centroid
   coordinates.
-- For datasets with multiple levels, rows **must** be sorted by
+- For datasets with multiple levels, rows MUST be sorted by
   `(level ASC, hilbert_index ASC)`. Single-level datasets keep the Hilbert-only
   rule.
 - `hilbert_index` is a sort key, not a stored column; no `hilbert_index` field
   is present on `catchments.parquet`.
-- Files with fewer than 4,096 rows **must** contain exactly one row group.
-- Files with 4,096 or more rows **must** use row groups of 4,096-8,192 rows.
+- Files with fewer than 4,096 rows MUST contain exactly one row group.
+- Files with 4,096 or more rows MUST use row groups of 4,096-8,192 rows.
 - Parquet row-group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
-  `bbox_maxy` **must** be written.
+  `bbox_maxy` MUST be written.
 
 Row-group sizing violations are WARN diagnostics in the reference validator and
 are promoted to ERROR under `--strict`.
 
 ### Unit Invariants
 
-- `id = 0` is reserved and **must not** be used.
+- `id = 0` is reserved and MUST NOT be used.
 - IDs are positive and unique across the dataset.
 - `level >= 0`.
 - `parent_id` is null for coarsest available units.
@@ -115,20 +119,20 @@ are promoted to ERROR under `--strict`.
 - `outlet_lon` and `outlet_lat` are finite WGS84 coordinates.
 - `up_area_km2`, when present, is the inclusive cumulative upstream area for
   same-level graph traversal. It is deliberately non-comparable across levels.
-  Producers may emit null `up_area_km2` for individual rows where computation
+  Producers MAY emit null `up_area_km2` for individual rows where computation
   is not possible (e.g., source-data anomalies preventing the producer's chosen
   accumulation algorithm from converging); the manifest's `has_up_area=true`
   flag claims coverage at the column level, not every-row populated.
 
 For DAG-topology datasets, `up_area_km2` semantics at bifurcations are
-producer-defined and must be documented in the manifest or an accompanying
-README. Producers must choose and document one of: (a) area partitioned by flow
+producer-defined and MUST be documented in the manifest or an accompanying
+README. Producers MUST choose and document one of: (a) area partitioned by flow
 physics at bifurcations, (b) geometric union of upstream catchments, or (c)
 mainstem-routed single-threaded accumulation. Engines comparing upstream areas
-across DAG datasets must reconcile these semantics before comparison.
+across DAG datasets MUST reconcile these semantics before comparison.
 
 Perfect nesting is required within one HFX dataset. Fabrics whose levels do not
-nest cleanly should be shipped as separate HFX datasets.
+nest cleanly SHOULD be shipped as separate HFX datasets.
 
 ---
 
@@ -151,34 +155,34 @@ geometry. This is what engines traverse during upstream accumulation.
 
 ### Spatial Partitioning
 
-- Rows **must** be sorted by Hilbert curve index computed on referenced unit
+- Rows MUST be sorted by Hilbert curve index computed on referenced unit
   centroid coordinates.
-- For datasets with multiple levels, rows **must** be sorted by
+- For datasets with multiple levels, rows MUST be sorted by
   `(level ASC, hilbert_index ASC)`. Single-level datasets keep the Hilbert-only
   rule.
 - `hilbert_index` is a sort key, not a stored column; no `hilbert_index` field
   is present on `graph.parquet`.
-- Files with fewer than 4,096 rows **must** contain exactly one row group.
-- Files with 4,096 or more rows **must** use row groups of 4,096-8,192 rows.
+- Files with fewer than 4,096 rows MUST contain exactly one row group.
+- Files with 4,096 or more rows MUST use row groups of 4,096-8,192 rows.
 - Parquet row-group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
-  `bbox_maxy` **must** be written.
+  `bbox_maxy` MUST be written.
 
 Row-group sizing violations are WARN diagnostics in the reference validator and
 are promoted to ERROR under `--strict`.
 
 ### Notes
 
-- Every unit in `catchments.parquet` **must** have exactly one graph row.
-- Every graph row ID **must** reference an existing unit.
-- `level` **must** match the referenced unit's level.
-- `upstream_ids` entries **must** reference existing units at the same level.
+- Every unit in `catchments.parquet` MUST have exactly one graph row.
+- Every graph row ID MUST reference an existing unit.
+- `level` MUST match the referenced unit's level.
+- `upstream_ids` entries MUST reference existing units at the same level.
 - Cross-level relationships are represented by `parent_id`, not graph edges.
-- The graph must be acyclic within each level.
+- The graph MUST be acyclic within each level.
 - For tree-topology fabrics, each unit has at most one downstream neighbor.
 - For DAG-topology fabrics, distributaries are represented by one upstream unit
   appearing in multiple downstream rows.
 
-The on-disk `list<int64>` schema is the contract. Engines may convert it to CSR
+The on-disk `list<int64>` schema is the contract. Engines MAY convert it to CSR
 arrays, hash maps, or any other runtime layout after loading.
 
 ---
@@ -196,7 +200,7 @@ Every drainage unit declares exactly one outlet coordinate. The single-outlet
 rule holds even when same-level graph topology is a DAG. A unit with multiple
 downstream graph neighbors still has one physical outlet; fan-out happens at
 that outlet through multiple graph edges. A polygon with multiple physical exit
-points should be represented as multiple drainage units.
+points SHOULD be represented as multiple drainage units.
 
 Outlet validation is characterized by topology role:
 
@@ -217,7 +221,7 @@ The tolerance is a validation parameter, not a stored dataset field.
 Sidecar metadata file. Declares dataset identity, topology class, row counts,
 and optional auxiliary artifacts.
 
-The manifest describes **what the data is**, not how an engine should use it.
+The manifest describes **what the data is**, not how an engine uses it.
 Traversal policies and refinement policies are engine runtime parameters.
 
 ### Schema Example
@@ -254,10 +258,10 @@ Traversal policies and refinement policies are engine runtime parameters.
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
-| `format_version` | string | Yes | Must be `"0.2.1"` |
+| `format_version` | string | Yes | MUST be `"0.2.1"` |
 | `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
-| `crs` | string | Yes | Must be `"EPSG:4326"` in HFX v0.2 |
+| `crs` | string | Yes | MUST be `"EPSG:4326"` in HFX v0.2 |
 | `has_up_area` | bool | Yes | Whether `up_area_km2` is computed and populated. When true, the column carries computed values for rows where computation is possible; nulls are permitted for rows where computation is not possible. When false, all values are null. |
 | `topology` | string | Yes | `"tree"` or `"dag"` |
 | `region` | string | No | Geographic or source-fabric subset label |
@@ -287,16 +291,16 @@ paths that escape the dataset root are non-conformant.
 Auxiliary schema namespaces:
 
 - `hfx.aux.*`: blessed schemas defined by HFX in `spec/aux/<name>/v<N>.md`,
-  with companion JSON Schema for metadata. Validators must implement these
+  with companion JSON Schema for metadata. Validators MUST implement these
   schemas as stable surface area.
-- `hfx.x.*`: provisional schemas in the HFX spec repo. Validators may implement
-  them, but engines should not depend on them as stable contracts.
+- `hfx.x.*`: provisional schemas in the HFX spec repo. Validators MAY implement
+  them, but engines SHOULD NOT depend on them as stable contracts.
 - `<reverse-dns>.*`: third-party schemas outside the HFX spec repo. Validators
   perform structural checks only, such as file presence and well-formed
   metadata JSON.
 
 Auxiliary schemas use explicit `vN` breaking versions. Within one `vN`, changes
-must be additive only. Renaming, removing, or retyping a field requires
+MUST be additive only. Renaming, removing, or retyping a field requires
 `v(N+1)`.
 
 ---
@@ -304,29 +308,29 @@ must be additive only. Renaming, removing, or retyping a field requires
 ## Deployment Patterns
 
 An HFX dataset is the artifact bundle described by a single `manifest.json`.
-Every dataset covers a contiguous extent of its source fabric. That extent may
-be the fabric in full, or a named subset. Both deployment patterns are
+Every dataset covers a contiguous extent of its source fabric. That extent is
+either the fabric in full or a named subset. Both deployment patterns are
 conformant with v0.2 and use the same artifact schemas.
 
 ### Global Datasets
 
 A global dataset covers the full extent of its source fabric.
 
-- `region` **should** be omitted.
+- `region` SHOULD be omitted.
 - `bbox` spans the full source-fabric extent. For a planetary dataset this is
   `[-180, -90, 180, 90]`; these boundary values are exact in EPSG:4326 and
-  **must not** be padded beyond them.
+  MUST NOT be padded beyond them.
 - `fabric_name` and `fabric_version` identify the dataset unambiguously.
 
 ### Partial-Fabric Datasets
 
 A partial-fabric dataset covers a named subset of the source fabric.
 
-- `region` **should** be populated with a free-form label such as `"europe"`,
+- `region` SHOULD be populated with a free-form label such as `"europe"`,
   `"pfaf27"`, or `"conus"`.
 - `bbox` spans the subset extent.
-- The subset **must** be closed under upstream traversal for each same-level
-  graph: every `upstream_ids` entry must resolve to a unit present in the same
+- The subset MUST be closed under upstream traversal for each same-level
+  graph: every `upstream_ids` entry MUST resolve to a unit present in the same
   dataset.
 
 HFX does not prescribe a controlled vocabulary for `region`.
@@ -335,38 +339,38 @@ HFX does not prescribe a controlled vocabulary for `region`.
 
 ## Validation
 
-A conformant HFX v0.2.1 dataset must pass the following validation classes.
+A conformant HFX v0.2.1 dataset MUST pass the following validation classes.
 
 ### File Presence
 
 - `manifest.json`, `catchments.parquet`, and `graph.parquet` are required.
 - Auxiliary artifacts are required only when referenced by `manifest.json`.
 - `graph.arrow` is a legacy v0.1 artifact and is not valid in v0.2.
-- `snap.parquet` at the dataset root is a legacy v0.2 artifact. Producers must
+- `snap.parquet` at the dataset root is a legacy v0.2 artifact. Producers MUST
   migrate snap features to `hfx.aux.snap.v1`.
 
 ### Manifest
 
-- `format_version` must be `"0.2.1"`.
-- A v0.2 validator must reject v0.1 datasets with a clear unsupported-version
+- `format_version` MUST be `"0.2.1"`.
+- A v0.2 validator MUST reject v0.1 datasets with a clear unsupported-version
   diagnostic rather than attempting dual-reader compatibility.
-- Required fields must be present and well-typed.
-- `unit_count` must equal the row count of `catchments.parquet`.
-- `auxiliary[]` entries must have parseable schema IDs, non-empty artifact
+- Required fields MUST be present and well-typed.
+- `unit_count` MUST equal the row count of `catchments.parquet`.
+- `auxiliary[]` entries MUST have parseable schema IDs, non-empty artifact
   keys, relative artifact paths, and object metadata.
 
 ### Schema and Values
 
-- Required Parquet columns must exist with the specified physical types.
-- `id` values must be positive and unique.
-- `level` values must be non-negative.
-- `parent_id`, when present, must be positive.
-- Bounding boxes must be finite and ordered.
-- Graph bounding boxes must be finite and ordered.
-- Outlet coordinates must be finite and within WGS84 longitude/latitude range.
-- `stem_role`, when present, must be `mainstem`, `tributary`,
+- Required Parquet columns MUST exist with the specified physical types.
+- `id` values MUST be positive and unique.
+- `level` values MUST be non-negative.
+- `parent_id`, when present, MUST be positive.
+- Bounding boxes MUST be finite and ordered.
+- Graph bounding boxes MUST be finite and ordered.
+- Outlet coordinates MUST be finite and within WGS84 longitude/latitude range.
+- `stem_role`, when present, MUST be `mainstem`, `tributary`,
   `distributary`, or `unknown`.
-- `weight` values must be finite and non-negative; the "monotonically
+- `weight` values MUST be finite and non-negative; the "monotonically
   increasing in drainage dominance" phrase describes the semantic intent of the
   column, not a structural constraint enforced by validators.
 
@@ -383,9 +387,9 @@ A conformant HFX v0.2.1 dataset must pass the following validation classes.
 
 - Same-level graphs are acyclic.
 - The parent relation is an acyclic forest.
-- Finer units must nest within parent units within validator tolerance.
-- Sibling units must have disjoint interiors within validator tolerance.
-- Unit outlets must satisfy their topology-role rule within validator tolerance.
+- Finer units MUST nest within parent units within validator tolerance.
+- Sibling units MUST have disjoint interiors within validator tolerance.
+- Unit outlets MUST satisfy their topology-role rule within validator tolerance.
 - Geometry samples are structurally valid WKB Polygon or MultiPolygon values.
 - Snap geometries are WKB Point or LineString values.
 
@@ -394,24 +398,60 @@ A conformant HFX v0.2.1 dataset must pass the following validation classes.
 The v0.2 reference validator enforces the manifest, schema, ID/value,
 referential-integrity, parent-forest, same-level graph, WKB geometry, snap, and
 auxiliary checks listed above. Expensive geometry-topology checks are
-conformance requirements but may be implemented incrementally by validators:
+conformance requirements but MAY be implemented incrementally by validators:
 perfect nesting, sibling interior disjointness, and outlet topology-role
-position checks are reserved for follow-up validator releases. Producers should
+position checks are reserved for follow-up validator releases. Producers SHOULD
 still enforce these invariants during ETL.
 
 ### Auxiliary Validation
 
 - Known `hfx.aux.*` schemas receive dedicated validation.
-- Known `hfx.x.*` schemas may receive dedicated validation.
+- Known `hfx.x.*` schemas MAY receive dedicated validation.
 - Unknown third-party schemas receive structural validation only.
 - `hfx.aux.d8_raster.v1` requires `flow_dir` and `flow_acc` artifacts and a
   valid metadata block as defined in [`spec/aux/d8_raster/v1.md`](./aux/d8_raster/v1.md).
 - `hfx.aux.snap.v1` requires one `snap` artifact and a valid metadata block as
   defined in [`spec/aux/snap/v1.md`](./aux/snap/v1.md).
 
+## Version Compatibility
+
+`format_version` follows [SemVer](https://semver.org) semantics. While the
+MAJOR version is 0, a MINOR bump signals a breaking change and a PATCH bump
+signals a compatible or editorial change. The 0.2.0 → 0.2.1 hard cut predates
+this policy (see the [CHANGELOG](./CHANGELOG.md)); that history is recorded
+as-is and is not retroactively reclassified.
+
+Examples of compatible changes:
+
+- Adding an OPTIONAL manifest field that readers can ignore without changing
+  the interpretation of existing data.
+- Adding a new allowed value to an open enum-like field, such as blessing a
+  new `hfx.aux.*` auxiliary schema.
+- Editorial clarification that does not alter conformance requirements.
+
+Examples of breaking changes:
+
+- Adding a REQUIRED column or manifest field.
+- Retyping an existing field or changing the meaning of an existing field
+  value.
+- Removing a field.
+
+To stay forward compatible with future compatible releases, engine and reader
+implementations:
+
+- SHOULD NOT reject manifests containing unknown fields introduced by a newer
+  compatible release.
+- SHOULD validate the field values they rely on, even where only one value is
+  currently allowed.
+
+This guidance describes forward-compatibility behavior for engine and reader
+implementations. The pinned 0.2.1 JSON Schema
+(`schemas/manifest.schema.json`) sets `additionalProperties: false` and serves
+as an exact-match conformance tool for producers targeting 0.2.1.
+
 ## Migration from v0.2
 
-HFX v0.2.1 is a hard-cut manifest version. Producers migrating from v0.2 must:
+HFX v0.2.1 is a hard-cut manifest version. Producers migrating from v0.2 MUST:
 
 - Set `manifest.json::format_version` to `"0.2.1"`.
 - Add `bbox_minx`, `bbox_miny`, `bbox_maxx`, and `bbox_maxy` to
