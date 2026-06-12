@@ -13,3 +13,9 @@ __pycache__/
 adapters/*/out/
 adapters/*/*.log
 adapters/*/batch_logs/
+
+# Planning / scratch clutter (M5 hygiene)
+docs/plans/
+outputs/
+planning/
+TODO.md
