@@ -34,7 +34,7 @@ The authoritative locations for the current spec version are:
 The toolkit is the pair of workspace crates `hfx-core` and `hfx-validator`
 (the `hfx-validator` crate installs a binary named `hfx`). They move in
 lockstep: both inherit the workspace version via `version.workspace = true` in
-the root `Cargo.toml`. The current workspace version is 0.2.64.
+the root `Cargo.toml`. The current workspace version is 0.3.0.
 
 Toolkit releases follow Rust SemVer over the crate API and the `hfx` CLI
 surface. While MAJOR is 0, a MINOR bump signals a breaking change to either
