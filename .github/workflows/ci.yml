@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-fmt:
+    name: Rust fmt
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  rust-clippy:
+    name: Rust clippy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install GDAL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            gdal-bin \
+            libclang-dev \
+            libgdal-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install GDAL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            gdal-bin \
+            libclang-dev \
+            libgdal-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+
+  conformance:
+    name: Conformance fixtures
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install GDAL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            gdal-bin \
+            libclang-dev \
+            libgdal-dev \
+            pkg-config
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install check-jsonschema
+        run: python -m pip install check-jsonschema
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build validator
+        run: cargo build -p hfx-validator
+
+      - name: Validate valid fixtures
+        run: |
+          for d in conformance/valid/*/ examples/tiny/; do
+            echo "validating $d"
+            ./target/debug/hfx "$d"
+          done
+
+      - name: Reject invalid fixtures
+        run: |
+          for d in conformance/invalid/*/; do
+            echo "expecting failure for $d"
+            rc=0
+            ./target/debug/hfx "$d" || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "expected exit 1 for $d, got $rc"
+              exit 1
+            fi
+          done
+
+      - name: Schema-validate fixture manifests
+        run: >-
+          check-jsonschema
+          --schemafile schemas/manifest.schema.json
+          conformance/valid/*/manifest.json
+          examples/tiny/manifest.json
+
+      - name: Assert spec header matches schema const
+        run: |
+          spec_v=$(grep -m1 -oE 'Version [0-9]+\.[0-9]+\.[0-9]+' spec/HFX_SPEC.md | awk '{print $2}')
+          schema_v=$(jq -r '.properties.format_version.const' schemas/manifest.schema.json)
+          echo "spec=$spec_v schema=$schema_v"
+          test "$spec_v" = "$schema_v"
