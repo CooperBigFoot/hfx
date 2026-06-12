@@ -1,0 +1,21 @@
+Citation for the source dataset: Global River Topology (GRIT) vector datasets (Zenodo record 17435232)
+
+Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.
+
+@dataset{wortmann_2025_17435232,
+  author       = {Wortmann, Michel and
+                  Slater, Louise and
+                  Hawker, Laurence and
+                  Liu, Yinxue and
+                  Neal, Jeffrey},
+  title        = {Global River Topology (GRIT) vector datasets},
+  month        = dec,
+  year         = 2025,
+  publisher    = {Zenodo},
+  version      = {1.0},
+  doi          = {10.5281/zenodo.17435232},
+  url          = {https://doi.org/10.5281/zenodo.17435232},
+}
+
+DOI: 10.5281/zenodo.17435232
+https://doi.org/10.5281/zenodo.17435232

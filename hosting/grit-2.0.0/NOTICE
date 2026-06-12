@@ -1,0 +1,22 @@
+NOTICE
+
+This object set is an HFX compilation of the Global River Topology (GRIT)
+vector datasets, hosted at grit/2.0.0/ on
+basin-delineations-public.upstream.tech.
+
+Source data: Global River Topology (GRIT) vector datasets,
+Wortmann et al. 2025, DOI 10.5281/zenodo.17435232
+(https://doi.org/10.5281/zenodo.17435232).
+
+License: the source data is released under CC BY-NC 4.0
+(https://creativecommons.org/licenses/by-nc/4.0/). This derived HFX dataset
+inherits that license: CC BY-NC 4.0, NonCommercial — no commercial use is
+permitted.
+
+Attribution: any use of this dataset must credit the source data authors.
+See CITATION.txt in this directory for the exact citation in plain text and
+BibTeX form.
+
+Hosting: Upstream Tech sponsors the hosting infrastructure for these objects
+(infrastructure sponsor only). Upstream Tech is not the publisher or vendor
+of the data.
