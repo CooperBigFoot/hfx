@@ -29,7 +29,7 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
 | Catchment atom | Smallest indivisible drainage unit in an HFX dataset; one row of `catchments.parquet` |
 | Snap target | A candidate point or linestring reach to which a pour point may be snapped; one row of `snap.parquet` |
 | Adjacency row | One node in the upstream drainage graph — an atom ID plus the IDs of its direct upstream neighbours |
-| Drainage graph | Complete upstream adjacency over all atoms; in-memory representation of `graph.arrow` |
+| Drainage graph | Complete upstream adjacency over all atoms; in-memory representation of `graph.parquet` |
 | Manifest | Dataset metadata (`manifest.json`): format version, CRS, topology, artifact availability, bounding box |
 | Mainstem | Primary channel in a drainage network, as opposed to tributaries or distributaries |
 | WKB | Well-Known Binary — OGC binary encoding for geometry; treated as an opaque byte buffer by this crate |

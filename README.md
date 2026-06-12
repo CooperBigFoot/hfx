@@ -107,67 +107,57 @@ Validation behavior is defined against [spec/HFX_SPEC.md](./spec/HFX_SPEC.md).
 
 ## Datasets
 
-Both reference datasets are hosted on Cloudflare R2 (kindly donated by [Upstream Tech](https://upstream.tech/)) and readable directly over HTTPS via range requests, so engines do not have to download them in full.
+One reference dataset is hosted on Cloudflare R2 and readable directly over HTTPS via range requests, so engines do not have to download it in full. [Upstream Tech](https://upstream.tech/) sponsors the hosting infrastructure (infrastructure sponsor only); it is not the publisher or vendor of the data.
 
-### `merit_basins` — Global MERIT-Basins HFX (Pfafstetter Level-2)
+### GRIT 2.0.0 HFX
 
-Compiled from MERIT-Basins v0.7 / v1.0_bugfix1 and the mghydro per-basin raster rehost.
+An HFX compilation of the Global River Topology (GRIT) vector datasets, with segment (`level=0`) and reach (`level=1`) drainage units.
 
-| Property | Value |
-|---|---|
-| Adapter version | `0.1.0` |
-| Format version | `0.1` |
-| Topology | tree |
-| Atom count | 2,876,771 across 60 of 61 Pfaf-L2 basins |
-| Bounding box | `[-178.03, -55.57, 179.89, 83.65]` (planetary) |
-| Manifest | <https://basin-delineations-public.upstream.tech/merit-basins/0.1.0/manifest.json> |
-
-**Files:**
-
-| Artifact | Size |
-|---|---|
-| `manifest.json` | 428 B |
-| `graph.parquet` | Pending v0.2 republish; hosted v0.1 dataset uses the legacy graph artifact |
-| `catchments.parquet` | 6.1 GB |
-| `snap.parquet` | 1.7 GB |
-| `flow_dir.tif` | 12 GB |
-| `flow_acc.tif` | 45 GB |
-| **Total** | **~65 GB** |
-
-**Known gaps:** pfaf-35 (anti-meridian wrap — mghydro clips at 180°E); pfaf-87/88 (Antarctic sub-basins — absent from mghydro's distribution).
-
-### `grit` — Global GRIT HFX
-
-Compiled from the seven published [GRIT](https://zenodo.org/records/17435232) regions (`AF`, `AS`, `EU`, `NA`, `SA`, `SI`, `SP`) merged into one strict-valid dataset. Vector-only — GRIT does not ship paired rasters.
+Manifest: <https://basin-delineations-public.upstream.tech/grit/2.0.0/manifest.json>
 
 | Property | Value |
 |---|---|
-| Fabric version | `1.0.0` |
-| Adapter version | `grit-regional-scratch-2026-04-30` |
-| Format version | `0.1` |
-| Topology | DAG (handles braiding and distributaries) |
-| Atom count | 1,767,065 |
-| Bounding box | global |
-| Manifest | <https://basin-delineations-public.upstream.tech/grit/1.0.0/manifest.json> |
+| `format_version` | 0.2.1 |
+| `fabric_name` | grit |
+| `fabric_version` | 1.0.0 |
+| `adapter_version` | grit-global-2.0.0 |
+| `unit_count` | 22,337,300 |
+| `topology` | dag |
+| CRS | EPSG:4326 |
+| Auxiliaries | two `hfx.aux.snap.v1` snap indexes (segment-stems, reach-stems) |
+| Total size | ~43 GB (43,361,501,501 bytes) |
 
-**Files:**
+**Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/2.0.0/`):
 
-| Artifact | Size |
-|---|---|
-| `manifest.json` | 446 B |
-| `graph.parquet` | Pending v0.2 republish; hosted v0.1 dataset uses the legacy graph artifact |
-| `snap.parquet` | 3.4 GB |
-| `catchments.parquet` | 9.6 GB |
-| **Total** | **~13 GB** |
+- `manifest.json`
+- `catchments.parquet`
+- `graph.parquet`
+- `aux/snap_segments.parquet`
+- `aux/snap_reaches.parquet`
+- `NOTICE`, `CITATION.txt`, `README.md` (attribution objects)
 
-**Validate** any local copy of either dataset:
+**License and attribution:** CC BY-NC 4.0 (<https://creativecommons.org/licenses/by-nc/4.0/>), inherited from the source data — NonCommercial use only. Any use of this dataset must credit the source data authors:
+
+> Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.
+
+DOI: <https://doi.org/10.5281/zenodo.17435232>
+
+**Validate** any local copy:
 
 ```bash
 hfx ./path/to/dataset --strict
 ```
 
+## Versioning
+
+HFX carries two independent version tracks: the SPEC track is the format version itself (`format_version`, currently 0.2.1 and frozen), while the TOOLKIT track covers the lockstep workspace crates `hfx-core` and `hfx-validator`, whose next curated release is 0.3.0. See [docs/VERSIONING.md](./docs/VERSIONING.md) for the full policy, the spec-to-toolkit mapping table, and the release procedure.
+
+## Implementations
+
+HFX is the standard; engines and adapters implement it. [shed](https://github.com/CooperBigFoot/shed) is the reference engine implementation — it consumes HFX datasets directly and ships the Python bindings.
+
+Contributions are welcome on the adapter side: a HydroBASINS adapter is the most-wanted next adapter. See [docs/ADAPTER_GUIDE.md](./docs/ADAPTER_GUIDE.md) for how to build one and [adapters/](./adapters) for the existing compilers.
+
 ## Status
 
-HFX v0.2 is the active spec direction. The Rust toolkit ships on crates.io: [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator). Existing hosted GRIT and MERIT datasets are v0.1 examples until their adapters are updated to the v0.2 contract.
-
-Language choice is Rust for the validator and engine-facing tooling. Python bindings live in the downstream [shed](https://github.com/CooperBigFoot/shed) engine.
+HFX spec 0.2.1 is frozen, and the hosted GRIT 2.0.0 dataset conforms to it. The crates.io releases of [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator) predate the curated-release policy; the next curated toolkit release will be 0.3.0.
