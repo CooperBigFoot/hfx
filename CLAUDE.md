@@ -4,34 +4,25 @@
 
 HFX (HydroFabric Exchange) is an open specification and Rust toolkit for a compiled drainage format that lets delineation engines consume any source hydrofabric through one normalized contract. Source-specific adapters compile HydroBASINS, GRIT, MERIT Hydro, and similar fabrics into HFX offline; the engine then reads HFX only, with no fabric-specific logic in runtime traversal or snapping. The canonical dev spec lives at `spec/HFX_SPEC.md`, and the official validator CLI lives in `crates/hfx-validator`.
 
-## Version Bumping (mandatory)
+## Releases (curated)
 
-**Every commit MUST include a patch version bump.** No exceptions.
+This repository does NOT bump versions or create tags on ordinary commits. Commit with a
+conventional message and leave `Cargo.toml`'s version field, git tags, and `CHANGELOG.md`
+alone — version changes are never per-commit ceremony.
 
-Before committing, follow this exact sequence:
+Releases are intentional, maintainer-driven events:
 
-1. `./scripts/bump-version.sh patch` — modifies `Cargo.toml` version field
-2. Stage `Cargo.toml` alongside code changes
-3. Commit with a conventional commit message
-4. `git tag v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')` — tag the commit
-
-**Rules:**
-
-- **Patch bumps**: Automatic with every commit. Claude MUST do this.
-- **Minor/major bumps**: Only when the user explicitly requests. Use `./scripts/bump-version.sh minor` or `./scripts/bump-version.sh major`.
-- **Never let tooling create its own commit or tag.** Fold version changes into the real commit.
-- **Always tag** after every commit.
-
-> **Note:** `cargo bump` does not support Cargo workspaces (it panics). Use `./scripts/bump-version.sh` instead — it edits `Cargo.toml` directly.
-
-### Quick Reference
-
-| Command | Effect |
-|---|---|
-| `./scripts/bump-version.sh patch` | `0.1.0` → `0.1.1` |
-| `./scripts/bump-version.sh minor` | `0.1.1` → `0.2.0` |
-| `./scripts/bump-version.sh major` | `0.2.0` → `1.0.0` |
-| `grep '^version' Cargo.toml` | Show current version |
+- **No per-commit bumps.** The workspace version changes only as part of a deliberate
+  release, prepared with `./scripts/bump-version.sh <patch|minor|major>` in the release
+  commit itself.
+- **Human-tagged.** `v*` git tags are created by a human maintainer at release time.
+  Agents never create or push tags.
+- **CHANGELOG'd.** Every release ships with notes in the root `CHANGELOG.md` describing
+  what changed since the previous release.
+- **Two version tracks.** The SPEC track (`format_version`, currently `0.2.1`) and the
+  TOOLKIT track (the lockstep `hfx-core`/`hfx-validator` workspace crates, which own the
+  `v*` tags) evolve independently. See `docs/VERSIONING.md` for the full two-track policy
+  and the spec-to-toolkit mapping table.
 
 ## Rust Coding Conventions
 
