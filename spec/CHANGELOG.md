@@ -20,6 +20,21 @@ Hard-cut manifest version over 0.2.0.
 - `format_version` const changed from `"0.2"` to `"0.2.1"` in the manifest
   JSON Schema.
 
+### Overlap coherence — 2026-06-18
+
+Normative clarification to `aux/d8_raster/v1.md`. The wire shape is unchanged
+(no new fields) and `format_version` remains `0.2.1`.
+
+- Added an "Overlap Coherence" section: where multi-entry `hfx.aux.d8_raster.v1`
+  declarations have overlapping rectangular extents, every overlapping entry
+  MUST report identical `flow_dir`/`flow_acc` values at each shared cell (the
+  entries MUST be windows of a single coherent D8 fabric). A producer that
+  cannot guarantee this MUST NOT declare overlapping entries.
+- Consumers MAY select any entry fully covering a region (e.g. manifest-first);
+  the result is independent of the choice. This resolves the previously
+  underspecified case where per-Pfaf basin partitions produce overlapping
+  rectangular extents over a single terminal.
+
 ### Editorial — 2026-06-12
 
 Language-only hardening of the 0.2.1 text. The wire shape is unchanged and
