@@ -4,6 +4,7 @@ use std::path::Path;
 
 use arrow::array::{
     Array, BinaryArray, Float32Array, Float64Array, Int16Array, Int64Array, LargeBinaryArray,
+    StructArray,
 };
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -14,7 +15,10 @@ use super::{
 };
 use crate::dataset::CatchmentsData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
-use crate::reader::schema::{ExpectedColumn, row_group_has_bbox_stats, validate_schema};
+use crate::reader::schema::{
+    ExpectedColumn, bbox_struct_type, check_bbox_covering, row_group_has_struct_bbox_stats,
+    validate_schema,
+};
 
 /// Expected schema for catchments.parquet.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -26,10 +30,7 @@ fn expected_columns() -> Vec<ExpectedColumn> {
         ExpectedColumn::new("up_area_km2", DataType::Float32, true),
         ExpectedColumn::new("outlet_lon", DataType::Float64, false),
         ExpectedColumn::new("outlet_lat", DataType::Float64, false),
-        ExpectedColumn::new("bbox_minx", DataType::Float32, false),
-        ExpectedColumn::new("bbox_miny", DataType::Float32, false),
-        ExpectedColumn::new("bbox_maxx", DataType::Float32, false),
-        ExpectedColumn::new("bbox_maxy", DataType::Float32, false),
+        ExpectedColumn::new("bbox", bbox_struct_type(), false),
         ExpectedColumn::new("geometry", DataType::Binary, false),
     ]
 }
@@ -83,6 +84,12 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
         return (None, diags);
     }
 
+    // --- GeoParquet covering metadata ---
+    diags.extend(check_bbox_covering(
+        builder.metadata().file_metadata().key_value_metadata(),
+        Artifact::Catchments,
+    ));
+
     // --- Row group metadata ---
     let parquet_meta = builder.metadata().clone();
     let num_row_groups = parquet_meta.num_row_groups();
@@ -92,7 +99,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     for rg_idx in 0..num_row_groups {
         let rg = parquet_meta.row_group(rg_idx);
         row_group_sizes.push(rg.num_rows() as usize);
-        row_group_has_bbox_stats_vec.push(row_group_has_bbox_stats(rg));
+        row_group_has_bbox_stats_vec.push(row_group_has_struct_bbox_stats(rg));
     }
 
     // --- Stream record batches ---
@@ -323,40 +330,48 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             up_area_null_count += num_rows;
         }
 
-        // bbox columns (all non-nullable)
-        let minx = batch
-            .column_by_name("bbox_minx")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let miny = batch
-            .column_by_name("bbox_miny")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let maxx = batch
-            .column_by_name("bbox_maxx")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let maxy = batch
-            .column_by_name("bbox_maxy")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        // bbox struct column (non-nullable struct, non-nullable leaves)
+        let bbox_struct = batch
+            .column_by_name("bbox")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+        if let Some(bbox_struct) = bbox_struct {
+            let minx = bbox_struct
+                .column_by_name("xmin")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let miny = bbox_struct
+                .column_by_name("ymin")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let maxx = bbox_struct
+                .column_by_name("xmax")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let maxy = bbox_struct
+                .column_by_name("ymax")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
 
-        if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
-            for i in 0..num_rows {
-                let bbox_null =
-                    minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
-                if bbox_null {
-                    null_bbox_count += 1;
-                    if null_bbox_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
-                        diags.push(
-                            Diagnostic::error(
-                                "catchments.null_bbox",
-                                Category::Schema,
-                                Artifact::Catchments,
-                                format!("row {}: one or more bbox columns are null in a non-nullable column", total_rows + i),
-                            )
-                            .at(Location::Row { index: total_rows + i }),
-                        );
+            if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
+                for i in 0..num_rows {
+                    let bbox_null = bbox_struct.is_null(i)
+                        || minx.is_null(i)
+                        || miny.is_null(i)
+                        || maxx.is_null(i)
+                        || maxy.is_null(i);
+                    if bbox_null {
+                        null_bbox_count += 1;
+                        if null_bbox_count <= MAX_NULL_DIAGNOSTICS_PER_COLUMN {
+                            diags.push(
+                                Diagnostic::error(
+                                    "catchments.null_bbox",
+                                    Category::Schema,
+                                    Artifact::Catchments,
+                                    format!("row {}: one or more bbox struct leaves are null in a non-nullable column", total_rows + i),
+                                )
+                                .at(Location::Row { index: total_rows + i }),
+                            );
+                        }
+                        bboxes.push([0.0, 0.0, 0.0, 0.0]); // sentinel
+                    } else {
+                        bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
                     }
-                    bboxes.push([0.0, 0.0, 0.0, 0.0]); // sentinel
-                } else {
-                    bboxes.push([minx.value(i), miny.value(i), maxx.value(i), maxy.value(i)]);
                 }
             }
         }

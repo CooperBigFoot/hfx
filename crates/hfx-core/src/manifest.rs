@@ -44,6 +44,8 @@ pub enum FormatVersion {
     V0_1,
     /// HFX specification version 0.2.1.
     V0_2_1,
+    /// HFX specification version 0.3.0.
+    V0_3_0,
 }
 
 impl std::fmt::Display for FormatVersion {
@@ -51,6 +53,7 @@ impl std::fmt::Display for FormatVersion {
         match self {
             FormatVersion::V0_1 => write!(f, "0.1"),
             FormatVersion::V0_2_1 => write!(f, "0.2.1"),
+            FormatVersion::V0_3_0 => write!(f, "0.3.0"),
         }
     }
 }
@@ -62,6 +65,7 @@ impl FromStr for FormatVersion {
         match s {
             "0.1" => Ok(FormatVersion::V0_1),
             "0.2.1" => Ok(FormatVersion::V0_2_1),
+            "0.3.0" => Ok(FormatVersion::V0_3_0),
             _ => Err(ManifestError::UnsupportedFormatVersion {
                 value: s.to_owned(),
             }),
@@ -140,7 +144,7 @@ pub enum ManifestError {
     },
 
     /// Returned when an unsupported format version is provided.
-    #[error("unsupported format version: {value:?}, expected \"0.2.1\"")]
+    #[error("unsupported format version: {value:?}, expected \"0.3.0\"")]
     UnsupportedFormatVersion {
         /// The unrecognized version string.
         value: String,
@@ -597,6 +601,11 @@ mod tests {
         assert_eq!(
             "0.2.1".parse::<FormatVersion>().unwrap(),
             FormatVersion::V0_2_1
+        );
+        assert_eq!(FormatVersion::V0_3_0.to_string(), "0.3.0");
+        assert_eq!(
+            "0.3.0".parse::<FormatVersion>().unwrap(),
+            FormatVersion::V0_3_0
         );
     }
 

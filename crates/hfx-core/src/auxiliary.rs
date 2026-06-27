@@ -35,14 +35,14 @@ pub enum BlessedAuxSchema {
     /// Paired D8 flow-direction and flow-accumulation rasters.
     D8RasterV1,
     /// Optional snap features for outlet snapping.
-    SnapV1,
+    SnapV2,
 }
 
 impl std::fmt::Display for BlessedAuxSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BlessedAuxSchema::D8RasterV1 => write!(f, "hfx.aux.d8_raster.v1"),
-            BlessedAuxSchema::SnapV1 => write!(f, "hfx.aux.snap.v1"),
+            BlessedAuxSchema::SnapV2 => write!(f, "hfx.aux.snap.v2"),
         }
     }
 }
@@ -73,7 +73,7 @@ impl AuxiliarySchemaId {
         }
         match raw {
             "hfx.aux.d8_raster.v1" => Ok(Self::Blessed(BlessedAuxSchema::D8RasterV1)),
-            "hfx.aux.snap.v1" => Ok(Self::Blessed(BlessedAuxSchema::SnapV1)),
+            "hfx.aux.snap.v2" => Ok(Self::Blessed(BlessedAuxSchema::SnapV2)),
             value if value.starts_with("hfx.aux.") => Err(AuxiliaryError::MalformedSchemaId {
                 value: value.to_owned(),
             }),
@@ -160,16 +160,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_blessed_snap_v1() {
+    fn parse_blessed_snap_v2() {
         assert_eq!(
-            AuxiliarySchemaId::parse("hfx.aux.snap.v1").unwrap(),
-            AuxiliarySchemaId::Blessed(BlessedAuxSchema::SnapV1)
+            AuxiliarySchemaId::parse("hfx.aux.snap.v2").unwrap(),
+            AuxiliarySchemaId::Blessed(BlessedAuxSchema::SnapV2)
         );
     }
 
     #[test]
-    fn display_blessed_snap_v1() {
-        assert_eq!(BlessedAuxSchema::SnapV1.to_string(), "hfx.aux.snap.v1");
+    fn display_blessed_snap_v2() {
+        assert_eq!(BlessedAuxSchema::SnapV2.to_string(), "hfx.aux.snap.v2");
     }
 
     #[test]

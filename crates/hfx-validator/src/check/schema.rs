@@ -46,8 +46,9 @@ pub fn check_schemas(dataset: &ParsedDataset) -> Vec<Diagnostic> {
                     Category::Schema,
                     Artifact::Catchments,
                     format!(
-                        "catchments.parquet row group {rg_idx} is missing statistics for bbox columns; \
-                         spec requires row group statistics on bbox columns"
+                        "catchments.parquet row group {rg_idx} is missing statistics for the bbox \
+                         struct leaves; spec requires row group statistics on bbox.xmin, bbox.ymin, \
+                         bbox.xmax, bbox.ymax"
                     ),
                 ));
             }

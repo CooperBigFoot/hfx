@@ -1,4 +1,4 @@
-# Invalid tiny v0.2.1 fixture with non-overlapping D8 auxiliary rasters
+# Invalid tiny v0.3.0 fixture with non-overlapping D8 auxiliary rasters
 
 Expected diagnostic: `raster.extent_no_overlap`.
 

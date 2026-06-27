@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use arrow::array::{Array, BinaryArray, Float32Array, Int64Array, LargeBinaryArray, StringArray};
+use arrow::array::{
+    Array, BinaryArray, Float32Array, Int64Array, LargeBinaryArray, StringArray, StructArray,
+};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, warn};
@@ -12,7 +14,10 @@ use super::{
 };
 use crate::dataset::SnapData;
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
-use crate::reader::schema::{ExpectedColumn, row_group_has_bbox_stats, validate_schema};
+use crate::reader::schema::{
+    ExpectedColumn, bbox_struct_type, check_bbox_covering, row_group_has_struct_bbox_stats,
+    validate_schema,
+};
 
 /// Expected schema for snap.parquet.
 fn expected_columns() -> Vec<ExpectedColumn> {
@@ -21,10 +26,7 @@ fn expected_columns() -> Vec<ExpectedColumn> {
         ExpectedColumn::new("unit_id", DataType::Int64, false),
         ExpectedColumn::new("weight", DataType::Float32, false),
         ExpectedColumn::new("stem_role", DataType::Utf8, true),
-        ExpectedColumn::new("bbox_minx", DataType::Float32, true),
-        ExpectedColumn::new("bbox_miny", DataType::Float32, true),
-        ExpectedColumn::new("bbox_maxx", DataType::Float32, true),
-        ExpectedColumn::new("bbox_maxy", DataType::Float32, true),
+        ExpectedColumn::new("bbox", bbox_struct_type(), true),
         ExpectedColumn::new("geometry", DataType::Binary, false),
     ]
 }
@@ -79,6 +81,12 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
         return (None, diags);
     }
 
+    // --- GeoParquet covering metadata ---
+    diags.extend(check_bbox_covering(
+        builder.metadata().file_metadata().key_value_metadata(),
+        Artifact::Snap,
+    ));
+
     // --- Row group metadata ---
     let parquet_meta = builder.metadata().clone();
     let num_row_groups = parquet_meta.num_row_groups();
@@ -88,7 +96,7 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
     for rg_idx in 0..num_row_groups {
         let rg = parquet_meta.row_group(rg_idx);
         row_group_sizes.push(rg.num_rows() as usize);
-        row_group_has_bbox_stats_vec.push(row_group_has_bbox_stats(rg));
+        row_group_has_bbox_stats_vec.push(row_group_has_struct_bbox_stats(rg));
     }
 
     // --- Stream record batches ---
@@ -261,33 +269,41 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
             }
         }
 
-        // bbox columns (nullable as a group)
-        let minx = batch
-            .column_by_name("bbox_minx")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let miny = batch
-            .column_by_name("bbox_miny")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let maxx = batch
-            .column_by_name("bbox_maxx")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
-        let maxy = batch
-            .column_by_name("bbox_maxy")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+        // bbox struct column (nullable struct, non-nullable leaves)
+        let bbox_struct = batch
+            .column_by_name("bbox")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>());
+        if let Some(bbox_struct) = bbox_struct {
+            let minx = bbox_struct
+                .column_by_name("xmin")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let miny = bbox_struct
+                .column_by_name("ymin")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let maxx = bbox_struct
+                .column_by_name("xmax")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            let maxy = bbox_struct
+                .column_by_name("ymax")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
 
-        if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
-            for i in 0..num_rows {
-                let bbox_null =
-                    minx.is_null(i) || miny.is_null(i) || maxx.is_null(i) || maxy.is_null(i);
-                if bbox_null {
-                    bboxes.push(None);
-                } else {
-                    bboxes.push(Some([
-                        minx.value(i),
-                        miny.value(i),
-                        maxx.value(i),
-                        maxy.value(i),
-                    ]));
+            if let (Some(minx), Some(miny), Some(maxx), Some(maxy)) = (minx, miny, maxx, maxy) {
+                for i in 0..num_rows {
+                    let bbox_null = bbox_struct.is_null(i)
+                        || minx.is_null(i)
+                        || miny.is_null(i)
+                        || maxx.is_null(i)
+                        || maxy.is_null(i);
+                    if bbox_null {
+                        bboxes.push(None);
+                    } else {
+                        bboxes.push(Some([
+                            minx.value(i),
+                            miny.value(i),
+                            maxx.value(i),
+                            maxy.value(i),
+                        ]));
+                    }
                 }
             }
         }

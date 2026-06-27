@@ -4,7 +4,7 @@ This directory holds small reference HFX datasets for implementers.
 
 | Path | Description |
 |---|---|
-| [`tiny/`](./tiny) | 5-unit valid HFX 0.2.1 dataset with parquet artifacts, CSV dumps, and embedded schemas. |
+| [`tiny/`](./tiny) | 5-unit valid HFX 0.3.0 dataset with parquet artifacts, CSV dumps, and embedded schemas. |
 
 When adding examples, keep them:
 

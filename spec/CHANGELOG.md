@@ -5,6 +5,30 @@ Specification-level changes, newest first. See the
 spec for the versioning policy. The 0.2.0 → 0.2.1 hard cut predates that
 policy and is recorded here as it happened.
 
+## 0.3.0 — 2026-06-27
+
+Breaking MINOR bump over 0.2.1 (see the
+[Version Compatibility](./HFX_SPEC.md#version-compatibility) worked example).
+
+- `catchments.parquet` replaces the four flat `float32` bbox columns
+  (`bbox_minx`, `bbox_miny`, `bbox_maxx`, `bbox_maxy`) with a single
+  non-nullable struct column `bbox` whose non-nullable leaves are `xmin`,
+  `ymin`, `xmax`, and `ymax`. The leaves are declared as a
+  [GeoParquet 1.1](https://geoparquet.org/releases/v1.1.0/) `covering` at
+  `geo.columns.geometry.covering.bbox.{xmin,ymin,xmax,ymax}` so standard spatial
+  tools recognize the bbox for predicate pushdown. The required row-group
+  statistics move to the four struct leaves (`bbox.xmin`, `bbox.ymin`,
+  `bbox.xmax`, `bbox.ymax`).
+- Snap features move to the breaking auxiliary version
+  [`hfx.aux.snap.v2`](./aux/snap/v2.md): the optional flat bbox columns become a
+  nullable `bbox` struct with non-nullable leaves and the same covering
+  convention. `hfx.aux.snap.v1` ([`spec/aux/snap/v1.md`](./aux/snap/v1.md)) is
+  retained for historical reference.
+- `graph.parquet` is unchanged: it carries no geometry column, so it keeps its
+  four flat `float32` bbox columns and their row-group-statistics rule.
+- `format_version` const changed from `"0.2.1"` to `"0.3.0"` in the manifest
+  JSON Schema (`schemas/manifest.schema.json`).
+
 ## 0.2.1 — 2026-05-25
 
 Hard-cut manifest version over 0.2.0.
