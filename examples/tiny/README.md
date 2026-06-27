@@ -1,6 +1,6 @@
 # `tiny` — reference HFX dataset
 
-A complete, valid HFX `format_version` 0.2.1 dataset with 5 drainage units (`fabric_name` `conformance-tiny`, EPSG:4326, `topology` tree, ~7 KB across the three artifacts). It exists as a READ-ONLY inspectable reference for implementers — modeled on geoparquet's `examples/` pattern of shipping a real artifact alongside human-readable dumps — so you can open a working dataset by hand while reading [`../../spec/HFX_SPEC.md`](../../spec/HFX_SPEC.md), the canonical contract.
+A complete, valid HFX `format_version` 0.3.0 dataset with 5 drainage units (`fabric_name` `conformance-tiny`, EPSG:4326, `topology` tree, ~7 KB across the three artifacts). It exists as a READ-ONLY inspectable reference for implementers — modeled on geoparquet's `examples/` pattern of shipping a real artifact alongside human-readable dumps — so you can open a working dataset by hand while reading [`../../spec/HFX_SPEC.md`](../../spec/HFX_SPEC.md), the canonical contract.
 
 ## Provenance
 
@@ -10,15 +10,15 @@ The `manifest.json` and the two parquet files are copied **byte-for-byte** from 
 
 | File | Size | Description |
 |---|---|---|
-| [`manifest.json`](./manifest.json) | 295 B | Dataset metadata: `format_version` 0.2.1, `fabric_name`, CRS, bbox, `unit_count` 5, `has_up_area: false`, `topology: tree`. |
-| [`catchments.parquet`](./catchments.parquet) | 4.3 KB | One row per drainage unit: ids, levels, areas, outlets, bboxes, WKB polygon geometry. |
+| [`manifest.json`](./manifest.json) | 295 B | Dataset metadata: `format_version` 0.3.0, `fabric_name`, CRS, bbox, `unit_count` 5, `has_up_area: false`, `topology: tree`. |
+| [`catchments.parquet`](./catchments.parquet) | ~5 KB | One row per drainage unit: ids, levels, areas, outlets, a GeoParquet 1.1 `bbox` covering struct, WKB polygon geometry. |
 | [`graph.parquet`](./graph.parquet) | 2.2 KB | Topology: one row per unit with its `upstream_ids` adjacency list and bbox. |
 | [`catchments.csv`](./catchments.csv) | 554 B | Human-readable dump of `catchments.parquet` (header + 5 rows). |
 | [`graph.csv`](./graph.csv) | 183 B | Human-readable dump of `graph.parquet` (header + 5 rows). |
 
 ## Embedded schemas
 
-Captured verbatim from `python3 -c "import pyarrow.parquet as pq; print(pq.read_schema('examples/tiny/catchments.parquet'))"`:
+Captured from `python3 -c "import pyarrow.parquet as pq; print(pq.read_schema('examples/tiny/catchments.parquet'))"` (struct fields shown; the `geo` GeoParquet 1.1 covering metadata footer is omitted for brevity):
 
 ```text
 id: int64 not null
@@ -28,10 +28,11 @@ area_km2: float not null
 up_area_km2: float
 outlet_lon: double not null
 outlet_lat: double not null
-bbox_minx: float not null
-bbox_miny: float not null
-bbox_maxx: float not null
-bbox_maxy: float not null
+bbox: struct<xmin: float not null, ymin: float not null, xmax: float not null, ymax: float not null> not null
+  child 0, xmin: float not null
+  child 1, ymin: float not null
+  child 2, xmax: float not null
+  child 3, ymax: float not null
 geometry: binary not null
 source_id: string
 level_label: string

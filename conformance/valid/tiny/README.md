@@ -1,3 +1,3 @@
-# Valid tiny v0.2.1 fixture
+# Valid tiny v0.3.0 fixture
 
 Expected diagnostic: `none`.

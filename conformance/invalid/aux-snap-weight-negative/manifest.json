@@ -1,5 +1,5 @@
 {
-  "format_version": "0.2.1",
+  "format_version": "0.3.0",
   "fabric_name": "conformance-tiny",
   "crs": "EPSG:4326",
   "has_up_area": false,
@@ -15,7 +15,7 @@
   "adapter_version": "conformance-fixture-v2",
   "auxiliary": [
     {
-      "schema": "hfx.aux.snap.v1",
+      "schema": "hfx.aux.snap.v2",
       "artifacts": {
         "snap": "snap/negative_weight.parquet"
       },

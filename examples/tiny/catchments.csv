@@ -1,4 +1,4 @@
-id,level,parent_id,area_km2,up_area_km2,outlet_lon,outlet_lat,bbox_minx,bbox_miny,bbox_maxx,bbox_maxy,geometry,source_id,level_label
+id,level,parent_id,area_km2,up_area_km2,outlet_lon,outlet_lat,bbox.xmin,bbox.ymin,bbox.xmax,bbox.ymax,geometry,source_id,level_label
 1,0,,4.0,,1.0,0.0,0.0,0.0,2.0,2.0,"POLYGON ((2 0, 2 2, 0 2, 0 0, 2 0))",src-1,coarse
 2,1,1,1.0,,0.5,1.0,0.0,1.0,1.0,2.0,"POLYGON ((1 1, 1 2, 0 2, 0 1, 1 1))",src-2,fine
 3,1,1,1.0,,1.5,1.0,1.0,1.0,2.0,2.0,"POLYGON ((2 1, 2 2, 1 2, 1 1, 2 1))",src-3,fine
