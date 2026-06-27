@@ -64,7 +64,7 @@ pub fn check_file_presence(
             "file_presence.legacy_snap_parquet",
             Category::FilePresence,
             Artifact::Snap,
-            "snap.parquet at dataset root is a v0.2 artifact; move to hfx.aux.snap.v1",
+            "snap.parquet at dataset root is a v0.2 artifact; move to hfx.aux.snap.v2",
         ));
     }
 

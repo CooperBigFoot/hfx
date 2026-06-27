@@ -23,7 +23,7 @@ pub fn check_auxiliary(
     let mut snap_names = HashSet::new();
 
     for (idx, entry) in entries.iter().enumerate() {
-        if entry.schema.as_deref() == Some("hfx.aux.snap.v1")
+        if entry.schema.as_deref() == Some("hfx.aux.snap.v2")
             && let Some(name) = snap_name(entry)
             && !snap_names.insert(name.to_string())
         {
@@ -32,7 +32,7 @@ pub fn check_auxiliary(
                     "aux.snap.duplicate_name",
                     Category::Manifest,
                     Artifact::Manifest,
-                    format!("hfx.aux.snap.v1 metadata.name {name:?} is duplicated"),
+                    format!("hfx.aux.snap.v2 metadata.name {name:?} is duplicated"),
                 )
                 .at(Location::Field {
                     name: "auxiliary".into(),
@@ -90,8 +90,8 @@ fn check_entry(
 
     if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1") {
         check_d8_raster(idx, entry, diags);
-    } else if entry.schema.as_deref() == Some("hfx.aux.snap.v1") {
-        check_snap_v1(idx, entry, dataset_root, catchments, diags);
+    } else if entry.schema.as_deref() == Some("hfx.aux.snap.v2") {
+        check_snap_v2(idx, entry, dataset_root, catchments, diags);
     }
 }
 
@@ -133,7 +133,7 @@ fn check_d8_raster(idx: usize, entry: &RawAuxEntry, diags: &mut Vec<Diagnostic>)
     }
 }
 
-fn check_snap_v1(
+fn check_snap_v2(
     idx: usize,
     entry: &RawAuxEntry,
     dataset_root: &Path,
@@ -184,7 +184,7 @@ fn snap_name(entry: &RawAuxEntry) -> Option<&str> {
 }
 
 fn entry_label(idx: usize, entry: &RawAuxEntry) -> String {
-    if entry.schema.as_deref() == Some("hfx.aux.snap.v1") {
+    if entry.schema.as_deref() == Some("hfx.aux.snap.v2") {
         snap_label(idx, entry)
     } else {
         format!("auxiliary[{idx}]")
@@ -357,7 +357,7 @@ mod tests {
         };
         let catchments = catchments_with_levels(vec![2], vec![1]);
         let entry = RawAuxEntry {
-            schema: Some("hfx.aux.snap.v1".to_string()),
+            schema: Some("hfx.aux.snap.v2".to_string()),
             artifacts: None,
             metadata: Some(serde_json::json!({
                 "references_levels": [0]
@@ -389,12 +389,12 @@ mod tests {
             adapter_version: None,
             auxiliary: Some(vec![
                 RawAuxEntry {
-                    schema: Some("hfx.aux.snap.v1".to_string()),
+                    schema: Some("hfx.aux.snap.v2".to_string()),
                     artifacts: Some(Default::default()),
                     metadata: Some(serde_json::json!({"name": "reach-stems"})),
                 },
                 RawAuxEntry {
-                    schema: Some("hfx.aux.snap.v1".to_string()),
+                    schema: Some("hfx.aux.snap.v2".to_string()),
                     artifacts: Some(Default::default()),
                     metadata: Some(serde_json::json!({"name": "reach-stems"})),
                 },

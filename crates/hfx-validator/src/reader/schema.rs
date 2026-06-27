@@ -1,6 +1,6 @@
 //! Generic Arrow schema validation helper.
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use tracing::debug;
 
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
@@ -51,6 +51,13 @@ fn data_type_matches(actual: &DataType, expected: &DataType) -> bool {
         (DataType::List(actual_field), DataType::List(expected_field)) => {
             actual_field.data_type() == expected_field.data_type()
                 && actual_field.is_nullable() == expected_field.is_nullable()
+        }
+        (DataType::Struct(actual_fields), DataType::Struct(expected_fields)) => {
+            actual_fields.len() == expected_fields.len()
+                && actual_fields
+                    .iter()
+                    .zip(expected_fields.iter())
+                    .all(|(a, e)| a.name() == e.name() && a.data_type() == e.data_type())
         }
         _ => false,
     }
@@ -218,4 +225,98 @@ pub(crate) fn row_group_has_bbox_stats(meta: &parquet::file::metadata::RowGroupM
         }
     }
     true
+}
+
+/// The catchments/snap `bbox` struct column type: four non-nullable `float32`
+/// leaves `xmin`, `ymin`, `xmax`, `ymax`, in GeoParquet 1.1 covering order.
+pub(crate) fn bbox_struct_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("xmin", DataType::Float32, false),
+        Field::new("ymin", DataType::Float32, false),
+        Field::new("xmax", DataType::Float32, false),
+        Field::new("ymax", DataType::Float32, false),
+    ]))
+}
+
+/// Check whether a row group has statistics on all four `bbox` struct leaves.
+///
+/// Struct leaves are matched on the FULL dotted column path
+/// (`column(i).path().string() == "bbox.xmin"`), because the parquet
+/// `ColumnDescriptor::name()` collapses to the bare leaf name (`"xmin"`).
+pub(crate) fn row_group_has_struct_bbox_stats(
+    meta: &parquet::file::metadata::RowGroupMetaData,
+) -> bool {
+    let leaf_paths = ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"];
+    let schema_desc = meta.schema_descr();
+    for leaf_path in &leaf_paths {
+        let col_idx = (0..schema_desc.num_columns())
+            .find(|&i| schema_desc.column(i).path().string() == *leaf_path);
+        let Some(idx) = col_idx else {
+            return false;
+        };
+        if meta.column(idx).statistics().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate the GeoParquet 1.1 `bbox` covering metadata for a struct-bbox file.
+///
+/// The geometry column is literally named `geometry`; the covering MUST be
+/// declared at `geo.columns.geometry.covering.bbox.{xmin,ymin,xmax,ymax}`, each
+/// entry referencing the matching leaf of the `bbox` struct as `["bbox","<leaf>"]`.
+pub(crate) fn check_bbox_covering(
+    kv: Option<&Vec<parquet::format::KeyValue>>,
+    artifact: Artifact,
+) -> Vec<Diagnostic> {
+    let check_id = match artifact {
+        Artifact::Catchments => "schema.catchments.covering_missing",
+        Artifact::Snap => "schema.snap.covering_missing",
+        _ => "schema.bbox_covering",
+    };
+    let err = |msg: String| vec![Diagnostic::error(check_id, Category::Schema, artifact, msg)];
+
+    let Some(geo_raw) = kv
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.key == "geo")
+        .and_then(|entry| entry.value.as_deref())
+    else {
+        return err(
+            "missing GeoParquet 'geo' file metadata; the bbox covering must be declared at \
+             geo.columns.geometry.covering.bbox"
+                .to_string(),
+        );
+    };
+
+    let geo: serde_json::Value = match serde_json::from_str(geo_raw) {
+        Ok(value) => value,
+        Err(parse_err) => {
+            return err(format!(
+                "GeoParquet 'geo' metadata is not valid JSON: {parse_err}"
+            ));
+        }
+    };
+
+    let bbox = &geo["columns"]["geometry"]["covering"]["bbox"];
+    if !bbox.is_object() {
+        return err(
+            "GeoParquet covering is missing at geo.columns.geometry.covering.bbox".to_string(),
+        );
+    }
+
+    let mut diags = Vec::new();
+    for leaf in ["xmin", "ymin", "xmax", "ymax"] {
+        let expected = serde_json::json!(["bbox", leaf]);
+        if bbox[leaf] != expected {
+            diags.push(Diagnostic::error(
+                check_id,
+                Category::Schema,
+                artifact,
+                format!("GeoParquet covering bbox.{leaf} must reference [\"bbox\", \"{leaf}\"]"),
+            ));
+        }
+    }
+    diags
 }
