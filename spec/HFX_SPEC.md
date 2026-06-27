@@ -1,6 +1,6 @@
 # HFX - HydroFabric Exchange Specification
 
-**Version 0.2.1**
+**Version 0.3.0**
 
 ---
 
@@ -47,11 +47,11 @@ drainage unit. The outlet is distinct from optional snap features.
 | `graph.parquet` | Yes | Same-level upstream adjacency graph |
 | `manifest.json` | Yes | Dataset metadata and auxiliary declarations |
 
-Auxiliary artifacts such as D8 rasters are not first-class core files in v0.2.
-They are declared in `manifest.json` under `auxiliary[]` and validated according
-to their schema. HFX v0.2 blesses one auxiliary schema:
-[`hfx.aux.d8_raster.v1`](./aux/d8_raster/v1.md). HFX v0.2.1 also blesses
-optional snap features through [`hfx.aux.snap.v1`](./aux/snap/v1.md).
+Auxiliary artifacts such as D8 rasters are not first-class core files. They are
+declared in `manifest.json` under `auxiliary[]` and validated according to their
+schema. HFX v0.3.0 blesses two auxiliary schemas:
+[`hfx.aux.d8_raster.v1`](./aux/d8_raster/v1.md) for D8 rasters and
+[`hfx.aux.snap.v2`](./aux/snap/v2.md) for optional snap features.
 
 ---
 
@@ -70,10 +70,7 @@ One row per drainage unit.
 | `up_area_km2` | `float32` | Yes | Inclusive upstream drainage area at this unit's level, if precomputed |
 | `outlet_lon` | `float64` | No | Unit outlet longitude in EPSG:4326 |
 | `outlet_lat` | `float64` | No | Unit outlet latitude in EPSG:4326 |
-| `bbox_minx` | `float32` | No | Bounding box west |
-| `bbox_miny` | `float32` | No | Bounding box south |
-| `bbox_maxx` | `float32` | No | Bounding box east |
-| `bbox_maxy` | `float32` | No | Bounding box north |
+| `bbox` | `struct<xmin: float32, ymin: float32, xmax: float32, ymax: float32>` | No | GeoParquet 1.1 covering bounding box; all four leaves are non-nullable (see Bounding Box Covering) |
 | `geometry` | `binary` WKB | No | Polygon or MultiPolygon, EPSG:4326 |
 
 Allowed optional columns:
@@ -88,6 +85,49 @@ Allowed optional columns:
 `level_label` is unnormalized and not validated beyond type; engines MUST NOT
 parse it for behavior.
 
+### Bounding Box Covering
+
+The `bbox` column is a Parquet struct with four non-nullable `float32` leaves:
+`xmin`, `ymin`, `xmax`, and `ymax`. The struct column itself is non-nullable;
+every drainage unit has a bounding box. The leaves carry the per-row bounds of
+the unit's `geometry` in EPSG:4326: `xmin`/`xmax` are west/east longitude and
+`ymin`/`ymax` are south/north latitude.
+
+This struct is a [GeoParquet 1.1](https://geoparquet.org/releases/v1.1.0/)
+`covering`. A conformant `catchments.parquet` MUST declare the covering in the
+file-level `geo` metadata so standard spatial tools recognize the bbox for
+predicate pushdown. With `geometry` as the primary geometry column, the covering
+MUST be declared at the literal path
+`geo.columns.geometry.covering.bbox.{xmin,ymin,xmax,ymax}`, where each entry is
+the column-path reference to the matching struct leaf:
+
+```json
+{
+  "version": "1.1.0",
+  "primary_column": "geometry",
+  "columns": {
+    "geometry": {
+      "encoding": "WKB",
+      "geometry_types": ["Polygon", "MultiPolygon"],
+      "covering": {
+        "bbox": {
+          "xmin": ["bbox", "xmin"],
+          "ymin": ["bbox", "ymin"],
+          "xmax": ["bbox", "xmax"],
+          "ymax": ["bbox", "ymax"]
+        }
+      }
+    }
+  }
+}
+```
+
+All four covering references MUST point at leaves of the same struct column
+named `bbox`, per the GeoParquet 1.1 requirement that the four covering bbox
+references share one column. The covering metadata is table-level; the row-group
+statistics on the four leaves (see Spatial Partitioning) are what actually drive
+predicate pushdown over remote range reads.
+
 ### Spatial Partitioning
 
 - Rows MUST be sorted by Hilbert curve index computed on centroid
@@ -99,8 +139,8 @@ parse it for behavior.
   is present on `catchments.parquet`.
 - Files with fewer than 4,096 rows MUST contain exactly one row group.
 - Files with 4,096 or more rows MUST use row groups of 4,096-8,192 rows.
-- Parquet row-group statistics on `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
-  `bbox_maxy` MUST be written.
+- Parquet row-group statistics on the `bbox` struct leaves `bbox.xmin`,
+  `bbox.ymin`, `bbox.xmax`, and `bbox.ymax` MUST be written.
 
 Row-group sizing violations are WARN diagnostics in the reference validator and
 are promoted to ERROR under `--strict`.
@@ -190,7 +230,7 @@ arrays, hash maps, or any other runtime layout after loading.
 ## 3. Snap Features
 
 Snap features are optional auxiliary data declared with
-[`hfx.aux.snap.v1`](./aux/snap/v1.md), not a core root-level artifact.
+[`hfx.aux.snap.v2`](./aux/snap/v2.md), not a core root-level artifact.
 
 ---
 
@@ -228,7 +268,7 @@ Traversal policies and refinement policies are engine runtime parameters.
 
 ```json
 {
-  "format_version": "0.2.1",
+  "format_version": "0.3.0",
   "fabric_name": "example-fabric",
   "fabric_version": "2026.1",
   "crs": "EPSG:4326",
@@ -258,7 +298,7 @@ Traversal policies and refinement policies are engine runtime parameters.
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
-| `format_version` | string | Yes | MUST be `"0.2.1"` |
+| `format_version` | string | Yes | MUST be `"0.3.0"` |
 | `fabric_name` | string | Yes | Source fabric identifier. Lowercase ASCII, no whitespace |
 | `fabric_version` | string | No | Version of the source fabric |
 | `crs` | string | Yes | MUST be `"EPSG:4326"` in HFX v0.2 |
@@ -339,7 +379,7 @@ HFX does not prescribe a controlled vocabulary for `region`.
 
 ## Validation
 
-A conformant HFX v0.2.1 dataset MUST pass the following validation classes.
+A conformant HFX v0.3.0 dataset MUST pass the following validation classes.
 
 ### File Presence
 
@@ -347,11 +387,11 @@ A conformant HFX v0.2.1 dataset MUST pass the following validation classes.
 - Auxiliary artifacts are required only when referenced by `manifest.json`.
 - `graph.arrow` is a legacy v0.1 artifact and is not valid in v0.2.
 - `snap.parquet` at the dataset root is a legacy v0.2 artifact. Producers MUST
-  migrate snap features to `hfx.aux.snap.v1`.
+  migrate snap features to `hfx.aux.snap.v2`.
 
 ### Manifest
 
-- `format_version` MUST be `"0.2.1"`.
+- `format_version` MUST be `"0.3.0"`.
 - A v0.2 validator MUST reject v0.1 datasets with a clear unsupported-version
   diagnostic rather than attempting dual-reader compatibility.
 - Required fields MUST be present and well-typed.
@@ -410,8 +450,8 @@ still enforce these invariants during ETL.
 - Unknown third-party schemas receive structural validation only.
 - `hfx.aux.d8_raster.v1` requires `flow_dir` and `flow_acc` artifacts and a
   valid metadata block as defined in [`spec/aux/d8_raster/v1.md`](./aux/d8_raster/v1.md).
-- `hfx.aux.snap.v1` requires one `snap` artifact and a valid metadata block as
-  defined in [`spec/aux/snap/v1.md`](./aux/snap/v1.md).
+- `hfx.aux.snap.v2` requires one `snap` artifact and a valid metadata block as
+  defined in [`spec/aux/snap/v2.md`](./aux/snap/v2.md).
 
 ## Version Compatibility
 
@@ -436,6 +476,22 @@ Examples of breaking changes:
   value.
 - Removing a field.
 
+The 0.2.1 → 0.3.0 release is a worked example of a breaking MINOR bump. It
+replaces the four flat `float32` bbox columns (`bbox_minx`, `bbox_miny`,
+`bbox_maxx`, `bbox_maxy`) on `catchments.parquet` with a single non-nullable
+struct column `bbox` whose non-nullable leaves are `xmin`, `ymin`, `xmax`, and
+`ymax`, so the leaves can be declared as a GeoParquet 1.1 `covering`. This
+restructure removes four existing columns and adds one new required struct
+column — and equivalently retypes the bbox representation from four flat columns
+to one struct column — so it lands under "Removing a field", "Adding a REQUIRED
+column", and "Retyping an existing field" above. Any one of those
+classifications independently forces a MINOR bump rather than a PATCH. The
+companion `hfx.aux.snap.v2` schema restructures snap's optional bbox the same
+way; per the auxiliary versioning rule a breaking aux change increments the
+auxiliary `vN`, so snap moves from `v1` to `v2`. `graph.parquet` keeps its four
+flat bbox columns unchanged because it carries no geometry column to attach a
+covering to.
+
 To stay forward compatible with future compatible releases, engine and reader
 implementations:
 
@@ -445,23 +501,28 @@ implementations:
   currently allowed.
 
 This guidance describes forward-compatibility behavior for engine and reader
-implementations. The pinned 0.2.1 JSON Schema
+implementations. The pinned 0.3.0 JSON Schema
 (`schemas/manifest.schema.json`) sets `additionalProperties: false` and serves
-as an exact-match conformance tool for producers targeting 0.2.1.
+as an exact-match conformance tool for producers targeting 0.3.0.
 
-## Migration from v0.2
+## Migration from v0.2.1
 
-HFX v0.2.1 is a hard-cut manifest version. Producers migrating from v0.2 MUST:
+HFX v0.3.0 is a breaking MINOR bump over v0.2.1. Producers migrating from
+v0.2.1 MUST:
 
-- Set `manifest.json::format_version` to `"0.2.1"`.
-- Add `bbox_minx`, `bbox_miny`, `bbox_maxx`, and `bbox_maxy` to
-  `graph.parquet`.
-- Move root-level `snap.parquet` into one or more `hfx.aux.snap.v1`
-  declarations.
-- Allow `stem_role = "distributary"` where snap features represent a branch
-  diverging at a bifurcation.
-- Expect validators to enforce the `stem_role` enum; invalid values that were
-  previously unchecked are non-conformant in v0.2.1.
+- Set `manifest.json::format_version` to `"0.3.0"`.
+- Replace the four flat `bbox_minx`, `bbox_miny`, `bbox_maxx`, and `bbox_maxy`
+  columns on `catchments.parquet` with a single non-nullable struct column
+  `bbox` whose non-nullable leaves are `xmin`, `ymin`, `xmax`, and `ymax`.
+- Declare the `bbox` struct as a GeoParquet 1.1 `covering` at
+  `geo.columns.geometry.covering.bbox.{xmin,ymin,xmax,ymax}` and write Parquet
+  row-group statistics on the four struct leaves.
+- Migrate every `hfx.aux.snap.v1` declaration to
+  [`hfx.aux.snap.v2`](./aux/snap/v2.md), restructuring the optional flat snap
+  bbox columns into the nullable `bbox` struct with non-nullable leaves and the
+  same covering convention.
+- Leave `graph.parquet` unchanged: it carries no geometry column, so its four
+  flat bbox columns and their row-group-statistics rule are retained.
 
 ---
 
