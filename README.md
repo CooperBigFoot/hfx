@@ -1,18 +1,20 @@
 # HFX
 
-HFX (HydroFabric Exchange) is an open specification and toolkit for a compiled drainage format that lets watershed delineation engines consume any source hydrofabric through a single normalized contract.
+> **Just want to delineate watersheds?** You do not need this spec. Install the Python package (`pip install pyshed`) or use the reference engine, shed ([github.com/CooperBigFoot/shed](https://github.com/CooperBigFoot/shed)). Read on only if you are building or validating HFX datasets.
+
+HFX (HydroFabric Exchange) is an open specification and toolkit for a compiled drainage format that lets watershed delineation engines consume any source hydrofabric (a dataset describing a region's river network: the streams, how they connect, and the land area draining to each) through a single normalized contract.
 
 The core idea is simple: adapters compile source-specific hydrofabrics such as HydroBASINS, GRIT, or MERIT Hydro into HFX once, offline. Engines then consume HFX exclusively, with no fabric-specific logic in the hot path.
 
 ## Why HFX Exists
 
-Every hydrofabric comes with its own topology model, file format, identifier scheme, and edge-case behavior. Engines that try to support multiple fabrics directly tend to accumulate fabric-specific branching throughout loading, traversal, snapping, and validation code.
+Today a watershed delineation tool is usually wired to a single hydrofabric, so moving to a different fabric, or comparing results across several, means re-tooling the engine for each one's format, identifiers, and edge cases.
+The same fragmentation blocks AI agents and automated pipelines, which need one documented, machine-checkable contract to target instead of many bespoke, often undocumented formats.
+HFX is that contract, and it splits the work so each side stays simple:
 
-HFX separates those concerns:
-
-- Adapters handle source-specific ETL and normalization.
-- The engine reads one compiled contract.
-- Validation happens against the compiled dataset, not against every upstream source format.
+- Adapters handle the source-specific ETL and normalization, once and offline.
+- The engine reads one compiled contract, with no fabric-specific logic in its hot path.
+- A validator checks each compiled dataset, instead of every upstream source format.
 
 ## Architecture
 
@@ -34,14 +36,17 @@ An HFX dataset is a single folder containing these artifacts:
 
 | Artifact | Purpose |
 |---|---|
-| `catchments.parquet` | Drainage-unit polygons, levels, parent links, outlets, and bbox columns for row-group pruning |
-| `graph.parquet` | Same-level upstream adjacency graph |
+| `catchments.parquet` | Drainage-unit polygons (the area of land draining to each river reach), levels, parent links, outlets, and bbox columns for row-group pruning (skipping blocks of the Parquet file whose bounding boxes cannot overlap a query, so a remote read fetches less data) |
+| `graph.parquet` | Same-level upstream adjacency graph (a list of which drainage unit flows directly into which, used to traverse upstream) |
 | `snap.parquet` | Optional reach or node geometries used for outlet snapping |
-| `manifest.json` | Dataset metadata describing fabric identity, CRS, topology class, counts, and auxiliary declarations |
+| `manifest.json` | Dataset metadata describing fabric identity, CRS, topology class (the network's connectivity model, e.g. whether flow paths only branch apart or can also rejoin), counts, and auxiliary declarations |
 
-Auxiliary data such as paired D8 rasters is declared in `manifest.json`, for
-example with `hfx.aux.d8_raster.v1` entries pointing at `flow_dir.tif` and
-`flow_acc.tif`.
+Auxiliary data such as paired D8 rasters (a matched pair of grids in the D8 flow
+model, in which each cell drains to whichever of its 8 neighbors is steepest
+downhill) is declared in `manifest.json`, for example with `hfx.aux.d8_raster.v1`
+entries pointing at `flow_dir.tif` (the flow-direction grid) and `flow_acc.tif`
+(the flow-accumulation grid, the number of upstream cells draining through each
+cell).
 
 ## v0.2 Scope
 
@@ -54,7 +59,7 @@ Current design boundaries for HFX v0.2:
 - EPSG:4326 is required.
 - Each dataset is self-contained in a single folder.
 - The manifest describes the data, not engine traversal policy.
-- The graph supports both tree and DAG topologies.
+- The graph supports both tree and DAG topologies (in a tree, each drainage unit drains to exactly one downstream unit; in a DAG, a directed acyclic graph, a unit may drain to more than one downstream unit, as with braided or anabranching rivers, while flow never loops back on itself).
 - Adapter implementation is intentionally out of scope for the spec: any tool that produces conformant artifacts is valid.
 
 ## Repository Layout
