@@ -21,6 +21,7 @@ use arrow::array::{ArrayRef, Float32Array, Int64Array, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 /// Full dotted paths of the four covering-bbox struct leaves.
@@ -35,13 +36,13 @@ fn write_struct_bbox_parquet(path: &Path) {
     ]
     .into();
 
-    let xmin = Arc::new(Float32Array::from(vec![0.0f32, 1.0, 2.0])) as ArrayRef;
-    let ymin = Arc::new(Float32Array::from(vec![0.5f32, 1.5, 2.5])) as ArrayRef;
-    let xmax = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0])) as ArrayRef;
-    let ymax = Arc::new(Float32Array::from(vec![1.5f32, 2.5, 3.5])) as ArrayRef;
+    let xmin = Arc::new(Float32Array::from(vec![0.0f32, 1.0, 2.0, 3.0])) as ArrayRef;
+    let ymin = Arc::new(Float32Array::from(vec![0.5f32, 1.5, 2.5, 3.5])) as ArrayRef;
+    let xmax = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0])) as ArrayRef;
+    let ymax = Arc::new(Float32Array::from(vec![1.5f32, 2.5, 3.5, 4.5])) as ArrayRef;
 
     let bbox = StructArray::new(leaf_fields.clone(), vec![xmin, ymin, xmax, ymax], None);
-    let id = Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef;
+    let id = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])) as ArrayRef;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -51,8 +52,10 @@ fn write_struct_bbox_parquet(path: &Path) {
     let batch = RecordBatch::try_new(schema.clone(), vec![id, Arc::new(bbox) as ArrayRef]).unwrap();
 
     let file = File::create(path).unwrap();
-    // `None` == default WriterProperties, which enable column-chunk statistics.
-    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_size(2)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
@@ -66,8 +69,8 @@ fn struct_bbox_leaf_row_group_stats_are_present() {
     let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
     let meta = reader.metadata();
     assert!(
-        meta.num_row_groups() >= 1,
-        "expected at least one row group"
+        meta.num_row_groups() >= 2,
+        "expected at least two row groups"
     );
 
     for rg_idx in 0..meta.num_row_groups() {

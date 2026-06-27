@@ -130,7 +130,7 @@ def write_prototype_struct_catchments(out_path: Path) -> Path:
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pq.ParquetWriter(out_path, schema, write_statistics=True) as writer:
-        writer.write_table(table)
+        writer.write_table(table, row_group_size=2)
     return out_path
 
 
