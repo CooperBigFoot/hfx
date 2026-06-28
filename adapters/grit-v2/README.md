@@ -56,8 +56,8 @@ Subcommands, in pipeline order:
 - `catchments.parquet`
 - `graph.parquet`
 - `manifest.json`
-- `aux/snap_segments.parquet` — `hfx.aux.snap.v1` index `segment-stems` (references level 0)
-- `aux/snap_reaches.parquet` — `hfx.aux.snap.v1` index `reach-stems` (references level 1)
+- `aux/snap_segments.parquet` — `hfx.aux.snap.v2` index `segment-stems` (references level 0)
+- `aux/snap_reaches.parquet` — `hfx.aux.snap.v2` index `reach-stems` (references level 1)
 
 ## Validate Locally
 
