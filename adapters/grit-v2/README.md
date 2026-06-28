@@ -1,18 +1,18 @@
 # GRIT v2 → HFX Adapter
 
-Python adapter that compiles the [GRIT](https://zenodo.org/records/17435232) v1.0 vector hydrofabric into one planetary HFX v0.2.1 dataset with two drainage-unit levels: segment catchments (`level=0`) and reach catchments (`level=1`).
+Python adapter that compiles the [GRIT](https://zenodo.org/records/17435232) v1.0 vector hydrofabric into one planetary HFX v0.3.0 dataset with two drainage-unit levels: segment catchments (`level=0`) and reach catchments (`level=1`).
 
 ## Status
 
 Current reference adapter. This adapter compiled the hosted GRIT 2.0.0 reference dataset:
 
-<https://basin-delineations-public.upstream.tech/grit/2.0.0/>
+<https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/>
 
 The hosted manifest reports:
 
 | Property | Value |
 |---|---|
-| `format_version` | 0.2.1 |
+| `format_version` | 0.3.0 |
 | `fabric_name` | grit |
 | `fabric_version` | 1.0.0 |
 | `adapter_version` | grit-global-2.0.0 |

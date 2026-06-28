@@ -5,7 +5,7 @@ HFX adapters compile a source hydrofabric into the canonical HFX artifacts (mani
 | Path | Status | Purpose |
 |---|---|---|
 | [`_template/`](_template/) | scaffold | Starting point for new adapters — copy and fill in the nine numbered stages. |
-| [`grit-v2/`](grit-v2/) | current reference adapter | Produced the hosted `grit/2.0.0` dataset — `format_version` 0.2.1, `adapter_version` grit-global-2.0.0; planetary dag with segment (level 0) and reach (level 1) drainage units. |
+| [`grit-v2/`](grit-v2/) | current reference adapter | Produced the hosted `grit/hfx-v0.3.0` dataset — `format_version` 0.3.0, `adapter_version` grit-global-2.0.0; planetary dag with segment (level 0) and reach (level 1) drainage units. |
 | [`merit-v2/`](merit-v2/) | current reference implementation / worked example | Compiles MERIT-Basins + MERIT Hydro into HFX 0.2.1 locally — tree topology, D8 rasters as `hfx.aux.d8_raster.v1` COGs; per-basin, multi-basin, or planetary builds. |
 | [`grit/`](grit/) | historical (v1, format_version 0.1) | Compiled GRIT v1.0 regional segment catchments into the original HFX 0.1 layout. |
 | [`merit/`](merit/) | historical (v1, format_version 0.1) | Compiled MERIT-Basins v0.7 / v1.0_bugfix1 vectors plus MERIT Hydro rasters into per-basin HFX 0.1 datasets. |

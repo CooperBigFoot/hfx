@@ -73,7 +73,7 @@ the call, then:
 
 ## Post-fire assertions (human)
 
-- `curl -s .../grit/2.0.0/manifest.json | jq -r .format_version` -> `0.3.0`.
+- `curl -s .../grit/hfx-v0.3.0/manifest.json | jq -r .format_version` -> `0.3.0`.
 - The 5 data-object ETags CHANGED vs the pre-state listing (bytes were rewritten);
   the attribution-object ETags (`NOTICE`, `CITATION.txt`, `README.md`) UNCHANGED.
 - Re-run the validator on a fresh download -> exit 0.
