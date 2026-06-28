@@ -33,7 +33,7 @@ from shapely.geometry.base import BaseGeometry
 FABRIC_NAME = "grit"
 FABRIC_VERSION = "1.0.0"
 ADAPTER_VERSION = "grit-global-2.0.0"
-FORMAT_VERSION = "0.2.1"
+FORMAT_VERSION = "0.3.0"
 TOPOLOGY = "dag"
 CRS = "EPSG:4326"
 HAS_UP_AREA = True
@@ -94,8 +94,11 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
+
+
 def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
-    """Build GeoParquet 1.1 metadata for an Arrow schema."""
+    """Build GeoParquet 1.1 metadata (with `bbox` covering) for an Arrow schema."""
     geo = {
         "version": "1.1.0",
         "primary_column": "geometry",
@@ -103,10 +106,36 @@ def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
             "geometry": {
                 "encoding": "WKB",
                 "geometry_types": geometry_types,
+                "covering": {"bbox": {name: ["bbox", name] for name in BBOX_LEAF_NAMES}},
             },
         },
     }
     return {b"geo": json.dumps(geo).encode("utf-8")}
+
+
+def bbox_struct_type() -> pa.DataType:
+    """Struct type for the GeoParquet 1.1 covering `bbox` column (non-nullable leaves)."""
+    return pa.struct(
+        [pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES]
+    )
+
+
+def build_bbox_struct(minx, miny, maxx, maxy) -> pa.StructArray:
+    """Build the `bbox` struct array so its four float32 leaves carry row-group stats.
+
+    Uses pa.StructArray.from_arrays (NOT the pa.array([{...}]) list-of-dicts
+    anti-pattern, which does not propagate leaf stats) so the Parquet writer
+    records min/max on bbox.xmin / ymin / xmax / ymax. GATE-1 (s04) proven pattern.
+    """
+    return pa.StructArray.from_arrays(
+        [
+            pa.array(minx, type=pa.float32()),
+            pa.array(miny, type=pa.float32()),
+            pa.array(maxx, type=pa.float32()),
+            pa.array(maxy, type=pa.float32()),
+        ],
+        fields=[pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES],
+    )
 
 
 def assert_geoparquet_valid(out_path: Path) -> None:
@@ -1091,10 +1120,7 @@ def stage_6_write_catchments(source: SourceData, out_dir: Path) -> None:
             pa.field("up_area_km2", pa.float32(), nullable=True),
             pa.field("outlet_lon", pa.float64(), nullable=False),
             pa.field("outlet_lat", pa.float64(), nullable=False),
-            pa.field("bbox_minx", pa.float32(), nullable=False),
-            pa.field("bbox_miny", pa.float32(), nullable=False),
-            pa.field("bbox_maxx", pa.float32(), nullable=False),
-            pa.field("bbox_maxy", pa.float32(), nullable=False),
+            pa.field("bbox", bbox_struct_type(), nullable=False),
             pa.field("geometry", pa.binary(), nullable=False),
             pa.field("source_id", pa.string(), nullable=True),
             pa.field("level_label", pa.string(), nullable=True),
@@ -1111,10 +1137,12 @@ def stage_6_write_catchments(source: SourceData, out_dir: Path) -> None:
             pa.array(up_area, type=pa.float32()),
             pa.array(units["outlet_lon"].astype("float64").tolist(), type=pa.float64()),
             pa.array(units["outlet_lat"].astype("float64").tolist(), type=pa.float64()),
-            pa.array(units["bbox_minx"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(units["bbox_miny"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(units["bbox_maxx"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(units["bbox_maxy"].astype("float32").tolist(), type=pa.float32()),
+            build_bbox_struct(
+                units["bbox_minx"].astype("float32").tolist(),
+                units["bbox_miny"].astype("float32").tolist(),
+                units["bbox_maxx"].astype("float32").tolist(),
+                units["bbox_maxy"].astype("float32").tolist(),
+            ),
             pa.array(units["geometry_wkb"].tolist(), type=pa.binary()),
             pa.array(units["source_id"].astype(str).tolist(), type=pa.string()),
             pa.array(units["level_label"].astype(str).tolist(), type=pa.string()),
@@ -1198,7 +1226,7 @@ def stage_9_write_manifest(source: SourceData, out_dir: Path) -> None:
         "adapter_version": ADAPTER_VERSION,
         "auxiliary": [
             {
-                "schema": "hfx.aux.snap.v1",
+                "schema": "hfx.aux.snap.v2",
                 "artifacts": {"snap": "aux/snap_segments.parquet"},
                 "metadata": {
                     "name": "segment-stems",
@@ -1208,7 +1236,7 @@ def stage_9_write_manifest(source: SourceData, out_dir: Path) -> None:
                 },
             },
             {
-                "schema": "hfx.aux.snap.v1",
+                "schema": "hfx.aux.snap.v2",
                 "artifacts": {"snap": "aux/snap_reaches.parquet"},
                 "metadata": {
                     "name": "reach-stems",
@@ -1244,10 +1272,7 @@ def _write_snap_file(shards: tuple[Path, ...], id_map: pd.DataFrame, level: int,
             pa.field("unit_id", pa.int64(), nullable=False),
             pa.field("weight", pa.float32(), nullable=False),
             pa.field("stem_role", pa.string(), nullable=True),
-            pa.field("bbox_minx", pa.float32(), nullable=True),
-            pa.field("bbox_miny", pa.float32(), nullable=True),
-            pa.field("bbox_maxx", pa.float32(), nullable=True),
-            pa.field("bbox_maxy", pa.float32(), nullable=True),
+            pa.field("bbox", bbox_struct_type(), nullable=True),
             pa.field("geometry", pa.binary(), nullable=False),
         ]
     ).with_metadata(build_geo_metadata(["LineString", "MultiLineString"]))
@@ -1257,10 +1282,12 @@ def _write_snap_file(shards: tuple[Path, ...], id_map: pd.DataFrame, level: int,
             pa.array(snap["unit_id"].astype("int64").tolist(), type=pa.int64()),
             pa.array(snap["weight"].astype("float32").tolist(), type=pa.float32()),
             pa.array(snap["stem_role"].astype(str).tolist(), type=pa.string()),
-            pa.array(snap["bbox_minx"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(snap["bbox_miny"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(snap["bbox_maxx"].astype("float32").tolist(), type=pa.float32()),
-            pa.array(snap["bbox_maxy"].astype("float32").tolist(), type=pa.float32()),
+            build_bbox_struct(
+                snap["bbox_minx"].astype("float32").tolist(),
+                snap["bbox_miny"].astype("float32").tolist(),
+                snap["bbox_maxx"].astype("float32").tolist(),
+                snap["bbox_maxy"].astype("float32").tolist(),
+            ),
             pa.array(snap["geometry_wkb"].tolist(), type=pa.binary()),
         ],
         schema=schema,
