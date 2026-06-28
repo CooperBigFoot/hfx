@@ -10,6 +10,28 @@ changes.
 
 Nothing yet.
 
+## [0.4.0] - 2026-06-28
+
+Breaking MINOR bump implementing **HFX spec 0.3.0** (the GeoParquet bbox
+covering break). `hfx-core` and `hfx-validator` both release as 0.4.0 in
+lockstep; the validator pins `hfx-core` with an exact `=0.4.0` dependency.
+
+### Changed
+
+- `hfx-validator` now reads the `catchments.parquet` and snap `bbox` as a
+  single [GeoParquet 1.1](https://geoparquet.org/releases/v1.1.0/) `covering`
+  struct (`xmin`, `ymin`, `xmax`, `ymax`) instead of four flat `bbox_minx…`
+  columns, validates the covering metadata at
+  `geo.columns.geometry.covering.bbox`, and reads the required row-group
+  statistics from the struct leaves. `graph.parquet` stays flat (no geometry).
+- `manifest.json::format_version` is hard-cut to `"0.3.0"`; datasets declaring
+  `"0.2.1"` or earlier are rejected with `manifest.unsupported_format_version`.
+- Snap auxiliary declarations move to `hfx.aux.snap.v2`; `hfx.aux.snap.v1` is no
+  longer blessed.
+- `hfx-core` adds `FormatVersion::V0_3_0` and replaces
+  `BlessedAuxSchema::SnapV1` with `BlessedAuxSchema::SnapV2`.
+- The `hfx-validator` → `hfx-core` dependency pin moves to `=0.4.0`.
+
 ## [0.3.0] - 2026-06-12
 
 First curated release of the HFX toolkit under the two-track version policy

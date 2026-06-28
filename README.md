@@ -122,14 +122,14 @@ Manifest: <https://basin-delineations-public.upstream.tech/grit/2.0.0/manifest.j
 
 | Property | Value |
 |---|---|
-| `format_version` | 0.2.1 |
+| `format_version` | 0.3.0 |
 | `fabric_name` | grit |
 | `fabric_version` | 1.0.0 |
 | `adapter_version` | grit-global-2.0.0 |
 | `unit_count` | 22,337,300 |
 | `topology` | dag |
 | CRS | EPSG:4326 |
-| Auxiliaries | two `hfx.aux.snap.v1` snap indexes (segment-stems, reach-stems) |
+| Auxiliaries | two `hfx.aux.snap.v2` snap indexes (segment-stems, reach-stems) |
 | Total size | ~43 GB (43,361,501,501 bytes) |
 
 **Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/2.0.0/`):
@@ -155,7 +155,7 @@ hfx ./path/to/dataset --strict
 
 ## Versioning
 
-HFX carries two independent version tracks: the SPEC track is the format version itself (`format_version`, currently 0.2.1 and frozen), while the TOOLKIT track covers the lockstep workspace crates `hfx-core` and `hfx-validator`, whose next curated release is 0.3.0. See [docs/VERSIONING.md](./docs/VERSIONING.md) for the full policy, the spec-to-toolkit mapping table, and the release procedure.
+HFX carries two independent version tracks: the SPEC track is the format version itself (`format_version`, currently 0.3.0), while the TOOLKIT track covers the lockstep workspace crates `hfx-core` and `hfx-validator`, whose next curated release is 0.4.0 (implementing spec 0.3.0). See [docs/VERSIONING.md](./docs/VERSIONING.md) for the full policy, the spec-to-toolkit mapping table, and the release procedure.
 
 ## Implementations
 
@@ -165,4 +165,4 @@ Contributions are welcome on the adapter side: a HydroBASINS adapter is the most
 
 ## Status
 
-HFX spec 0.2.1 is frozen, and the hosted GRIT 2.0.0 dataset conforms to it. The crates.io releases of [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator) predate the curated-release policy; the next curated toolkit release will be 0.3.0.
+HFX spec 0.3.0 is the current format version, and the hosted GRIT 2.0.0 dataset conforms to it. [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator) 0.3.0 are published on crates.io; the next curated toolkit release, 0.4.0, implements spec 0.3.0.
