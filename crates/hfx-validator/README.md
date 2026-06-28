@@ -68,21 +68,29 @@ hfx <DATASET_PATH> [--format text|json] [--strict] [--skip-rasters] [--sample-pc
 
 Exit codes: `0` = valid, `1` = invalid.
 
-## v0.2.1 Changes
+## v0.3.0 Changes
 
-- `manifest.json::format_version` is hard-cut to `"0.2.1"`; `"0.2"` and
-  `"0.1"` are rejected with `manifest.unsupported_format_version`.
-- `graph.parquet` now requires `bbox_minx`, `bbox_miny`, `bbox_maxx`, and
-  `bbox_maxy`, plus row-group bbox statistics and row-group layout checks.
+- `manifest.json::format_version` is hard-cut to `"0.3.0"`; `"0.2.1"`, `"0.2"`,
+  and `"0.1"` are rejected with `manifest.unsupported_format_version`.
+- `catchments.parquet` and snap files carry the bounding box as a single `bbox`
+  struct with four `float32` leaves (`xmin`, `ymin`, `xmax`, `ymax`) declared as
+  a [GeoParquet 1.1](https://geoparquet.org/releases/v1.1.0/) `covering`, so
+  standard spatial tools recognize the bbox for predicate pushdown. The required
+  row-group statistics now sit on the struct leaves (`bbox.xmin`, `bbox.ymin`,
+  `bbox.xmax`, `bbox.ymax`), and the validator checks the covering metadata at
+  `geo.columns.geometry.covering.bbox`.
+- Snap features are declared with `hfx.aux.snap.v2`; the previous v1 snap schema
+  is no longer blessed.
+- `graph.parquet` is unchanged: it carries no geometry column, so it keeps its
+  four flat `bbox_minx`, `bbox_miny`, `bbox_maxx`, `bbox_maxy` columns plus their
+  row-group statistics and layout checks.
 - Multi-level `catchments.parquet` and `graph.parquet` must be ordered by
   non-decreasing `level`. Hilbert ordering remains deferred until curve
   parameters are specified.
-- Root-level `snap.parquet` is removed from the core format. Snap features move
-  to one or more `hfx.aux.snap.v1` auxiliary declarations.
-- `stem_role` now allows `distributary`, and the validator now enforces the
-  `stem_role` enum. This was unchecked in v0.2.
-- Snap auxiliary `weight` values must be finite and non-negative, and
-  `metadata.references_levels` must include every referenced catchment level.
+- `stem_role` allows `mainstem`, `tributary`, `distributary`, or `unknown`, and
+  the validator enforces the enum. Snap `weight` values must be finite and
+  non-negative, and `metadata.references_levels` must include every referenced
+  catchment level.
 
 ## Diagnostic Capping
 

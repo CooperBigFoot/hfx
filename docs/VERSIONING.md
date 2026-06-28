@@ -12,8 +12,9 @@ and records the release procedure for the toolkit.
 
 ## Spec track (`format_version`)
 
-The spec version is currently **0.2.1** and is frozen: the 0.2.1 wire shape
-does not change. SemVer semantics for `format_version` — what counts as a
+The spec version is currently **0.3.0**: the 0.3.0 wire shape replaced the four
+flat catchments/snap bbox columns with a single GeoParquet 1.1 `bbox` covering
+struct (a breaking change over 0.2.1). SemVer semantics for `format_version` — what counts as a
 compatible change versus a breaking change while MAJOR is 0 — are defined
 normatively in the spec's
 [Version Compatibility](../spec/HFX_SPEC.md#version-compatibility) section.
@@ -34,27 +35,28 @@ The authoritative locations for the current spec version are:
 The toolkit is the pair of workspace crates `hfx-core` and `hfx-validator`
 (the `hfx-validator` crate installs a binary named `hfx`). They move in
 lockstep: both inherit the workspace version via `version.workspace = true` in
-the root `Cargo.toml`. The current workspace version is 0.3.0.
+the root `Cargo.toml`. The current workspace version is 0.4.0.
 
 Toolkit releases follow Rust SemVer over the crate API and the `hfx` CLI
 surface. While MAJOR is 0, a MINOR bump signals a breaking change to either
 surface. `v*` git tags belong to this track.
 
-crates.io currently has `hfx-core` 0.2.0 and `hfx-validator` 0.1.26. Both are
-stale — they predate the curated-release policy. The next curated release is
-**0.3.0** for both crates, tagged `v0.3.0`, fired by a human maintainer.
+crates.io currently has `hfx-core` 0.3.0 and `hfx-validator` 0.3.0 — the first
+curated release under this policy. The next curated release is **0.4.0** for
+both crates, tagged `v0.4.0`, fired by a human maintainer.
 
 ## Spec-to-toolkit mapping
 
 Each toolkit release implements exactly one spec version.
-hfx-validator 0.3.0 implements HFX spec 0.2.1. The published 0.2.0 / 0.1.26
-crates target the legacy 0.1-era format and should not be used against current
-datasets.
+hfx-validator 0.4.0 implements HFX spec 0.3.0; the published 0.3.0 crates
+implement the previous HFX spec 0.2.1. The legacy 0.2.0 / 0.1.26 crates target
+the 0.1-era format and should not be used against current datasets.
 
 | Toolkit release | Spec version implemented | Status |
 |---|---|---|
 | hfx-core 0.2.0 / hfx-validator 0.1.26 (crates.io) | legacy 0.1-era format | superseded |
-| hfx-core 0.3.0 / hfx-validator 0.3.0 | HFX spec 0.2.1 | planned |
+| hfx-core 0.3.0 / hfx-validator 0.3.0 (crates.io) | HFX spec 0.2.1 | released |
+| hfx-core 0.4.0 / hfx-validator 0.4.0 | HFX spec 0.3.0 | planned |
 
 ## Release procedure (toolkit)
 
@@ -77,5 +79,6 @@ push tags, and never publish to crates.io. The procedure:
 8. Publish `hfx-core` first, wait for the crates.io index to pick it up, then
    publish `hfx-validator`. Publishing is human-fired.
 
-Spec releases are independent of this procedure: the frozen spec does not
-block toolkit releases.
+Spec releases are independent of this procedure: the spec and toolkit tracks
+version independently, so a spec change does not block a toolkit release and
+vice versa.
