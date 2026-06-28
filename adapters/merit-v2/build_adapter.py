@@ -38,7 +38,7 @@ from shapely.ops import nearest_points
 FABRIC_NAME = "merit_basins"
 FABRIC_VERSION = "v0.7_bugfix1"
 ADAPTER_VERSION = "0.2.0"
-FORMAT_VERSION = "0.2.1"
+FORMAT_VERSION = "0.3.0"
 CRS = "EPSG:4326"
 TOPOLOGY = "tree"
 HAS_UP_AREA = True
@@ -161,14 +161,48 @@ def run_stage(ctx: BuildContext, label: str, fn, *args):
     return result
 
 
+BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
+
+
 def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
-    """Build GeoParquet 1.1 metadata for an Arrow schema."""
+    """Build GeoParquet 1.1 metadata (with `bbox` covering) for an Arrow schema."""
     geo = {
         "version": "1.1.0",
         "primary_column": "geometry",
-        "columns": {"geometry": {"encoding": "WKB", "geometry_types": geometry_types}},
+        "columns": {
+            "geometry": {
+                "encoding": "WKB",
+                "geometry_types": geometry_types,
+                "covering": {"bbox": {name: ["bbox", name] for name in BBOX_LEAF_NAMES}},
+            }
+        },
     }
     return {b"geo": json.dumps(geo).encode("utf-8")}
+
+
+def bbox_struct_type() -> pa.DataType:
+    """Struct type for the GeoParquet 1.1 covering `bbox` column (non-nullable leaves)."""
+    return pa.struct(
+        [pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES]
+    )
+
+
+def build_bbox_struct(minx, miny, maxx, maxy) -> pa.StructArray:
+    """Build the `bbox` struct array so its four float32 leaves carry row-group stats.
+
+    Uses pa.StructArray.from_arrays (NOT the pa.array([{...}]) list-of-dicts
+    anti-pattern, which does not propagate leaf stats) so the Parquet writer
+    records min/max on bbox.xmin / ymin / xmax / ymax. GATE-1 (s04) proven pattern.
+    """
+    return pa.StructArray.from_arrays(
+        [
+            pa.array(minx, type=pa.float32()),
+            pa.array(miny, type=pa.float32()),
+            pa.array(maxx, type=pa.float32()),
+            pa.array(maxy, type=pa.float32()),
+        ],
+        fields=[pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES],
+    )
 
 
 def assert_geoparquet_valid(out_path: Path) -> None:
@@ -428,10 +462,7 @@ def stage_6_write_catchments(source: SourceData, catchments: gpd.GeoDataFrame, c
             pa.field("up_area_km2", pa.float32(), nullable=True),
             pa.field("outlet_lon", pa.float64(), nullable=False),
             pa.field("outlet_lat", pa.float64(), nullable=False),
-            pa.field("bbox_minx", pa.float32(), nullable=False),
-            pa.field("bbox_miny", pa.float32(), nullable=False),
-            pa.field("bbox_maxx", pa.float32(), nullable=False),
-            pa.field("bbox_maxy", pa.float32(), nullable=False),
+            pa.field("bbox", bbox_struct_type(), nullable=False),
             pa.field("geometry", pa.binary(), nullable=False),
             pa.field("source_id", pa.string(), nullable=True),
             pa.field("level_label", pa.string(), nullable=True),
@@ -448,10 +479,12 @@ def stage_6_write_catchments(source: SourceData, catchments: gpd.GeoDataFrame, c
         pa.array(up_area, type=pa.float32()),
         pa.array(outlet_lon, type=pa.float64()),
         pa.array(outlet_lat, type=pa.float64()),
-        pa.array(bounds["bbox_minx"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_miny"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_maxx"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_maxy"].astype("float32").to_numpy(), type=pa.float32()),
+        build_bbox_struct(
+            bounds["bbox_minx"].astype("float32").to_numpy(),
+            bounds["bbox_miny"].astype("float32").to_numpy(),
+            bounds["bbox_maxx"].astype("float32").to_numpy(),
+            bounds["bbox_maxy"].astype("float32").to_numpy(),
+        ),
         pa.array(catchments.geometry.to_wkb(hex=False).tolist(), type=pa.binary()),
         pa.array([f"merit:{int(unit_id)}" for unit_id in ids], type=pa.string()),
         pa.array(["merit-basins"] * row_count, type=pa.string()),
@@ -571,10 +604,7 @@ def stage_8_write_snap(source: SourceData, ctx: BuildContext) -> None:
             pa.field("unit_id", pa.int64(), nullable=False),
             pa.field("weight", pa.float32(), nullable=False),
             pa.field("stem_role", pa.string(), nullable=True),
-            pa.field("bbox_minx", pa.float32(), nullable=True),
-            pa.field("bbox_miny", pa.float32(), nullable=True),
-            pa.field("bbox_maxx", pa.float32(), nullable=True),
-            pa.field("bbox_maxy", pa.float32(), nullable=True),
+            pa.field("bbox", bbox_struct_type(), nullable=True),
             pa.field("geometry", pa.binary(), nullable=False),
         ]
     ).with_metadata(build_geo_metadata(["LineString"]))
@@ -583,10 +613,12 @@ def stage_8_write_snap(source: SourceData, ctx: BuildContext) -> None:
         pa.array(rivers["COMID"].astype("int64").to_numpy(), type=pa.int64()),
         pa.array(rivers["uparea"].astype("float32").to_numpy(), type=pa.float32()),
         pa.array([roles[int(comid)] for comid in rivers["COMID"]], type=pa.string()),
-        pa.array(bounds["bbox_minx"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_miny"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_maxx"].astype("float32").to_numpy(), type=pa.float32()),
-        pa.array(bounds["bbox_maxy"].astype("float32").to_numpy(), type=pa.float32()),
+        build_bbox_struct(
+            bounds["bbox_minx"].astype("float32").to_numpy(),
+            bounds["bbox_miny"].astype("float32").to_numpy(),
+            bounds["bbox_maxx"].astype("float32").to_numpy(),
+            bounds["bbox_maxy"].astype("float32").to_numpy(),
+        ),
         pa.array(rivers.geometry.to_wkb(hex=False).tolist(), type=pa.binary()),
     ]
     out_path = snap_dir / "snap_stems.parquet"
@@ -683,7 +715,7 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
         "adapter_version": ADAPTER_VERSION,
         "auxiliary": [
             {
-                "schema": "hfx.aux.snap.v1",
+                "schema": "hfx.aux.snap.v2",
                 "artifacts": {"snap": "aux/snap_stems.parquet"},
                 "metadata": {
                     "name": "stems",
