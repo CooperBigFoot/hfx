@@ -130,7 +130,7 @@ Manifest: <https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manif
 | `topology` | dag |
 | CRS | EPSG:4326 |
 | Auxiliaries | two `hfx.aux.snap.v2` snap indexes (segment-stems, reach-stems) |
-| Total size | ~43 GB (43,361,501,501 bytes) |
+| Total size | ~43 GB |
 
 **Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/`):
 
