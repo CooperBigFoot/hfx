@@ -772,7 +772,7 @@ def _git_head() -> str:
 
 def _fallback_segment_lines(fallback: dict) -> str:
     lines: list[str] = []
-    for region in REGIONS:
+    for region in REGION_CODES:
         region_summary = fallback.get("by_region", {}).get(region)
         if not region_summary:
             continue
