@@ -118,7 +118,7 @@ One reference dataset is hosted on Cloudflare R2 and readable directly over HTTP
 
 An HFX compilation of the Global River Topology (GRIT) vector datasets, with segment (`level=0`) and reach (`level=1`) drainage units.
 
-Manifest: <https://basin-delineations-public.upstream.tech/grit/2.0.0/manifest.json>
+Manifest: <https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manifest.json>
 
 | Property | Value |
 |---|---|
@@ -130,9 +130,9 @@ Manifest: <https://basin-delineations-public.upstream.tech/grit/2.0.0/manifest.j
 | `topology` | dag |
 | CRS | EPSG:4326 |
 | Auxiliaries | two `hfx.aux.snap.v2` snap indexes (segment-stems, reach-stems) |
-| Total size | ~43 GB (43,361,501,501 bytes) |
+| Total size | ~43 GB |
 
-**Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/2.0.0/`):
+**Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/`):
 
 - `manifest.json`
 - `catchments.parquet`

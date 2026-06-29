@@ -5,8 +5,10 @@
 #
 # Re-uploads the GRIT 2.0.0 dataset rebuilt with the HFX v0.3.0 GeoParquet bbox
 # covering struct (manifest format_version 0.3.0, validated by hfx toolkit
-# 0.4.0). It OVERWRITES the 5 data objects under grit/2.0.0/ in place (default;
-# see OD-8 change point below). Because this is a real dataset publish, the
+# 0.4.0). It PUBLISHES the 5 data objects under the NEW additive prefix
+# grit/hfx-v0.3.0/ (OD-8 chosen: new prefix, not in-place). This deletes
+# nothing: the legacy grit/2.0.0/ dataset (format_version 0.2.1) stays live for
+# clients pinned to pyshed 0.2.4. Because this is a real dataset publish, the
 # manifest is uploaded LAST so a reader never sees a 0.3.0 manifest pointing at
 # not-yet-uploaded data.
 #
@@ -32,13 +34,13 @@ set -euo pipefail
 
 # ============================================================================
 # OD-8 CHANGE POINT -- ONE LINE.
-# Default: in-place overwrite of the published dataset at grit/2.0.0/.
-# To publish the 0.3.0 build under a NEW prefix instead (OD-8 decision reserved
-# for Nik -- see planning/milestone-alden-feedback/pending-human-decisions.md),
-# change ONLY the line below, e.g.  TARGET_PREFIX="grit/2.0.0-covering/"
+# OD-8 decision (Nik -- see planning/milestone-alden-feedback/pending-human-decisions.md):
+# publish the 0.3.0 build under the NEW additive prefix grit/hfx-v0.3.0/. The
+# legacy grit/2.0.0/ dataset (format_version 0.2.1) stays live and is NOT touched
+# by this script. To target a different prefix, change ONLY the line below.
 # The scope guard regex is DERIVED from this constant, so it tracks whatever
 # prefix you choose; nothing else needs to change.
-TARGET_PREFIX="grit/2.0.0/"
+TARGET_PREFIX="grit/hfx-v0.3.0/"
 # ============================================================================
 
 usage() {
@@ -105,8 +107,8 @@ ALLOW_LIST=(
 )
 
 # Scope guard regex, DERIVED from TARGET_PREFIX (dot-escaped, anchored). With the
-# default TARGET_PREFIX this is exactly  ^grit/2\.0\.0/  -- the prefix outside of
-# which no key may ever be written.
+# default TARGET_PREFIX this is exactly  ^grit/hfx-v0\.3\.0/  -- the prefix outside
+# of which no key may ever be written.
 GUARD_RE="^$(printf '%s' "$TARGET_PREFIX" | sed 's/\./\\./g')"
 
 content_type_for() {
@@ -178,7 +180,7 @@ guard_ops() {
     done
   fi
   if [[ ${#dests[@]} -eq 0 ]]; then
-    printf 'FATAL: no upload candidates found under %s (expected the 5 grit/2.0.0 data objects)\n' "$STAGING" >&2
+    printf 'FATAL: no upload candidates found under %s (expected the 5 grit/hfx-v0.3.0 data objects)\n' "$STAGING" >&2
     exit 1
   fi
   assert_keys_in_scope "${dests[@]}"

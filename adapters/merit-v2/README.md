@@ -1,6 +1,6 @@
 # MERIT v2 → HFX Adapter
 
-Python adapter that compiles [MERIT-Basins](https://www.reachhydro.org/home/params/merit-basins) vector hydrography and MERIT Hydro D8 rasters into HFX v0.2.1 datasets — one dataset per Pfafstetter Level-2 basin, or multi-basin and planetary builds.
+Python adapter that compiles [MERIT-Basins](https://www.reachhydro.org/home/params/merit-basins) vector hydrography and MERIT Hydro D8 rasters into HFX v0.3.0 datasets — one dataset per Pfafstetter Level-2 basin, or multi-basin and planetary builds.
 
 ## Status
 
@@ -12,7 +12,7 @@ This adapter doubles as the **worked example** for authoring new adapters — fo
 
 | Property | Value |
 |---|---|
-| `format_version` | 0.2.1 |
+| `format_version` | 0.3.0 |
 | `fabric_name` | merit_basins |
 | `fabric_version` | v0.7_bugfix1 |
 | `adapter_version` | 0.2.0 |
@@ -20,7 +20,7 @@ This adapter doubles as the **worked example** for authoring new adapters — fo
 | CRS | EPSG:4326 |
 | `has_up_area` | true |
 
-D8 rasters are transcoded to Cloud-Optimized GeoTIFFs at `aux/d8/pfaf_<NN>/flow_dir.tif` and `aux/d8/pfaf_<NN>/flow_acc.tif`, declared as `hfx.aux.d8_raster.v1` auxiliary entries with `flow_dir_encoding = "esri"`. Reach centerlines ship as one `hfx.aux.snap.v1` index (`stems`) at `aux/snap_stems.parquet`.
+D8 rasters are transcoded to Cloud-Optimized GeoTIFFs at `aux/d8/pfaf_<NN>/flow_dir.tif` and `aux/d8/pfaf_<NN>/flow_acc.tif`, declared as `hfx.aux.d8_raster.v1` auxiliary entries with `flow_dir_encoding = "esri"`. Reach centerlines ship as one `hfx.aux.snap.v2` index (`stems`) at `aux/snap_stems.parquet`.
 
 ## Inputs (public sources)
 
