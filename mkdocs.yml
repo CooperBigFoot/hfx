@@ -1,0 +1,58 @@
+site_name: HFX
+site_url: https://cooperbigfoot.github.io/hfx/
+site_description: HFX (HydroFabric Exchange) specification and toolkit documentation.
+repo_url: https://github.com/CooperBigFoot/hfx
+
+theme:
+  name: material
+
+# Plugins: search only. mkdocs-material ships pymdown-extensions as a hard
+# dependency, so pymdownx.snippets adds no plugin beyond search and keeps the
+# Material + search-only tooling constraint intact.
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.snippets:
+      # base_path is resolved to the directory holding this mkdocs.yml (repo
+      # root), so snippet paths like "spec/HFX_SPEC.md" resolve from the root.
+      # !relative $config_dir MUST be an UNQUOTED YAML tag. Quoting it makes it
+      # a literal string, the tag never fires, and the strict build dies with
+      # "SnippetMissingError: Snippet at path 'spec/CHANGELOG.md' could not be
+      # found". Write it exactly as the two lines below.
+      base_path:
+        - !relative $config_dir
+      # check_paths makes a missing snippet source a hard build error, which
+      # preserves the single-source guarantee if a canonical file ever moves.
+      check_paths: true
+
+# exclude_docs mirrors the CI grep exclusions in .github/workflows/ci.yml.
+# mkdocs --strict does NOT fail on pages missing from nav, so without this list
+# the repo-internal records and legacy pages would be built and published:
+#   decisions/  -> internal ADRs
+#   plans/      -> gitignored plans (would make local and CI builds diverge)
+#   releases/   -> release notes
+#   VERSIONING.md, ADAPTER_GUIDE.md -> legacy pages a later step rewrites
+#   STYLE.md    -> contributor-facing authoring guide
+# Any future README.md placed inside docs/ MUST be added here as well.
+exclude_docs: |
+  STYLE.md
+  decisions/
+  plans/
+  releases/
+  VERSIONING.md
+  ADAPTER_GUIDE.md
+
+validation:
+  links:
+    anchors: warn
+
+nav:
+  - Home: index.md
+  - Specification:
+      - Specification: spec/HFX_SPEC.md
+      - "Auxiliary: D8 raster v1": spec/aux/d8_raster/v1.md
+      - "Auxiliary: snap v2": spec/aux/snap/v2.md
+      - "Auxiliary: snap v1 (historical)": spec/aux/snap/v1.md
+      - Changelog: spec/CHANGELOG.md

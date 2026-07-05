@@ -482,8 +482,8 @@ replaces the four flat `float32` bbox columns (`bbox_minx`, `bbox_miny`,
 struct column `bbox` whose non-nullable leaves are `xmin`, `ymin`, `xmax`, and
 `ymax`, so the leaves can be declared as a GeoParquet 1.1 `covering`. This
 restructure removes four existing columns and adds one new required struct
-column — and equivalently retypes the bbox representation from four flat columns
-to one struct column — so it lands under "Removing a field", "Adding a REQUIRED
+column, and equivalently retypes the bbox representation from four flat columns
+to one struct column, so it lands under "Removing a field", "Adding a REQUIRED
 column", and "Retyping an existing field" above. Any one of those
 classifications independently forces a MINOR bump rather than a PATCH. The
 companion `hfx.aux.snap.v2` schema restructures snap's optional bbox the same

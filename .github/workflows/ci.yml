@@ -140,3 +140,39 @@ jobs:
           schema_v=$(jq -r '.properties.format_version.const' schemas/manifest.schema.json)
           echo "spec=$spec_v schema=$schema_v"
           test "$spec_v" = "$schema_v"
+
+  docs:
+    name: Docs style and strict build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Ban em dash (U+2014)
+        run: |
+          EMDASH="$(printf '\342\200\224')"
+          if grep -rn --include='*.md' \
+            --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
+            --exclude=VERSIONING.md --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+            -e "$EMDASH" docs/ spec/; then
+            echo 'Style ban: em dash (U+2014) in docs sources. See docs/STYLE.md.'
+            exit 1
+          fi
+
+      - name: Ban contrastive negation
+        run: |
+          if grep -rniE --include='*.md' \
+            --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
+            --exclude=VERSIONING.md --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+            "\b(it|this|that|they)('s|'re| is| are| was| were)?(n't| not)\b[^.]{0,80}[,;:] ?(it|this|that|they)('s|'re| is| are| was| were)\b" \
+            docs/ spec/; then
+            echo 'Style ban: contrastive negation in docs sources. State what it is. See docs/STYLE.md.'
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build docs (strict)
+        run: make docs
