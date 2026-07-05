@@ -40,7 +40,7 @@ The second layer is GeoParquet 1.1 structural validation via `validate_geoparque
 
 - **`bbox_*` column statistics missing in Parquet row groups** — ensure `pq.ParquetWriter` is opened with `write_statistics=True` (the default) and that `bbox_minx`, `bbox_miny`, `bbox_maxx`, `bbox_maxy` are top-level `float32` columns.  If they are nested inside a struct column, Parquet statistics are not written for them and the engine cannot prune row groups.
 
-- **`hfx: command not found`** — install the validator with `cargo install hfx-validator`, or run it from the repo root with `cargo run -p hfx-validator -- <dataset-path> --strict`.
+- **`hfx: command not found`** — install the validator with `cargo install --path crates/hfx-cli`, or run it from the repo root with `cargo run -p hfx-cli -- <dataset-path> --strict`.
 
 - **Row-group size outside `[4096, 8192]`** — vendor the `balanced_row_group_bounds` helper from `adapters/grit/build_adapter.py`.  It computes evenly distributed row-group boundaries that satisfy the strict-mode size constraint.
 

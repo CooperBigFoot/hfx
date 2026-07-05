@@ -1,4 +1,4 @@
-# hfx-validator
+# hfx-cli
 
 CLI tool that validates HFX dataset directories against `spec/HFX_SPEC.md`.
 
@@ -10,10 +10,10 @@ violations in a single pass.
 
 ## Quickstart
 
-Install the crate:
+Install the crate from a repository checkout:
 
 ```bash
-cargo install hfx-validator
+cargo install --path crates/hfx-cli
 ```
 
 This installs the `hfx` binary:
@@ -114,4 +114,4 @@ A dataset that passes this validator with `--strict` is conformant on all checke
 
 ## Build Requirement
 
-`hfx-validator` now requires GDAL at build/runtime for raster CRS and extent validation. The validator links against the system GDAL installed on the host.
+`hfx-cli` requires GDAL at build/runtime for raster CRS and extent validation. The validator links against the system GDAL installed on the host.

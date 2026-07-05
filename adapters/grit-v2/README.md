@@ -62,7 +62,7 @@ Subcommands, in pipeline order:
 ## Validate Locally
 
 ```bash
-cargo run -p hfx-validator -- /path/to/dataset --strict
+cargo run -p hfx-cli -- /path/to/dataset --strict
 ```
 
 ## License and Attribution

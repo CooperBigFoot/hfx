@@ -1304,7 +1304,7 @@ def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0)
         "cargo",
         "run",
         "-p",
-        "hfx-validator",
+        "hfx-cli",
         "--",
         str(dataset_path),
         "--format",

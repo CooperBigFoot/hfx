@@ -6,7 +6,7 @@ This file is a running log of concrete findings while wrangling the Europe `EPSG
 
 - A strictly valid HFX dataset was produced at `/tmp/grit-hfx-eu/hfx`.
 - Validation command:
-  - `cargo run -p hfx-validator -- /tmp/grit-hfx-eu/hfx --format text --strict --sample-pct 100`
+  - `cargo run -p hfx-cli -- /tmp/grit-hfx-eu/hfx --format text --strict --sample-pct 100`
 - Final text-mode result:
   - `0 error(s), 0 warning(s), 0 info(s)`
   - `Result: VALID`
@@ -32,7 +32,7 @@ This file is a running log of concrete findings while wrangling the Europe `EPSG
 - Reproduced on `2026-04-13`
 - Trigger: validate a dataset written with `zstd`-compressed Parquet
 - Observed behavior:
-  - `hfx-validator` emits repeated `catchments.batch_read` / `snap.batch_read` errors:
+  - `hfx-cli` emits repeated `catchments.batch_read` / `snap.batch_read` errors:
     - `Parquet error: Disabled feature at compile time: zstd`
   - The validator then continues and emits many downstream referential errors caused by the failed reads.
 - Why this is a validator issue:
@@ -45,7 +45,7 @@ This file is a running log of concrete findings while wrangling the Europe `EPSG
 
 - Reproduced on `2026-04-13`
 - Command:
-  - `cargo run -p hfx-validator -- /tmp/grit-hfx-eu/hfx --format json --strict`
+  - `cargo run -p hfx-cli -- /tmp/grit-hfx-eu/hfx --format json --strict`
 - Observed behavior:
   - tracing logs and cargo run chatter are emitted ahead of the JSON payload on stdout
   - the captured output is therefore not directly parseable as JSON

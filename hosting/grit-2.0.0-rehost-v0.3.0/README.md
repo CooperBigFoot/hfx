@@ -54,7 +54,7 @@ is derived from that constant.
     into a local staging dir, e.g. `<staging>/grit-2.0.0/`.
 
 (b) VALIDATE -- human:
-      cargo run -p hfx-validator -- <staging>/grit-2.0.0 --strict      # exit 0
+      cargo run -p hfx-cli -- <staging>/grit-2.0.0 --strict      # exit 0
       python <covering-stack>/verify_struct_leaf_stats.py \
         <staging>/grit-2.0.0/catchments.parquet                        # exit 0
     (`verify_struct_leaf_stats.py` ships with the s07/s08 covering stack.) The

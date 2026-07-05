@@ -14,5 +14,5 @@
 - [ ] Every `conformance/valid/*/` fixture (and `examples/tiny/`) validates with exit 0
 - [ ] Every `conformance/invalid/*/` fixture is rejected with exit 1
 - [ ] `check-jsonschema --schemafile schemas/manifest.schema.json conformance/valid/*/manifest.json examples/tiny/manifest.json` passes
-- [ ] Spec changes are language-only — no change to the format_version 0.2.1 wire shape
-- [ ] CHANGELOG.md updated if the change is user-visible
+- [ ] Spec changes keep the `spec/HFX_SPEC.md` version header equal to `schemas/manifest.schema.json` `format_version` const (wire-shape changes require a spec release)
+- [ ] No CHANGELOG.md, version, or tag changes (release notes are maintainer-owned at release time)

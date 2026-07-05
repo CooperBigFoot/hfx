@@ -52,7 +52,7 @@ fn main() -> ExitCode {
 
     info!(path = %cli.dataset_path.display(), "validating HFX dataset");
 
-    let report = hfx_validator::validate(
+    let report = hfx_cli::validate(
         &cli.dataset_path,
         cli.strict,
         cli.skip_rasters,

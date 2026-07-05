@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a problem with hfx-core, hfx-validator, or the conformance fixtures
+about: Report a problem with hfx, hfx-cli, or the conformance fixtures
 labels: bug
 ---
 
