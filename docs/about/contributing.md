@@ -1,3 +1,3 @@
 # Contributing
 
-This page describes how you can contribute to HFX.
+--8<-- "CONTRIBUTING.md"
