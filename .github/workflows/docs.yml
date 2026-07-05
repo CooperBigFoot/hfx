@@ -1,0 +1,71 @@
+name: Docs
+
+# Deploy the MkDocs site to GitHub Pages.
+#
+# This uses GitHub's official Pages actions flow
+# (configure-pages -> upload-pages-artifact -> deploy-pages), NOT `mkdocs
+# gh-deploy`. There is no gh-pages branch to create or pollute, deployment uses
+# least-privilege OIDC permissions instead of a contents-write token, and the
+# deployed artifact is byte-identical to what the `make docs` CI gate builds
+# because this workflow invokes the same Makefile target.
+#
+# The build runs unscoped on every push to main. The site is small and the
+# build is fast, so path filtering is omitted for simplicity and safety: a
+# change to any source that MkDocs renders (docs/, spec/, mkdocs.yml, the
+# Makefile, or this workflow) always redeploys, with no risk of a stale site
+# from an un-listed path.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least-privilege token: read the repo to check out, write Pages, and mint the
+# OIDC id-token that deploy-pages exchanges for a deployment.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent Pages deployment. Do NOT cancel an in-progress run:
+# cancelling a deploy mid-flight can leave the live site in a partial state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build docs (strict)
+        run: make docs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-24.04
+    needs: build
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
