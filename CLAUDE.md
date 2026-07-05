@@ -21,7 +21,7 @@ Releases are intentional, maintainer-driven events:
   what changed since the previous release.
 - **Two version tracks.** The SPEC track (`format_version`, currently `0.3.0`) and the
   TOOLKIT track (the lockstep `hfx`/`hfx-cli` workspace crates, which own the
-  `v*` tags) evolve independently. See `docs/VERSIONING.md` for the full two-track policy
+  `v*` tags) evolve independently. See `docs/spec/versioning.md` for the full two-track policy
   and the spec-to-toolkit mapping table.
 
 ## Rust Coding Conventions
