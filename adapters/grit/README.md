@@ -163,4 +163,4 @@ These workarounds were required to pass strict validation:
 
 ## Adapter Guide
 
-This adapter is the **canonical worked example** for the HFX adapter development guide. For authoring a new adapter against a different source hydrofabric, refer to `../../docs/ADAPTER_GUIDE.md` (created in Phase 3 of the adapter refactor). That guide generalizes the patterns established here — Hilbert sorting, row-group balancing, snap weight conformance, and manifest construction — into reusable guidance for any HFX adapter author.
+This adapter is the **canonical worked example** for the HFX adapter development guide. For authoring a new adapter against a different source hydrofabric, refer to `../../docs/adapter/index.md` (created in Phase 3 of the adapter refactor). That guide generalizes the patterns established here — Hilbert sorting, row-group balancing, snap weight conformance, and manifest construction — into reusable guidance for any HFX adapter author.

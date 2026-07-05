@@ -328,7 +328,7 @@ Both pass `rio_cogeo.cog_validate` post-write.
 - **pfaf-87 / pfaf-88 missing from mghydro** — Antarctic sub-basins, HTTP 404 for both flowdir and accum at mghydro's directory. Vector shapefiles may still exist in the Lin et al. 2019 release; the global dataset excludes these two basins.
 - **`flow_acc.tif` size** — the global raster is 45 GB because raw float32 upstream pixel counts compress poorly. A km² conversion or int32 encoding would roughly halve the file. Revisit once a shed consumer profiles query cost.
 
-For HFX adapter authoring guidance generally, see [`docs/ADAPTER_GUIDE.md`](../../docs/ADAPTER_GUIDE.md).
+For HFX adapter authoring guidance generally, see [`docs/adapter/index.md`](../../docs/adapter/index.md).
 
 ## Citations
 
