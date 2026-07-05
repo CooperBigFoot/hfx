@@ -1,6 +1,6 @@
 # Adapters
 
-HFX adapters compile a source hydrofabric into the canonical HFX artifacts (manifest, catchments, graph, optional snap and rasters). Each subdirectory is one adapter. See [`../docs/ADAPTER_GUIDE.md`](../docs/ADAPTER_GUIDE.md) for the authoring guide.
+HFX adapters compile a source hydrofabric into the canonical HFX artifacts (manifest, catchments, graph, optional snap and rasters). Each subdirectory is one adapter. See [`../docs/adapter/index.md`](../docs/adapter/index.md) for the authoring guide.
 
 | Path | Status | Purpose |
 |---|---|---|
@@ -14,4 +14,4 @@ HFX adapters compile a source hydrofabric into the canonical HFX artifacts (mani
 
 The v2 adapters are the current reference implementations and target `format_version` 0.3.0; the v1 `grit/` and `merit/` adapters produced 0.1 datasets and are kept for historical reference only. The MERIT v2 adapter is the worked example to follow when authoring a new adapter: it covers vectors, tree topology, snap stems, and D8 raster auxiliaries end to end, and its output is fully reproducible from public sources.
 
-**HydroBASINS is the most-wanted next adapter.** To build it (or any other adapter): copy [`_template/`](_template/), use [`merit-v2/`](merit-v2/) as the worked example, and see [`../docs/ADAPTER_GUIDE.md`](../docs/ADAPTER_GUIDE.md).
+**HydroBASINS is the most-wanted next adapter.** To build it (or any other adapter): copy [`_template/`](_template/), use [`merit-v2/`](merit-v2/) as the worked example, and see [`../docs/adapter/index.md`](../docs/adapter/index.md).

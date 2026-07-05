@@ -33,7 +33,6 @@ markdown_extensions:
 #   decisions/  -> internal ADRs
 #   plans/      -> gitignored plans (would make local and CI builds diverge)
 #   releases/   -> release notes
-#   ADAPTER_GUIDE.md -> legacy page a later step rewrites
 #   STYLE.md    -> contributor-facing authoring guide
 # Any future README.md placed inside docs/ MUST be added here as well.
 exclude_docs: |
@@ -41,7 +40,6 @@ exclude_docs: |
   decisions/
   plans/
   releases/
-  ADAPTER_GUIDE.md
 
 validation:
   links:

@@ -195,8 +195,6 @@ That scope is exactly the set of sources shipped to the documentation site plus 
 The current exclusion list is deliberate.
 `docs/decisions/`, `docs/plans/`, and `docs/releases/` are repository-internal records.
 Those records are never shipped to the site.
-`docs/ADAPTER_GUIDE.md` is a legacy page pending rewrite.
-Remove that exclusion when its replacement lands.
 Any file named `CHANGELOG.md` is permanently excluded by basename.
 Changelog files are historical records and are never rewritten, per the repository release policy.
 
@@ -213,13 +211,13 @@ Treat anything beyond those three hits as a new violation.
 EMDASH="$(printf '\342\200\224')"
 grep -rn --include='*.md' \
   --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
-  --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+  --exclude=CHANGELOG.md \
   -e "$EMDASH" docs/ spec/
 
 # Ban 2: contrastive negation (pronoun forms).
 grep -rniE --include='*.md' \
   --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
-  --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+  --exclude=CHANGELOG.md \
   "\b(it|this|that|they)('s|'re| is| are| was| were)?(n't| not)\b[^.]{0,80}[,;:] ?(it|this|that|they)('s|'re| is| are| was| were)\b" \
   docs/ spec/
 ```

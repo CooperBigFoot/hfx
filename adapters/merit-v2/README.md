@@ -6,7 +6,7 @@ Python adapter that compiles [MERIT-Basins](https://www.reachhydro.org/home/para
 
 Current reference implementation. There is **no hosted MERIT dataset** — the only hosted HFX reference dataset is GRIT 2.0.0 (see the root [README](../../README.md#datasets)). MERIT HFX datasets are locally reproducible: anyone can compile them from the public sources below with this adapter.
 
-This adapter doubles as the **worked example** for authoring new adapters — for instance the most-wanted HydroBASINS adapter. Copy [`adapters/_template/`](../_template/), follow this adapter end to end, and see [`docs/ADAPTER_GUIDE.md`](../../docs/ADAPTER_GUIDE.md).
+This adapter doubles as the **worked example** for authoring new adapters — for instance the most-wanted HydroBASINS adapter. Copy [`adapters/_template/`](../_template/), follow this adapter end to end, and see [`docs/adapter/index.md`](../../docs/adapter/index.md).
 
 ## Manifest Facts
 

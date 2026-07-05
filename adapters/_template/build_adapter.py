@@ -110,7 +110,7 @@ def stage_1_inspect_source(input_path: Path) -> SourceData:
     """
     raise NotImplementedError(
         "stage_1_inspect_source not implemented — see spec/HFX_SPEC.md "
-        "§Artifact Summary and docs/ADAPTER_GUIDE.md §Inspect Source"
+        "§Artifact Summary and docs/adapter/index.md §Inspect the source fabric"
     )
 
 
@@ -125,7 +125,7 @@ def stage_2_assign_ids(source: SourceData) -> gpd.GeoDataFrame:
     """
     raise NotImplementedError(
         "stage_2_assign_ids not implemented — see spec/HFX_SPEC.md "
-        "§1. catchments.parquet and docs/ADAPTER_GUIDE.md §Assign IDs"
+        "§1. catchments.parquet and docs/adapter/index.md §Assign stable unit IDs"
     )
 
 
@@ -138,7 +138,7 @@ def stage_3_reproject(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     raise NotImplementedError(
         "stage_3_reproject not implemented — see spec/HFX_SPEC.md "
-        "§1. catchments.parquet §Notes and docs/ADAPTER_GUIDE.md §Reproject"
+        "§1. catchments.parquet §Notes and docs/adapter/index.md §Reproject to EPSG:4326"
     )
 
 
@@ -151,7 +151,7 @@ def stage_4_make_valid(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     raise NotImplementedError(
         "stage_4_make_valid not implemented — see spec/HFX_SPEC.md "
-        "§1. catchments.parquet §Notes and docs/ADAPTER_GUIDE.md §Make Valid"
+        "§1. catchments.parquet §Notes and docs/adapter/index.md §Validate geometries and outlets"
     )
 
 
@@ -176,7 +176,7 @@ def stage_5_hilbert_sort(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     raise NotImplementedError(
         "stage_5_hilbert_sort not implemented — see spec/HFX_SPEC.md "
         "§1. catchments.parquet §Spatial Partitioning "
-        "and docs/ADAPTER_GUIDE.md §Hilbert Sort"
+        "and docs/adapter/index.md §Hilbert-sort and write catchments.parquet"
     )
 
 
@@ -205,7 +205,7 @@ def stage_6_write_catchments(gdf: gpd.GeoDataFrame, out_dir: Path) -> None:
     """
     raise NotImplementedError(
         "stage_6_write_catchments not implemented — see spec/HFX_SPEC.md "
-        "§1. catchments.parquet and docs/ADAPTER_GUIDE.md §Write Catchments"
+        "§1. catchments.parquet and docs/adapter/index.md §Hilbert-sort and write catchments.parquet"
     )
 
 
@@ -228,7 +228,7 @@ def stage_7_write_graph(
     """
     raise NotImplementedError(
         "stage_7_write_graph not implemented — see spec/HFX_SPEC.md "
-        "§2. graph.arrow and docs/ADAPTER_GUIDE.md §Write Graph"
+        "§2. graph.arrow and docs/adapter/index.md §Build and write graph.parquet"
     )
 
 
@@ -253,7 +253,7 @@ def stage_8_write_snap(snap_gdf: gpd.GeoDataFrame, out_dir: Path) -> None:
     """
     raise NotImplementedError(
         "stage_8_write_snap not implemented — see spec/HFX_SPEC.md "
-        "§3. snap.parquet and docs/ADAPTER_GUIDE.md §Write Snap"
+        "§3. snap.parquet and docs/adapter/index.md §Declare optional auxiliary data"
     )
 
 
@@ -277,7 +277,7 @@ def stage_9_write_manifest(
     """
     raise NotImplementedError(
         "stage_9_write_manifest not implemented — see spec/HFX_SPEC.md "
-        "§6. manifest.json and docs/ADAPTER_GUIDE.md §Write Manifest"
+        "§6. manifest.json and docs/adapter/index.md §Write manifest.json"
     )
 
 
