@@ -55,7 +55,7 @@ uv run --project adapters/grit python adapters/grit/merge_regions.py \
     --output /Users/nicolaslazaro/Desktop/grit-hfx/global/grit-hfx-global
 
 # 4. Save a JSON validator report and sanity-check the global manifest.
-cargo run -p hfx-validator -- \
+cargo run -p hfx-cli -- \
     /Users/nicolaslazaro/Desktop/grit-hfx/global/grit-hfx-global \
     --strict --sample-pct 100 --skip-rasters --format json \
     > /Users/nicolaslazaro/Desktop/grit-hfx/global/validator-report.json

@@ -266,7 +266,7 @@ impl OutletCoord {
 
 /// Opaque WKB (Well-Known Binary) geometry bytes.
 ///
-/// `hfx-core` treats WKB as a raw byte buffer and does not parse its internal
+/// `hfx` treats WKB as a raw byte buffer and does not parse its internal
 /// structure. Callers that need geometry operations should use a dedicated
 /// geometry library (e.g. `geo`, `geos`).
 #[derive(Debug, Clone, PartialEq)]

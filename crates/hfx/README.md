@@ -1,26 +1,26 @@
-# hfx-core
+# hfx
 
 Shared types and validation primitives for HFX artifacts.
 
 ## Purpose
 
-`hfx-core` defines the canonical in-memory representation of the [HFX specification](../../spec/HFX_SPEC.md). Every type enforces its invariants at construction time (parse, don't validate): an `AtomId` is always positive, a `BoundingBox` is always non-degenerate, a `Manifest` always names a real fabric. Invalid states are unrepresentable.
+`hfx` defines the canonical in-memory representation of the [HFX specification](../../spec/HFX_SPEC.md). Every type enforces its invariants at construction time (parse, don't validate): a `UnitId` is always positive, a `BoundingBox` is always non-degenerate, a `Manifest` always names a real fabric. Invalid states are unrepresentable.
 
-The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, and GeoTIFF is the responsibility of downstream crates (`hfx-validator`, source adapters, the delineation engine).
+The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, and GeoTIFF is the responsibility of downstream crates (`hfx-cli`, source adapters, the delineation engine).
 
 ## Architecture
 
 - Primitive modules:
-  - `id.rs`: `AtomId`, `SnapId`, `IdError`
+  - `id.rs`: `UnitId`, `SnapId`, `IdError`
   - `area.rs`: `AreaKm2`, `Weight`, `MeasureError`
   - `geo.rs`: `Longitude`, `Latitude`, `BoundingBox`, `WkbGeometry`, `GeoError`
   - `raster.rs`: `FlowDirEncoding`, `FlowDirEncodingError`
 - Composite modules:
-  - `catchment.rs`: `CatchmentAtom`
-  - `snap.rs`: `SnapTarget`, `MainstemStatus`
+  - `catchment.rs`: `CatchmentUnit`
+  - `snap.rs`: `SnapTarget`, `StemRole`
   - `graph.rs`: `AdjacencyRow`, `DrainageGraph`, `GraphError`
   - `manifest.rs`: `Manifest`, `ManifestBuilder`, related enums and errors
-- `lib.rs` re-exports the public surface and defines shared helper traits such as `HasBbox` and `HasAtomId`.
+- `lib.rs` re-exports the public surface and defines shared helper traits such as `HasBbox` and `HasUnitId`.
 
 ## Glossary
 
@@ -41,19 +41,19 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
 
 | Type | Module | Role |
 |---|---|---|
-| `AtomId` | `id` | Strictly-positive `i64` identifier for a catchment atom; distinct from `SnapId` to prevent accidental mixing |
+| `UnitId` | `id` | Strictly-positive `i64` identifier for a catchment unit; distinct from `SnapId` to prevent accidental mixing |
 | `SnapId` | `id` | Strictly-positive `i64` identifier for a snap target |
 | `AreaKm2` | `area` | Finite, non-negative `f32` area in km² |
 | `Weight` | `area` | Finite, non-negative `f32` snap ranking weight. Higher values MUST indicate greater hydrological dominance (adapters typically write upstream drainage area in km² or cell count). |
 | `BoundingBox` | `geo` | Axis-aligned WGS84 bbox; enforces `min < max` on both axes at construction |
 | `WkbGeometry` | `geo` | Non-empty WKB byte buffer; geometry parsing is delegated to callers |
-| `CatchmentAtom` | `catchment` | One row of `catchments.parquet` — id, local area, optional upstream area, bbox, geometry |
-| `SnapTarget` | `snap` | One row of `snap.parquet` — id, catchment FK, weight, `MainstemStatus`, bbox, geometry |
-| `MainstemStatus` | `snap` | Enum (`Mainstem` / `Tributary`) — replaces a `bool` flag so call sites are self-documenting |
+| `CatchmentUnit` | `catchment` | One row of `catchments.parquet` — id, local area, optional upstream area, bbox, geometry |
+| `SnapTarget` | `snap` | One row of `snap.parquet` — id, catchment FK, weight, `StemRole`, bbox, geometry |
+| `StemRole` | `snap` | Enum (`Mainstem` / `Tributary` / `Distributary` / `Unknown`) — replaces a `bool` flag so call sites are self-documenting |
 | `AdjacencyRow` | `graph` | One node in the adjacency graph — atom ID and its upstream neighbour IDs |
-| `DrainageGraph` | `graph` | HashMap-indexed adjacency over all atoms; O(1) lookup by `AtomId`. Optimised for validation, not traversal — engines are expected to convert to CSR at load time |
+| `DrainageGraph` | `graph` | HashMap-indexed adjacency over all units; O(1) lookup by `UnitId`. Optimised for validation, not traversal — engines are expected to convert to CSR at load time |
 | `FlowDirEncoding` | `raster` | D8 convention enum (`Esri` / `Taudem`); stored in `RasterAvailability::Present` so encoding is only expressible when rasters actually exist |
 | `Manifest` | `manifest` | Parsed `manifest.json`; constructed exclusively via `ManifestBuilder` |
 | `ManifestBuilder` | `manifest` | Builder for `Manifest` — required fields validated in `new()`, optional fields set via chainable `with_*` methods |
 | `HasBbox` | `lib` | Trait for generic spatial filtering over any artifact row type |
-| `HasAtomId` | `lib` | Trait for generic operations over any atom-identified row type |
+| `HasUnitId` | `lib` | Trait for generic operations over any unit-identified row type |

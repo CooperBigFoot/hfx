@@ -1,5 +1,5 @@
 [package]
-name = "hfx-core"
+name = "hfx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

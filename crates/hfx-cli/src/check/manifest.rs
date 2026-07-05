@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use hfx_core::{
+use hfx::{
     AuxiliaryDecl, AuxiliarySchemaId, BoundingBox, Crs, FormatVersion, ManifestBuilder, Topology,
     UnitCount,
 };
@@ -38,8 +38,8 @@ pub fn check_manifest(raw: &RawManifest) -> Vec<Diagnostic> {
     diags
 }
 
-/// Attempt to construct an [`hfx_core::Manifest`] from a `RawManifest`.
-pub fn try_build_manifest(raw: &RawManifest) -> Option<hfx_core::Manifest> {
+/// Attempt to construct an [`hfx::Manifest`] from a `RawManifest`.
+pub fn try_build_manifest(raw: &RawManifest) -> Option<hfx::Manifest> {
     if raw.format_version.as_deref()? != "0.3.0" {
         return None;
     }

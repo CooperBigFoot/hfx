@@ -1,5 +1,5 @@
 [package]
-name = "hfx-validator"
+name = "hfx-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ name = "hfx"
 path = "src/main.rs"
 
 [dependencies]
-hfx-core = { path = "../hfx-core", version = "=0.4.0" }
+hfx = { path = "../hfx", version = "=0.4.0" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
