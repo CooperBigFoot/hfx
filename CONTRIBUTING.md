@@ -4,7 +4,7 @@ HFX is an open specification and toolkit repository. Contributions may target th
 
 ## Working Principles
 
-- Treat [`spec/HFX_SPEC.md`](./spec/HFX_SPEC.md) as the canonical development spec.
+- Treat [`spec/HFX_SPEC.md`](https://cooperbigfoot.github.io/hfx/spec/HFX_SPEC/) as the canonical development spec.
 - Keep machine-readable contracts in [`schemas/`](./schemas).
 - Keep implementer-facing examples in [`examples/`](./examples).
 - Keep validator fixtures in [`conformance/`](./conformance).

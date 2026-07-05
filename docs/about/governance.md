@@ -1,3 +1,3 @@
 # Governance
 
-This page describes how the HFX project is governed.
+--8<-- "GOVERNANCE.md"
