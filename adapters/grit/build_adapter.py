@@ -680,7 +680,7 @@ def stage_9_write_manifest(
 def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0) -> int:
     """Validate the built HFX dataset at ``dataset_path``.
 
-    Layer 1 — authoritative HFX validator via ``cargo run -p hfx-validator``
+    Layer 1 — authoritative HFX validator via ``cargo run -p hfx-cli``
     (text + json output, json saved as ``validator-report.json`` beside
     the dataset root).
 
@@ -699,7 +699,7 @@ def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0)
         "cargo",
         "run",
         "-p",
-        "hfx-validator",
+        "hfx-cli",
         "--",
         str(dataset_path),
         "--format",
@@ -716,7 +716,7 @@ def validate(dataset_path: Path, strict: bool = True, sample_pct: float = 100.0)
         "cargo",
         "run",
         "-p",
-        "hfx-validator",
+        "hfx-cli",
         "--",
         str(dataset_path),
         "--format",

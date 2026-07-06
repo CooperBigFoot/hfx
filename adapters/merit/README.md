@@ -22,7 +22,7 @@ Two inputs are needed per Pfaf-L2 basin. `<NN>` is the two-digit Pfafstetter Lev
 - [ ] The MERIT-Basins v0.7 / v1.0_bugfix1 share accepted into your Google Drive "Shared with me" so `--drive-shared-with-me` can see it.
 - [ ] Chosen Pfafstetter Level-2 code `<NN>` in `11`..`91`.
 - [ ] `uv` installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
-- [ ] `hfx` validator CLI on `PATH`. From the repo root: `cargo install --path crates/hfx-validator`.
+- [ ] `hfx` validator CLI on `PATH`. From the repo root: `cargo install --path crates/hfx-cli`.
 
 ### 2. Download MERIT-Basins vectors
 
@@ -314,7 +314,7 @@ Both pass `rio_cogeo.cog_validate` post-write.
 
 ## Troubleshooting
 
-- **`hfx` behaves like an older build after editing the validator.** The `cargo install --path crates/hfx-validator` command installs to `~/.cargo/bin/`; re-run it from the repo root after pulling or editing validator code so the CLI on `PATH` matches the workspace.
+- **`hfx` behaves like an older build after editing the validator.** The `cargo install --path crates/hfx-cli` command installs to `~/.cargo/bin/`; re-run it from the repo root after pulling or editing validator code so the CLI on `PATH` matches the workspace.
 - **`rclone` reports no files for the MERIT-Basins share.** The share must first be accepted into your Google Drive "Shared with me"; `--drive-shared-with-me` reads that namespace, not public links. Open the share URL once in a browser while signed in to the same Google account, then retry.
 - **`curl` returns HTML instead of a GeoTIFF.** mghydro serves a plain directory listing for unknown paths. Double-check `<NN>` and that the two parent directories (`flow_dir_basins/`, `accum_basins/`) exist locally before writing.
 

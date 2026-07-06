@@ -106,7 +106,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build validator
-        run: cargo build -p hfx-validator
+        run: cargo build -p hfx-cli
 
       - name: Validate valid fixtures
         run: |

@@ -48,12 +48,11 @@ See `CITATION.txt` in this directory for the BibTeX entry.
 ## Validating a download
 
 ```sh
-git clone https://github.com/CooperBigFoot/hfx && cd hfx && cargo run -p hfx-validator -- /path/to/downloaded/grit-2.0.0 --strict
+git clone https://github.com/CooperBigFoot/hfx && cd hfx && cargo run -p hfx-cli -- /path/to/downloaded/grit-2.0.0 --strict
 ```
 
-Alternatively, `cargo install hfx-validator` (version 0.3.0 or later; earlier
-published versions predate spec 0.2.1), then run
-`hfx-validator /path/to/downloaded/grit-2.0.0 --strict`.
+Alternatively, clone this repository, run `cargo install --path crates/hfx-cli`,
+then run `hfx /path/to/downloaded/grit-2.0.0 --strict`.
 
 ## DAG `up_area_km2` semantics
 

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use hfx_validator::validate;
+use hfx_cli::validate;
 
 fn fixture_path(category: &str, name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

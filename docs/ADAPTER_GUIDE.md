@@ -13,7 +13,7 @@ This guide describes the v0.2 output contract.
 
 - Python 3.11 or later for Python adapters; Rust or other languages are valid.
 - `uv` for Python dependency management when using this repo's adapter pattern.
-- `hfx` validator on `PATH`: `cargo install hfx-validator`.
+- `hfx` validator on `PATH`: `cargo install --path crates/hfx-cli` from a checkout of this repository.
 - Full read of [`spec/HFX_SPEC.md`](../spec/HFX_SPEC.md).
 - Typical Python libraries: `geopandas`, `pyarrow`, `shapely`, `pyogrio`,
   `geoparquet-io==1.0.0b2`.

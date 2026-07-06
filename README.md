@@ -91,10 +91,10 @@ The validator and future adapters exist to serve the specification, not define i
 
 ## Validator CLI
 
-The validator is published as the `hfx-validator` crate and installs the `hfx` binary:
+The validator lives in the `hfx-cli` crate and installs the `hfx` binary:
 
 ```bash
-cargo install hfx-validator
+cargo install --path crates/hfx-cli
 hfx ./path/to/dataset
 ```
 
@@ -155,7 +155,7 @@ hfx ./path/to/dataset --strict
 
 ## Versioning
 
-HFX carries two independent version tracks: the SPEC track is the format version itself (`format_version`, currently 0.3.0), while the TOOLKIT track covers the lockstep workspace crates `hfx-core` and `hfx-validator`, whose next curated release is 0.4.0 (implementing spec 0.3.0). See [docs/VERSIONING.md](./docs/VERSIONING.md) for the full policy, the spec-to-toolkit mapping table, and the release procedure.
+HFX carries two independent version tracks: the SPEC track is the format version itself (`format_version`, currently 0.3.0), while the TOOLKIT track covers the lockstep workspace crates `hfx` and `hfx-cli`, whose next curated release is 0.4.0 (implementing spec 0.3.0). See [docs/VERSIONING.md](./docs/VERSIONING.md) for the full policy, the spec-to-toolkit mapping table, and the release procedure.
 
 ## Implementations
 
@@ -165,4 +165,4 @@ Contributions are welcome on the adapter side: a HydroBASINS adapter is the most
 
 ## Status
 
-HFX spec 0.3.0 is the current format version, and the hosted GRIT 2.0.0 dataset conforms to it. [`hfx-core`](https://crates.io/crates/hfx-core) and [`hfx-validator`](https://crates.io/crates/hfx-validator) 0.3.0 are published on crates.io; the next curated toolkit release, 0.4.0, implements spec 0.3.0.
+HFX spec 0.3.0 is the current format version, and the hosted GRIT 2.0.0 dataset conforms to it. The workspace crates are now `hfx` and `hfx-cli`; the 0.3.0 crates.io releases predate the rename, so use this repository until maintainers publish under the new names. The next curated toolkit release, 0.4.0, implements spec 0.3.0.

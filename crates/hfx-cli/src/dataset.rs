@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use hfx_core::{BoundingBox, Manifest};
+use hfx::{BoundingBox, Manifest};
 
 use crate::diagnostic::Diagnostic;
 use crate::reader::manifest::RawManifest;

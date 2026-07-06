@@ -72,7 +72,7 @@ The fixtures under [`../../conformance`](../../conformance) are validator and in
 From the repo root:
 
 ```sh
-cargo run -p hfx-validator -- examples/tiny --strict
+cargo run -p hfx-cli -- examples/tiny --strict
 ```
 
 Expected output ends with `Result: VALID` (exit 0). With the binary installed, the equivalent is:

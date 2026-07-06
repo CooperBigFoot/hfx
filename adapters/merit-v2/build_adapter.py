@@ -816,11 +816,11 @@ def validate_dataset(dataset: Path, report_dir: Path) -> None:
     """Run strict validator in text and JSON modes."""
     ensure_dir(report_dir)
     commands = {
-        "text": ["cargo", "run", "-p", "hfx-validator", "--", str(dataset), "--format", "text", "--strict", "--sample-pct", "100"],
-        "json": ["cargo", "run", "-p", "hfx-validator", "--", str(dataset), "--format", "json", "--strict", "--sample-pct", "100"],
+        "text": ["cargo", "run", "-p", "hfx-cli", "--", str(dataset), "--format", "text", "--strict", "--sample-pct", "100"],
+        "json": ["cargo", "run", "-p", "hfx-cli", "--", str(dataset), "--format", "json", "--strict", "--sample-pct", "100"],
     }
     env = dict(os.environ)
-    env.setdefault("RUST_LOG", "hfx_validator::reader::raster=debug")
+    env.setdefault("RUST_LOG", "hfx_cli::reader::raster=debug")
     for kind, command in commands.items():
         result = subprocess.run(command, cwd=Path(__file__).parents[2], env=env, capture_output=True, text=True, check=False)
         (report_dir / f"validator-report.{kind}").write_text(result.stdout, encoding="utf-8")

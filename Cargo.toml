@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hfx-core", "crates/hfx-validator"]
+members = ["crates/hfx", "crates/hfx-cli"]
 resolver = "2"
 
 [workspace.package]

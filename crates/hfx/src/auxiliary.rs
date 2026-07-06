@@ -112,7 +112,7 @@ pub struct AuxiliaryDecl {
 impl AuxiliaryDecl {
     /// Construct an [`AuxiliaryDecl`] from a schema and artifact map.
     ///
-    /// Metadata is intentionally not modeled in `hfx-core`; schema-specific
+    /// Metadata is intentionally not modeled in `hfx`; schema-specific
     /// metadata parsing belongs at the manifest deserialization boundary.
     ///
     /// # Errors

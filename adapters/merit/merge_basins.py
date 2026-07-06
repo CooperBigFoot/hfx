@@ -372,7 +372,7 @@ def stage_8_write_manifest(
 
 
 def stage_9_validate(out_dir: Path, rasters_ready: bool, skip_validate: bool) -> None:
-    """Run GeoParquet and optional hfx-validator checks on the merged output."""
+    """Run GeoParquet and optional hfx-cli checks on the merged output."""
     assert_geoparquet_valid(out_dir / "catchments.parquet", kind="catchments")
     logger.info("stage_9_validate: catchments.parquet passed GeoParquet 1.1 validation")
     assert_geoparquet_valid(out_dir / "snap.parquet", kind="snap")
@@ -386,7 +386,7 @@ def stage_9_validate(out_dir: Path, rasters_ready: bool, skip_validate: bool) ->
     if hfx_bin is None:
         logger.warning(
             "stage_9_validate: 'hfx' not found on PATH; "
-            "skipping hfx CLI validation (install hfx-validator to enable)"
+            "skipping hfx CLI validation (install hfx-cli to enable)"
         )
         return
 

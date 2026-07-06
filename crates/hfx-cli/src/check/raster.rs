@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use hfx_core::Manifest;
+use hfx::Manifest;
 
 use crate::dataset::{RasterBoundingBox, RasterMeta, RasterSampleFormat};
 use crate::diagnostic::{Artifact, Category, Diagnostic};

@@ -89,7 +89,7 @@ uv run python verify_cross_basin.py \
 ## Validate Locally
 
 ```bash
-cargo run -p hfx-validator -- /path/to/dataset --strict
+cargo run -p hfx-cli -- /path/to/dataset --strict
 ```
 
 ## Citations
