@@ -19,3 +19,9 @@ docs/plans/
 outputs/
 planning/
 TODO.md
+
+# MkDocs build output
+site/
+
+# Git worktrees scratch
+.worktrees/
