@@ -154,7 +154,7 @@ jobs:
           EMDASH="$(printf '\342\200\224')"
           if grep -rn --include='*.md' \
             --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
-            --exclude=VERSIONING.md --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+            --exclude=CHANGELOG.md \
             -e "$EMDASH" docs/ spec/; then
             echo 'Style ban: em dash (U+2014) in docs sources. See docs/STYLE.md.'
             exit 1
@@ -164,7 +164,7 @@ jobs:
         run: |
           if grep -rniE --include='*.md' \
             --exclude-dir=decisions --exclude-dir=plans --exclude-dir=releases \
-            --exclude=VERSIONING.md --exclude=ADAPTER_GUIDE.md --exclude=CHANGELOG.md \
+            --exclude=CHANGELOG.md \
             "\b(it|this|that|they)('s|'re| is| are| was| were)?(n't| not)\b[^.]{0,80}[,;:] ?(it|this|that|they)('s|'re| is| are| was| were)\b" \
             docs/ spec/; then
             echo 'Style ban: contrastive negation in docs sources. State what it is. See docs/STYLE.md.'

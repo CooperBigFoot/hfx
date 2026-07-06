@@ -22,4 +22,4 @@ HFX is organized as a spec-first monorepo:
 
 ## Release Philosophy
 
-The repository contains the development version of the specification. Tagged releases will later serve as stable, immutable snapshots of the spec and related artifacts. Version tracks and the release procedure are defined in [`docs/VERSIONING.md`](./docs/VERSIONING.md).
+The repository contains the development version of the specification. Tagged releases will later serve as stable, immutable snapshots of the spec and related artifacts. Version tracks and the release procedure are defined in the [versioning policy](https://cooperbigfoot.github.io/hfx/spec/versioning/).

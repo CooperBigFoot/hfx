@@ -45,6 +45,6 @@ uv run python build_adapter.py extract --input <path-to-source>
 ## Where to learn more
 
 - [`../../spec/HFX_SPEC.md`](../../spec/HFX_SPEC.md) — canonical data contract
-- [`../../docs/ADAPTER_GUIDE.md`](../../docs/ADAPTER_GUIDE.md) — adapter authoring guide
+- [`../../docs/adapter/index.md`](../../docs/adapter/index.md) — adapter authoring guide
 - [`../grit/`](../grit/) — canonical worked example (GRIT Europe, 150K atoms, validated with `--strict --sample-pct 100`)
 - [`../../crates/hfx-cli/README.md`](../../crates/hfx-cli/README.md) — validator CLI usage and known conformance gaps
