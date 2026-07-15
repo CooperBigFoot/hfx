@@ -219,6 +219,39 @@ def _normalize_area(values: pd.Series, source_name: str) -> pd.Series:
         raise AdapterError(f"{source_name} cannot be converted to float64: {error}") from error
 
 
+def _normalize_topology_integers(
+    values: pd.Series,
+    source_name: str,
+    *,
+    allow_negative: bool,
+) -> pd.Series:
+    """Normalize a required topology field to non-null int64 values."""
+    normalized: list[int] = []
+    minimum = -(2**63)
+    maximum = 2**63 - 1
+    for value in values:
+        try:
+            decimal = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise AdapterError(
+                f"{source_name} contains a non-numeric value: {value!r}"
+            ) from None
+        if not decimal.is_finite() or decimal != decimal.to_integral_value():
+            raise AdapterError(
+                f"{source_name} contains a non-integral value: {value!r}"
+            )
+        integer = int(decimal)
+        if not allow_negative and integer < 0:
+            raise AdapterError(
+                f"{source_name} values must be non-negative; "
+                "0 is the terminal-sink sentinel"
+            )
+        if integer < minimum or integer > maximum:
+            raise AdapterError(f"{source_name} is outside the int64 range: {value!r}")
+        normalized.append(integer)
+    return pd.Series(normalized, index=values.index, dtype="int64")
+
+
 def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     """Load and normalize one HydroBASINS Pfaf-12 regional polygon layer."""
     source_path = _source_path(region, basins_dir)
@@ -227,7 +260,7 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     except Exception as error:
         raise AdapterError(f"failed to read HydroBASINS layer {source_path}: {error}") from error
 
-    required = {"HYBAS_ID", "SUB_AREA", "UP_AREA"}
+    required = {"HYBAS_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"}
     missing = sorted(required - set(units.columns))
     if missing:
         raise AdapterError(f"HydroBASINS layer missing required columns: {missing}")
@@ -257,6 +290,16 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     units["parent_id"] = pd.Series(pd.NA, index=units.index, dtype="Int64")
     units["area_km2"] = _normalize_area(units["SUB_AREA"], "SUB_AREA")
     units["up_area_km2"] = _normalize_area(units["UP_AREA"], "UP_AREA")
+    units["NEXT_DOWN"] = _normalize_topology_integers(
+        units["NEXT_DOWN"],
+        "NEXT_DOWN",
+        allow_negative=False,
+    )
+    units["ENDO"] = _normalize_topology_integers(
+        units["ENDO"],
+        "ENDO",
+        allow_negative=True,
+    )
 
     units["_hilbert"] = units.geometry.centroid.hilbert_distance(
         total_bounds=units.total_bounds
@@ -435,12 +478,98 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     return path
 
 
+def _assert_acyclic(outgoing: dict[int, int]) -> None:
+    """Reject cycles in a deterministic scalar downstream relation."""
+    visited: set[int] = set()
+    for start in sorted(outgoing):
+        if start in visited:
+            continue
+        path: list[int] = []
+        positions: dict[int, int] = {}
+        current = start
+        while current in outgoing and current not in visited:
+            if current in positions:
+                cycle = path[positions[current] :] + [current]
+                raise AdapterError(
+                    "cut HydroBASINS graph must be acyclic; cycle detected: "
+                    + " -> ".join(str(identifier) for identifier in cycle)
+                )
+            positions[current] = len(path)
+            path.append(current)
+            current = outgoing[current]
+        visited.update(path)
+
+
+def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
+    """Write the cut, acyclic HydroBASINS tree as HFX graph Parquet."""
+    unit_ids = [int(identifier) for identifier in units["id"]]
+    id_set = set(unit_ids)
+    upstream: dict[int, list[int]] = {identifier: [] for identifier in unit_ids}
+    outgoing: dict[int, int] = {}
+
+    for unit in units.itertuples(index=False):
+        source_id = int(unit.id)
+        downstream_id = int(unit.NEXT_DOWN)
+        endo = int(unit.ENDO)
+        if downstream_id == 0:
+            continue
+        if endo == 2:
+            continue
+        if downstream_id < 0:
+            raise AdapterError(
+                f"unit {source_id} has negative NEXT_DOWN value {downstream_id}"
+            )
+        if downstream_id == source_id:
+            raise AdapterError(f"unit {source_id} has a topology self-link cycle")
+        if downstream_id not in id_set:
+            raise AdapterError(
+                f"unit {source_id} has downstream ID {downstream_id}, "
+                "which is absent from this region"
+            )
+        outgoing[source_id] = downstream_id
+        upstream[downstream_id].append(source_id)
+
+    _assert_acyclic(outgoing)
+    for identifiers in upstream.values():
+        identifiers.sort()
+
+    bounds = units.reset_index(drop=True).geometry.bounds
+    list_type = pa.list_(pa.field("item", pa.int64(), nullable=True))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("upstream_ids", list_type, nullable=False),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+    row_count = len(units)
+    columns = [
+        pa.array(units["id"].to_numpy(dtype="int64"), type=pa.int64()),
+        pa.array(units["level"].to_numpy(dtype="int16"), type=pa.int16()),
+        pa.array([upstream[identifier] for identifier in unit_ids], type=list_type),
+        pa.array(bounds["minx"].to_numpy(dtype="float32"), type=pa.float32()),
+        pa.array(bounds["miny"].to_numpy(dtype="float32"), type=pa.float32()),
+        pa.array(bounds["maxx"].to_numpy(dtype="float32"), type=pa.float32()),
+        pa.array(bounds["maxy"].to_numpy(dtype="float32"), type=pa.float32()),
+    ]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "graph.parquet"
+    _write_table(path, schema, columns, row_count)
+    return path
+
+
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, and write the requested regional polygon layer."""
     units = load_region_units(args.region, args.basins)
     pour_points = load_pour_points(args.pour_points)
     units = assign_outlets(units, pour_points)
     write_catchments(units, args.out)
+    write_graph(units, args.out)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
