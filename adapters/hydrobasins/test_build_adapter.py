@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-import json
+from datetime import datetime
 from pathlib import Path
 
 import geopandas as gpd
@@ -477,6 +478,84 @@ class BuildCatchmentsTests(unittest.TestCase):
                 stored = graph.column(name).to_numpy()
                 self.assertAlmostEqual(physical.statistics.min, float(stored.min()))
                 self.assertAlmostEqual(physical.statistics.max, float(stored.max()))
+
+
+class BuildManifestTests(unittest.TestCase):
+    """Exercise manifest serialization through the public build command."""
+
+    def test_regional_manifest_describes_built_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            units = build_adapter.load_region_units("gr", basins_dir)
+
+            return_code = build_adapter.main(
+                _build_args(basins_dir, pour_points_dir, out_dir)
+            )
+
+            manifest_path = out_dir / "manifest.json"
+            self.assertEqual(return_code, 0)
+            self.assertTrue(manifest_path.is_file())
+            with manifest_path.open(encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            catchments = gpd.read_parquet(out_dir / "catchments.parquet")
+
+        self.assertEqual(manifest["format_version"], "0.3.0")
+        self.assertEqual(manifest["fabric_name"], "hydrobasins")
+        self.assertEqual(manifest["fabric_version"], "v1c")
+        self.assertEqual(manifest["crs"], "EPSG:4326")
+        self.assertIs(manifest["has_up_area"], True)
+        self.assertEqual(manifest["topology"], "tree")
+        self.assertEqual(manifest["adapter_version"], "0.1.0")
+        self.assertEqual(manifest["unit_count"], len(units))
+        self.assertEqual(manifest["unit_count"], len(catchments))
+        self.assertEqual(manifest["region"], "gr")
+        expected_bbox = [float(value) for value in units.geometry.total_bounds]
+        np.testing.assert_allclose(manifest["bbox"], expected_bbox)
+        self.assertNotIn("auxiliary", manifest)
+        datetime.fromisoformat(manifest["created_at"])
+
+    def test_planetary_manifest_omits_region_and_uses_global_bbox(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            args = _build_args(basins_dir, pour_points_dir, out_dir)
+            args.append("--planetary")
+
+            return_code = build_adapter.main(args)
+
+            manifest_path = out_dir / "manifest.json"
+            self.assertEqual(return_code, 0)
+            self.assertTrue(manifest_path.is_file())
+            with manifest_path.open(encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            catchments = gpd.read_parquet(out_dir / "catchments.parquet")
+
+        self.assertEqual(manifest["format_version"], "0.3.0")
+        self.assertEqual(manifest["fabric_name"], "hydrobasins")
+        self.assertEqual(manifest["fabric_version"], "v1c")
+        self.assertEqual(manifest["crs"], "EPSG:4326")
+        self.assertIs(manifest["has_up_area"], True)
+        self.assertEqual(manifest["topology"], "tree")
+        self.assertEqual(manifest["adapter_version"], "0.1.0")
+        self.assertEqual(manifest["unit_count"], len(ids))
+        self.assertEqual(manifest["unit_count"], len(catchments))
+        self.assertNotIn("region", manifest)
+        self.assertEqual(manifest["bbox"], [-180.0, -90.0, 180.0, 90.0])
+        self.assertNotIn("auxiliary", manifest)
+        datetime.fromisoformat(manifest["created_at"])
 
 
 class BuildGraphErrorTests(unittest.TestCase):

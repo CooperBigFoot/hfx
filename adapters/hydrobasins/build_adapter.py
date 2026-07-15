@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -25,6 +26,9 @@ ADAPTER_VERSION = "0.1.0"
 FORMAT_VERSION = "0.3.0"
 TOPOLOGY = "tree"
 HAS_UP_AREA = True
+CRS = "EPSG:4326"
+PLANETARY_BBOX = [-180.0, -90.0, 180.0, 90.0]
+FABRIC_VERSION = "v1c"  # Assumed HydroBASINS standard-product version, pending confirmation per the vision open question.
 HAS_RASTERS = False
 HAS_SNAP = False
 ROW_GROUP_MIN = 4096
@@ -563,6 +567,39 @@ def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     return path
 
 
+def write_manifest(
+    units: gpd.GeoDataFrame,
+    out_dir: Path,
+    region: str,
+    planetary: bool,
+) -> Path:
+    """Write the HFX dataset manifest with regional or planetary semantics."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "fabric_name": FABRIC_NAME,
+        "fabric_version": FABRIC_VERSION,
+        "crs": CRS,
+        "has_up_area": HAS_UP_AREA,
+        "topology": TOPOLOGY,
+        "unit_count": len(units),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "adapter_version": ADAPTER_VERSION,
+    }
+    if planetary:
+        manifest["bbox"] = list(PLANETARY_BBOX)
+    else:
+        manifest["region"] = region
+        manifest["bbox"] = [float(value) for value in units.geometry.total_bounds]
+
+    path = out_dir / "manifest.json"
+    path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, and write the requested regional polygon layer."""
     units = load_region_units(args.region, args.basins)
@@ -570,6 +607,7 @@ def build_dataset(args: argparse.Namespace) -> None:
     units = assign_outlets(units, pour_points)
     write_catchments(units, args.out)
     write_graph(units, args.out)
+    write_manifest(units, args.out, region=args.region, planetary=args.planetary)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -593,6 +631,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="directory containing hybas_pour_lev12_v1.shp",
     )
     build.add_argument("--out", type=Path, required=True, help="output directory")
+    build.add_argument(
+        "--planetary",
+        action="store_true",
+        help="omit the manifest region and use the exact planetary bbox",
+    )
     return parser
 
 
