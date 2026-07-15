@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from geoparquet_io.core.validate import validate_geoparquet
 from shapely import make_valid
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -21,10 +27,111 @@ TOPOLOGY = "tree"
 HAS_UP_AREA = True
 HAS_RASTERS = False
 HAS_SNAP = False
+ROW_GROUP_MIN = 4096
+ROW_GROUP_MAX = 8192
+BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
 
 
 class AdapterError(RuntimeError):
     """Report a HydroBASINS source-contract violation."""
+
+
+def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
+    """Build GeoParquet 1.1 metadata with a `bbox` covering."""
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {
+            "geometry": {
+                "encoding": "WKB",
+                "geometry_types": geometry_types,
+                "covering": {
+                    "bbox": {name: ["bbox", name] for name in BBOX_LEAF_NAMES}
+                },
+            }
+        },
+    }
+    return {b"geo": json.dumps(geo).encode("utf-8")}
+
+
+def bbox_struct_type() -> pa.DataType:
+    """Return the GeoParquet covering `bbox` type with non-nullable leaves."""
+    return pa.struct(
+        [pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES]
+    )
+
+
+def build_bbox_struct(minx, miny, maxx, maxy) -> pa.StructArray:
+    """Build a bbox struct whose float32 leaves carry row-group statistics."""
+    return pa.StructArray.from_arrays(
+        [
+            pa.array(minx, type=pa.float32()),
+            pa.array(miny, type=pa.float32()),
+            pa.array(maxx, type=pa.float32()),
+            pa.array(maxy, type=pa.float32()),
+        ],
+        fields=[
+            pa.field(name, pa.float32(), nullable=False)
+            for name in BBOX_LEAF_NAMES
+        ],
+    )
+
+
+def assert_geoparquet_valid(path: Path) -> None:
+    """Raise when a Parquet file fails GeoParquet 1.1 validation."""
+    result = validate_geoparquet(str(path), target_version="1.1")
+    if result.is_valid:
+        return
+    failures = [check for check in result.checks if check.status.value == "failed"]
+    details = "; ".join(f"{check.name}: {check.message}" for check in failures)
+    raise AdapterError(f"GeoParquet validation failed for {path}: {details}")
+
+
+def balanced_row_group_bounds(
+    total_rows: int,
+    min_size: int = ROW_GROUP_MIN,
+    max_size: int = ROW_GROUP_MAX,
+) -> list[tuple[int, int]]:
+    """Split ``total_rows`` into row-group slices of size in ``[min_size, max_size]``."""
+    if total_rows <= 0:
+        return []
+
+    min_groups = math.ceil(total_rows / max_size)
+    max_groups = max(1, total_rows // min_size)
+    group_count = max_groups
+    while group_count >= min_groups:
+        base = total_rows // group_count
+        remainder = total_rows % group_count
+        if min_size <= base <= max_size and base + (1 if remainder else 0) <= max_size:
+            bounds: list[tuple[int, int]] = []
+            start = 0
+            for index in range(group_count):
+                size = base + (1 if index < remainder else 0)
+                stop = start + size
+                bounds.append((start, stop))
+                start = stop
+            return bounds
+        group_count -= 1
+
+    return [(0, total_rows)]
+
+
+def _write_table(
+    path: Path,
+    schema: pa.Schema,
+    columns: list[pa.Array],
+    row_count: int,
+) -> None:
+    """Write an Arrow table with balanced Parquet row groups."""
+    table = pa.Table.from_arrays(columns, schema=schema)
+    with pq.ParquetWriter(
+        path,
+        schema=schema,
+        compression="snappy",
+        write_statistics=True,
+    ) as writer:
+        for start, stop in balanced_row_group_bounds(row_count):
+            writer.write_table(table.slice(start, stop - start))
 
 
 def _source_path(region: str, basins_dir: Path) -> Path:
@@ -143,9 +250,58 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     return units.drop(columns=["_hilbert"]).reset_index(drop=True)
 
 
+def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
+    """Write normalized units as an HFX catchments GeoParquet slice."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "catchments.parquet"
+    row_count = len(units)
+    bounds = units.reset_index(drop=True).geometry.bounds
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox", bbox_struct_type(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
+
+    # These non-null NaNs are temporary M1 schema placeholders that intentionally
+    # fail full HFX semantics; M2 replaces them with HydroBASINS pour-point values.
+    outlet_stubs = np.full(row_count, np.nan, dtype="float64")
+    columns = [
+        pa.array(units["id"].to_numpy(), type=pa.int64()),
+        pa.array(units["level"].to_numpy(dtype="int16"), type=pa.int16()),
+        pa.nulls(row_count, type=pa.int64()),
+        pa.array(units["area_km2"].to_numpy(dtype="float32"), type=pa.float32()),
+        pa.array(
+            units["up_area_km2"].to_numpy(dtype="float32"),
+            type=pa.float32(),
+        ),
+        pa.array(outlet_stubs, type=pa.float64()),
+        pa.array(outlet_stubs, type=pa.float64()),
+        build_bbox_struct(
+            bounds["minx"].to_numpy(dtype="float32"),
+            bounds["miny"].to_numpy(dtype="float32"),
+            bounds["maxx"].to_numpy(dtype="float32"),
+            bounds["maxy"].to_numpy(dtype="float32"),
+        ),
+        pa.array(units.geometry.to_wkb(hex=False).tolist(), type=pa.binary()),
+    ]
+    _write_table(path, schema, columns, row_count)
+    assert_geoparquet_valid(path)
+    return path
+
+
 def build_dataset(args: argparse.Namespace) -> None:
-    """Load and normalize the requested regional polygon layer in memory."""
-    load_region_units(args.region, args.basins)
+    """Load, normalize, and write the requested regional polygon layer."""
+    units = load_region_units(args.region, args.basins)
+    write_catchments(units, args.out)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
