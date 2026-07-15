@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import subprocess
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -610,6 +612,87 @@ def build_dataset(args: argparse.Namespace) -> None:
     write_manifest(units, args.out, region=args.region, planetary=args.planetary)
 
 
+def extract_dataset(args: argparse.Namespace) -> None:
+    """Inspect one regional polygon layer and its ancillary pour points."""
+    basins_path = _source_path(args.region, args.basins)
+    pour_points_path = _pour_points_source_path(args.pour_points)
+
+    try:
+        basins = gpd.read_file(basins_path, engine="pyogrio")
+    except Exception as error:
+        raise AdapterError(
+            f"failed to read regional HydroBASINS polygon layer {basins_path}: {error}"
+        ) from error
+
+    try:
+        pour_points = gpd.read_file(pour_points_path, engine="pyogrio")
+    except Exception as error:
+        raise AdapterError(
+            f"failed to read HydroBASINS pour-points layer {pour_points_path}: {error}"
+        ) from error
+
+    print(f"basins path: {basins_path}")
+    print(f"basins features: {len(basins)}")
+    print(f"basins CRS: {basins.crs}")
+    for column in ("HYBAS_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"):
+        status = "present" if column in basins.columns else "absent"
+        print(f"basins column {column}: {status}")
+
+    if "HYBAS_ID" in pour_points.columns:
+        join_key_status = "HYBAS_ID"
+    else:
+        candidates = [
+            column
+            for column in pour_points.columns
+            if column.casefold() == "HYBAS_ID".casefold()
+        ]
+        if len(candidates) == 1:
+            join_key_status = candidates[0]
+        elif candidates:
+            join_key_status = f"ambiguous ({', '.join(candidates)})"
+        else:
+            join_key_status = "missing"
+
+    print(f"pour points path: {pour_points_path}")
+    print(f"pour points features: {len(pour_points)}")
+    print(f"pour points CRS: {pour_points.crs}")
+    print(f"pour points join key: {join_key_status}")
+
+
+def validate_dataset(dataset: Path, report_dir: Path) -> None:
+    """Run strict text and JSON validation and persist the reports."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    commands = {
+        "text": [
+            "cargo", "run", "-p", "hfx-cli", "--", str(dataset),
+            "--format", "text", "--strict", "--sample-pct", "100",
+        ],
+        "json": [
+            "cargo", "run", "-p", "hfx-cli", "--", str(dataset),
+            "--format", "json", "--strict", "--sample-pct", "100",
+        ],
+    }
+    for report_format, command in commands.items():
+        result = subprocess.run(
+            command,
+            cwd=Path(__file__).parents[2],
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report_path = report_dir / f"validator-report.{report_format}"
+        report_path.write_text(result.stdout, encoding="utf-8")
+        if result.stderr:
+            stderr_path = report_dir / f"validator-report.{report_format}.stderr"
+            stderr_path.write_text(result.stderr, encoding="utf-8")
+        if result.returncode != 0:
+            raise AdapterError(
+                f"{report_format} validator failed with return code "
+                f"{result.returncode}; see reports in {report_dir}"
+            )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the HydroBASINS adapter command-line parser."""
     parser = argparse.ArgumentParser(
@@ -636,6 +719,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="omit the manifest region and use the exact planetary bbox",
     )
+    extract = subparsers.add_parser(
+        "extract", help="inspect one region's source inputs"
+    )
+    extract.add_argument("--region", required=True, help="HydroBASINS region code")
+    extract.add_argument(
+        "--basins",
+        type=Path,
+        required=True,
+        help="directory containing the regional Pfaf-12 polygon layer",
+    )
+    extract.add_argument(
+        "--pour-points",
+        type=Path,
+        required=True,
+        help="directory containing hybas_pour_lev12_v1.shp",
+    )
+    validate = subparsers.add_parser(
+        "validate", help="run strict validation and persist reports"
+    )
+    validate.add_argument("dataset", type=Path, help="HFX dataset directory")
+    validate.add_argument(
+        "--report-dir",
+        type=Path,
+        help="report directory (default: <dataset>/validation)",
+    )
     return parser
 
 
@@ -644,6 +752,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.command == "build":
         build_dataset(args)
+        return 0
+    if args.command == "extract":
+        extract_dataset(args)
+        return 0
+    if args.command == "validate":
+        dataset = args.dataset.expanduser()
+        report_dir = (
+            args.report_dir.expanduser()
+            if args.report_dir is not None
+            else dataset / "validation"
+        )
+        validate_dataset(dataset, report_dir)
         return 0
     raise AssertionError(f"unsupported command: {args.command}")
 
