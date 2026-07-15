@@ -13,12 +13,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from geoparquet_io.core.validate import validate_geoparquet
-from shapely.geometry import Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 import build_adapter
 
 
 LAYER_NAME = "hybas_gr_lev12_v1.shp"
+POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
 
 
 def _write_layer(
@@ -53,6 +54,49 @@ def _write_layer(
         driver="ESRI Shapefile",
         engine="pyogrio",
         index=False,
+    )
+
+
+def _write_pour_points(
+    pour_points_dir: Path,
+    *,
+    ids: list[object],
+    points: list[object],
+    key_name: str = "HYBAS_ID",
+    crs: str | None = "EPSG:4326",
+    extra_columns: dict[str, list[object]] | None = None,
+) -> None:
+    pour_points_dir.mkdir(parents=True, exist_ok=True)
+    rows: dict[str, list[object]] = {key_name: ids}
+    if extra_columns is not None:
+        rows.update(extra_columns)
+    frame = gpd.GeoDataFrame(rows, geometry=points, crs=crs)
+    frame.to_file(
+        pour_points_dir / POUR_POINTS_LAYER_NAME,
+        driver="ESRI Shapefile",
+        engine="pyogrio",
+        index=False,
+    )
+
+
+def _build_args(basins_dir: Path, pour_points_dir: Path, out_dir: Path) -> list[str]:
+    return [
+        "build",
+        "--region",
+        "gr",
+        "--basins",
+        str(basins_dir),
+        "--pour-points",
+        str(pour_points_dir),
+        "--out",
+        str(out_dir),
+    ]
+
+
+def _ordinary_points() -> tuple[list[int], list[Point]]:
+    return (
+        [30, 10, 20, 40],
+        [Point(0.30, 0.30), Point(0.10, 0.10), Point(10.20, 0.20), Point(20.20, 0.20)],
     )
 
 
@@ -173,21 +217,16 @@ class BuildCatchmentsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
 
             expected = build_adapter.load_region_units("gr", basins_dir)
             return_code = build_adapter.main(
-                [
-                    "build",
-                    "--region",
-                    "gr",
-                    "--basins",
-                    str(basins_dir),
-                    "--out",
-                    str(out_dir),
-                ]
+                _build_args(basins_dir, pour_points_dir, out_dir)
             )
             catchments_path = out_dir / "catchments.parquet"
             self.assertEqual(return_code, 0)
@@ -265,14 +304,26 @@ class BuildCatchmentsTests(unittest.TestCase):
                 },
             )
 
-            for name in ("outlet_lon", "outlet_lat"):
+            expected_outlets = {
+                identifier: (point.x, point.y)
+                for identifier, point in zip(ids, points, strict=True)
+            }
+            for name, coordinate_index, lower, upper in (
+                ("outlet_lon", 0, -180.0, 180.0),
+                ("outlet_lat", 1, -90.0, 90.0),
+            ):
                 outlet = table.column(name)
+                values = outlet.to_numpy()
                 self.assertEqual(outlet.type, pa.float64())
                 self.assertEqual(outlet.null_count, 0)
-                self.assertTrue(
-                    np.isnan(outlet.to_numpy()).all(),
-                    "M1 deliberately stubs outlets with NaN; M2 adds real outlets",
-                )
+                self.assertTrue(np.isfinite(values).all())
+                self.assertFalse(np.isnan(values).any())
+                self.assertTrue(((values >= lower) & (values <= upper)).all())
+                wanted = [
+                    expected_outlets[identifier][coordinate_index]
+                    for identifier in table.column("id").to_pylist()
+                ]
+                np.testing.assert_allclose(values, wanted)
 
             expected_ids = expected["id"].tolist()
             self.assertEqual(table.column("id").to_pylist(), expected_ids)
@@ -310,6 +361,207 @@ class BuildCatchmentsTests(unittest.TestCase):
                 if check.status.value == "failed"
             ]
             self.assertTrue(validation.is_valid, "; ".join(failures))
+
+
+class PourPointTests(unittest.TestCase):
+    """Exercise pour-point source normalization and outlet assignment."""
+
+    def _build_fixture(
+        self,
+        root: Path,
+        *,
+        ids: list[object],
+        points: list[object],
+        key_name: str = "HYBAS_ID",
+        crs: str | None = "EPSG:4326",
+        extra_columns: dict[str, list[object]] | None = None,
+    ) -> Path:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir)
+        _write_pour_points(
+            pour_points_dir,
+            ids=ids,
+            points=points,
+            key_name=key_name,
+            crs=crs,
+            extra_columns=extra_columns,
+        )
+        build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir))
+        return out_dir / "catchments.parquet"
+
+    def test_unique_case_insensitive_join_key_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ids, points = _ordinary_points()
+            path = self._build_fixture(
+                Path(temporary), ids=ids, points=points, key_name="Hybas_ID"
+            )
+            output = gpd.read_parquet(path).set_index("id")
+
+        for identifier, point in zip(ids, points, strict=True):
+            self.assertEqual(output.loc[identifier, "outlet_lon"], point.x)
+            self.assertEqual(output.loc[identifier, "outlet_lat"], point.y)
+
+    def test_missing_join_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "HYBAS_ID.*available"):
+                self._build_fixture(
+                    root,
+                    ids=[30, 10, 20, 40],
+                    points=_ordinary_points()[1],
+                    key_name="OTHER_ID",
+                )
+
+    def test_ambiguous_case_insensitive_join_keys_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(
+                pour_points_dir,
+                ids=ids,
+                points=points,
+                key_name="Hybas_ID",
+                extra_columns={"other_id": ids},
+            )
+            dbf_path = pour_points_dir / "hybas_pour_lev12_v1.dbf"
+            dbf = bytearray(dbf_path.read_bytes())
+            dbf[64:75] = b"hybas_id\0\0\0"
+            dbf_path.write_bytes(dbf)
+
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError, "ambiguous.*Hybas_ID.*hybas_id"
+            ):
+                build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir))
+
+    def test_exact_join_key_is_preferred(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(
+                pour_points_dir,
+                ids=ids,
+                points=points,
+                extra_columns={"other_id": [999, 999, 999, 999]},
+            )
+            dbf_path = pour_points_dir / "hybas_pour_lev12_v1.dbf"
+            dbf = bytearray(dbf_path.read_bytes())
+            dbf[64:75] = b"hybas_id\0\0\0"
+            dbf_path.write_bytes(dbf)
+            build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir))
+            path = out_dir / "catchments.parquet"
+            output = gpd.read_parquet(path)
+
+        self.assertEqual(set(output["id"]), set(ids))
+
+    def test_missing_unit_is_rejected_and_unrelated_id_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ids = [30, 10, 40, 999]
+            points = [
+                Point(0.30, 0.30),
+                Point(0.10, 0.10),
+                Point(20.20, 0.20),
+                Point(30.0, 30.0),
+            ]
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                self._build_fixture(Path(temporary), ids=ids, points=points)
+            self.assertIn("20", str(caught.exception))
+            self.assertNotIn("999", str(caught.exception))
+
+    def test_duplicate_points_choose_nearest_then_lexicographic_ties(self) -> None:
+        cases = (
+            ([Point(0.1, 0.1), Point(0.4, 0.5)], (0.4, 0.5)),
+            ([Point(0.25, 0.5), Point(0.75, 0.5)], (0.25, 0.5)),
+            ([Point(0.5, 0.25), Point(0.5, 0.75)], (0.5, 0.25)),
+        )
+        for candidates, wanted in cases:
+            with self.subTest(candidates=candidates), tempfile.TemporaryDirectory() as temporary:
+                path = self._build_fixture(
+                    Path(temporary),
+                    ids=[30, 30, 10, 20, 40],
+                    points=candidates
+                    + [Point(0.1, 0.1), Point(10.2, 0.2), Point(20.2, 0.2)],
+                )
+                row = gpd.read_parquet(path).set_index("id").loc[30]
+                self.assertEqual((row["outlet_lon"], row["outlet_lat"]), wanted)
+
+    def test_invalid_selected_coordinates_are_rejected(self) -> None:
+        for bad_point in (Point(181.0, 0.0), Point(0.0, 91.0)):
+            with self.subTest(point=bad_point), tempfile.TemporaryDirectory() as temporary:
+                ids, points = _ordinary_points()
+                points[0] = bad_point
+                with self.assertRaisesRegex(build_adapter.AdapterError, "30.*invalid"):
+                    self._build_fixture(Path(temporary), ids=ids, points=points)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ids, points = _ordinary_points()
+            path = self._build_fixture(
+                Path(temporary),
+                ids=ids + [999],
+                points=points + [Point(181.0, 91.0)],
+            )
+            self.assertEqual(set(gpd.read_parquet(path)["id"]), set(ids))
+
+    def test_point_layer_match_count_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pour_points_dir = Path(temporary)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "found 0"):
+                build_adapter.load_pour_points(pour_points_dir)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pour_points_dir = Path(temporary)
+            nested = pour_points_dir / "nested"
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_pour_points(nested, ids=ids, points=points)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "found 2"):
+                build_adapter.load_pour_points(pour_points_dir)
+
+    def test_point_layer_requires_declared_crs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pour_points_dir = Path(temporary)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points, crs=None)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "no declared CRS"):
+                build_adapter.load_pour_points(pour_points_dir)
+
+    def test_point_layer_crs_is_transformed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pour_points_dir = Path(temporary)
+            _write_pour_points(
+                pour_points_dir,
+                ids=[30],
+                points=[Point(111319.490793, 111325.142866)],
+                crs="EPSG:3857",
+            )
+            points = build_adapter.load_pour_points(pour_points_dir)
+
+        self.assertEqual(points.crs.to_epsg(), 4326)
+        self.assertAlmostEqual(points.loc[0, "outlet_lon"], 1.0, places=6)
+        self.assertAlmostEqual(points.loc[0, "outlet_lat"], 1.0, places=6)
+        self.assertEqual(points.loc[0, "outlet_lon"], points.geometry.iloc[0].x)
+        self.assertEqual(points.loc[0, "outlet_lat"], points.geometry.iloc[0].y)
+
+    def test_invalid_point_geometries_are_rejected(self) -> None:
+        cases = (None, Point(), LineString([(0, 0), (1, 1)]))
+        for geometry in cases:
+            with self.subTest(geometry=geometry), tempfile.TemporaryDirectory() as temporary:
+                pour_points_dir = Path(temporary)
+                _write_pour_points(pour_points_dir, ids=[30], points=[geometry])
+                with self.assertRaisesRegex(build_adapter.AdapterError, "geometry"):
+                    build_adapter.load_pour_points(pour_points_dir)
 
 
 if __name__ == "__main__":
