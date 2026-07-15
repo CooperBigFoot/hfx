@@ -26,6 +26,8 @@ def _write_layer(
     basins_dir: Path,
     *,
     ids: list[object] | None = None,
+    next_down: list[object] | None = None,
+    endo: list[object] | None = None,
     omit: str | None = None,
     crs: str = "EPSG:4326",
     geometries: list[Polygon] | None = None,
@@ -35,8 +37,8 @@ def _write_layer(
         "HYBAS_ID": values,
         "SUB_AREA": [3.5, 1.5, 2.5, 4.5],
         "UP_AREA": [30.5, 10.5, 20.5, 40.5],
-        "NEXT_DOWN": [20, 20, 0, 20],
-        "ENDO": [0, 0, 0, 2],
+        "NEXT_DOWN": next_down if next_down is not None else [20, 20, 0, 20],
+        "ENDO": endo if endo is not None else [0, 0, 0, 2],
         "PFAF_ID": [111, 112, 113, 114],
     }
     if omit is not None:
@@ -111,6 +113,22 @@ class LoadRegionUnitsTests(unittest.TestCase):
             with self.assertRaisesRegex(build_adapter.AdapterError, "UP_AREA"):
                 build_adapter.load_region_units("gr", basins_dir)
 
+    def test_missing_next_down_names_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            basins_dir = Path(temporary)
+            _write_layer(basins_dir, omit="NEXT_DOWN")
+
+            with self.assertRaisesRegex(build_adapter.AdapterError, "NEXT_DOWN"):
+                build_adapter.load_region_units("gr", basins_dir)
+
+    def test_missing_endo_names_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            basins_dir = Path(temporary)
+            _write_layer(basins_dir, omit="ENDO")
+
+            with self.assertRaisesRegex(build_adapter.AdapterError, "ENDO"):
+                build_adapter.load_region_units("gr", basins_dir)
+
     def test_non_positive_and_non_integral_ids_are_rejected(self) -> None:
         cases = ([0, 10, 20, 40], [-1, 10, 20, 40], [1.5, 10, 20, 40])
         for ids in cases:
@@ -144,6 +162,8 @@ class LoadRegionUnitsTests(unittest.TestCase):
         self.assertEqual(units["up_area_km2"].dtype, "float64")
         self.assertIn("NEXT_DOWN", units.columns)
         self.assertIn("ENDO", units.columns)
+        self.assertEqual(units["NEXT_DOWN"].dtype, "int64")
+        self.assertTrue(pd.api.types.is_integer_dtype(units["ENDO"].dtype))
         self.assertIn("PFAF_ID", units.columns)
 
     def test_single_level_defaults_use_nullable_parent_ids(self) -> None:
@@ -229,8 +249,10 @@ class BuildCatchmentsTests(unittest.TestCase):
                 _build_args(basins_dir, pour_points_dir, out_dir)
             )
             catchments_path = out_dir / "catchments.parquet"
+            graph_path = out_dir / "graph.parquet"
             self.assertEqual(return_code, 0)
             self.assertTrue(catchments_path.is_file())
+            self.assertTrue(graph_path.is_file())
 
             parquet_file = pq.ParquetFile(catchments_path)
             table = pq.read_table(catchments_path)
@@ -361,6 +383,146 @@ class BuildCatchmentsTests(unittest.TestCase):
                 if check.status.value == "failed"
             ]
             self.assertTrue(validation.is_valid, "; ".join(failures))
+
+            graph_file = pq.ParquetFile(graph_path)
+            graph = pq.read_table(graph_path)
+            graph_schema = graph_file.schema_arrow
+            list_type = pa.list_(pa.field("item", pa.int64(), nullable=True))
+            graph_fields = [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("level", pa.int16(), nullable=False),
+                pa.field("upstream_ids", list_type, nullable=False),
+                pa.field("bbox_minx", pa.float32(), nullable=False),
+                pa.field("bbox_miny", pa.float32(), nullable=False),
+                pa.field("bbox_maxx", pa.float32(), nullable=False),
+                pa.field("bbox_maxy", pa.float32(), nullable=False),
+            ]
+            self.assertEqual(graph_schema.names, [field.name for field in graph_fields])
+            for actual, required in zip(graph_schema, graph_fields, strict=True):
+                self.assertEqual(actual, required)
+            for column in graph.columns:
+                self.assertEqual(column.null_count, 0)
+
+            upstream_column = graph.column("upstream_ids").combine_chunks()
+            self.assertEqual(upstream_column.type, list_type)
+            self.assertEqual(upstream_column.flatten().type, pa.int64())
+            self.assertEqual(upstream_column.flatten().null_count, 0)
+
+            graph_ids = graph.column("id").to_pylist()
+            graph_levels = graph.column("level").to_pylist()
+            catchment_ids = table.column("id").to_pylist()
+            catchment_levels = table.column("level").to_pylist()
+            self.assertEqual(graph.num_rows, table.num_rows)
+            self.assertEqual(len(graph_ids), len(set(graph_ids)))
+            self.assertEqual(set(graph_ids), set(catchment_ids))
+            self.assertEqual(graph_ids, catchment_ids)
+            self.assertEqual(graph_levels, catchment_levels)
+            self.assertEqual(graph_levels, [0, 0, 0, 0])
+
+            catchments_by_id = output.set_index("id")
+            for row in graph.to_pylist():
+                referenced = catchments_by_id.loc[row["id"]]
+                self.assertEqual(row["level"], int(referenced["level"]))
+                wanted_bounds = np.asarray(
+                    referenced.geometry.bounds,
+                    dtype="float32",
+                )
+                stored_bounds = np.asarray(
+                    [
+                        row["bbox_minx"],
+                        row["bbox_miny"],
+                        row["bbox_maxx"],
+                        row["bbox_maxy"],
+                    ],
+                    dtype="float32",
+                )
+                np.testing.assert_array_equal(stored_bounds, wanted_bounds)
+
+            levels_by_id = dict(zip(graph_ids, graph_levels, strict=True))
+            adjacency = dict(
+                zip(graph_ids, upstream_column.to_pylist(), strict=True)
+            )
+            for downstream_id, upstream_ids in adjacency.items():
+                self.assertEqual(upstream_ids, sorted(upstream_ids))
+                self.assertTrue(set(upstream_ids) <= set(graph_ids))
+                self.assertTrue(
+                    all(
+                        levels_by_id[upstream_id] == levels_by_id[downstream_id]
+                        for upstream_id in upstream_ids
+                    )
+                )
+            self.assertEqual(adjacency[20], [10, 30])
+            self.assertEqual(adjacency[10], [])
+            self.assertEqual(adjacency[30], [])
+            self.assertEqual(adjacency[40], [])
+            self.assertNotIn(40, adjacency[20])
+
+            downstream_counts = {identifier: 0 for identifier in graph_ids}
+            for upstream_ids in adjacency.values():
+                for upstream_id in upstream_ids:
+                    downstream_counts[upstream_id] += 1
+            self.assertTrue(all(count <= 1 for count in downstream_counts.values()))
+
+            self.assertEqual(graph_file.metadata.num_row_groups, 1)
+            graph_row_group = graph_file.metadata.row_group(0)
+            self.assertEqual(graph_row_group.num_rows, 4)
+            graph_physical_columns = {
+                graph_row_group.column(index).path_in_schema: graph_row_group.column(index)
+                for index in range(graph_row_group.num_columns)
+            }
+            for name in ("bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"):
+                physical = graph_physical_columns[name]
+                self.assertIsNotNone(physical.statistics)
+                self.assertTrue(physical.statistics.has_min_max)
+                stored = graph.column(name).to_numpy()
+                self.assertAlmostEqual(physical.statistics.min, float(stored.min()))
+                self.assertAlmostEqual(physical.statistics.max, float(stored.max()))
+
+
+class BuildGraphErrorTests(unittest.TestCase):
+    """Reject invalid topology through the public build command."""
+
+    def _run_invalid_build(
+        self,
+        *,
+        next_down: list[object],
+        endo: list[object],
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir, next_down=next_down, endo=endo)
+        ids, points = _ordinary_points()
+        _write_pour_points(pour_points_dir, ids=ids, points=points)
+        build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir))
+
+    def test_two_node_cycle_is_rejected(self) -> None:
+        with self.assertRaisesRegex(build_adapter.AdapterError, "cycle|acyclic"):
+            self._run_invalid_build(
+                next_down=[10, 30, 0, 0],
+                endo=[0, 0, 0, 0],
+            )
+
+    def test_self_link_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            build_adapter.AdapterError,
+            "30.*(?:self-link|cycle)|(?:self-link|cycle).*30",
+        ):
+            self._run_invalid_build(
+                next_down=[30, 0, 0, 0],
+                endo=[0, 0, 0, 0],
+            )
+
+    def test_out_of_set_downstream_is_rejected(self) -> None:
+        with self.assertRaisesRegex(build_adapter.AdapterError, "999"):
+            self._run_invalid_build(
+                next_down=[999, 0, 0, 0],
+                endo=[0, 0, 0, 0],
+            )
 
 
 class PourPointTests(unittest.TestCase):
