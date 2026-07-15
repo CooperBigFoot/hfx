@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +30,7 @@ POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
 def _write_layer(
     basins_dir: Path,
     *,
+    region: str = "gr",
     ids: list[object] | None = None,
     next_down: list[object] | None = None,
     endo: list[object] | None = None,
@@ -37,13 +39,31 @@ def _write_layer(
     geometries: list[Polygon] | None = None,
 ) -> None:
     values = ids if ids is not None else [30, 10, 20, 40]
+    size = len(values)
+    default_fixture = size == 4
     rows: dict[str, list[object]] = {
         "HYBAS_ID": values,
-        "SUB_AREA": [3.5, 1.5, 2.5, 4.5],
-        "UP_AREA": [30.5, 10.5, 20.5, 40.5],
-        "NEXT_DOWN": next_down if next_down is not None else [20, 20, 0, 20],
-        "ENDO": endo if endo is not None else [0, 0, 0, 2],
-        "PFAF_ID": [111, 112, 113, 114],
+        "SUB_AREA": (
+            [3.5, 1.5, 2.5, 4.5]
+            if default_fixture
+            else [float(index + 1) for index in range(size)]
+        ),
+        "UP_AREA": (
+            [30.5, 10.5, 20.5, 40.5]
+            if default_fixture
+            else [float(index + 1) for index in range(size)]
+        ),
+        "NEXT_DOWN": next_down if next_down is not None else (
+            [20, 20, 0, 20] if default_fixture else [0] * size
+        ),
+        "ENDO": endo if endo is not None else (
+            [0, 0, 0, 2] if default_fixture else [0] * size
+        ),
+        "PFAF_ID": (
+            [111, 112, 113, 114]
+            if default_fixture
+            else list(range(1, size + 1))
+        ),
     }
     if omit is not None:
         del rows[omit]
@@ -56,11 +76,24 @@ def _write_layer(
         ]
     frame = gpd.GeoDataFrame(rows, geometry=geometries, crs=crs)
     frame.to_file(
-        basins_dir / LAYER_NAME,
+        basins_dir / f"hybas_{region}_lev12_v1.shp",
         driver="ESRI Shapefile",
         engine="pyogrio",
         index=False,
     )
+
+
+def _selector_args(selector: list[str], root: Path) -> list[str]:
+    return [
+        "build",
+        *selector,
+        "--basins",
+        str(root / "basins"),
+        "--pour-points",
+        str(root / "pour_points"),
+        "--out",
+        str(root / "out"),
+    ]
 
 
 def _write_pour_points(
@@ -361,6 +394,467 @@ class ConformanceTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class BuildSelectorTests(unittest.TestCase):
+    """Exercise required build-region selection without changing extract."""
+
+    def _parse_and_resolve(self, selector: list[str], root: Path) -> list[str]:
+        args = build_adapter.build_arg_parser().parse_args(
+            _selector_args(selector, root)
+        )
+        return build_adapter.resolve_build_regions(args)
+
+    def test_single_region_resolves_without_changing_root_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(self._parse_and_resolve(["--region", "gr"], root), ["gr"])
+
+    def test_strict_build_defaults_false_and_is_opt_in(self) -> None:
+        parser = build_adapter.build_arg_parser()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            default_args = parser.parse_args(
+                _selector_args(["--region", "gr"], root)
+            )
+            strict_args = parser.parse_args(
+                _selector_args(["--region", "gr"], root) + ["--strict-build"]
+            )
+
+        self.assertIs(default_args.strict_build, False)
+        self.assertIs(strict_args.strict_build, True)
+
+    def test_regions_accept_commas_and_space_tokens_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(
+                self._parse_and_resolve(["--regions", "gr,af"], root),
+                ["gr", "af"],
+            )
+            self.assertEqual(
+                self._parse_and_resolve(["--regions", "gr", "af"], root),
+                ["gr", "af"],
+            )
+
+    def test_all_regions_selects_present_layers_in_standard_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            basins_dir.mkdir()
+            for region in ("si", "af", "eu"):
+                (basins_dir / f"hybas_{region}_lev12_v1.shp").touch()
+            self.assertEqual(
+                self._parse_and_resolve(["--all-regions"], root),
+                ["af", "eu", "si"],
+            )
+
+    def test_selector_is_required_and_mutually_exclusive(self) -> None:
+        parser = build_adapter.build_arg_parser()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(SystemExit, "2"):
+                parser.parse_args(_selector_args([], root))
+            pairs = (
+                ["--region", "gr", "--regions", "af"],
+                ["--region", "gr", "--all-regions"],
+                ["--regions", "gr", "--all-regions"],
+            )
+            for selectors in pairs:
+                with self.subTest(selectors=selectors), self.assertRaisesRegex(SystemExit, "2"):
+                    parser.parse_args(_selector_args(selectors, root))
+
+    def test_repeated_and_empty_regions_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "gr"):
+                self._parse_and_resolve(["--regions", "gr,af,gr"], root)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "empty|region"):
+                self._parse_and_resolve(["--regions", ", \t ,"], root)
+
+    def test_all_regions_rejects_an_empty_basins_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "basins").mkdir()
+            with self.assertRaisesRegex(build_adapter.AdapterError, "no regions found"):
+                self._parse_and_resolve(["--all-regions"], root)
+
+    def test_extract_retains_singular_required_region(self) -> None:
+        parser = build_adapter.build_arg_parser()
+        args = parser.parse_args(
+            [
+                "extract",
+                "--region",
+                "gr",
+                "--basins",
+                "basins",
+                "--pour-points",
+                "pour_points",
+            ]
+        )
+        self.assertEqual(args.command, "extract")
+        self.assertEqual(args.region, "gr")
+        self.assertFalse(hasattr(args, "regions"))
+        self.assertFalse(hasattr(args, "all_regions"))
+
+
+class MergedBuildTests(unittest.TestCase):
+    """Exercise deterministic normalization and graph construction across regions."""
+
+    def _write_two_regions(self, root: Path) -> tuple[Path, Path]:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        basins_dir.mkdir()
+        _write_layer(
+            basins_dir,
+            region="gr",
+            ids=[101, 103],
+            next_down=[202, 0],
+            geometries=[box(20, 0, 21, 1), box(0, 0, 1, 1)],
+        )
+        _write_layer(
+            basins_dir,
+            region="af",
+            ids=[202, 204],
+            geometries=[box(10, 0, 11, 1), box(30, 0, 31, 1)],
+        )
+        _write_pour_points(
+            pour_points_dir / "gr",
+            ids=[101, 103],
+            points=[Point(20.5, 0.5), Point(0.5, 0.5)],
+        )
+        _write_pour_points(
+            pour_points_dir / "af",
+            ids=[202, 204],
+            points=[Point(10.5, 0.5), Point(30.5, 0.5)],
+        )
+        return basins_dir, pour_points_dir
+
+    def test_two_regions_merge_sort_graph_and_manifest_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir, pour_points_dir = self._write_two_regions(root)
+            output_orders: list[list[int]] = []
+            for name in ("out-first", "out-second"):
+                out_dir = root / name
+                return_code = build_adapter.main(
+                    _selector_args(["--regions", "gr,af"], root)[:-1]
+                    + [str(out_dir)]
+                )
+                self.assertEqual(return_code, 0)
+                catchments = gpd.read_parquet(out_dir / "catchments.parquet")
+                graph = pq.read_table(out_dir / "graph.parquet")
+                output_orders.append(catchments["id"].tolist())
+
+                self.assertEqual(len(catchments), 4)
+                self.assertEqual(set(catchments["id"]), {101, 103, 202, 204})
+                distances = catchments.geometry.centroid.hilbert_distance(
+                    total_bounds=catchments.total_bounds
+                )
+                self.assertTrue((distances.diff().dropna() >= 0).all())
+                tied = pd.DataFrame(
+                    {"distance": distances, "id": catchments["id"]}
+                )
+                for _, group in tied.groupby("distance", sort=False):
+                    self.assertEqual(group["id"].tolist(), sorted(group["id"]))
+                self.assertNotEqual(catchments["id"].tolist(), [103, 101, 202, 204])
+                self.assertEqual(graph.column("id").to_pylist(), catchments["id"].tolist())
+                adjacency = {
+                    row["id"]: row["upstream_ids"] for row in graph.to_pylist()
+                }
+                self.assertIn(101, adjacency[202])
+
+                with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+                    manifest = json.load(stream)
+                self.assertEqual(manifest["region"], "gr,af")
+                self.assertEqual(manifest["unit_count"], 4)
+                np.testing.assert_allclose(
+                    manifest["bbox"], catchments.geometry.total_bounds
+                )
+                schema = pq.ParquetFile(out_dir / "catchments.parquet").schema_arrow
+                geo = json.loads(schema.metadata[b"geo"])
+                self.assertEqual(geo["version"], "1.1.0")
+                self.assertIn("covering", geo["columns"]["geometry"])
+
+            self.assertEqual(output_orders[0], output_orders[1])
+
+    def test_duplicate_ids_across_regions_are_rejected_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            for region, offset in (("gr", 0), ("af", 10)):
+                _write_layer(
+                    basins_dir,
+                    region=region,
+                    ids=[22, 11],
+                    geometries=[box(offset, 0, offset + 1, 1), box(offset + 2, 0, offset + 3, 1)],
+                )
+                _write_pour_points(
+                    pour_points_dir / region,
+                    ids=[22, 11],
+                    points=[Point(offset + 0.5, 0.5), Point(offset + 2.5, 0.5)],
+                )
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(_selector_args(["--regions", "gr,af"], root))
+            message = str(caught.exception)
+            self.assertIn("duplicate HYBAS_ID values", message)
+            self.assertIn("[11, 22]", message)
+            self.assertFalse((root / "out").exists())
+
+    def test_all_regions_builds_every_present_standard_region_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            fixtures = (("si", 303, 30), ("af", 101, 0), ("eu", 202, 15))
+            for region, identifier, x in fixtures:
+                _write_layer(
+                    basins_dir,
+                    region=region,
+                    ids=[identifier],
+                    geometries=[box(x, 0, x + 1, 1)],
+                )
+                _write_pour_points(
+                    pour_points_dir / region,
+                    ids=[identifier],
+                    points=[Point(x + 0.5, 0.5)],
+                )
+            self.assertEqual(
+                build_adapter.main(_selector_args(["--all-regions"], root)), 0
+            )
+            catchments = gpd.read_parquet(root / "out" / "catchments.parquet")
+            with (root / "out" / "manifest.json").open(encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(set(catchments["id"]), {101, 202, 303})
+            self.assertEqual(manifest["region"], "af,eu,si")
+            self.assertEqual(manifest["unit_count"], 3)
+
+
+class AntimeridianGuardTests(unittest.TestCase):
+    """Exercise antimeridian detection through complete synthetic builds."""
+
+    @staticmethod
+    def _adapter_warnings(captured: list[warnings.WarningMessage]) -> list[warnings.WarningMessage]:
+        return [
+            warning
+            for warning in captured
+            if "antimeridian-wrap candidates" in str(warning.message)
+        ]
+
+    @staticmethod
+    def _assert_artifacts(test: unittest.TestCase, out_dir: Path) -> None:
+        for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+            test.assertTrue((out_dir / filename).is_file())
+
+    @staticmethod
+    def _assert_no_artifacts(test: unittest.TestCase, out_dir: Path) -> None:
+        for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+            test.assertFalse((out_dir / filename).exists())
+
+    def _write_wrapping_region(self, root: Path) -> tuple[Path, Path]:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        basins_dir.mkdir()
+        _write_layer(
+            basins_dir,
+            ids=[901],
+            next_down=[0],
+            endo=[0],
+            geometries=[box(-179.0, 0.0, 179.0, 1.0)],
+        )
+        _write_pour_points(
+            pour_points_dir,
+            ids=[901],
+            points=[Point(0.0, 0.5)],
+        )
+        return basins_dir, pour_points_dir
+
+    def _write_two_regions_with_wrap(self, root: Path) -> None:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        basins_dir.mkdir()
+        _write_layer(
+            basins_dir,
+            region="gr",
+            ids=[101, 103],
+            next_down=[902, 0],
+            geometries=[box(20, 0, 21, 1), box(0, 0, 1, 1)],
+        )
+        _write_layer(
+            basins_dir,
+            region="af",
+            ids=[902, 204],
+            next_down=[0, 0],
+            endo=[0, 0],
+            geometries=[box(-179.0, 0.0, 179.0, 1.0), box(30, 0, 31, 1)],
+        )
+        _write_pour_points(
+            pour_points_dir / "gr",
+            ids=[101, 103],
+            points=[Point(20.5, 0.5), Point(0.5, 0.5)],
+        )
+        _write_pour_points(
+            pour_points_dir / "af",
+            ids=[902, 204],
+            points=[Point(0.0, 0.5), Point(30.5, 0.5)],
+        )
+
+    def test_ordinary_geometry_is_silent_in_both_modes(self) -> None:
+        for strict_build in (False, True):
+            with self.subTest(strict_build=strict_build), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                basins_dir = root / "basins"
+                pour_points_dir = root / "pour_points"
+                out_dir = root / "out"
+                basins_dir.mkdir()
+                _write_layer(basins_dir)
+                ids, points = _ordinary_points()
+                _write_pour_points(pour_points_dir, ids=ids, points=points)
+                args = _build_args(basins_dir, pour_points_dir, out_dir)
+                if strict_build:
+                    args.append("--strict-build")
+
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always")
+                    return_code = build_adapter.main(args)
+
+                self.assertEqual(return_code, 0)
+                self._assert_artifacts(self, out_dir)
+                self.assertEqual(self._adapter_warnings(captured), [])
+
+    def test_default_single_region_warns_and_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir, pour_points_dir = self._write_wrapping_region(root)
+            out_dir = root / "out"
+
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                return_code = build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                )
+
+            adapter_warnings = self._adapter_warnings(captured)
+            self.assertEqual(return_code, 0)
+            self.assertEqual(len(adapter_warnings), 1)
+            self.assertIs(adapter_warnings[0].category, UserWarning)
+            self.assertIn("count=1", str(adapter_warnings[0].message))
+            self.assertIn("901", str(adapter_warnings[0].message))
+            self._assert_artifacts(self, out_dir)
+
+    def test_strict_single_region_rejects_before_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir, pour_points_dir = self._write_wrapping_region(root)
+            out_dir = root / "out"
+
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--strict-build"]
+                )
+
+            message = str(caught.exception)
+            self.assertIn("antimeridian-wrap candidates", message)
+            self.assertIn("count=1", message)
+            self.assertIn("901", message)
+            self._assert_no_artifacts(self, out_dir)
+
+    def test_combined_regions_warn_or_reject_before_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_two_regions_with_wrap(root)
+            default_out = root / "out-default"
+            strict_out = root / "out-strict"
+
+            default_args = _selector_args(["--regions", "gr,af"], root)
+            default_args[-1] = str(default_out)
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                return_code = build_adapter.main(default_args)
+
+            adapter_warnings = self._adapter_warnings(captured)
+            self.assertEqual(return_code, 0)
+            self.assertEqual(len(adapter_warnings), 1)
+            self.assertIs(adapter_warnings[0].category, UserWarning)
+            self.assertIn("count=1", str(adapter_warnings[0].message))
+            self.assertIn("HYBAS_IDs=[902]", str(adapter_warnings[0].message))
+            self._assert_artifacts(self, default_out)
+
+            strict_args = _selector_args(["--regions", "gr,af"], root)
+            strict_args[-1] = str(strict_out)
+            strict_args.append("--strict-build")
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(strict_args)
+
+            message = str(caught.exception)
+            self.assertIn("antimeridian-wrap candidates", message)
+            self.assertIn("count=1", message)
+            self.assertIn("HYBAS_IDs=[902]", message)
+            self._assert_no_artifacts(self, strict_out)
+
+
+class LargeRowGroupTests(unittest.TestCase):
+    """Prove both writers balance a roughly 12,000-unit real build."""
+
+    def test_large_build_has_balanced_row_groups_and_bbox_statistics(self) -> None:
+        count = 12_000
+        columns = 120
+        width = 0.005
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            ids = list(range(1, count + 1))
+            geometries = [
+                box(
+                    -10 + (index % columns) * 0.01,
+                    -10 + (index // columns) * 0.01,
+                    -10 + (index % columns) * 0.01 + width,
+                    -10 + (index // columns) * 0.01 + width,
+                )
+                for index in range(count)
+            ]
+            points = [geometry.centroid for geometry in geometries]
+            _write_layer(basins_dir, ids=ids, geometries=geometries)
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+
+            self.assertEqual(
+                build_adapter.main(_build_args(basins_dir, pour_points_dir, root / "out")),
+                0,
+            )
+
+            for filename, bbox_names in (
+                (
+                    "catchments.parquet",
+                    tuple(f"bbox.{name}" for name in build_adapter.BBOX_LEAF_NAMES),
+                ),
+                (
+                    "graph.parquet",
+                    ("bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy"),
+                ),
+            ):
+                metadata = pq.ParquetFile(root / "out" / filename).metadata
+                self.assertGreater(metadata.num_row_groups, 1)
+                self.assertEqual(
+                    sum(metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)),
+                    count,
+                )
+                for group_index in range(metadata.num_row_groups):
+                    row_group = metadata.row_group(group_index)
+                    self.assertGreaterEqual(row_group.num_rows, 4096)
+                    self.assertLessEqual(row_group.num_rows, 8192)
+                    columns_by_name = {
+                        row_group.column(index).path_in_schema: row_group.column(index)
+                        for index in range(row_group.num_columns)
+                    }
+                    for name in bbox_names:
+                        statistics = columns_by_name[name].statistics
+                        self.assertIsNotNone(statistics)
+                        self.assertTrue(statistics.has_min_max)
 
 
 class LoadRegionUnitsTests(unittest.TestCase):

@@ -7,7 +7,9 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
+import warnings
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -36,6 +38,7 @@ HAS_SNAP = False
 ROW_GROUP_MIN = 4096
 ROW_GROUP_MAX = 8192
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
+STANDARD_REGION_CODES = ("af", "ar", "as", "au", "eu", "gr", "na", "sa", "si")
 
 
 class AdapterError(RuntimeError):
@@ -258,6 +261,18 @@ def _normalize_topology_integers(
     return pd.Series(normalized, index=values.index, dtype="int64")
 
 
+def _hilbert_sort(units: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Sort units stably by centroid Hilbert distance and ID."""
+    sorted_units = units.copy()
+    sorted_units["_hilbert"] = sorted_units.geometry.centroid.hilbert_distance(
+        total_bounds=sorted_units.total_bounds
+    )
+    sorted_units = sorted_units.sort_values(
+        ["_hilbert", "id"], kind="mergesort"
+    )
+    return sorted_units.drop(columns=["_hilbert"]).reset_index(drop=True)
+
+
 def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     """Load and normalize one HydroBASINS Pfaf-12 regional polygon layer."""
     source_path = _source_path(region, basins_dir)
@@ -307,11 +322,7 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
         allow_negative=True,
     )
 
-    units["_hilbert"] = units.geometry.centroid.hilbert_distance(
-        total_bounds=units.total_bounds
-    )
-    units = units.sort_values(["_hilbert", "id"], kind="mergesort")
-    return units.drop(columns=["_hilbert"]).reset_index(drop=True)
+    return _hilbert_sort(units)
 
 
 def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
@@ -439,6 +450,32 @@ def assign_outlets(
     return assigned
 
 
+def guard_antimeridian(
+    units: gpd.GeoDataFrame,
+    *,
+    strict_build: bool,
+) -> None:
+    """Warn about or reject unit geometries whose raw longitude extent exceeds 180 degrees."""
+    bounds = units.geometry.bounds
+    candidate_ids = sorted(
+        int(identifier)
+        for identifier in units.loc[
+            (bounds["maxx"] - bounds["minx"]) > 180.0,
+            "id",
+        ]
+    )
+    if not candidate_ids:
+        return
+
+    message = (
+        "antimeridian-wrap candidates detected: "
+        f"count={len(candidate_ids)}, HYBAS_IDs={candidate_ids}"
+    )
+    if strict_build:
+        raise AdapterError(message)
+    warnings.warn(message, UserWarning, stacklevel=2)
+
+
 def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     """Write normalized units as an HFX catchments GeoParquet slice."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -530,7 +567,7 @@ def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
         if downstream_id not in id_set:
             raise AdapterError(
                 f"unit {source_id} has downstream ID {downstream_id}, "
-                "which is absent from this region"
+                "which is absent from this dataset"
             )
         outgoing[source_id] = downstream_id
         upstream[downstream_id].append(source_id)
@@ -572,7 +609,7 @@ def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
 def write_manifest(
     units: gpd.GeoDataFrame,
     out_dir: Path,
-    region: str,
+    region_label: str,
     planetary: bool,
 ) -> Path:
     """Write the HFX dataset manifest with regional or planetary semantics."""
@@ -591,7 +628,7 @@ def write_manifest(
     if planetary:
         manifest["bbox"] = list(PLANETARY_BBOX)
     else:
-        manifest["region"] = region
+        manifest["region"] = region_label
         manifest["bbox"] = [float(value) for value in units.geometry.total_bounds]
 
     path = out_dir / "manifest.json"
@@ -602,14 +639,73 @@ def write_manifest(
     return path
 
 
+def resolve_build_regions(args: argparse.Namespace) -> list[str]:
+    """Resolve the selected build regions in their authored deterministic order."""
+    if args.region is not None:
+        return [args.region]
+    if args.regions is not None:
+        regions = [
+            code
+            for code in re.split(r"[\s,]+", " ".join(args.regions))
+            if code
+        ]
+        if not regions:
+            raise AdapterError("--regions must contain at least one region code")
+        duplicates = sorted(
+            {code for code in regions if regions.count(code) > 1}
+        )
+        if duplicates:
+            raise AdapterError(f"duplicate region codes: {duplicates}")
+        return regions
+
+    regions = [
+        code
+        for code in STANDARD_REGION_CODES
+        if (args.basins / f"hybas_{code}_lev12_v1.shp").is_file()
+    ]
+    if not regions:
+        raise AdapterError(
+            f"no regions found under {args.basins} for --all-regions"
+        )
+    return regions
+
+
 def build_dataset(args: argparse.Namespace) -> None:
-    """Load, normalize, and write the requested regional polygon layer."""
-    units = load_region_units(args.region, args.basins)
-    pour_points = load_pour_points(args.pour_points)
-    units = assign_outlets(units, pour_points)
+    """Load, normalize, merge, and write the selected regional polygon layers."""
+    regions = resolve_build_regions(args)
+    assigned_frames: list[gpd.GeoDataFrame] = []
+    for region in regions:
+        units = load_region_units(region, args.basins)
+        pour_points_dir = (
+            args.pour_points if args.region is not None else args.pour_points / region
+        )
+        pour_points = load_pour_points(pour_points_dir)
+        assigned_frames.append(assign_outlets(units, pour_points))
+
+    units = gpd.GeoDataFrame(
+        pd.concat(assigned_frames, ignore_index=True),
+        geometry="geometry",
+        crs=CRS,
+    )
+    duplicates = sorted(
+        int(identifier)
+        for identifier in units.loc[
+            units["id"].duplicated(keep=False), "id"
+        ].unique()
+    )
+    if duplicates:
+        raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
+
+    units = _hilbert_sort(units)
+    guard_antimeridian(units, strict_build=args.strict_build)
     write_catchments(units, args.out)
     write_graph(units, args.out)
-    write_manifest(units, args.out, region=args.region, planetary=args.planetary)
+    write_manifest(
+        units,
+        args.out,
+        region_label=",".join(regions),
+        planetary=args.planetary,
+    )
 
 
 def extract_dataset(args: argparse.Namespace) -> None:
@@ -699,8 +795,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Build standard without-lakes HydroBASINS Pfaf-12 HFX datasets."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    build = subparsers.add_parser("build", help="build one regional Pfaf-12 dataset")
-    build.add_argument("--region", required=True, help="HydroBASINS region code")
+    build = subparsers.add_parser("build", help="build a Pfaf-12 dataset")
+    region_selector = build.add_mutually_exclusive_group(required=True)
+    region_selector.add_argument("--region", help="HydroBASINS region code")
+    region_selector.add_argument(
+        "--regions",
+        nargs="+",
+        help="HydroBASINS region codes separated by commas or whitespace",
+    )
+    region_selector.add_argument(
+        "--all-regions",
+        action="store_true",
+        help="build all present standard HydroBASINS regions",
+    )
     build.add_argument(
         "--basins",
         type=Path,
@@ -718,6 +825,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--planetary",
         action="store_true",
         help="omit the manifest region and use the exact planetary bbox",
+    )
+    build.add_argument(
+        "--strict-build",
+        action="store_true",
+        default=False,
+        help="make antimeridian-wrap candidates build errors",
     )
     extract = subparsers.add_parser(
         "extract", help="inspect one region's source inputs"
