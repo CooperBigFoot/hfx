@@ -145,6 +145,17 @@ def _source_path(region: str, basins_dir: Path) -> Path:
     return matches[0]
 
 
+def _pour_points_source_path(pour_points_dir: Path) -> Path:
+    filename = "hybas_pour_lev12_v1.shp"
+    matches = sorted(pour_points_dir.rglob(filename))
+    if len(matches) != 1:
+        raise AdapterError(
+            f"expected exactly one {filename} layer under {pour_points_dir}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
 def _coerce_to_polygonal(geometry: BaseGeometry | None) -> BaseGeometry:
     if geometry is None or geometry.is_empty:
         raise AdapterError("geometry is null or empty")
@@ -171,7 +182,11 @@ def _coerce_to_polygonal(geometry: BaseGeometry | None) -> BaseGeometry:
     )
 
 
-def _normalize_ids(values: pd.Series) -> pd.Series:
+def _normalize_ids(
+    values: pd.Series,
+    *,
+    reject_duplicates: bool = True,
+) -> pd.Series:
     normalized: list[int] = []
     maximum = 2**63 - 1
     for value in values:
@@ -191,7 +206,7 @@ def _normalize_ids(values: pd.Series) -> pd.Series:
         normalized.append(identifier)
 
     result = pd.Series(normalized, index=values.index, dtype="int64")
-    if result.duplicated().any():
+    if reject_duplicates and result.duplicated().any():
         duplicates = result.loc[result.duplicated(keep=False)].unique().tolist()
         raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
     return result
@@ -250,6 +265,131 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     return units.drop(columns=["_hilbert"]).reset_index(drop=True)
 
 
+def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
+    """Load and normalize the HydroBASINS Pfaf-12 ancillary pour points."""
+    source_path = _pour_points_source_path(pour_points_dir)
+    try:
+        pour_points = gpd.read_file(source_path, engine="pyogrio")
+    except Exception as error:
+        raise AdapterError(
+            f"failed to read HydroBASINS pour-points layer {source_path}: {error}"
+        ) from error
+
+    if "HYBAS_ID" in pour_points.columns:
+        join_key = "HYBAS_ID"
+    else:
+        candidates = [
+            column
+            for column in pour_points.columns
+            if column.casefold() == "HYBAS_ID".casefold()
+        ]
+        if not candidates:
+            raise AdapterError(
+                "HydroBASINS pour-points layer missing join key HYBAS_ID; "
+                f"available columns: {list(pour_points.columns)}"
+            )
+        if len(candidates) > 1:
+            raise AdapterError(
+                "ambiguous case-insensitive HYBAS_ID columns in HydroBASINS "
+                f"pour-points layer: {candidates}"
+            )
+        join_key = candidates[0]
+
+    if pour_points.crs is None:
+        raise AdapterError("HydroBASINS pour-points layer has no declared CRS")
+    if pour_points.crs.to_epsg() != 4326:
+        try:
+            pour_points = pour_points.to_crs("EPSG:4326")
+        except Exception as error:
+            raise AdapterError(
+                "failed to transform HydroBASINS pour-points layer to "
+                f"EPSG:4326: {error}"
+            ) from error
+    if pour_points.crs is None or pour_points.crs.to_epsg() != 4326:
+        raise AdapterError(
+            "normalized HydroBASINS pour-points layer does not resolve to EPSG:4326"
+        )
+
+    if pour_points.geometry.isna().any():
+        raise AdapterError("HydroBASINS pour-points geometry is null")
+    if pour_points.geometry.is_empty.any():
+        raise AdapterError("HydroBASINS pour-points geometry is empty")
+    if not pour_points.geometry.geom_type.eq("Point").all():
+        invalid_types = sorted(set(pour_points.geometry.geom_type) - {"Point"})
+        raise AdapterError(
+            "HydroBASINS pour-points geometry must contain only Point values; "
+            f"found {invalid_types}"
+        )
+
+    normalized = pour_points.copy()
+    normalized["id"] = _normalize_ids(
+        normalized[join_key], reject_duplicates=False
+    )
+    normalized["outlet_lon"] = normalized.geometry.x.astype("float64")
+    normalized["outlet_lat"] = normalized.geometry.y.astype("float64")
+    return normalized
+
+
+def assign_outlets(
+    units: gpd.GeoDataFrame,
+    pour_points: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Assign one deterministic, finite pour-point outlet to every unit."""
+    points_by_id = {
+        int(identifier): group
+        for identifier, group in pour_points.groupby("id", sort=False)
+    }
+    missing = sorted(
+        int(identifier)
+        for identifier in units["id"]
+        if int(identifier) not in points_by_id
+    )
+    if missing:
+        raise AdapterError(f"units missing HydroBASINS pour points: {missing}")
+
+    selected: list[tuple[float, float]] = []
+    for unit in units.itertuples(index=False):
+        identifier = int(unit.id)
+        centroid = unit.geometry.centroid
+        candidates = points_by_id[identifier]
+        ranked = sorted(
+            (
+                (
+                    centroid.distance(point.geometry),
+                    float(point.outlet_lon),
+                    float(point.outlet_lat),
+                )
+                for point in candidates.itertuples(index=False)
+            ),
+            key=lambda candidate: candidate,
+        )
+        _, outlet_lon, outlet_lat = ranked[0]
+        if (
+            not math.isfinite(outlet_lon)
+            or not math.isfinite(outlet_lat)
+            or not -180.0 <= outlet_lon <= 180.0
+            or not -90.0 <= outlet_lat <= 90.0
+        ):
+            raise AdapterError(
+                f"unit {identifier} has invalid outlet coordinate "
+                f"({outlet_lon}, {outlet_lat})"
+            )
+        selected.append((outlet_lon, outlet_lat))
+
+    assigned = units.copy()
+    assigned["outlet_lon"] = pd.Series(
+        (coordinates[0] for coordinates in selected),
+        index=assigned.index,
+        dtype="float64",
+    )
+    assigned["outlet_lat"] = pd.Series(
+        (coordinates[1] for coordinates in selected),
+        index=assigned.index,
+        dtype="float64",
+    )
+    return assigned
+
+
 def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     """Write normalized units as an HFX catchments GeoParquet slice."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,9 +411,6 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
         ]
     ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
 
-    # These non-null NaNs are temporary M1 schema placeholders that intentionally
-    # fail full HFX semantics; M2 replaces them with HydroBASINS pour-point values.
-    outlet_stubs = np.full(row_count, np.nan, dtype="float64")
     columns = [
         pa.array(units["id"].to_numpy(), type=pa.int64()),
         pa.array(units["level"].to_numpy(dtype="int16"), type=pa.int16()),
@@ -283,8 +420,8 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
             units["up_area_km2"].to_numpy(dtype="float32"),
             type=pa.float32(),
         ),
-        pa.array(outlet_stubs, type=pa.float64()),
-        pa.array(outlet_stubs, type=pa.float64()),
+        pa.array(units["outlet_lon"].to_numpy(dtype="float64"), type=pa.float64()),
+        pa.array(units["outlet_lat"].to_numpy(dtype="float64"), type=pa.float64()),
         build_bbox_struct(
             bounds["minx"].to_numpy(dtype="float32"),
             bounds["miny"].to_numpy(dtype="float32"),
@@ -301,6 +438,8 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, and write the requested regional polygon layer."""
     units = load_region_units(args.region, args.basins)
+    pour_points = load_pour_points(args.pour_points)
+    units = assign_outlets(units, pour_points)
     write_catchments(units, args.out)
 
 
@@ -317,6 +456,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="directory containing the regional Pfaf-12 polygon layer",
+    )
+    build.add_argument(
+        "--pour-points",
+        type=Path,
+        required=True,
+        help="directory containing hybas_pour_lev12_v1.shp",
     )
     build.add_argument("--out", type=Path, required=True, help="output directory")
     return parser
