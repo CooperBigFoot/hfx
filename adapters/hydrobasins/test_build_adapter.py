@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import geopandas as gpd
 import numpy as np
@@ -101,6 +104,263 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
         [30, 10, 20, 40],
         [Point(0.30, 0.30), Point(0.10, 0.10), Point(10.20, 0.20), Point(20.20, 0.20)],
     )
+
+
+def _build_synthetic_dataset(tmpdir: Path) -> Path:
+    basins_dir = tmpdir / "basins"
+    pour_points_dir = tmpdir / "pour_points"
+    out_dir = tmpdir / "out"
+    basins_dir.mkdir()
+    _write_layer(basins_dir)
+    ids, points = _ordinary_points()
+    _write_pour_points(pour_points_dir, ids=ids, points=points)
+    return_code = build_adapter.main(
+        [
+            "build",
+            "--region",
+            "gr",
+            "--basins",
+            str(basins_dir),
+            "--pour-points",
+            str(pour_points_dir),
+            "--out",
+            str(out_dir),
+        ]
+    )
+    if return_code != 0:
+        raise AssertionError(f"synthetic build returned {return_code}")
+    for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+        if not (out_dir / filename).is_file():
+            raise AssertionError(f"synthetic build did not create {filename}")
+    return out_dir
+
+
+class ExtractCommandTests(unittest.TestCase):
+    """Exercise read-only source inspection through the public CLI."""
+
+    def test_extract_reports_sources_without_writing_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            sentinel = root / "candidate-output"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(
+                pour_points_dir,
+                ids=ids,
+                points=points,
+                key_name="Hybas_ID",
+            )
+            with tempfile.TemporaryFile(mode="w+") as stdout:
+                with patch("sys.stdout", stdout):
+                    return_code = build_adapter.main(
+                        [
+                            "extract",
+                            "--region",
+                            "gr",
+                            "--basins",
+                            str(basins_dir),
+                            "--pour-points",
+                            str(pour_points_dir),
+                        ]
+                    )
+                stdout.seek(0)
+                inspection = stdout.read()
+
+            self.assertEqual(return_code, 0)
+            self.assertIn("basins features: 4", inspection)
+            self.assertIn("pour points features: 4", inspection)
+            self.assertEqual(inspection.count("CRS: EPSG:4326"), 2)
+            for column in ("HYBAS_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"):
+                self.assertIn(column, inspection)
+            self.assertIn("pour points join key: Hybas_ID", inspection)
+            self.assertFalse(sentinel.exists())
+            for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+                self.assertEqual(list(root.rglob(filename)), [])
+
+    def test_extract_rejects_missing_polygon_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "found 0"):
+                build_adapter.main(
+                    ["extract", "--region", "gr", "--basins", str(basins_dir),
+                     "--pour-points", str(pour_points_dir)]
+                )
+
+    def test_extract_rejects_missing_pour_points_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            pour_points_dir.mkdir()
+            _write_layer(basins_dir)
+            with self.assertRaisesRegex(build_adapter.AdapterError, "found 0"):
+                build_adapter.main(
+                    ["extract", "--region", "gr", "--basins", str(basins_dir),
+                     "--pour-points", str(pour_points_dir)]
+                )
+
+    def test_extract_translates_unreadable_polygon_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            (basins_dir / LAYER_NAME).write_text("not a shapefile", encoding="utf-8")
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError, "regional HydroBASINS polygon layer"
+            ):
+                build_adapter.main(
+                    ["extract", "--region", "gr", "--basins", str(basins_dir),
+                     "--pour-points", str(pour_points_dir)]
+                )
+
+    def test_extract_translates_unreadable_pour_points_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            basins_dir.mkdir()
+            pour_points_dir.mkdir()
+            _write_layer(basins_dir)
+            (pour_points_dir / POUR_POINTS_LAYER_NAME).write_text(
+                "not a shapefile", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError, "HydroBASINS pour-points layer"
+            ):
+                build_adapter.main(
+                    ["extract", "--region", "gr", "--basins", str(basins_dir),
+                     "--pour-points", str(pour_points_dir)]
+                )
+
+
+class ValidateCommandTests(unittest.TestCase):
+    """Exercise strict validator command construction and report persistence."""
+
+    @patch("build_adapter.subprocess.run")
+    def test_validate_writes_text_and_json_reports(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            report_dir = root / "reports"
+            dataset.mkdir()
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, stdout="text output\n", stderr="text warning\n"),
+                subprocess.CompletedProcess([], 0, stdout='{"valid": true}\n', stderr=""),
+            ]
+
+            return_code = build_adapter.main(
+                ["validate", str(dataset), "--report-dir", str(report_dir)]
+            )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(run.call_count, 2)
+            expected_commands = [
+                ["cargo", "run", "-p", "hfx-cli", "--", str(dataset),
+                 "--format", "text", "--strict", "--sample-pct", "100"],
+                ["cargo", "run", "-p", "hfx-cli", "--", str(dataset),
+                 "--format", "json", "--strict", "--sample-pct", "100"],
+            ]
+            for call, command in zip(run.call_args_list, expected_commands):
+                self.assertEqual(call.args, (command,))
+                self.assertEqual(call.kwargs["cwd"], Path(build_adapter.__file__).parents[2])
+                self.assertEqual(call.kwargs["env"], dict(os.environ))
+                self.assertIs(call.kwargs["capture_output"], True)
+                self.assertIs(call.kwargs["text"], True)
+                self.assertIs(call.kwargs["check"], False)
+            self.assertEqual(
+                (report_dir / "validator-report.text").read_text(encoding="utf-8"),
+                "text output\n",
+            )
+            self.assertEqual(
+                (report_dir / "validator-report.json").read_text(encoding="utf-8"),
+                '{"valid": true}\n',
+            )
+            self.assertEqual(
+                (report_dir / "validator-report.text.stderr").read_text(encoding="utf-8"),
+                "text warning\n",
+            )
+            self.assertFalse((report_dir / "validator-report.json.stderr").exists())
+
+    @patch("build_adapter.subprocess.run")
+    def test_validate_defaults_report_directory(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = Path(temporary) / "dataset"
+            dataset.mkdir()
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, stdout="text", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="json", stderr=""),
+            ]
+
+            self.assertEqual(build_adapter.main(["validate", str(dataset)]), 0)
+
+            self.assertEqual(
+                (dataset / "validation" / "validator-report.text").read_text(
+                    encoding="utf-8"
+                ),
+                "text",
+            )
+            self.assertEqual(
+                (dataset / "validation" / "validator-report.json").read_text(
+                    encoding="utf-8"
+                ),
+                "json",
+            )
+
+    @patch("build_adapter.subprocess.run")
+    def test_validate_persists_failed_report_before_raising(self, run) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            report_dir = root / "reports"
+            dataset.mkdir()
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout="invalid\n", stderr="failure detail\n"
+            )
+
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError, str(report_dir)
+            ):
+                build_adapter.main(
+                    ["validate", str(dataset), "--report-dir", str(report_dir)]
+                )
+
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(
+                (report_dir / "validator-report.text").read_text(encoding="utf-8"),
+                "invalid\n",
+            )
+            self.assertEqual(
+                (report_dir / "validator-report.text.stderr").read_text(encoding="utf-8"),
+                "failure detail\n",
+            )
+
+
+class ConformanceTests(unittest.TestCase):
+    """Run authoritative strict conformance when a prebuilt validator is supplied."""
+
+    @unittest.skipUnless(os.environ.get("HFX_BIN"), "HFX_BIN not set")
+    def test_synthetic_dataset_passes_strict_conformance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = _build_synthetic_dataset(Path(temporary))
+            result = subprocess.run(
+                [os.environ["HFX_BIN"], str(dataset), "--strict", "--sample-pct", "100"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
 
 
 class LoadRegionUnitsTests(unittest.TestCase):
