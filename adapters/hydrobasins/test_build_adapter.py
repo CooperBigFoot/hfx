@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -409,6 +410,20 @@ class BuildSelectorTests(unittest.TestCase):
             root = Path(temporary)
             self.assertEqual(self._parse_and_resolve(["--region", "gr"], root), ["gr"])
 
+    def test_strict_build_defaults_false_and_is_opt_in(self) -> None:
+        parser = build_adapter.build_arg_parser()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            default_args = parser.parse_args(
+                _selector_args(["--region", "gr"], root)
+            )
+            strict_args = parser.parse_args(
+                _selector_args(["--region", "gr"], root) + ["--strict-build"]
+            )
+
+        self.assertIs(default_args.strict_build, False)
+        self.assertIs(strict_args.strict_build, True)
+
     def test_regions_accept_commas_and_space_tokens_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -615,6 +630,170 @@ class MergedBuildTests(unittest.TestCase):
             self.assertEqual(set(catchments["id"]), {101, 202, 303})
             self.assertEqual(manifest["region"], "af,eu,si")
             self.assertEqual(manifest["unit_count"], 3)
+
+
+class AntimeridianGuardTests(unittest.TestCase):
+    """Exercise antimeridian detection through complete synthetic builds."""
+
+    @staticmethod
+    def _adapter_warnings(captured: list[warnings.WarningMessage]) -> list[warnings.WarningMessage]:
+        return [
+            warning
+            for warning in captured
+            if "antimeridian-wrap candidates" in str(warning.message)
+        ]
+
+    @staticmethod
+    def _assert_artifacts(test: unittest.TestCase, out_dir: Path) -> None:
+        for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+            test.assertTrue((out_dir / filename).is_file())
+
+    @staticmethod
+    def _assert_no_artifacts(test: unittest.TestCase, out_dir: Path) -> None:
+        for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+            test.assertFalse((out_dir / filename).exists())
+
+    def _write_wrapping_region(self, root: Path) -> tuple[Path, Path]:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        basins_dir.mkdir()
+        _write_layer(
+            basins_dir,
+            ids=[901],
+            next_down=[0],
+            endo=[0],
+            geometries=[box(-179.0, 0.0, 179.0, 1.0)],
+        )
+        _write_pour_points(
+            pour_points_dir,
+            ids=[901],
+            points=[Point(0.0, 0.5)],
+        )
+        return basins_dir, pour_points_dir
+
+    def _write_two_regions_with_wrap(self, root: Path) -> None:
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        basins_dir.mkdir()
+        _write_layer(
+            basins_dir,
+            region="gr",
+            ids=[101, 103],
+            next_down=[902, 0],
+            geometries=[box(20, 0, 21, 1), box(0, 0, 1, 1)],
+        )
+        _write_layer(
+            basins_dir,
+            region="af",
+            ids=[902, 204],
+            next_down=[0, 0],
+            endo=[0, 0],
+            geometries=[box(-179.0, 0.0, 179.0, 1.0), box(30, 0, 31, 1)],
+        )
+        _write_pour_points(
+            pour_points_dir / "gr",
+            ids=[101, 103],
+            points=[Point(20.5, 0.5), Point(0.5, 0.5)],
+        )
+        _write_pour_points(
+            pour_points_dir / "af",
+            ids=[902, 204],
+            points=[Point(0.0, 0.5), Point(30.5, 0.5)],
+        )
+
+    def test_ordinary_geometry_is_silent_in_both_modes(self) -> None:
+        for strict_build in (False, True):
+            with self.subTest(strict_build=strict_build), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                basins_dir = root / "basins"
+                pour_points_dir = root / "pour_points"
+                out_dir = root / "out"
+                basins_dir.mkdir()
+                _write_layer(basins_dir)
+                ids, points = _ordinary_points()
+                _write_pour_points(pour_points_dir, ids=ids, points=points)
+                args = _build_args(basins_dir, pour_points_dir, out_dir)
+                if strict_build:
+                    args.append("--strict-build")
+
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always")
+                    return_code = build_adapter.main(args)
+
+                self.assertEqual(return_code, 0)
+                self._assert_artifacts(self, out_dir)
+                self.assertEqual(self._adapter_warnings(captured), [])
+
+    def test_default_single_region_warns_and_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir, pour_points_dir = self._write_wrapping_region(root)
+            out_dir = root / "out"
+
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                return_code = build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                )
+
+            adapter_warnings = self._adapter_warnings(captured)
+            self.assertEqual(return_code, 0)
+            self.assertEqual(len(adapter_warnings), 1)
+            self.assertIs(adapter_warnings[0].category, UserWarning)
+            self.assertIn("count=1", str(adapter_warnings[0].message))
+            self.assertIn("901", str(adapter_warnings[0].message))
+            self._assert_artifacts(self, out_dir)
+
+    def test_strict_single_region_rejects_before_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir, pour_points_dir = self._write_wrapping_region(root)
+            out_dir = root / "out"
+
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--strict-build"]
+                )
+
+            message = str(caught.exception)
+            self.assertIn("antimeridian-wrap candidates", message)
+            self.assertIn("count=1", message)
+            self.assertIn("901", message)
+            self._assert_no_artifacts(self, out_dir)
+
+    def test_combined_regions_warn_or_reject_before_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_two_regions_with_wrap(root)
+            default_out = root / "out-default"
+            strict_out = root / "out-strict"
+
+            default_args = _selector_args(["--regions", "gr,af"], root)
+            default_args[-1] = str(default_out)
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                return_code = build_adapter.main(default_args)
+
+            adapter_warnings = self._adapter_warnings(captured)
+            self.assertEqual(return_code, 0)
+            self.assertEqual(len(adapter_warnings), 1)
+            self.assertIs(adapter_warnings[0].category, UserWarning)
+            self.assertIn("count=1", str(adapter_warnings[0].message))
+            self.assertIn("HYBAS_IDs=[902]", str(adapter_warnings[0].message))
+            self._assert_artifacts(self, default_out)
+
+            strict_args = _selector_args(["--regions", "gr,af"], root)
+            strict_args[-1] = str(strict_out)
+            strict_args.append("--strict-build")
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(strict_args)
+
+            message = str(caught.exception)
+            self.assertIn("antimeridian-wrap candidates", message)
+            self.assertIn("count=1", message)
+            self.assertIn("HYBAS_IDs=[902]", message)
+            self._assert_no_artifacts(self, strict_out)
 
 
 class LargeRowGroupTests(unittest.TestCase):

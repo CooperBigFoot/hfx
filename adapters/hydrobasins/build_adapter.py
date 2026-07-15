@@ -9,6 +9,7 @@ import math
 import os
 import re
 import subprocess
+import warnings
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -449,6 +450,32 @@ def assign_outlets(
     return assigned
 
 
+def guard_antimeridian(
+    units: gpd.GeoDataFrame,
+    *,
+    strict_build: bool,
+) -> None:
+    """Warn about or reject unit geometries whose raw longitude extent exceeds 180 degrees."""
+    bounds = units.geometry.bounds
+    candidate_ids = sorted(
+        int(identifier)
+        for identifier in units.loc[
+            (bounds["maxx"] - bounds["minx"]) > 180.0,
+            "id",
+        ]
+    )
+    if not candidate_ids:
+        return
+
+    message = (
+        "antimeridian-wrap candidates detected: "
+        f"count={len(candidate_ids)}, HYBAS_IDs={candidate_ids}"
+    )
+    if strict_build:
+        raise AdapterError(message)
+    warnings.warn(message, UserWarning, stacklevel=2)
+
+
 def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     """Write normalized units as an HFX catchments GeoParquet slice."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -670,6 +697,7 @@ def build_dataset(args: argparse.Namespace) -> None:
         raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
 
     units = _hilbert_sort(units)
+    guard_antimeridian(units, strict_build=args.strict_build)
     write_catchments(units, args.out)
     write_graph(units, args.out)
     write_manifest(
@@ -797,6 +825,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--planetary",
         action="store_true",
         help="omit the manifest region and use the exact planetary bbox",
+    )
+    build.add_argument(
+        "--strict-build",
+        action="store_true",
+        default=False,
+        help="make antimeridian-wrap candidates build errors",
     )
     extract = subparsers.add_parser(
         "extract", help="inspect one region's source inputs"
