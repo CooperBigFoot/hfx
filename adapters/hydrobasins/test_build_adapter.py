@@ -130,6 +130,7 @@ def _write_rivers(
     rivers_dir: Path,
     *,
     layer_path: Path | None = None,
+    hyriv_id: list[object] | None = None,
     hybas_l12: list[object] | None = None,
     upland_skm: list[object] | None = None,
     next_down: list[object] | None = None,
@@ -140,7 +141,13 @@ def _write_rivers(
 ) -> None:
     target = layer_path or rivers_dir / "nested" / RIVERS_LAYER_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
+    row_count = len(hybas_l12) if hybas_l12 is not None else 4
     rows: dict[str, list[object]] = {
+        "HYRIV_ID": (
+            hyriv_id
+            if hyriv_id is not None
+            else list(range(1, row_count + 1))
+        ),
         "HYBAS_L12": hybas_l12 if hybas_l12 is not None else [30, 20, 999, 10],
         "UPLAND_SKM": (
             upland_skm
@@ -151,7 +158,10 @@ def _write_rivers(
     }
     for field in omit or set():
         rows.pop(field, None)
-    rows.update(extra_columns or {})
+    for field, values in (extra_columns or {}).items():
+        if any(field.casefold() == existing.casefold() for existing in rows):
+            raise ValueError(f"duplicate HydroRIVERS field: {field}")
+        rows[field] = values
     frame = gpd.GeoDataFrame(
         rows,
         geometry=geometries if geometries is not None else [
@@ -494,6 +504,48 @@ class HydroRiversSnapTests(unittest.TestCase):
         self.assertEqual(return_code, 0)
         return out_dir, captured.output
 
+    def test_well_formed_confluence_emits_largest_upstream_as_mainstem(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hybas_l12=[30, 10, 20],
+                upland_skm=[80.0, 20.0, 100.0],
+                next_down=[200, 200, 0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    LineString([(-0.20, 0.35), (1.20, 0.65)]),
+                    LineString([(9.75, 0.15), (11.25, 0.85)]),
+                ],
+                hyriv_id=[101, 102, 200],
+            )
+
+            return_code = build_adapter.main(
+                _build_args(basins_dir, pour_points_dir, out_dir)
+                + ["--rivers", str(rivers_dir)]
+            )
+
+            self.assertEqual(return_code, 0)
+            table = pq.read_table(out_dir / "aux" / "snap_stems.parquet")
+            roles_by_unit = dict(
+                zip(
+                    table.column("unit_id").to_pylist(),
+                    table.column("stem_role").to_pylist(),
+                    strict=True,
+                )
+            )
+            self.assertEqual(roles_by_unit[30], "mainstem")
+            self.assertEqual(roles_by_unit[10], "tributary")
+            self.assertEqual(roles_by_unit[20], "mainstem")
+
     def test_build_writes_strict_valid_snap_stems(self) -> None:
         out_dir, logs = self._build()
         snap_path = out_dir / "aux" / "snap_stems.parquet"
@@ -569,7 +621,10 @@ class HydroRiversSnapTests(unittest.TestCase):
             table.column("weight").to_numpy(),
             np.asarray([20.5, 30.25, 10.75], dtype="float32"),
         )
-        self.assertEqual(table.column("stem_role").to_pylist(), ["unknown"] * 3)
+        self.assertEqual(
+            table.column("stem_role").to_pylist(),
+            ["mainstem", "mainstem", "mainstem"],
+        )
         for name in ("id", "unit_id", "weight", "geometry"):
             self.assertEqual(table.column(name).null_count, 0)
         catchment_ids = set(
@@ -676,7 +731,7 @@ class HydroRiversSnapTests(unittest.TestCase):
                     "artifacts": {"snap": "aux/snap_stems.parquet"},
                     "metadata": {
                         "name": "stems",
-                        "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = unknown in milestone 1.",
+                        "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = mainstem/tributary derived from NEXT_DOWN confluences.",
                         "references_levels": [0],
                         "weight_semantics": "drainage_area_km2",
                     },
@@ -796,17 +851,24 @@ class HydroRiversNormalizationTests(unittest.TestCase):
     @staticmethod
     def _frame(
         *,
+        reach_ids: list[object] | None = None,
         ids: list[object] | None = None,
         weights: list[object] | None = None,
+        next_down: list[object] | None = None,
         geometries: list[object] | None = None,
         crs: str | None = "EPSG:4326",
     ) -> gpd.GeoDataFrame:
         ids = ids if ids is not None else [30]
         return gpd.GeoDataFrame(
             {
+                "HYRIV_ID": (
+                    reach_ids
+                    if reach_ids is not None
+                    else list(range(1, len(ids) + 1))
+                ),
                 "HYBAS_L12": ids,
                 "UPLAND_SKM": weights if weights is not None else [30.25] * len(ids),
-                "NEXT_DOWN": [0] * len(ids),
+                "NEXT_DOWN": next_down if next_down is not None else [0] * len(ids),
             },
             geometry=geometries if geometries is not None else [
                 LineString([(-0.25, 0.20), (1.25, 0.80)])
@@ -869,11 +931,9 @@ class HydroRiversNormalizationTests(unittest.TestCase):
     def test_required_attributes_are_resolved_uniquely_case_insensitively(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "rivers"
-            required = ("HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
+            required = ("HYRIV_ID", "HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
             for missing in required:
                 with self.subTest(missing=missing):
-                    # NEXT_DOWN is reserved for milestone-2 topology and is not
-                    # interpreted when milestone-1 snap roles are emitted.
                     case_root = root / missing
                     _write_rivers(
                         case_root,
@@ -897,7 +957,7 @@ class HydroRiversNormalizationTests(unittest.TestCase):
                 geometries=[LineString([(-0.25, 0.20), (1.25, 0.80)])],
             )
             dbf = next(case_root.rglob("*.dbf"))
-            variants = ("hybas_l12", "upland_skm", "next_down")
+            variants = ("hyriv_id", "hybas_l12", "upland_skm", "next_down")
             for canonical, variant in zip(required, variants, strict=True):
                 _rename_dbf_field(dbf, canonical, variant)
             normalized = build_adapter.load_rivers(case_root)
@@ -905,6 +965,7 @@ class HydroRiversNormalizationTests(unittest.TestCase):
 
     def test_ambiguous_required_attributes_name_both_candidates(self) -> None:
         cases = (
+            ("HYRIV_ID", "oth_reach", "hyriv_id", [2]),
             ("HYBAS_L12", "other_id", "hybas_l12", [20]),
             ("UPLAND_SKM", "other_area", "upland_skm", [31.0]),
             ("NEXT_DOWN", "other_next", "next_down", [99]),
@@ -932,7 +993,12 @@ class HydroRiversNormalizationTests(unittest.TestCase):
 
     def test_geometry_schema_requires_one_active_geometry(self) -> None:
         plain = pd.DataFrame(
-            {"HYBAS_L12": [30], "UPLAND_SKM": [30.25], "NEXT_DOWN": [0]}
+            {
+                "HYRIV_ID": [1],
+                "HYBAS_L12": [30],
+                "UPLAND_SKM": [30.25],
+                "NEXT_DOWN": [0],
+            }
         )
         with self.assertRaisesRegex(build_adapter.AdapterError, "no.*geometry"):
             build_adapter._normalize_rivers_layer(plain)
@@ -1045,6 +1111,25 @@ class HydroRiversNormalizationTests(unittest.TestCase):
             self._frame(ids=[30, 30], weights=[30.25, 20.5])
         )
         self.assertEqual(duplicates["HYBAS_L12"].tolist(), [30, 30])
+
+    def test_reach_and_downstream_ids_normalize_to_int64(self) -> None:
+        normalized = build_adapter._normalize_rivers_layer(
+            self._frame(
+                reach_ids=["101", 102.0],
+                ids=[30, 20],
+                weights=[80.0, 20.0],
+                next_down=["200", 0.0],
+            )
+        )
+
+        pd.testing.assert_series_equal(
+            normalized["HYRIV_ID"].reset_index(drop=True),
+            pd.Series([101, 102], dtype="int64", name="HYRIV_ID"),
+        )
+        pd.testing.assert_series_equal(
+            normalized["NEXT_DOWN"].reset_index(drop=True),
+            pd.Series([200, 0], dtype="int64", name="NEXT_DOWN"),
+        )
 
     def test_upland_skm_requires_non_negative_finite_float32(self) -> None:
         cases = (
@@ -1610,6 +1695,7 @@ class LargeRowGroupTests(unittest.TestCase):
                     [float(identifier) for identifier in ids], dtype="float32"
                 ),
                 "NEXT_DOWN": pd.Series([0] * count, dtype="int64"),
+                "stem_role": pd.Series(["mainstem"] * count, dtype="string"),
                 "_source_order": pd.Series(range(count), dtype="int64"),
             },
             geometry=geometries,
