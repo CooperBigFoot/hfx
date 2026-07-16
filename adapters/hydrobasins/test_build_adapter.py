@@ -483,6 +483,14 @@ class ConformanceTests(unittest.TestCase):
 class HydroRiversSnapTests(unittest.TestCase):
     """Exercise HydroRIVERS snap emission through the public build command."""
 
+    def _assert_stem_role_vocabulary(self, table: pa.Table) -> None:
+        roles = table.column("stem_role").to_pylist()
+        self.assertLessEqual(
+            set(roles),
+            {"mainstem", "tributary", "unknown"},
+        )
+        self.assertNotIn("distributary", roles)
+
     def _build(self) -> tuple[Path, list[str]]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -545,6 +553,250 @@ class HydroRiversSnapTests(unittest.TestCase):
             self.assertEqual(roles_by_unit[30], "mainstem")
             self.assertEqual(roles_by_unit[10], "tributary")
             self.assertEqual(roles_by_unit[20], "mainstem")
+            self._assert_stem_role_vocabulary(table)
+
+    def test_equal_area_confluence_uses_higher_reach_id_deterministically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101, 102, 200],
+                hybas_l12=[30, 10, 20],
+                upland_skm=[50.0, 50.0, 100.0],
+                next_down=[200, 200, 0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    LineString([(-0.20, 0.35), (1.20, 0.65)]),
+                    LineString([(9.75, 0.15), (11.25, 0.85)]),
+                ],
+            )
+
+            tables = []
+            for output_name in ("out_first", "out_second"):
+                out_dir = root / output_name
+                self.assertEqual(
+                    build_adapter.main(
+                        _build_args(basins_dir, pour_points_dir, out_dir)
+                        + ["--rivers", str(rivers_dir)]
+                    ),
+                    0,
+                )
+                table = pq.read_table(out_dir / "aux" / "snap_stems.parquet")
+                self._assert_stem_role_vocabulary(table)
+                tables.append(table)
+
+            mappings = [
+                dict(
+                    zip(
+                        table.column("unit_id").to_pylist(),
+                        table.column("stem_role").to_pylist(),
+                        strict=True,
+                    )
+                )
+                for table in tables
+            ]
+            self.assertEqual(
+                mappings[0],
+                {10: "mainstem", 20: "mainstem", 30: "tributary"},
+            )
+            self.assertEqual(mappings[0], mappings[1])
+            paired_roles = [
+                sorted(
+                    zip(
+                        table.column("unit_id").to_pylist(),
+                        table.column("stem_role").to_pylist(),
+                        strict=True,
+                    )
+                )
+                for table in tables
+            ]
+            self.assertEqual(paired_roles[0], paired_roles[1])
+
+    def test_single_contributor_chain_remains_mainstem(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101, 200],
+                hybas_l12=[30, 20],
+                upland_skm=[25.0, 50.0],
+                next_down=[200, 0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    LineString([(9.75, 0.15), (11.25, 0.85)]),
+                ],
+            )
+
+            self.assertEqual(
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--rivers", str(rivers_dir)]
+                ),
+                0,
+            )
+            table = pq.read_table(out_dir / "aux" / "snap_stems.parquet")
+            roles_by_unit = dict(
+                zip(
+                    table.column("unit_id").to_pylist(),
+                    table.column("stem_role").to_pylist(),
+                    strict=True,
+                )
+            )
+            self.assertEqual(roles_by_unit, {20: "mainstem", 30: "mainstem"})
+            self._assert_stem_role_vocabulary(table)
+
+    def test_terminal_zero_remains_mainstem(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101],
+                hybas_l12=[30],
+                upland_skm=[25.0],
+                next_down=[0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                ],
+            )
+
+            self.assertEqual(
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--rivers", str(rivers_dir)]
+                ),
+                0,
+            )
+            table = pq.read_table(out_dir / "aux" / "snap_stems.parquet")
+            self.assertEqual(table.num_rows, 1)
+            self.assertEqual(table.column("unit_id").to_pylist(), [30])
+            self.assertEqual(table.column("stem_role").to_pylist(), ["mainstem"])
+            self._assert_stem_role_vocabulary(table)
+
+    def test_null_next_down_is_rejected_without_snap_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101, 200],
+                hybas_l12=[30, 20],
+                upland_skm=[25.0, 50.0],
+                next_down=[None, 0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    LineString([(9.75, 0.15), (11.25, 0.85)]),
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError,
+                r"NEXT_DOWN.*(?:non-integral|non-numeric)",
+            ):
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--rivers", str(rivers_dir)]
+                )
+            self.assertFalse((out_dir / "aux" / "snap_stems.parquet").exists())
+
+    def test_missing_next_down_is_rejected_without_snap_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101],
+                hybas_l12=[30],
+                upland_skm=[25.0],
+                next_down=[0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                ],
+                omit={"NEXT_DOWN"},
+            )
+
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError,
+                r"missing required field NEXT_DOWN",
+            ):
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--rivers", str(rivers_dir)]
+                )
+            self.assertFalse((out_dir / "aux" / "snap_stems.parquet").exists())
+
+    def test_dangling_positive_next_down_emits_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[101],
+                hybas_l12=[30],
+                upland_skm=[25.0],
+                next_down=[999],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                ],
+            )
+
+            self.assertEqual(
+                build_adapter.main(
+                    _build_args(basins_dir, pour_points_dir, out_dir)
+                    + ["--rivers", str(rivers_dir)]
+                ),
+                0,
+            )
+            table = pq.read_table(out_dir / "aux" / "snap_stems.parquet")
+            self.assertEqual(table.num_rows, 1)
+            self.assertEqual(table.column("unit_id").to_pylist(), [30])
+            self.assertEqual(table.column("stem_role").to_pylist(), ["unknown"])
+            self._assert_stem_role_vocabulary(table)
 
     def test_build_writes_strict_valid_snap_stems(self) -> None:
         out_dir, logs = self._build()
@@ -625,6 +877,7 @@ class HydroRiversSnapTests(unittest.TestCase):
             table.column("stem_role").to_pylist(),
             ["mainstem", "mainstem", "mainstem"],
         )
+        self._assert_stem_role_vocabulary(table)
         for name in ("id", "unit_id", "weight", "geometry"):
             self.assertEqual(table.column(name).null_count, 0)
         catchment_ids = set(

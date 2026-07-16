@@ -555,6 +555,7 @@ def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
 
 def _stem_roles(rivers: gpd.GeoDataFrame) -> dict[int, str]:
     """Derive HydroRIVERS stem roles from confluence topology."""
+    reach_ids = {int(reach_id) for reach_id in rivers["HYRIV_ID"]}
     roles = {int(reach_id): "mainstem" for reach_id in rivers["HYRIV_ID"]}
     children: dict[int, list[tuple[int, float]]] = {}
     for reach_id, next_down, upland_skm in zip(
@@ -568,6 +569,9 @@ def _stem_roles(rivers: gpd.GeoDataFrame) -> dict[int, str]:
             continue
         downstream_id = int(next_down)
         if downstream_id <= 0:
+            continue
+        if downstream_id not in reach_ids:
+            roles[int(reach_id)] = "unknown"
             continue
         children.setdefault(downstream_id, []).append(
             (int(reach_id), float(upland_skm))
