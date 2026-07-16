@@ -169,7 +169,16 @@ def _pour_points_source_path(pour_points_dir: Path) -> Path:
 
 
 def _rivers_source_path(rivers_dir: Path) -> Path:
-    matches = sorted(rivers_dir.rglob("*.shp"))
+    if not rivers_dir.is_dir():
+        raise AdapterError(
+            f"HydroRIVERS source {rivers_dir} must be an existing readable directory"
+        )
+    try:
+        matches = sorted(rivers_dir.rglob("*.shp"))
+    except OSError as error:
+        raise AdapterError(
+            f"HydroRIVERS source {rivers_dir} must be a readable directory: {error}"
+        ) from error
     if len(matches) != 1:
         raise AdapterError(
             f"expected exactly one HydroRIVERS layer under {rivers_dir}, "
@@ -411,28 +420,75 @@ def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
     return normalized
 
 
-def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
-    """Load and normalize one recursively discovered HydroRIVERS layer."""
-    source_path = _rivers_source_path(rivers_dir)
-    try:
-        rivers = gpd.read_file(source_path, engine="pyogrio")
-    except Exception as error:
-        raise AdapterError(
-            f"failed to read HydroRIVERS layer {source_path}: {error}"
-        ) from error
+def _resolve_rivers_fields(rivers: pd.DataFrame) -> pd.DataFrame:
+    """Resolve required HydroRIVERS attributes to canonical names."""
+    required = ("HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
+    available = [str(column) for column in rivers.columns]
+    renames: dict[object, str] = {}
+    for canonical in required:
+        candidates = [
+            column
+            for column in rivers.columns
+            if str(column).casefold() == canonical.casefold()
+        ]
+        if not candidates:
+            raise AdapterError(
+                f"HydroRIVERS layer missing required field {canonical}; "
+                f"available fields: {available}"
+            )
+        if len(candidates) > 1:
+            raise AdapterError(
+                f"ambiguous HydroRIVERS field {canonical}: "
+                f"candidates {[str(candidate) for candidate in candidates]}"
+            )
+        if candidates[0] != canonical:
+            renames[candidates[0]] = canonical
+    return rivers.rename(columns=renames)
 
-    required = {"HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN", "geometry"}
-    missing = sorted(required - set(rivers.columns))
-    if missing:
-        raise AdapterError(f"HydroRIVERS layer missing required columns: {missing}")
+
+def _normalize_rivers_layer(rivers: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Normalize one loaded HydroRIVERS layer at the source boundary."""
+    geometry_columns = [
+        str(column)
+        for column in rivers.columns
+        if isinstance(rivers[column].dtype, gpd.array.GeometryDtype)
+    ]
+    if not isinstance(rivers, gpd.GeoDataFrame) or not geometry_columns:
+        raise AdapterError("HydroRIVERS layer has no active geometry column")
+    try:
+        active_geometry = rivers.geometry.name
+    except AttributeError as error:
+        raise AdapterError("HydroRIVERS layer has no active geometry column") from error
+    if len(geometry_columns) != 1:
+        raise AdapterError(
+            "ambiguous HydroRIVERS geometry columns: "
+            f"{geometry_columns}"
+        )
+    if active_geometry != geometry_columns[0]:
+        raise AdapterError(
+            "HydroRIVERS active geometry does not match its geometry column: "
+            f"active={active_geometry!r}, available={geometry_columns}"
+        )
+
+    rivers = gpd.GeoDataFrame(
+        _resolve_rivers_fields(rivers),
+        geometry=active_geometry,
+        crs=rivers.crs,
+    )
     if rivers.empty:
         raise AdapterError("HydroRIVERS layer contains no reaches")
     if rivers.crs is None:
         raise AdapterError("HydroRIVERS layer has no declared CRS")
-    if rivers.geometry.isna().any() or rivers.geometry.is_empty.any():
-        raise AdapterError("HydroRIVERS layer contains null or empty geometries")
+    if rivers.geometry.isna().any():
+        raise AdapterError("HydroRIVERS layer contains null geometries")
+    if rivers.geometry.is_empty.any():
+        raise AdapterError("HydroRIVERS layer contains empty geometries")
     if not rivers.geometry.geom_type.eq("LineString").all():
-        raise AdapterError("HydroRIVERS layer contains non-LineString geometries")
+        invalid_types = sorted(set(rivers.geometry.geom_type) - {"LineString"})
+        raise AdapterError(
+            "HydroRIVERS layer must contain only LineString geometries; "
+            f"found {invalid_types}"
+        )
     if rivers.crs.to_epsg() != 4326:
         try:
             rivers = rivers.to_crs(CRS)
@@ -464,6 +520,8 @@ def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
         float32_weights
     ).all():
         raise AdapterError("UPLAND_SKM values must be finite float32 values")
+    if (weights < 0).any():
+        raise AdapterError("UPLAND_SKM values must be non-negative")
     rivers["UPLAND_SKM"] = pd.Series(
         float32_weights,
         index=rivers.index,
@@ -471,6 +529,18 @@ def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
     )
     rivers["_source_order"] = np.arange(len(rivers), dtype="int64")
     return rivers
+
+
+def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
+    """Load and normalize one recursively discovered HydroRIVERS layer."""
+    source_path = _rivers_source_path(rivers_dir)
+    try:
+        rivers = gpd.read_file(source_path, engine="pyogrio")
+    except Exception as error:
+        raise AdapterError(
+            f"failed to read HydroRIVERS layer {source_path}: {error}"
+        ) from error
+    return _normalize_rivers_layer(rivers)
 
 
 def assign_outlets(
