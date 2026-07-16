@@ -809,11 +809,13 @@ def write_snap_stems(
 ) -> Path:
     """Write normalized HydroRIVERS reaches as an HFX snap auxiliary."""
     ordered = rivers.copy()
+    if "_region_index" not in ordered.columns:
+        ordered["_region_index"] = 0
     ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
         total_bounds=units.geometry.total_bounds
     )
     ordered = ordered.sort_values(
-        ["_hilbert", "_source_order"], kind="mergesort"
+        ["_hilbert", "_region_index", "_source_order"], kind="mergesort"
     ).reset_index(drop=True)
     bounds = ordered.geometry.bounds
     minx = bounds["minx"].to_numpy(dtype="float32")
@@ -934,19 +936,25 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
 
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
-    if args.rivers is not None and args.region is None:
-        raise AdapterError("HydroRIVERS currently requires --region")
     regions = resolve_build_regions(args)
-    if args.rivers is not None and len(regions) != 1:
-        raise AdapterError("HydroRIVERS currently requires --region")
     assigned_frames: list[gpd.GeoDataFrame] = []
-    for region in regions:
+    rivers_frames: list[gpd.GeoDataFrame] = []
+    for region_index, region in enumerate(regions):
         units = load_region_units(region, args.basins)
         pour_points_dir = (
             args.pour_points if args.region is not None else args.pour_points / region
         )
         pour_points = load_pour_points(pour_points_dir)
         assigned_frames.append(assign_outlets(units, pour_points))
+        if args.rivers is not None:
+            rivers_dir = (
+                args.rivers if args.region is not None else args.rivers / region
+            )
+            rivers = load_rivers(rivers_dir)
+            roles = _stem_roles(rivers)
+            rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
+            rivers["_region_index"] = region_index
+            rivers_frames.append(rivers)
 
     units = gpd.GeoDataFrame(
         pd.concat(assigned_frames, ignore_index=True),
@@ -966,11 +974,15 @@ def build_dataset(args: argparse.Namespace) -> None:
     guard_antimeridian(units, strict_build=args.strict_build)
     snap_rivers: gpd.GeoDataFrame | None = None
     if args.rivers is not None:
-        rivers = load_rivers(args.rivers)
-        roles = _stem_roles(rivers)
-        rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
-        unit_ids = set(int(identifier) for identifier in units["id"])
-        snap_rivers = rivers.loc[rivers["HYBAS_L12"].isin(unit_ids)].copy()
+        rivers = gpd.GeoDataFrame(
+            pd.concat(rivers_frames, ignore_index=True),
+            geometry="geometry",
+            crs=CRS,
+        )
+        merged_unit_ids = set(int(identifier) for identifier in units["id"])
+        snap_rivers = rivers.loc[
+            rivers["HYBAS_L12"].isin(merged_unit_ids)
+        ].copy()
         dropped = len(rivers) - len(snap_rivers)
         LOGGER.info(
             "dropped %d HydroRIVERS reaches with HYBAS_L12 absent from the unit set",

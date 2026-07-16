@@ -1076,26 +1076,105 @@ class HydroRiversSnapTests(unittest.TestCase):
         with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
             self.assertNotIn("auxiliary", json.load(stream))
 
-    def test_rivers_rejects_multi_region_before_loading_or_writing(self) -> None:
+    def test_two_regions_merge_rivers_against_merged_unit_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            selectors = (
-                ["--regions", "gr"],
-                ["--regions", "gr", "eu"],
-                ["--all-regions"],
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+
+            _write_layer(
+                basins_dir,
+                region="gr",
+                ids=[101, 103],
+                next_down=[202, 0],
+                geometries=[box(20, 0, 21, 1), box(0, 0, 1, 1)],
             )
-            for selector in selectors:
-                with self.subTest(selector=selector):
-                    args = _selector_args(selector, root) + [
-                        "--rivers",
-                        str(root / "rivers"),
-                    ]
-                    with self.assertRaisesRegex(
-                        build_adapter.AdapterError,
-                        "HydroRIVERS currently requires --region",
-                    ):
-                        build_adapter.main(args)
-                    self.assertFalse((root / "out").exists())
+            _write_layer(
+                basins_dir,
+                region="af",
+                ids=[202, 204],
+                next_down=[0, 0],
+                geometries=[box(10, 0, 11, 1), box(30, 0, 31, 1)],
+            )
+            _write_pour_points(
+                pour_points_dir / "gr",
+                ids=[101, 103],
+                points=[Point(20.5, 0.5), Point(0.5, 0.5)],
+            )
+            _write_pour_points(
+                pour_points_dir / "af",
+                ids=[202, 204],
+                points=[Point(10.5, 0.5), Point(30.5, 0.5)],
+            )
+
+            gr_local_geometry = LineString([(20.1, 0.2), (20.9, 0.8)])
+            cross_region_geometry = LineString([(10.1, 0.2), (10.9, 0.8)])
+            af_local_geometry = LineString([(30.1, 0.2), (30.9, 0.8)])
+            _write_rivers(
+                rivers_dir / "gr",
+                layer_path=rivers_dir / "gr" / "nested" / "HydroRIVERS_v10_gr.shp",
+                hyriv_id=[1001, 1002],
+                hybas_l12=[101, 202],
+                upland_skm=[11.0, 22.0],
+                next_down=[0, 0],
+                geometries=[gr_local_geometry, cross_region_geometry],
+            )
+            _write_rivers(
+                rivers_dir / "af",
+                layer_path=rivers_dir / "af" / "nested" / "HydroRIVERS_v10_af.shp",
+                hyriv_id=[2001],
+                hybas_l12=[204],
+                upland_skm=[33.0],
+                next_down=[0],
+                geometries=[af_local_geometry],
+            )
+
+            args = _selector_args(["--regions", "gr,af"], root) + [
+                "--rivers",
+                str(rivers_dir),
+            ]
+            self.assertEqual(build_adapter.main(args), 0)
+
+            catchment_ids = set(
+                pq.read_table(out_dir / "catchments.parquet", columns=["id"])
+                .column("id")
+                .to_pylist()
+            )
+            snap = gpd.read_parquet(out_dir / "aux" / "snap_stems.parquet")
+            self.assertEqual(set(snap["unit_id"]), {101, 202, 204})
+            self.assertEqual(snap["id"].tolist(), list(range(1, len(snap) + 1)))
+            self.assertTrue(set(snap["unit_id"]) <= catchment_ids)
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(gr_local_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(cross_region_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(af_local_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+
+            with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(manifest["region"], "gr,af")
+            self.assertEqual(len(manifest["auxiliary"]), 1)
+            self.assertEqual(manifest["auxiliary"][0]["schema"], "hfx.aux.snap.v2")
+            self.assertEqual(
+                manifest["auxiliary"][0]["artifacts"],
+                {"snap": "aux/snap_stems.parquet"},
+            )
 
 
 class HydroRiversNormalizationTests(unittest.TestCase):
