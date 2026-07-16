@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -37,8 +38,10 @@ HAS_RASTERS = False
 HAS_SNAP = False
 ROW_GROUP_MIN = 4096
 ROW_GROUP_MAX = 8192
+SNAP_BBOX_EPSILON = 1e-4
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
 STANDARD_REGION_CODES = ("af", "ar", "as", "au", "eu", "gr", "na", "sa", "si")
+LOGGER = logging.getLogger(__name__)
 
 
 class AdapterError(RuntimeError):
@@ -165,6 +168,25 @@ def _pour_points_source_path(pour_points_dir: Path) -> Path:
     return matches[0]
 
 
+def _rivers_source_path(rivers_dir: Path) -> Path:
+    if not rivers_dir.is_dir():
+        raise AdapterError(
+            f"HydroRIVERS source {rivers_dir} must be an existing readable directory"
+        )
+    try:
+        matches = sorted(rivers_dir.rglob("*.shp"))
+    except OSError as error:
+        raise AdapterError(
+            f"HydroRIVERS source {rivers_dir} must be a readable directory: {error}"
+        ) from error
+    if len(matches) != 1:
+        raise AdapterError(
+            f"expected exactly one HydroRIVERS layer under {rivers_dir}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
 def _coerce_to_polygonal(geometry: BaseGeometry | None) -> BaseGeometry:
     if geometry is None or geometry.is_empty:
         raise AdapterError("geometry is null or empty")
@@ -195,6 +217,7 @@ def _normalize_ids(
     values: pd.Series,
     *,
     reject_duplicates: bool = True,
+    source_name: str = "HYBAS_ID",
 ) -> pd.Series:
     normalized: list[int] = []
     maximum = 2**63 - 1
@@ -202,22 +225,29 @@ def _normalize_ids(
         try:
             decimal = Decimal(str(value))
         except (InvalidOperation, ValueError):
-            raise AdapterError(f"HYBAS_ID contains a non-numeric value: {value!r}") from None
+            raise AdapterError(
+                f"{source_name} contains a non-numeric value: {value!r}"
+            ) from None
         if not decimal.is_finite() or decimal != decimal.to_integral_value():
-            raise AdapterError(f"HYBAS_ID contains a non-integral value: {value!r}")
+            raise AdapterError(
+                f"{source_name} contains a non-integral value: {value!r}"
+            )
         identifier = int(decimal)
         if identifier <= 0:
             raise AdapterError(
-                "HYBAS_ID values must be strictly positive; 0 is the terminal-sink sentinel"
+                f"{source_name} values must be strictly positive; "
+                "0 is the terminal-sink sentinel"
             )
         if identifier > maximum:
-            raise AdapterError(f"HYBAS_ID is outside the int64 range: {value!r}")
+            raise AdapterError(
+                f"{source_name} is outside the int64 range: {value!r}"
+            )
         normalized.append(identifier)
 
     result = pd.Series(normalized, index=values.index, dtype="int64")
     if reject_duplicates and result.duplicated().any():
         duplicates = result.loc[result.duplicated(keep=False)].unique().tolist()
-        raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
+        raise AdapterError(f"duplicate {source_name} values: {duplicates}")
     return result
 
 
@@ -388,6 +418,129 @@ def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
     normalized["outlet_lon"] = normalized.geometry.x.astype("float64")
     normalized["outlet_lat"] = normalized.geometry.y.astype("float64")
     return normalized
+
+
+def _resolve_rivers_fields(rivers: pd.DataFrame) -> pd.DataFrame:
+    """Resolve required HydroRIVERS attributes to canonical names."""
+    required = ("HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
+    available = [str(column) for column in rivers.columns]
+    renames: dict[object, str] = {}
+    for canonical in required:
+        candidates = [
+            column
+            for column in rivers.columns
+            if str(column).casefold() == canonical.casefold()
+        ]
+        if not candidates:
+            raise AdapterError(
+                f"HydroRIVERS layer missing required field {canonical}; "
+                f"available fields: {available}"
+            )
+        if len(candidates) > 1:
+            raise AdapterError(
+                f"ambiguous HydroRIVERS field {canonical}: "
+                f"candidates {[str(candidate) for candidate in candidates]}"
+            )
+        if candidates[0] != canonical:
+            renames[candidates[0]] = canonical
+    return rivers.rename(columns=renames)
+
+
+def _normalize_rivers_layer(rivers: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Normalize one loaded HydroRIVERS layer at the source boundary."""
+    geometry_columns = [
+        str(column)
+        for column in rivers.columns
+        if isinstance(rivers[column].dtype, gpd.array.GeometryDtype)
+    ]
+    if not isinstance(rivers, gpd.GeoDataFrame) or not geometry_columns:
+        raise AdapterError("HydroRIVERS layer has no active geometry column")
+    try:
+        active_geometry = rivers.geometry.name
+    except AttributeError as error:
+        raise AdapterError("HydroRIVERS layer has no active geometry column") from error
+    if len(geometry_columns) != 1:
+        raise AdapterError(
+            "ambiguous HydroRIVERS geometry columns: "
+            f"{geometry_columns}"
+        )
+    if active_geometry != geometry_columns[0]:
+        raise AdapterError(
+            "HydroRIVERS active geometry does not match its geometry column: "
+            f"active={active_geometry!r}, available={geometry_columns}"
+        )
+
+    rivers = gpd.GeoDataFrame(
+        _resolve_rivers_fields(rivers),
+        geometry=active_geometry,
+        crs=rivers.crs,
+    )
+    if rivers.empty:
+        raise AdapterError("HydroRIVERS layer contains no reaches")
+    if rivers.crs is None:
+        raise AdapterError("HydroRIVERS layer has no declared CRS")
+    if rivers.geometry.isna().any():
+        raise AdapterError("HydroRIVERS layer contains null geometries")
+    if rivers.geometry.is_empty.any():
+        raise AdapterError("HydroRIVERS layer contains empty geometries")
+    if not rivers.geometry.geom_type.eq("LineString").all():
+        invalid_types = sorted(set(rivers.geometry.geom_type) - {"LineString"})
+        raise AdapterError(
+            "HydroRIVERS layer must contain only LineString geometries; "
+            f"found {invalid_types}"
+        )
+    if rivers.crs.to_epsg() != 4326:
+        try:
+            rivers = rivers.to_crs(CRS)
+        except Exception as error:
+            raise AdapterError(
+                f"failed to transform HydroRIVERS layer to EPSG:4326: {error}"
+            ) from error
+    if rivers.crs is None or rivers.crs.to_epsg() != 4326:
+        raise AdapterError(
+            "normalized HydroRIVERS layer does not resolve to EPSG:4326"
+        )
+
+    rivers = rivers.copy()
+    rivers["HYBAS_L12"] = _normalize_ids(
+        rivers["HYBAS_L12"],
+        reject_duplicates=False,
+        source_name="HYBAS_L12",
+    )
+    try:
+        weights = pd.to_numeric(rivers["UPLAND_SKM"], errors="raise").astype(
+            "float64"
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise AdapterError(
+            f"UPLAND_SKM cannot be converted to float64: {error}"
+        ) from error
+    float32_weights = weights.to_numpy(dtype="float32")
+    if not np.isfinite(weights.to_numpy()).all() or not np.isfinite(
+        float32_weights
+    ).all():
+        raise AdapterError("UPLAND_SKM values must be finite float32 values")
+    if (weights < 0).any():
+        raise AdapterError("UPLAND_SKM values must be non-negative")
+    rivers["UPLAND_SKM"] = pd.Series(
+        float32_weights,
+        index=rivers.index,
+        dtype="float32",
+    )
+    rivers["_source_order"] = np.arange(len(rivers), dtype="int64")
+    return rivers
+
+
+def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
+    """Load and normalize one recursively discovered HydroRIVERS layer."""
+    source_path = _rivers_source_path(rivers_dir)
+    try:
+        rivers = gpd.read_file(source_path, engine="pyogrio")
+    except Exception as error:
+        raise AdapterError(
+            f"failed to read HydroRIVERS layer {source_path}: {error}"
+        ) from error
+    return _normalize_rivers_layer(rivers)
 
 
 def assign_outlets(
@@ -606,11 +759,64 @@ def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     return path
 
 
+def write_snap_stems(
+    rivers: gpd.GeoDataFrame,
+    units: gpd.GeoDataFrame,
+    out_dir: Path,
+) -> Path:
+    """Write normalized HydroRIVERS reaches as an HFX snap auxiliary."""
+    ordered = rivers.copy()
+    ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
+        total_bounds=units.geometry.total_bounds
+    )
+    ordered = ordered.sort_values(
+        ["_hilbert", "_source_order"], kind="mergesort"
+    ).reset_index(drop=True)
+    bounds = ordered.geometry.bounds
+    minx = bounds["minx"].to_numpy(dtype="float32")
+    miny = bounds["miny"].to_numpy(dtype="float32")
+    maxx = bounds["maxx"].to_numpy(dtype="float32")
+    maxy = bounds["maxy"].to_numpy(dtype="float32")
+    degenerate_x = minx >= maxx
+    degenerate_y = miny >= maxy
+    minx[degenerate_x] -= SNAP_BBOX_EPSILON
+    maxx[degenerate_x] += SNAP_BBOX_EPSILON
+    miny[degenerate_y] -= SNAP_BBOX_EPSILON
+    maxy[degenerate_y] += SNAP_BBOX_EPSILON
+
+    row_count = len(ordered)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["LineString"]))
+    columns = [
+        pa.array(np.arange(1, row_count + 1, dtype="int64"), type=pa.int64()),
+        pa.array(ordered["HYBAS_L12"].to_numpy(dtype="int64"), type=pa.int64()),
+        pa.array(ordered["UPLAND_SKM"].to_numpy(dtype="float32"), type=pa.float32()),
+        pa.array(["unknown"] * row_count, type=pa.string()),
+        build_bbox_struct(minx, miny, maxx, maxy),
+        pa.array(ordered.geometry.to_wkb(hex=False).tolist(), type=pa.binary()),
+    ]
+    aux_dir = out_dir / "aux"
+    aux_dir.mkdir(parents=True, exist_ok=True)
+    path = aux_dir / "snap_stems.parquet"
+    _write_table(path, schema, columns, row_count)
+    assert_geoparquet_valid(path)
+    return path
+
+
 def write_manifest(
     units: gpd.GeoDataFrame,
     out_dir: Path,
     region_label: str,
     planetary: bool,
+    snap_path: Path | None = None,
 ) -> Path:
     """Write the HFX dataset manifest with regional or planetary semantics."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -630,6 +836,19 @@ def write_manifest(
     else:
         manifest["region"] = region_label
         manifest["bbox"] = [float(value) for value in units.geometry.total_bounds]
+    if snap_path is not None:
+        manifest["auxiliary"] = [
+            {
+                "schema": "hfx.aux.snap.v2",
+                "artifacts": {"snap": str(snap_path.relative_to(out_dir))},
+                "metadata": {
+                    "name": "stems",
+                    "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = unknown in milestone 1.",
+                    "references_levels": [0],
+                    "weight_semantics": "drainage_area_km2",
+                },
+            }
+        ]
 
     path = out_dir / "manifest.json"
     path.write_text(
@@ -672,7 +891,11 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
 
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
+    if args.rivers is not None and args.region is None:
+        raise AdapterError("HydroRIVERS currently requires --region")
     regions = resolve_build_regions(args)
+    if args.rivers is not None and len(regions) != 1:
+        raise AdapterError("HydroRIVERS currently requires --region")
     assigned_frames: list[gpd.GeoDataFrame] = []
     for region in regions:
         units = load_region_units(region, args.basins)
@@ -698,13 +921,27 @@ def build_dataset(args: argparse.Namespace) -> None:
 
     units = _hilbert_sort(units)
     guard_antimeridian(units, strict_build=args.strict_build)
+    snap_rivers: gpd.GeoDataFrame | None = None
+    if args.rivers is not None:
+        rivers = load_rivers(args.rivers)
+        unit_ids = set(int(identifier) for identifier in units["id"])
+        snap_rivers = rivers.loc[rivers["HYBAS_L12"].isin(unit_ids)].copy()
+        dropped = len(rivers) - len(snap_rivers)
+        LOGGER.info(
+            "dropped %d HydroRIVERS reaches with HYBAS_L12 absent from the unit set",
+            dropped,
+        )
     write_catchments(units, args.out)
     write_graph(units, args.out)
+    snap_path = None
+    if snap_rivers is not None:
+        snap_path = write_snap_stems(snap_rivers, units, args.out)
     write_manifest(
         units,
         args.out,
         region_label=",".join(regions),
         planetary=args.planetary,
+        snap_path=snap_path,
     )
 
 
@@ -819,6 +1056,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="directory containing hybas_pour_lev12_v1.shp",
+    )
+    build.add_argument(
+        "--rivers",
+        type=Path,
+        help=(
+            "directory containing exactly one recursively discoverable "
+            "HydroRIVERS layer for a single-region build"
+        ),
     )
     build.add_argument("--out", type=Path, required=True, help="output directory")
     build.add_argument(

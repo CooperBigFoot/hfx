@@ -18,13 +18,21 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from geoparquet_io.core.validate import validate_geoparquet
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    Point,
+    Polygon,
+    box,
+)
 
 import build_adapter
 
 
 LAYER_NAME = "hybas_gr_lev12_v1.shp"
 POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
+RIVERS_LAYER_NAME = "HydroRIVERS_v10_gr.shp"
 
 
 def _write_layer(
@@ -118,6 +126,63 @@ def _write_pour_points(
     )
 
 
+def _write_rivers(
+    rivers_dir: Path,
+    *,
+    layer_path: Path | None = None,
+    hybas_l12: list[object] | None = None,
+    upland_skm: list[object] | None = None,
+    next_down: list[object] | None = None,
+    geometries: list[object] | None = None,
+    crs: str | None = "EPSG:4326",
+    omit: set[str] | None = None,
+    extra_columns: dict[str, list[object]] | None = None,
+) -> None:
+    target = layer_path or rivers_dir / "nested" / RIVERS_LAYER_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rows: dict[str, list[object]] = {
+        "HYBAS_L12": hybas_l12 if hybas_l12 is not None else [30, 20, 999, 10],
+        "UPLAND_SKM": (
+            upland_skm
+            if upland_skm is not None
+            else [30.25, 20.5, 999.0, 10.75]
+        ),
+        "NEXT_DOWN": next_down if next_down is not None else [0, 0, 0, 0],
+    }
+    for field in omit or set():
+        rows.pop(field, None)
+    rows.update(extra_columns or {})
+    frame = gpd.GeoDataFrame(
+        rows,
+        geometry=geometries if geometries is not None else [
+            LineString([(-0.25, 0.20), (1.25, 0.80)]),
+            LineString([(9.75, 0.15), (11.25, 0.85)]),
+            LineString([(29.75, 0.10), (31.25, 0.90)]),
+            LineString([(-0.20, 0.35), (1.20, 0.65)]),
+        ],
+        crs=crs,
+    )
+    frame.to_file(
+        target,
+        driver="ESRI Shapefile",
+        engine="pyogrio",
+        index=False,
+    )
+
+
+def _rename_dbf_field(dbf_path: Path, old: str, new: str) -> None:
+    data = bytearray(dbf_path.read_bytes())
+    header_length = int.from_bytes(data[8:10], "little")
+    replacement = new.encode("ascii").ljust(11, b"\0")
+    for offset in range(32, header_length - 1, 32):
+        name = bytes(data[offset : offset + 11]).split(b"\0", 1)[0].decode("ascii")
+        if name == old:
+            data[offset : offset + 11] = replacement
+            dbf_path.write_bytes(data)
+            return
+    raise AssertionError(f"DBF field {old!r} not found in {dbf_path}")
+
+
 def _build_args(basins_dir: Path, pour_points_dir: Path, out_dir: Path) -> list[str]:
     return [
         "build",
@@ -142,11 +207,13 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
 def _build_synthetic_dataset(tmpdir: Path) -> Path:
     basins_dir = tmpdir / "basins"
     pour_points_dir = tmpdir / "pour_points"
+    rivers_dir = tmpdir / "rivers"
     out_dir = tmpdir / "out"
     basins_dir.mkdir()
     _write_layer(basins_dir)
     ids, points = _ordinary_points()
     _write_pour_points(pour_points_dir, ids=ids, points=points)
+    _write_rivers(rivers_dir)
     return_code = build_adapter.main(
         [
             "build",
@@ -156,13 +223,20 @@ def _build_synthetic_dataset(tmpdir: Path) -> Path:
             str(basins_dir),
             "--pour-points",
             str(pour_points_dir),
+            "--rivers",
+            str(rivers_dir),
             "--out",
             str(out_dir),
         ]
     )
     if return_code != 0:
         raise AssertionError(f"synthetic build returned {return_code}")
-    for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+    for filename in (
+        "catchments.parquet",
+        "graph.parquet",
+        "manifest.json",
+        "aux/snap_stems.parquet",
+    ):
         if not (out_dir / filename).is_file():
             raise AssertionError(f"synthetic build did not create {filename}")
     return out_dir
@@ -394,6 +468,659 @@ class ConformanceTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class HydroRiversSnapTests(unittest.TestCase):
+    """Exercise HydroRIVERS snap emission through the public build command."""
+
+    def _build(self) -> tuple[Path, list[str]]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        rivers_dir = root / "rivers"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir)
+        ids, points = _ordinary_points()
+        _write_pour_points(pour_points_dir, ids=ids, points=points)
+        _write_rivers(rivers_dir)
+        with self.assertLogs(build_adapter.__name__, level="INFO") as captured:
+            return_code = build_adapter.main(
+                _build_args(basins_dir, pour_points_dir, out_dir)
+                + ["--rivers", str(rivers_dir)]
+            )
+        self.assertEqual(return_code, 0)
+        return out_dir, captured.output
+
+    def test_build_writes_strict_valid_snap_stems(self) -> None:
+        out_dir, logs = self._build()
+        snap_path = out_dir / "aux" / "snap_stems.parquet"
+        for path in (
+            out_dir / "catchments.parquet",
+            out_dir / "graph.parquet",
+            out_dir / "manifest.json",
+            snap_path,
+        ):
+            self.assertTrue(path.is_file(), path)
+
+        self.assertTrue(
+            any(
+                "dropped 1 HydroRIVERS reaches with HYBAS_L12 absent from the unit set"
+                in message
+                for message in logs
+            ),
+            logs,
+        )
+        parquet_file = pq.ParquetFile(snap_path)
+        table = pq.read_table(snap_path)
+        expected_schema = pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("unit_id", pa.int64(), nullable=False),
+                pa.field("weight", pa.float32(), nullable=False),
+                pa.field("stem_role", pa.string(), nullable=True),
+                pa.field(
+                    "bbox",
+                    pa.struct(
+                        [
+                            pa.field("xmin", pa.float32(), nullable=False),
+                            pa.field("ymin", pa.float32(), nullable=False),
+                            pa.field("xmax", pa.float32(), nullable=False),
+                            pa.field("ymax", pa.float32(), nullable=False),
+                        ]
+                    ),
+                    nullable=True,
+                ),
+                pa.field("geometry", pa.binary(), nullable=False),
+            ]
+        ).with_metadata(
+            {
+                b"geo": json.dumps(
+                    {
+                        "version": "1.1.0",
+                        "primary_column": "geometry",
+                        "columns": {
+                            "geometry": {
+                                "encoding": "WKB",
+                                "geometry_types": ["LineString"],
+                                "covering": {
+                                    "bbox": {
+                                        "xmin": ["bbox", "xmin"],
+                                        "ymin": ["bbox", "ymin"],
+                                        "xmax": ["bbox", "xmax"],
+                                        "ymax": ["bbox", "ymax"],
+                                    }
+                                },
+                            }
+                        },
+                    }
+                ).encode("utf-8")
+            }
+        )
+        schema = pq.read_schema(snap_path)
+        self.assertEqual(schema, expected_schema)
+        self.assertEqual(table.num_rows, 3)
+        self.assertEqual(table.column("id").to_pylist(), [1, 2, 3])
+        self.assertEqual(table.column("unit_id").to_pylist(), [20, 30, 10])
+        self.assertEqual(table.column("weight").type, pa.float32())
+        np.testing.assert_array_equal(
+            table.column("weight").to_numpy(),
+            np.asarray([20.5, 30.25, 10.75], dtype="float32"),
+        )
+        self.assertEqual(table.column("stem_role").to_pylist(), ["unknown"] * 3)
+        for name in ("id", "unit_id", "weight", "geometry"):
+            self.assertEqual(table.column(name).null_count, 0)
+        catchment_ids = set(
+            pq.read_table(out_dir / "catchments.parquet", columns=["id"])
+            .column("id")
+            .to_pylist()
+        )
+        self.assertNotIn(999, table.column("unit_id").to_pylist())
+        self.assertTrue(set(table.column("unit_id").to_pylist()) <= catchment_ids)
+
+        output = gpd.read_parquet(snap_path)
+        self.assertTrue(output.crs.equals("EPSG:4326", ignore_axis_order=True))
+        self.assertEqual(output.geometry.geom_type.tolist(), ["LineString"] * 3)
+        expected_geometry = [
+            LineString([(9.75, 0.15), (11.25, 0.85)]),
+            LineString([(-0.25, 0.20), (1.25, 0.80)]),
+            LineString([(-0.20, 0.35), (1.20, 0.65)]),
+        ]
+        self.assertTrue(
+            all(actual.equals_exact(expected, 0.0) for actual, expected in zip(
+                output.geometry, expected_geometry, strict=True
+            ))
+        )
+        catchments = gpd.read_parquet(out_dir / "catchments.parquet")
+        distances = output.geometry.centroid.hilbert_distance(
+            total_bounds=catchments.geometry.total_bounds
+        )
+        self.assertTrue((distances.diff().dropna() >= 0).all())
+
+        bbox = table.column("bbox").combine_chunks()
+        self.assertEqual(bbox.null_count, 0)
+        expected_bounds = output.geometry.bounds.to_numpy(dtype="float32")
+        stored_bounds = np.column_stack(
+            [
+                bbox.field(index).to_numpy()
+                for index in range(len(build_adapter.BBOX_LEAF_NAMES))
+            ]
+        )
+        self.assertTrue(np.all(stored_bounds[:, 0] <= stored_bounds[:, 2]))
+        self.assertTrue(np.all(stored_bounds[:, 1] <= stored_bounds[:, 3]))
+        for index, name in enumerate(build_adapter.BBOX_LEAF_NAMES):
+            leaf = bbox.field(index)
+            self.assertEqual(leaf.null_count, 0)
+            np.testing.assert_array_equal(leaf.to_numpy(), expected_bounds[:, index])
+            np.testing.assert_allclose(
+                leaf.to_numpy(),
+                expected_bounds[:, index],
+                atol=build_adapter.SNAP_BBOX_EPSILON,
+                rtol=0,
+            )
+        for group_index in range(parquet_file.metadata.num_row_groups):
+            row_group = parquet_file.metadata.row_group(group_index)
+            physical = {
+                row_group.column(index).path_in_schema: row_group.column(index)
+                for index in range(row_group.num_columns)
+            }
+            for name in build_adapter.BBOX_LEAF_NAMES:
+                statistics = physical[f"bbox.{name}"].statistics
+                self.assertIsNotNone(statistics)
+                self.assertTrue(statistics.has_min_max)
+            encodings = set(physical["stem_role"].encodings)
+            self.assertTrue(
+                {"RLE_DICTIONARY", "PLAIN_DICTIONARY"} & encodings,
+                encodings,
+            )
+        self.assertEqual(table.column("stem_role").type, pa.string())
+
+        self.assertEqual(
+            json.loads(schema.metadata[b"geo"]),
+            {
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {
+                        "encoding": "WKB",
+                        "geometry_types": ["LineString"],
+                        "covering": {
+                            "bbox": {
+                                "xmin": ["bbox", "xmin"],
+                                "ymin": ["bbox", "ymin"],
+                                "xmax": ["bbox", "xmax"],
+                                "ymax": ["bbox", "ymax"],
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        validation = validate_geoparquet(str(snap_path), target_version="1.1")
+        failures = [
+            f"{check.name}: {check.message}"
+            for check in validation.checks
+            if check.status.value == "failed"
+        ]
+        self.assertTrue(validation.is_valid, "; ".join(failures))
+
+        with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        self.assertEqual(
+            manifest["auxiliary"],
+            [
+                {
+                    "schema": "hfx.aux.snap.v2",
+                    "artifacts": {"snap": "aux/snap_stems.parquet"},
+                    "metadata": {
+                        "name": "stems",
+                        "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = unknown in milestone 1.",
+                        "references_levels": [0],
+                        "weight_semantics": "drainage_area_km2",
+                    },
+                }
+            ],
+        )
+
+    def test_snap_order_is_stable_for_hilbert_ties_after_drops(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            authored_geometries = [
+                LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                LineString([(29.75, 0.10), (31.25, 0.90)]),
+                LineString([(9.75, 0.15), (11.25, 0.85)]),
+                LineString([(-0.20, 0.35), (1.20, 0.65)]),
+            ]
+            authored_ids = [30, 999, 20, 10]
+            _write_rivers(
+                rivers_dir,
+                hybas_l12=authored_ids,
+                upland_skm=[30.25, 999.0, 20.5, 10.75],
+                next_down=[0, 0, 0, 0],
+                geometries=authored_geometries,
+                crs="EPSG:4326",
+            )
+
+            tables = []
+            for output_name in ("out_first", "out_second"):
+                out_dir = root / output_name
+                self.assertEqual(
+                    build_adapter.main(
+                        _build_args(basins_dir, pour_points_dir, out_dir)
+                        + ["--rivers", str(rivers_dir)]
+                    ),
+                    0,
+                )
+                tables.append(pq.read_table(out_dir / "aux" / "snap_stems.parquet"))
+
+            first, second = tables
+            for name in ("id", "unit_id", "geometry"):
+                self.assertEqual(first.column(name), second.column(name), name)
+            self.assertEqual(
+                first.column("id").to_pylist(),
+                list(range(1, first.num_rows + 1)),
+            )
+            self.assertEqual(first.column("id").to_pylist(), [1, 2, 3])
+
+            unit_ids = first.column("unit_id").to_pylist()
+            self.assertLess(unit_ids.index(30), unit_ids.index(10))
+            output = gpd.GeoSeries.from_wkb(first.column("geometry").to_pylist())
+            authored_by_id = dict(zip(authored_ids, authored_geometries, strict=True))
+            for unit_id, geometry in zip(unit_ids, output, strict=True):
+                self.assertTrue(geometry.equals_exact(authored_by_id[unit_id], 0.0))
+
+            tied = output[[unit_ids.index(30), unit_ids.index(10)]]
+            self.assertTrue(
+                tied.iloc[0].centroid.equals_exact(tied.iloc[1].centroid, 0.0)
+            )
+            catchments = gpd.read_parquet(root / "out_first" / "catchments.parquet")
+            tied_distances = tied.centroid.hilbert_distance(
+                total_bounds=catchments.geometry.total_bounds
+            )
+            self.assertEqual(tied_distances.iloc[0], tied_distances.iloc[1])
+
+    def test_no_rivers_preserves_core_only_artifacts(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir)
+        ids, points = _ordinary_points()
+        _write_pour_points(pour_points_dir, ids=ids, points=points)
+
+        self.assertEqual(
+            build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir)),
+            0,
+        )
+        self.assertFalse((out_dir / "aux").exists())
+        with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+            self.assertNotIn("auxiliary", json.load(stream))
+
+    def test_rivers_rejects_multi_region_before_loading_or_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selectors = (
+                ["--regions", "gr"],
+                ["--regions", "gr", "eu"],
+                ["--all-regions"],
+            )
+            for selector in selectors:
+                with self.subTest(selector=selector):
+                    args = _selector_args(selector, root) + [
+                        "--rivers",
+                        str(root / "rivers"),
+                    ]
+                    with self.assertRaisesRegex(
+                        build_adapter.AdapterError,
+                        "HydroRIVERS currently requires --region",
+                    ):
+                        build_adapter.main(args)
+                    self.assertFalse((root / "out").exists())
+
+
+class HydroRiversNormalizationTests(unittest.TestCase):
+    """Exercise HydroRIVERS validation at its source boundary."""
+
+    @staticmethod
+    def _frame(
+        *,
+        ids: list[object] | None = None,
+        weights: list[object] | None = None,
+        geometries: list[object] | None = None,
+        crs: str | None = "EPSG:4326",
+    ) -> gpd.GeoDataFrame:
+        ids = ids if ids is not None else [30]
+        return gpd.GeoDataFrame(
+            {
+                "HYBAS_L12": ids,
+                "UPLAND_SKM": weights if weights is not None else [30.25] * len(ids),
+                "NEXT_DOWN": [0] * len(ids),
+            },
+            geometry=geometries if geometries is not None else [
+                LineString([(-0.25, 0.20), (1.25, 0.80)])
+            ] * len(ids),
+            crs=crs,
+        )
+
+    def test_source_discovery_reports_exact_recursive_match_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "rivers"
+            (root / "nested").mkdir(parents=True)
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter._rivers_source_path(root)
+            self.assertIn(str(root), str(caught.exception))
+            self.assertIn("found 0", str(caught.exception))
+
+            _write_rivers(
+                root,
+                layer_path=root / "a" / RIVERS_LAYER_NAME,
+                hybas_l12=[30],
+                upland_skm=[30.25],
+                next_down=[0],
+                geometries=[LineString([(-0.25, 0.20), (1.25, 0.80)])],
+            )
+            _write_rivers(
+                root,
+                layer_path=root / "b" / "deeper" / "duplicate.shp",
+                hybas_l12=[20],
+                upland_skm=[20.5],
+                next_down=[0],
+                geometries=[LineString([(9.75, 0.15), (11.25, 0.85)])],
+            )
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter._rivers_source_path(root)
+            self.assertIn(str(root), str(caught.exception))
+            self.assertIn("found 2", str(caught.exception))
+
+    def test_source_path_preconditions_and_reader_failure_are_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (root / "does-not-exist", root / "rivers"):
+                if path.name == "rivers":
+                    path.write_text("not a directory\n", encoding="utf-8")
+                with self.subTest(path=path), self.assertRaises(
+                    build_adapter.AdapterError
+                ) as caught:
+                    build_adapter._rivers_source_path(path)
+                self.assertIn(str(path), str(caught.exception))
+                self.assertIn("readable directory", str(caught.exception))
+
+            rivers = root / "broken-rivers"
+            rivers.mkdir()
+            broken = rivers / "broken.shp"
+            broken.write_text("not a shapefile\n", encoding="utf-8")
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.load_rivers(rivers)
+            self.assertIn("failed to read HydroRIVERS layer", str(caught.exception))
+            self.assertIn(str(broken), str(caught.exception))
+
+    def test_required_attributes_are_resolved_uniquely_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "rivers"
+            required = ("HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
+            for missing in required:
+                with self.subTest(missing=missing):
+                    # NEXT_DOWN is reserved for milestone-2 topology and is not
+                    # interpreted when milestone-1 snap roles are emitted.
+                    case_root = root / missing
+                    _write_rivers(
+                        case_root,
+                        hybas_l12=[30],
+                        upland_skm=[30.25],
+                        next_down=[0],
+                        geometries=[LineString([(-0.25, 0.20), (1.25, 0.80)])],
+                        omit={missing},
+                    )
+                    with self.assertRaises(build_adapter.AdapterError) as caught:
+                        build_adapter.load_rivers(case_root)
+                    self.assertIn(missing, str(caught.exception))
+                    self.assertIn("available", str(caught.exception))
+
+            case_root = root / "case"
+            _write_rivers(
+                case_root,
+                hybas_l12=[30],
+                upland_skm=[30.25],
+                next_down=[0],
+                geometries=[LineString([(-0.25, 0.20), (1.25, 0.80)])],
+            )
+            dbf = next(case_root.rglob("*.dbf"))
+            variants = ("hybas_l12", "upland_skm", "next_down")
+            for canonical, variant in zip(required, variants, strict=True):
+                _rename_dbf_field(dbf, canonical, variant)
+            normalized = build_adapter.load_rivers(case_root)
+            self.assertTrue(set(required) <= set(normalized.columns))
+
+    def test_ambiguous_required_attributes_name_both_candidates(self) -> None:
+        cases = (
+            ("HYBAS_L12", "other_id", "hybas_l12", [20]),
+            ("UPLAND_SKM", "other_area", "upland_skm", [31.0]),
+            ("NEXT_DOWN", "other_next", "next_down", [99]),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for canonical, extra, variant, values in cases:
+                with self.subTest(field=canonical):
+                    rivers = root / canonical
+                    _write_rivers(
+                        rivers,
+                        hybas_l12=[30],
+                        upland_skm=[30.25],
+                        next_down=[0],
+                        geometries=[LineString([(-0.25, 0.20), (1.25, 0.80)])],
+                        extra_columns={extra: values},
+                    )
+                    _rename_dbf_field(next(rivers.rglob("*.dbf")), extra, variant)
+                    with self.assertRaises(build_adapter.AdapterError) as caught:
+                        build_adapter.load_rivers(rivers)
+                    message = str(caught.exception)
+                    self.assertIn("ambiguous", message)
+                    self.assertIn(canonical, message)
+                    self.assertIn(variant, message)
+
+    def test_geometry_schema_requires_one_active_geometry(self) -> None:
+        plain = pd.DataFrame(
+            {"HYBAS_L12": [30], "UPLAND_SKM": [30.25], "NEXT_DOWN": [0]}
+        )
+        with self.assertRaisesRegex(build_adapter.AdapterError, "no.*geometry"):
+            build_adapter._normalize_rivers_layer(plain)
+
+        frame = self._frame()
+        frame["alternate_geometry"] = gpd.GeoSeries(
+            [LineString([(-0.20, 0.35), (1.20, 0.65)])], crs="EPSG:4326"
+        )
+        with self.assertRaises(build_adapter.AdapterError) as caught:
+            build_adapter._normalize_rivers_layer(frame)
+        self.assertIn("ambiguous", str(caught.exception))
+        self.assertIn("geometry", str(caught.exception))
+        self.assertIn("alternate_geometry", str(caught.exception))
+
+    def test_crs_is_required_and_web_mercator_line_is_reprojected_unclipped(self) -> None:
+        with self.assertRaisesRegex(build_adapter.AdapterError, "no declared CRS"):
+            build_adapter._normalize_rivers_layer(self._frame(crs=None))
+
+        frame = self._frame(
+            geometries=[LineString([(0.0, 0.0), (111319.49079327357, 111325.1428663851)])],
+            crs="EPSG:3857",
+        )
+        normalized = build_adapter._normalize_rivers_layer(frame)
+        self.assertEqual(normalized.crs.to_epsg(), 4326)
+        self.assertEqual(normalized.geometry.iloc[0].geom_type, "LineString")
+        coordinates = list(normalized.geometry.iloc[0].coords)
+        self.assertEqual(len(coordinates), 2)
+        np.testing.assert_allclose(coordinates, [(0.0, 0.0), (1.0, 1.0)], atol=1e-6)
+
+    def test_any_invalid_geometry_rejects_the_complete_layer(self) -> None:
+        in_memory_invalid = (
+            (None, "null"),
+            (LineString(), "empty"),
+            (
+                GeometryCollection([
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    Point(0.30, 0.30),
+                ]),
+                "GeometryCollection",
+            ),
+        )
+        for geometry, diagnostic in in_memory_invalid:
+            with self.subTest(geometry=diagnostic), self.assertRaises(
+                build_adapter.AdapterError
+            ) as caught:
+                build_adapter._normalize_rivers_layer(self._frame(geometries=[geometry]))
+            self.assertIn(diagnostic, str(caught.exception))
+
+        file_invalid = (
+            (
+                MultiLineString([
+                    [(-0.25, 0.20), (0.50, 0.50)],
+                    [(0.50, 0.50), (1.25, 0.80)],
+                ]),
+                "MultiLineString",
+            ),
+            (Point(0.30, 0.30), "Point"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for geometry, diagnostic in file_invalid:
+                with self.subTest(geometry=diagnostic):
+                    rivers = root / diagnostic
+                    _write_rivers(
+                        rivers,
+                        hybas_l12=[30],
+                        upland_skm=[30.25],
+                        next_down=[0],
+                        geometries=[geometry],
+                    )
+                    with self.assertRaises(build_adapter.AdapterError) as caught:
+                        build_adapter.load_rivers(rivers)
+                    self.assertIn(diagnostic, str(caught.exception))
+
+        mixed = self._frame(
+            ids=[30, 20],
+            weights=[30.25, 20.5],
+            geometries=[
+                LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                Point(0.30, 0.30),
+            ],
+        )
+        with self.assertRaisesRegex(build_adapter.AdapterError, "Point"):
+            build_adapter._normalize_rivers_layer(mixed)
+
+    def test_hybas_l12_parsing_is_strict_and_duplicates_are_allowed(self) -> None:
+        cases = (
+            (None, "non-numeric"),
+            (0, "strictly positive"),
+            (-1, "strictly positive"),
+            (10.5, "non-integral"),
+            (9223372036854775808, "int64 range"),
+        )
+        for value, diagnostic in cases:
+            with self.subTest(value=value), self.assertRaises(
+                build_adapter.AdapterError
+            ) as caught:
+                build_adapter._normalize_rivers_layer(self._frame(ids=[value]))
+            self.assertIn("HYBAS_L12", str(caught.exception))
+            self.assertIn(diagnostic, str(caught.exception))
+
+        normalized = build_adapter._normalize_rivers_layer(
+            self._frame(ids=[30.0, "20"], weights=[30.25, 20.5])
+        )
+        pd.testing.assert_series_equal(
+            normalized["HYBAS_L12"].reset_index(drop=True),
+            pd.Series([30, 20], dtype="int64", name="HYBAS_L12"),
+        )
+        duplicates = build_adapter._normalize_rivers_layer(
+            self._frame(ids=[30, 30], weights=[30.25, 20.5])
+        )
+        self.assertEqual(duplicates["HYBAS_L12"].tolist(), [30, 30])
+
+    def test_upland_skm_requires_non_negative_finite_float32(self) -> None:
+        cases = (
+            (None, "finite float32"),
+            (float("nan"), "finite float32"),
+            (float("inf"), "finite float32"),
+            (float("-inf"), "finite float32"),
+            (-0.25, "non-negative"),
+            (3.5e38, "finite float32"),
+        )
+        for value, diagnostic in cases:
+            with self.subTest(value=value), self.assertRaises(
+                build_adapter.AdapterError
+            ) as caught:
+                build_adapter._normalize_rivers_layer(self._frame(weights=[value]))
+            self.assertIn("UPLAND_SKM", str(caught.exception))
+            self.assertIn(diagnostic, str(caught.exception))
+
+        normalized = build_adapter._normalize_rivers_layer(
+            self._frame(ids=[30, 20], weights=[0, 30.25])
+        )
+        self.assertEqual(normalized["UPLAND_SKM"].dtype, np.dtype("float32"))
+        np.testing.assert_array_equal(
+            normalized["UPLAND_SKM"].to_numpy(),
+            np.asarray([0.0, 30.25], dtype="float32"),
+        )
+
+    def test_unresolved_ids_are_counted_once_without_spatial_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            unresolved = [
+                LineString([(0.10, 0.10), (0.90, 0.90)]),
+                LineString([(10.10, 0.10), (10.90, 0.90)]),
+            ]
+            _write_rivers(
+                rivers_dir,
+                hybas_l12=[30, 999, 998, 20],
+                upland_skm=[30.25, 999.0, 998.0, 20.5],
+                next_down=[0, 0, 0, 0],
+                geometries=[
+                    LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                    *unresolved,
+                    LineString([(9.75, 0.15), (11.25, 0.85)]),
+                ],
+            )
+            with self.assertLogs(build_adapter.__name__, level="INFO") as captured:
+                self.assertEqual(
+                    build_adapter.main(
+                        _build_args(basins_dir, pour_points_dir, out_dir)
+                        + ["--rivers", str(rivers_dir)]
+                    ),
+                    0,
+                )
+            expected = (
+                "dropped 2 HydroRIVERS reaches with HYBAS_L12 absent "
+                "from the unit set"
+            )
+            self.assertEqual(sum(expected in message for message in captured.output), 1)
+            snap = gpd.read_parquet(out_dir / "aux" / "snap_stems.parquet")
+            self.assertEqual(len(snap), 2)
+            self.assertEqual(set(snap["unit_id"]), {30, 20})
+            self.assertFalse(
+                any(
+                    geometry.equals(candidate)
+                    for geometry in snap.geometry
+                    for candidate in unresolved
+                )
+            )
 
 
 class BuildSelectorTests(unittest.TestCase):
@@ -855,6 +1582,122 @@ class LargeRowGroupTests(unittest.TestCase):
                         statistics = columns_by_name[name].statistics
                         self.assertIsNotNone(statistics)
                         self.assertTrue(statistics.has_min_max)
+
+    def test_large_snap_has_balanced_row_groups_and_bbox_statistics(self) -> None:
+        count = 12_000
+        columns = 120
+        width = 0.005
+        ids = list(range(1, count + 1))
+        geometries = [
+            LineString(
+                [
+                    (
+                        -10 + (index % columns) * 0.01,
+                        -10 + (index // columns) * 0.01,
+                    ),
+                    (
+                        -10 + (index % columns) * 0.01 + width,
+                        -10 + (index // columns) * 0.01 + width,
+                    ),
+                ]
+            )
+            for index in range(count)
+        ]
+        rivers = gpd.GeoDataFrame(
+            {
+                "HYBAS_L12": pd.Series(ids, dtype="int64"),
+                "UPLAND_SKM": pd.Series(
+                    [float(identifier) for identifier in ids], dtype="float32"
+                ),
+                "NEXT_DOWN": pd.Series([0] * count, dtype="int64"),
+                "_source_order": pd.Series(range(count), dtype="int64"),
+            },
+            geometry=geometries,
+            crs="EPSG:4326",
+        )
+        units = gpd.GeoDataFrame(
+            {"id": [1]},
+            geometry=[box(-10.0, -10.0, -8.8, -9.0)],
+            crs="EPSG:4326",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            snap_path = build_adapter.write_snap_stems(
+                rivers, units, Path(temporary)
+            )
+            schema = pq.read_schema(snap_path)
+            parquet_file = pq.ParquetFile(snap_path)
+            metadata = parquet_file.metadata
+
+            expected_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("unit_id", pa.int64(), nullable=False),
+                    pa.field("weight", pa.float32(), nullable=False),
+                    pa.field("stem_role", pa.string(), nullable=True),
+                    pa.field(
+                        "bbox",
+                        pa.struct(
+                            [
+                                pa.field("xmin", pa.float32(), nullable=False),
+                                pa.field("ymin", pa.float32(), nullable=False),
+                                pa.field("xmax", pa.float32(), nullable=False),
+                                pa.field("ymax", pa.float32(), nullable=False),
+                            ]
+                        ),
+                        nullable=True,
+                    ),
+                    pa.field("geometry", pa.binary(), nullable=False),
+                ]
+            ).with_metadata(
+                {
+                    b"geo": json.dumps(
+                        {
+                            "version": "1.1.0",
+                            "primary_column": "geometry",
+                            "columns": {
+                                "geometry": {
+                                    "encoding": "WKB",
+                                    "geometry_types": ["LineString"],
+                                    "covering": {
+                                        "bbox": {
+                                            "xmin": ["bbox", "xmin"],
+                                            "ymin": ["bbox", "ymin"],
+                                            "xmax": ["bbox", "xmax"],
+                                            "ymax": ["bbox", "ymax"],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    ).encode("utf-8")
+                }
+            )
+            self.assertEqual(schema, expected_schema)
+            self.assertGreaterEqual(metadata.num_row_groups, 1)
+            self.assertEqual(
+                sum(
+                    metadata.row_group(i).num_rows
+                    for i in range(metadata.num_row_groups)
+                ),
+                count,
+            )
+            group_sizes = [
+                metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)
+            ]
+            self.assertEqual(group_sizes, [6000, 6000])
+            for group_index in range(metadata.num_row_groups):
+                row_group = metadata.row_group(group_index)
+                self.assertGreaterEqual(row_group.num_rows, build_adapter.ROW_GROUP_MIN)
+                self.assertLessEqual(row_group.num_rows, build_adapter.ROW_GROUP_MAX)
+                columns_by_name = {
+                    row_group.column(index).path_in_schema: row_group.column(index)
+                    for index in range(row_group.num_columns)
+                }
+                for name in ("bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"):
+                    statistics = columns_by_name[name].statistics
+                    self.assertIsNotNone(statistics)
+                    self.assertTrue(statistics.has_min_max)
 
 
 class LoadRegionUnitsTests(unittest.TestCase):
