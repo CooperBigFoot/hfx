@@ -521,11 +521,46 @@ class HydroRiversSnapTests(unittest.TestCase):
                 pa.field("unit_id", pa.int64(), nullable=False),
                 pa.field("weight", pa.float32(), nullable=False),
                 pa.field("stem_role", pa.string(), nullable=True),
-                pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
+                pa.field(
+                    "bbox",
+                    pa.struct(
+                        [
+                            pa.field("xmin", pa.float32(), nullable=False),
+                            pa.field("ymin", pa.float32(), nullable=False),
+                            pa.field("xmax", pa.float32(), nullable=False),
+                            pa.field("ymax", pa.float32(), nullable=False),
+                        ]
+                    ),
+                    nullable=True,
+                ),
                 pa.field("geometry", pa.binary(), nullable=False),
             ]
-        ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
-        self.assertEqual(parquet_file.schema_arrow, expected_schema)
+        ).with_metadata(
+            {
+                b"geo": json.dumps(
+                    {
+                        "version": "1.1.0",
+                        "primary_column": "geometry",
+                        "columns": {
+                            "geometry": {
+                                "encoding": "WKB",
+                                "geometry_types": ["LineString"],
+                                "covering": {
+                                    "bbox": {
+                                        "xmin": ["bbox", "xmin"],
+                                        "ymin": ["bbox", "ymin"],
+                                        "xmax": ["bbox", "xmax"],
+                                        "ymax": ["bbox", "ymax"],
+                                    }
+                                },
+                            }
+                        },
+                    }
+                ).encode("utf-8")
+            }
+        )
+        schema = pq.read_schema(snap_path)
+        self.assertEqual(schema, expected_schema)
         self.assertEqual(table.num_rows, 3)
         self.assertEqual(table.column("id").to_pylist(), [1, 2, 3])
         self.assertEqual(table.column("unit_id").to_pylist(), [20, 30, 10])
@@ -567,10 +602,24 @@ class HydroRiversSnapTests(unittest.TestCase):
         bbox = table.column("bbox").combine_chunks()
         self.assertEqual(bbox.null_count, 0)
         expected_bounds = output.geometry.bounds.to_numpy(dtype="float32")
+        stored_bounds = np.column_stack(
+            [
+                bbox.field(index).to_numpy()
+                for index in range(len(build_adapter.BBOX_LEAF_NAMES))
+            ]
+        )
+        self.assertTrue(np.all(stored_bounds[:, 0] <= stored_bounds[:, 2]))
+        self.assertTrue(np.all(stored_bounds[:, 1] <= stored_bounds[:, 3]))
         for index, name in enumerate(build_adapter.BBOX_LEAF_NAMES):
             leaf = bbox.field(index)
             self.assertEqual(leaf.null_count, 0)
             np.testing.assert_array_equal(leaf.to_numpy(), expected_bounds[:, index])
+            np.testing.assert_allclose(
+                leaf.to_numpy(),
+                expected_bounds[:, index],
+                atol=build_adapter.SNAP_BBOX_EPSILON,
+                rtol=0,
+            )
         for group_index in range(parquet_file.metadata.num_row_groups):
             row_group = parquet_file.metadata.row_group(group_index)
             physical = {
@@ -589,7 +638,7 @@ class HydroRiversSnapTests(unittest.TestCase):
         self.assertEqual(table.column("stem_role").type, pa.string())
 
         self.assertEqual(
-            json.loads(parquet_file.schema_arrow.metadata[b"geo"]),
+            json.loads(schema.metadata[b"geo"]),
             {
                 "version": "1.1.0",
                 "primary_column": "geometry",
@@ -634,6 +683,70 @@ class HydroRiversSnapTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_snap_order_is_stable_for_hilbert_ties_after_drops(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            basins_dir.mkdir()
+            _write_layer(basins_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_points_dir, ids=ids, points=points)
+            authored_geometries = [
+                LineString([(-0.25, 0.20), (1.25, 0.80)]),
+                LineString([(29.75, 0.10), (31.25, 0.90)]),
+                LineString([(9.75, 0.15), (11.25, 0.85)]),
+                LineString([(-0.20, 0.35), (1.20, 0.65)]),
+            ]
+            authored_ids = [30, 999, 20, 10]
+            _write_rivers(
+                rivers_dir,
+                hybas_l12=authored_ids,
+                upland_skm=[30.25, 999.0, 20.5, 10.75],
+                next_down=[0, 0, 0, 0],
+                geometries=authored_geometries,
+                crs="EPSG:4326",
+            )
+
+            tables = []
+            for output_name in ("out_first", "out_second"):
+                out_dir = root / output_name
+                self.assertEqual(
+                    build_adapter.main(
+                        _build_args(basins_dir, pour_points_dir, out_dir)
+                        + ["--rivers", str(rivers_dir)]
+                    ),
+                    0,
+                )
+                tables.append(pq.read_table(out_dir / "aux" / "snap_stems.parquet"))
+
+            first, second = tables
+            for name in ("id", "unit_id", "geometry"):
+                self.assertEqual(first.column(name), second.column(name), name)
+            self.assertEqual(
+                first.column("id").to_pylist(),
+                list(range(1, first.num_rows + 1)),
+            )
+            self.assertEqual(first.column("id").to_pylist(), [1, 2, 3])
+
+            unit_ids = first.column("unit_id").to_pylist()
+            self.assertLess(unit_ids.index(30), unit_ids.index(10))
+            output = gpd.GeoSeries.from_wkb(first.column("geometry").to_pylist())
+            authored_by_id = dict(zip(authored_ids, authored_geometries, strict=True))
+            for unit_id, geometry in zip(unit_ids, output, strict=True):
+                self.assertTrue(geometry.equals_exact(authored_by_id[unit_id], 0.0))
+
+            tied = output[[unit_ids.index(30), unit_ids.index(10)]]
+            self.assertTrue(
+                tied.iloc[0].centroid.equals_exact(tied.iloc[1].centroid, 0.0)
+            )
+            catchments = gpd.read_parquet(root / "out_first" / "catchments.parquet")
+            tied_distances = tied.centroid.hilbert_distance(
+                total_bounds=catchments.geometry.total_bounds
+            )
+            self.assertEqual(tied_distances.iloc[0], tied_distances.iloc[1])
 
     def test_no_rivers_preserves_core_only_artifacts(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -1469,6 +1582,122 @@ class LargeRowGroupTests(unittest.TestCase):
                         statistics = columns_by_name[name].statistics
                         self.assertIsNotNone(statistics)
                         self.assertTrue(statistics.has_min_max)
+
+    def test_large_snap_has_balanced_row_groups_and_bbox_statistics(self) -> None:
+        count = 12_000
+        columns = 120
+        width = 0.005
+        ids = list(range(1, count + 1))
+        geometries = [
+            LineString(
+                [
+                    (
+                        -10 + (index % columns) * 0.01,
+                        -10 + (index // columns) * 0.01,
+                    ),
+                    (
+                        -10 + (index % columns) * 0.01 + width,
+                        -10 + (index // columns) * 0.01 + width,
+                    ),
+                ]
+            )
+            for index in range(count)
+        ]
+        rivers = gpd.GeoDataFrame(
+            {
+                "HYBAS_L12": pd.Series(ids, dtype="int64"),
+                "UPLAND_SKM": pd.Series(
+                    [float(identifier) for identifier in ids], dtype="float32"
+                ),
+                "NEXT_DOWN": pd.Series([0] * count, dtype="int64"),
+                "_source_order": pd.Series(range(count), dtype="int64"),
+            },
+            geometry=geometries,
+            crs="EPSG:4326",
+        )
+        units = gpd.GeoDataFrame(
+            {"id": [1]},
+            geometry=[box(-10.0, -10.0, -8.8, -9.0)],
+            crs="EPSG:4326",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            snap_path = build_adapter.write_snap_stems(
+                rivers, units, Path(temporary)
+            )
+            schema = pq.read_schema(snap_path)
+            parquet_file = pq.ParquetFile(snap_path)
+            metadata = parquet_file.metadata
+
+            expected_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("unit_id", pa.int64(), nullable=False),
+                    pa.field("weight", pa.float32(), nullable=False),
+                    pa.field("stem_role", pa.string(), nullable=True),
+                    pa.field(
+                        "bbox",
+                        pa.struct(
+                            [
+                                pa.field("xmin", pa.float32(), nullable=False),
+                                pa.field("ymin", pa.float32(), nullable=False),
+                                pa.field("xmax", pa.float32(), nullable=False),
+                                pa.field("ymax", pa.float32(), nullable=False),
+                            ]
+                        ),
+                        nullable=True,
+                    ),
+                    pa.field("geometry", pa.binary(), nullable=False),
+                ]
+            ).with_metadata(
+                {
+                    b"geo": json.dumps(
+                        {
+                            "version": "1.1.0",
+                            "primary_column": "geometry",
+                            "columns": {
+                                "geometry": {
+                                    "encoding": "WKB",
+                                    "geometry_types": ["LineString"],
+                                    "covering": {
+                                        "bbox": {
+                                            "xmin": ["bbox", "xmin"],
+                                            "ymin": ["bbox", "ymin"],
+                                            "xmax": ["bbox", "xmax"],
+                                            "ymax": ["bbox", "ymax"],
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    ).encode("utf-8")
+                }
+            )
+            self.assertEqual(schema, expected_schema)
+            self.assertGreaterEqual(metadata.num_row_groups, 1)
+            self.assertEqual(
+                sum(
+                    metadata.row_group(i).num_rows
+                    for i in range(metadata.num_row_groups)
+                ),
+                count,
+            )
+            group_sizes = [
+                metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)
+            ]
+            self.assertEqual(group_sizes, [6000, 6000])
+            for group_index in range(metadata.num_row_groups):
+                row_group = metadata.row_group(group_index)
+                self.assertGreaterEqual(row_group.num_rows, build_adapter.ROW_GROUP_MIN)
+                self.assertLessEqual(row_group.num_rows, build_adapter.ROW_GROUP_MAX)
+                columns_by_name = {
+                    row_group.column(index).path_in_schema: row_group.column(index)
+                    for index in range(row_group.num_columns)
+                }
+                for name in ("bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"):
+                    statistics = columns_by_name[name].statistics
+                    self.assertIsNotNone(statistics)
+                    self.assertTrue(statistics.has_min_max)
 
 
 class LoadRegionUnitsTests(unittest.TestCase):
