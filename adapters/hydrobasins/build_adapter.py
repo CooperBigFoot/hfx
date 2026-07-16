@@ -422,7 +422,7 @@ def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
 
 def _resolve_rivers_fields(rivers: pd.DataFrame) -> pd.DataFrame:
     """Resolve required HydroRIVERS attributes to canonical names."""
-    required = ("HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
+    required = ("HYRIV_ID", "HYBAS_L12", "UPLAND_SKM", "NEXT_DOWN")
     available = [str(column) for column in rivers.columns]
     renames: dict[object, str] = {}
     for canonical in required:
@@ -502,6 +502,11 @@ def _normalize_rivers_layer(rivers: pd.DataFrame) -> gpd.GeoDataFrame:
         )
 
     rivers = rivers.copy()
+    rivers["HYRIV_ID"] = _normalize_ids(
+        rivers["HYRIV_ID"],
+        reject_duplicates=True,
+        source_name="HYRIV_ID",
+    )
     rivers["HYBAS_L12"] = _normalize_ids(
         rivers["HYBAS_L12"],
         reject_duplicates=False,
@@ -527,6 +532,11 @@ def _normalize_rivers_layer(rivers: pd.DataFrame) -> gpd.GeoDataFrame:
         index=rivers.index,
         dtype="float32",
     )
+    rivers["NEXT_DOWN"] = _normalize_topology_integers(
+        rivers["NEXT_DOWN"],
+        "NEXT_DOWN",
+        allow_negative=False,
+    )
     rivers["_source_order"] = np.arange(len(rivers), dtype="int64")
     return rivers
 
@@ -541,6 +551,39 @@ def load_rivers(rivers_dir: Path) -> gpd.GeoDataFrame:
             f"failed to read HydroRIVERS layer {source_path}: {error}"
         ) from error
     return _normalize_rivers_layer(rivers)
+
+
+def _stem_roles(rivers: gpd.GeoDataFrame) -> dict[int, str]:
+    """Derive HydroRIVERS stem roles from confluence topology."""
+    reach_ids = {int(reach_id) for reach_id in rivers["HYRIV_ID"]}
+    roles = {int(reach_id): "mainstem" for reach_id in rivers["HYRIV_ID"]}
+    children: dict[int, list[tuple[int, float]]] = {}
+    for reach_id, next_down, upland_skm in zip(
+        rivers["HYRIV_ID"],
+        rivers["NEXT_DOWN"],
+        rivers["UPLAND_SKM"],
+        strict=True,
+    ):
+        if np.isnan(float(upland_skm)):
+            roles[int(reach_id)] = "unknown"
+            continue
+        downstream_id = int(next_down)
+        if downstream_id <= 0:
+            continue
+        if downstream_id not in reach_ids:
+            roles[int(reach_id)] = "unknown"
+            continue
+        children.setdefault(downstream_id, []).append(
+            (int(reach_id), float(upland_skm))
+        )
+    for contributors in children.values():
+        if len(contributors) <= 1:
+            continue
+        winner = max(contributors, key=lambda item: (item[1], item[0]))[0]
+        for reach_id, _area in contributors:
+            if reach_id != winner and roles.get(reach_id) != "unknown":
+                roles[reach_id] = "tributary"
+    return roles
 
 
 def assign_outlets(
@@ -799,7 +842,7 @@ def write_snap_stems(
         pa.array(np.arange(1, row_count + 1, dtype="int64"), type=pa.int64()),
         pa.array(ordered["HYBAS_L12"].to_numpy(dtype="int64"), type=pa.int64()),
         pa.array(ordered["UPLAND_SKM"].to_numpy(dtype="float32"), type=pa.float32()),
-        pa.array(["unknown"] * row_count, type=pa.string()),
+        pa.array(ordered["stem_role"].tolist(), type=pa.string()),
         build_bbox_struct(minx, miny, maxx, maxy),
         pa.array(ordered.geometry.to_wkb(hex=False).tolist(), type=pa.binary()),
     ]
@@ -843,7 +886,7 @@ def write_manifest(
                 "artifacts": {"snap": str(snap_path.relative_to(out_dir))},
                 "metadata": {
                     "name": "stems",
-                    "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = unknown in milestone 1.",
+                    "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = mainstem/tributary derived from NEXT_DOWN confluences.",
                     "references_levels": [0],
                     "weight_semantics": "drainage_area_km2",
                 },
@@ -924,6 +967,8 @@ def build_dataset(args: argparse.Namespace) -> None:
     snap_rivers: gpd.GeoDataFrame | None = None
     if args.rivers is not None:
         rivers = load_rivers(args.rivers)
+        roles = _stem_roles(rivers)
+        rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
         unit_ids = set(int(identifier) for identifier in units["id"])
         snap_rivers = rivers.loc[rivers["HYBAS_L12"].isin(unit_ids)].copy()
         dropped = len(rivers) - len(snap_rivers)
