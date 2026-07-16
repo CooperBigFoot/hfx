@@ -1,10 +1,10 @@
 # HydroBASINS to HFX Adapter
 
-This adapter is a reusable, guarded single- or multi-region compiler for the HydroBASINS standard, without-lakes Pfafstetter level 12 product. It writes the HFX v0.3.0 core artifacts `catchments.parquet`, `graph.parquet`, and `manifest.json` as one level in EPSG:4326.
+This adapter is a reusable, guarded single- or multi-region compiler for the HydroBASINS standard, without-lakes Pfafstetter level 12 product. It writes the HFX v0.3.0 core artifacts `catchments.parquet`, `graph.parquet`, and `manifest.json` as one level in EPSG:4326. Supplying `--rivers` optionally adds an `hfx.aux.snap.v2` HydroRIVERS layer.
 
 ## Inputs
 
-Every selected region requires two source layers:
+Every selected region requires two HydroBASINS source layers:
 
 - `hybas_<region>_lev12_v1.shp`, directly under the directory supplied to `--basins`.
 - `hybas_pour_lev12_v1.shp`, resolved recursively from the applicable pour-point directory.
@@ -22,6 +22,25 @@ For `--region`, the directory supplied to `--pour-points` is itself passed to an
 
 A multi-region build does not read one root-wide pour-point shapefile or infer region membership from point attributes.
 
+### Optional HydroRIVERS input
+
+Pass `--rivers <dir>` to emit HydroRIVERS reaches as an HFX snap auxiliary. A single-region build recursively resolves exactly one `*.shp` anywhere below the supplied directory:
+
+```text
+<rivers>/HydroRIVERS_<region>.shp
+```
+
+For `--regions` and `--all-regions`, the adapter appends each selected region code and recursively resolves exactly one shapefile below `--rivers/<code>/`:
+
+```text
+<rivers>/af/HydroRIVERS_af.shp
+<rivers>/eu/HydroRIVERS_eu.shp
+```
+
+The resolver accepts any shapefile name, but each applicable root must contain exactly one recursively discoverable `*.shp`; zero or multiple matches are errors. Omitting `--rivers` preserves the core-only build and emits only the existing catchments, graph, and manifest without a snap auxiliary declaration.
+
+HydroRIVERS input must contain `HYRIV_ID`, `HYBAS_L12`, `UPLAND_SKM`, `NEXT_DOWN`, and one LineString geometry column. The adapter normalizes it to EPSG:4326.
+
 Only Pfafstetter level 12 and the standard without-lakes product are supported. The with-lakes variant is unsupported because its matching HydroBASINS Pour Points ancillary product is unavailable.
 
 ## CLI Reference
@@ -29,7 +48,7 @@ Only Pfafstetter level 12 and the standard without-lakes product are supported. 
 Run the adapter from `adapters/hydrobasins` with `uv run python build_adapter.py`.
 
 ```text
-build (--region <code> | --regions <code> [<code> ...] | --all-regions) --basins <dir> --pour-points <dir> --out <dir> [--planetary] [--strict-build]
+build (--region <code> | --regions <code> [<code> ...] | --all-regions) --basins <dir> --pour-points <dir> --out <dir> [--rivers <dir>] [--planetary] [--strict-build]
 extract --region <code> --basins <dir> --pour-points <dir>
 validate <dataset> [--report-dir <dir>]
 ```
@@ -56,12 +75,28 @@ uv run python build_adapter.py build \
   --pour-points /path/to/hydrobasins/pour-points/gr \
   --out ./out/gr
 
+# Build one region with an optional HydroRIVERS snap layer.
+uv run python build_adapter.py build \
+  --region gr \
+  --basins /path/to/hydrobasins/standard \
+  --pour-points /path/to/hydrobasins/pour-points/gr \
+  --rivers /path/to/hydrorivers/gr \
+  --out ./out/gr-snap
+
 # Build two regions. Each pour-point layer is below <root>/<code>/.
 uv run python build_adapter.py build \
   --regions af,eu \
   --basins /path/to/hydrobasins/standard \
   --pour-points /path/to/hydrobasins/pour-points \
   --out ./out/af-eu
+
+# Build two regions with one HydroRIVERS layer below <root>/<code>/.
+uv run python build_adapter.py build \
+  --regions af,eu \
+  --basins /path/to/hydrobasins/standard \
+  --pour-points /path/to/hydrobasins/pour-points \
+  --rivers /path/to/hydrorivers \
+  --out ./out/af-eu-snap
 
 # The equivalent whitespace-list form is also accepted.
 uv run python build_adapter.py build \
@@ -110,6 +145,27 @@ The antimeridian guard then checks the combined units before the adapter writes 
 
 Both `catchments.parquet` and `graph.parquet` use balanced row groups. Files with at least 4,096 units have row-group sizes from 4,096 through 8,192 rows inclusive; this permits one balanced group for 4,096 through 8,192 units. Files with fewer than 4,096 units use one row group.
 
+### HydroRIVERS snap auxiliary
+
+When `--rivers` is present, each HydroRIVERS reach joins to the level-0 HydroBASINS unit whose `id` equals `HYBAS_L12`. Reaches whose `HYBAS_L12` is absent from the complete merged unit set are dropped without a spatial fallback, and the adapter logs the dropped count with `dropped %d HydroRIVERS reaches with HYBAS_L12 absent from the unit set`.
+
+The adapter writes `aux/snap_stems.parquet` with these columns:
+
+| Column | Meaning |
+|---|---|
+| `id` | Sequential signed 64-bit integer from 1 through N after global ordering |
+| `unit_id` | Signed 64-bit joined HydroBASINS unit ID, equal to `HYBAS_L12` |
+| `weight` | `UPLAND_SKM` as float32, declared as `drainage_area_km2` |
+| `stem_role` | `mainstem`, `tributary`, or `unknown` from `NEXT_DOWN` confluences |
+| `bbox` | Required `xmin`, `ymin`, `xmax`, `ymax` GeoParquet covering struct |
+| `geometry` | Original, unclipped HydroRIVERS LineString WKB in EPSG:4326 |
+
+The artifact carries GeoParquet 1.1 metadata mapping the `bbox` covering to `geometry` and is written with row-group statistics. The covering is required by the consumer's spatial query path.
+
+Roles are derived within each regional HydroRIVERS layer. At each confluence, the contributor with the largest `UPLAND_SKM` continues as `mainstem`; other contributors are `tributary`. Equal weights use the larger `HYRIV_ID` as the deterministic winner. A reach whose positive `NEXT_DOWN` is outside the loaded regional layer produces `unknown`. Terminal reaches and reaches without a competing sibling remain `mainstem`, and the adapter never emits `distributary`.
+
+For multiple regions, the adapter concatenates regional reaches, filters them against the merged unit IDs, applies one global centroid-Hilbert order using the merged units' total bounds, and then assigns sequential snap IDs. Region index and source order provide deterministic tie breaks. The manifest declares schema `hfx.aux.snap.v2`, artifact `{"snap": "aux/snap_stems.parquet"}`, `references_levels: [0]`, and `weight_semantics: "drainage_area_km2"`.
+
 ## Outlets and Graph Boundary
 
 `outlet_lon` and `outlet_lat` come from the DEM-derived HydroBASINS Pour Points ancillary layer at the highest-flow-accumulation cell, joined to polygons by `HYBAS_ID`. They are not geometrically derived from polygons and do not depend on HydroRIVERS. The join is total within every selected region: every unit must have at least one matching point, and a missing match is a hard build error.
@@ -132,6 +188,29 @@ For a normal non-planetary build, `manifest.json` uses the selected codes joined
 
 `--planetary` omits `region` and writes the exact bbox `[-180, -90, 180, 90]`. Planetary mode changes manifest metadata only. It does not download or compile missing regions; the actual global compile and hosting remain deferred to Effort #34.
 
+When `--rivers` is supplied, `manifest.json` contains this auxiliary declaration:
+
+```json
+{
+  "auxiliary": [
+    {
+      "schema": "hfx.aux.snap.v2",
+      "artifacts": {
+        "snap": "aux/snap_stems.parquet"
+      },
+      "metadata": {
+        "name": "stems",
+        "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = mainstem/tributary derived from NEXT_DOWN confluences.",
+        "references_levels": [0],
+        "weight_semantics": "drainage_area_km2"
+      }
+    }
+  ]
+}
+```
+
+When `--rivers` is omitted, `auxiliary` is absent and no snap artifact is written.
+
 ## Validation and Conformance
 
 Authoritative HFX conformance uses `hfx-cli --strict --sample-pct 100`. The adapter's `validate` subcommand runs text and JSON modes from the repository root and persists their output:
@@ -143,14 +222,35 @@ cargo run -p hfx-cli -- <dataset> --format json --strict --sample-pct 100
 
 GeoParquet 1.1 structural validation of `catchments.parquet` occurs during `build`; `validate` does not repeat it. Test and conformance coverage includes a two-region merge smoke that exercises clean concatenation and global `HYBAS_ID` uniqueness. This documentation step does not run a source-data global build.
 
+For an operator check, build otherwise equivalent snap-enabled and core-only datasets and use the same coordinate on or near a known HydroRIVERS reach. Strictly validate the snap-enabled dataset from the HFX repository root:
+
+```bash
+cargo run -p hfx-cli -- \
+  adapters/hydrobasins/out/<REGION>-snap \
+  --strict \
+  --sample-pct 100
+```
+
+From the pourpoint repository root, delineate against the snap-enabled dataset without `--no-refine`:
+
+```bash
+cargo run --release -- delineate \
+  --dataset <ABSOLUTE_PATH_TO_REGION_SNAP_DATASET> \
+  --lat <LAT> \
+  --lon <LON> \
+  --format geojson
+```
+
+The GeoJSON FeatureCollection's successful feature has `resolution_method` beginning with `snap(` and `refinement` beginning with `best_effort_skipped(` whose provenance contains `NoD8AuxDeclared`. The same coordinate against a core-only dataset has `resolution_method` beginning with `pip(`. The default snap radius is 1000 m; `--snap-radius <METRES>` overrides it. See [WORKFLOW.md](WORKFLOW.md#verify-snap-and-polygon-resolution) for the complete two-dataset recipe.
+
 ## Licensing
 
-The HydroSHEDS License Agreement permits commercial, non-commercial, and internal use, but prohibits public/open redistribution of the Licensed Materials as a stand-alone product. The same license covers the HydroBASINS Pour Points ancillary layer. Neither the inputs nor compiled output should be assumed freely redistributable or promised for public hosting.
+HydroBASINS, HydroBASINS Pour Points, and HydroRIVERS are HydroSHEDS products covered by the same HydroSHEDS License Agreement. The agreement permits commercial, non-commercial, and internal use, but prohibits public or open redistribution of the licensed materials as a stand-alone product. Internal use of the source and compiled HFX output is permitted; do not treat either the source layers or compiled output as freely redistributable stand-alone material.
 
 ## Limitations and Deferred Work
 
 - The actual planetary compile and hosting remain Effort #34.
 - Antimeridian detection is implemented; operational unwrapping or splitting remains Effort #34.
-- Snap features and HydroRIVERS integration are Effort #33. HydroRIVERS is not an adapter input.
+- Snap dispatch is dataset-level. When `hfx.aux.snap.v2` is declared, every outlet query uses the snap resolver with no per-query point-in-polygon fallback. With the default 1000 m radius, a point farther than 1000 m from every channel returns `NoSnapCandidates`.
 - The with-lakes product is unsupported because its matching pour-points product is unavailable.
 - Only Pfafstetter level 12 is supported.
