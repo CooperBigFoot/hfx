@@ -25,6 +25,7 @@ import build_adapter
 
 LAYER_NAME = "hybas_gr_lev12_v1.shp"
 POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
+RIVERS_LAYER_NAME = "HydroRIVERS_v10_gr.shp"
 
 
 def _write_layer(
@@ -118,6 +119,31 @@ def _write_pour_points(
     )
 
 
+def _write_rivers(rivers_dir: Path) -> None:
+    nested = rivers_dir / "nested"
+    nested.mkdir(parents=True, exist_ok=True)
+    frame = gpd.GeoDataFrame(
+        {
+            "HYBAS_L12": [30, 20, 999, 10],
+            "UPLAND_SKM": [30.25, 20.5, 999.0, 10.75],
+            "NEXT_DOWN": [0, 0, 0, 0],
+        },
+        geometry=[
+            LineString([(-0.25, 0.20), (1.25, 0.80)]),
+            LineString([(9.75, 0.15), (11.25, 0.85)]),
+            LineString([(29.75, 0.10), (31.25, 0.90)]),
+            LineString([(-0.20, 0.35), (1.20, 0.65)]),
+        ],
+        crs="EPSG:4326",
+    )
+    frame.to_file(
+        nested / RIVERS_LAYER_NAME,
+        driver="ESRI Shapefile",
+        engine="pyogrio",
+        index=False,
+    )
+
+
 def _build_args(basins_dir: Path, pour_points_dir: Path, out_dir: Path) -> list[str]:
     return [
         "build",
@@ -142,11 +168,13 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
 def _build_synthetic_dataset(tmpdir: Path) -> Path:
     basins_dir = tmpdir / "basins"
     pour_points_dir = tmpdir / "pour_points"
+    rivers_dir = tmpdir / "rivers"
     out_dir = tmpdir / "out"
     basins_dir.mkdir()
     _write_layer(basins_dir)
     ids, points = _ordinary_points()
     _write_pour_points(pour_points_dir, ids=ids, points=points)
+    _write_rivers(rivers_dir)
     return_code = build_adapter.main(
         [
             "build",
@@ -156,13 +184,20 @@ def _build_synthetic_dataset(tmpdir: Path) -> Path:
             str(basins_dir),
             "--pour-points",
             str(pour_points_dir),
+            "--rivers",
+            str(rivers_dir),
             "--out",
             str(out_dir),
         ]
     )
     if return_code != 0:
         raise AssertionError(f"synthetic build returned {return_code}")
-    for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+    for filename in (
+        "catchments.parquet",
+        "graph.parquet",
+        "manifest.json",
+        "aux/snap_stems.parquet",
+    ):
         if not (out_dir / filename).is_file():
             raise AssertionError(f"synthetic build did not create {filename}")
     return out_dir
@@ -394,6 +429,205 @@ class ConformanceTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class HydroRiversSnapTests(unittest.TestCase):
+    """Exercise HydroRIVERS snap emission through the public build command."""
+
+    def _build(self) -> tuple[Path, list[str]]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        rivers_dir = root / "rivers"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir)
+        ids, points = _ordinary_points()
+        _write_pour_points(pour_points_dir, ids=ids, points=points)
+        _write_rivers(rivers_dir)
+        with self.assertLogs(build_adapter.__name__, level="INFO") as captured:
+            return_code = build_adapter.main(
+                _build_args(basins_dir, pour_points_dir, out_dir)
+                + ["--rivers", str(rivers_dir)]
+            )
+        self.assertEqual(return_code, 0)
+        return out_dir, captured.output
+
+    def test_build_writes_strict_valid_snap_stems(self) -> None:
+        out_dir, logs = self._build()
+        snap_path = out_dir / "aux" / "snap_stems.parquet"
+        for path in (
+            out_dir / "catchments.parquet",
+            out_dir / "graph.parquet",
+            out_dir / "manifest.json",
+            snap_path,
+        ):
+            self.assertTrue(path.is_file(), path)
+
+        self.assertTrue(
+            any(
+                "dropped 1 HydroRIVERS reaches with HYBAS_L12 absent from the unit set"
+                in message
+                for message in logs
+            ),
+            logs,
+        )
+        parquet_file = pq.ParquetFile(snap_path)
+        table = pq.read_table(snap_path)
+        expected_schema = pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("unit_id", pa.int64(), nullable=False),
+                pa.field("weight", pa.float32(), nullable=False),
+                pa.field("stem_role", pa.string(), nullable=True),
+                pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
+                pa.field("geometry", pa.binary(), nullable=False),
+            ]
+        ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
+        self.assertEqual(parquet_file.schema_arrow, expected_schema)
+        self.assertEqual(table.num_rows, 3)
+        self.assertEqual(table.column("id").to_pylist(), [1, 2, 3])
+        self.assertEqual(table.column("unit_id").to_pylist(), [20, 30, 10])
+        self.assertEqual(table.column("weight").type, pa.float32())
+        np.testing.assert_array_equal(
+            table.column("weight").to_numpy(),
+            np.asarray([20.5, 30.25, 10.75], dtype="float32"),
+        )
+        self.assertEqual(table.column("stem_role").to_pylist(), ["unknown"] * 3)
+        for name in ("id", "unit_id", "weight", "geometry"):
+            self.assertEqual(table.column(name).null_count, 0)
+        catchment_ids = set(
+            pq.read_table(out_dir / "catchments.parquet", columns=["id"])
+            .column("id")
+            .to_pylist()
+        )
+        self.assertNotIn(999, table.column("unit_id").to_pylist())
+        self.assertTrue(set(table.column("unit_id").to_pylist()) <= catchment_ids)
+
+        output = gpd.read_parquet(snap_path)
+        self.assertTrue(output.crs.equals("EPSG:4326", ignore_axis_order=True))
+        self.assertEqual(output.geometry.geom_type.tolist(), ["LineString"] * 3)
+        expected_geometry = [
+            LineString([(9.75, 0.15), (11.25, 0.85)]),
+            LineString([(-0.25, 0.20), (1.25, 0.80)]),
+            LineString([(-0.20, 0.35), (1.20, 0.65)]),
+        ]
+        self.assertTrue(
+            all(actual.equals_exact(expected, 0.0) for actual, expected in zip(
+                output.geometry, expected_geometry, strict=True
+            ))
+        )
+        catchments = gpd.read_parquet(out_dir / "catchments.parquet")
+        distances = output.geometry.centroid.hilbert_distance(
+            total_bounds=catchments.geometry.total_bounds
+        )
+        self.assertTrue((distances.diff().dropna() >= 0).all())
+
+        bbox = table.column("bbox").combine_chunks()
+        self.assertEqual(bbox.null_count, 0)
+        expected_bounds = output.geometry.bounds.to_numpy(dtype="float32")
+        for index, name in enumerate(build_adapter.BBOX_LEAF_NAMES):
+            leaf = bbox.field(index)
+            self.assertEqual(leaf.null_count, 0)
+            np.testing.assert_array_equal(leaf.to_numpy(), expected_bounds[:, index])
+        for group_index in range(parquet_file.metadata.num_row_groups):
+            row_group = parquet_file.metadata.row_group(group_index)
+            physical = {
+                row_group.column(index).path_in_schema: row_group.column(index)
+                for index in range(row_group.num_columns)
+            }
+            for name in build_adapter.BBOX_LEAF_NAMES:
+                statistics = physical[f"bbox.{name}"].statistics
+                self.assertIsNotNone(statistics)
+                self.assertTrue(statistics.has_min_max)
+            encodings = set(physical["stem_role"].encodings)
+            self.assertTrue(
+                {"RLE_DICTIONARY", "PLAIN_DICTIONARY"} & encodings,
+                encodings,
+            )
+        self.assertEqual(table.column("stem_role").type, pa.string())
+
+        self.assertEqual(
+            json.loads(parquet_file.schema_arrow.metadata[b"geo"]),
+            {
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {
+                        "encoding": "WKB",
+                        "geometry_types": ["LineString"],
+                        "covering": {
+                            "bbox": {
+                                "xmin": ["bbox", "xmin"],
+                                "ymin": ["bbox", "ymin"],
+                                "xmax": ["bbox", "xmax"],
+                                "ymax": ["bbox", "ymax"],
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        validation = validate_geoparquet(str(snap_path), target_version="1.1")
+        failures = [
+            f"{check.name}: {check.message}"
+            for check in validation.checks
+            if check.status.value == "failed"
+        ]
+        self.assertTrue(validation.is_valid, "; ".join(failures))
+
+        with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        self.assertEqual(
+            manifest["auxiliary"],
+            [
+                {
+                    "schema": "hfx.aux.snap.v2",
+                    "artifacts": {"snap": "aux/snap_stems.parquet"},
+                    "metadata": {
+                        "name": "stems",
+                        "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = unknown in milestone 1.",
+                        "references_levels": [0],
+                        "weight_semantics": "drainage_area_km2",
+                    },
+                }
+            ],
+        )
+
+    def test_no_rivers_preserves_core_only_artifacts(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        basins_dir = root / "basins"
+        pour_points_dir = root / "pour_points"
+        out_dir = root / "out"
+        basins_dir.mkdir()
+        _write_layer(basins_dir)
+        ids, points = _ordinary_points()
+        _write_pour_points(pour_points_dir, ids=ids, points=points)
+
+        self.assertEqual(
+            build_adapter.main(_build_args(basins_dir, pour_points_dir, out_dir)),
+            0,
+        )
+        self.assertFalse((out_dir / "aux").exists())
+        with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+            self.assertNotIn("auxiliary", json.load(stream))
+
+    def test_rivers_rejects_multi_region_before_loading_or_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = _selector_args(["--regions", "gr", "eu"], root) + [
+                "--rivers",
+                str(root / "rivers"),
+            ]
+            with self.assertRaisesRegex(
+                build_adapter.AdapterError, "HydroRIVERS currently requires --region"
+            ):
+                build_adapter.main(args)
+            self.assertFalse((root / "out").exists())
 
 
 class BuildSelectorTests(unittest.TestCase):
