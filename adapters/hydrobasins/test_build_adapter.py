@@ -276,13 +276,17 @@ def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
     }
 
 
-def _build_synthetic_dataset(tmpdir: Path) -> Path:
+def _build_synthetic_dataset(
+    tmpdir: Path,
+    *,
+    geometries: list[Polygon] | None = None,
+) -> Path:
     basins_dir = tmpdir / "basins"
     pour_points_dir = tmpdir / "pour_points"
     rivers_dir = tmpdir / "rivers"
     out_dir = tmpdir / "out"
     basins_dir.mkdir()
-    _write_layer(basins_dir)
+    _write_layer(basins_dir, geometries=geometries)
     ids, points = _ordinary_points()
     _write_pour_points(pour_points_dir, ids=ids, points=points)
     _write_rivers(rivers_dir)
@@ -540,6 +544,60 @@ class ConformanceTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout)
+
+    @unittest.skipUnless(os.environ.get("HFX_BIN"), "HFX_BIN not set")
+    def test_regional_float32_bbox_round_up_passes_strict_conformance(self) -> None:
+        max_y = 81.85897607
+        self.assertGreater(float(np.float32(max_y)), max_y)
+        geometries = [
+            Polygon([
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]),
+            Polygon([
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]),
+            Polygon([
+                (10.0, 0.0),
+                (11.0, 0.0),
+                (11.0, 1.0),
+                (10.0, 1.0),
+                (10.0, 0.0),
+            ]),
+            Polygon([
+                (20.0, 0.0),
+                (21.0, 0.0),
+                (21.0, max_y),
+                (20.0, max_y),
+                (20.0, 0.0),
+            ]),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = _build_synthetic_dataset(
+                Path(temporary), geometries=geometries
+            )
+            result = subprocess.run(
+                [
+                    os.environ["HFX_BIN"],
+                    str(dataset),
+                    "--strict",
+                    "--sample-pct",
+                    "100",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            report = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, report)
+            self.assertIn("Result: VALID", result.stdout)
 
 
 class HydroRiversSnapTests(unittest.TestCase):
@@ -1961,8 +2019,12 @@ class MergedBuildTests(unittest.TestCase):
                     manifest = json.load(stream)
                 self.assertEqual(manifest["region"], "gr,af")
                 self.assertEqual(manifest["unit_count"], 4)
-                np.testing.assert_allclose(
-                    manifest["bbox"], catchments.geometry.total_bounds
+                self.assertEqual(
+                    manifest["bbox"],
+                    [
+                        float(np.float32(v))
+                        for v in catchments.geometry.total_bounds
+                    ],
                 )
                 schema = pq.ParquetFile(out_dir / "catchments.parquet").schema_arrow
                 geo = json.loads(schema.metadata[b"geo"])
