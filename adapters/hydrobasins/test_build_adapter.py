@@ -214,6 +214,68 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
     )
 
 
+def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
+    basins_dir = root / "basins"
+    pour_points_dir = root / "pour_points"
+    rivers_dir = root / "rivers"
+    basins_dir.mkdir()
+
+    _write_layer(
+        basins_dir,
+        region="gr",
+        ids=[101, 103],
+        next_down=[0, 0],
+        geometries=[box(0, 0, 1, 1), box(10, 0, 11, 1)],
+    )
+    _write_layer(
+        basins_dir,
+        region="af",
+        ids=[202, 204],
+        next_down=[0, 0],
+        geometries=[box(20, 0, 21, 1), box(30, 0, 31, 1)],
+    )
+    _write_pour_points(
+        pour_points_dir / "gr",
+        ids=[101, 103],
+        points=[Point(0.5, 0.5), Point(10.5, 0.5)],
+    )
+    _write_pour_points(
+        pour_points_dir / "af",
+        ids=[202, 204],
+        points=[Point(20.5, 0.5), Point(30.5, 0.5)],
+    )
+
+    gr_tied = LineString([(4.8, 0.2), (5.2, 0.8)])
+    af_tied = LineString([(4.8, 0.8), (5.2, 0.2)])
+    unresolved_inside_af_unit = LineString([(30.1, 0.2), (30.9, 0.8)])
+    af_local = LineString([(20.1, 0.2), (20.9, 0.8)])
+
+    _write_rivers(
+        rivers_dir / "gr",
+        layer_path=rivers_dir / "gr" / "nested" / "HydroRIVERS_v10_gr.shp",
+        hyriv_id=[1001, 1002],
+        hybas_l12=[101, 999],
+        upland_skm=[11.0, 99.0],
+        next_down=[0, 0],
+        geometries=[gr_tied, unresolved_inside_af_unit],
+    )
+    _write_rivers(
+        rivers_dir / "af",
+        layer_path=rivers_dir / "af" / "nested" / "HydroRIVERS_v10_af.shp",
+        hyriv_id=[2001, 2002],
+        hybas_l12=[202, 204],
+        upland_skm=[22.0, 33.0],
+        next_down=[0, 0],
+        geometries=[af_tied, af_local],
+    )
+    return {
+        "gr_tied": gr_tied,
+        "af_tied": af_tied,
+        "unresolved": unresolved_inside_af_unit,
+        "af_local": af_local,
+    }
+
+
 def _build_synthetic_dataset(tmpdir: Path) -> Path:
     basins_dir = tmpdir / "basins"
     pour_points_dir = tmpdir / "pour_points"
@@ -1056,6 +1118,194 @@ class HydroRiversSnapTests(unittest.TestCase):
             )
             self.assertEqual(tied_distances.iloc[0], tied_distances.iloc[1])
 
+    def test_two_region_snap_order_is_stable_when_hilbert_and_source_order_collide(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = _write_two_region_snap_fixture(root)
+            tables: list[pa.Table] = []
+            frames: list[gpd.GeoDataFrame] = []
+
+            for output_name in ("out_first", "out_second"):
+                out_dir = root / output_name
+                args = _selector_args(["--regions", "gr,af"], root)[:-1] + [
+                    str(out_dir),
+                    "--rivers",
+                    str(root / "rivers"),
+                ]
+                self.assertEqual(build_adapter.main(args), 0)
+                snap_path = out_dir / "aux" / "snap_stems.parquet"
+                tables.append(pq.read_table(snap_path))
+                frames.append(gpd.read_parquet(snap_path))
+
+            first, second = tables
+            self.assertEqual(first.column("id").to_pylist(), [1, 2, 3])
+            self.assertEqual(second.column("id").to_pylist(), [1, 2, 3])
+            self.assertTrue(first.equals(second))
+
+            mappings = [
+                list(
+                    zip(
+                        table.column("id").to_pylist(),
+                        table.column("unit_id").to_pylist(),
+                        table.column("geometry").to_pylist(),
+                        strict=True,
+                    )
+                )
+                for table in tables
+            ]
+            self.assertEqual(mappings[0], mappings[1])
+
+            unit_ids = first.column("unit_id").to_pylist()
+            self.assertLess(unit_ids.index(101), unit_ids.index(202))
+            tied_rows = [unit_ids.index(101), unit_ids.index(202)]
+            tied = frames[0].geometry.iloc[tied_rows]
+            self.assertFalse(tied.iloc[0].equals_exact(tied.iloc[1], 0.0))
+            self.assertTrue(tied.iloc[0].equals_exact(authored["gr_tied"], 0.0))
+            self.assertTrue(tied.iloc[1].equals_exact(authored["af_tied"], 0.0))
+
+            catchments = gpd.read_parquet(root / "out_first" / "catchments.parquet")
+            distances = tied.centroid.hilbert_distance(
+                total_bounds=catchments.geometry.total_bounds
+            )
+            self.assertEqual(distances.iloc[0], distances.iloc[1])
+            self.assertFalse(
+                any(
+                    geometry.equals_exact(authored["unresolved"], 0.0)
+                    for geometry in frames[0].geometry
+                )
+            )
+
+    def test_two_region_unresolved_reach_is_dropped_against_merged_units_without_reassignment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = _write_two_region_snap_fixture(root)
+            args = _selector_args(["--regions", "gr,af"], root) + [
+                "--rivers",
+                str(root / "rivers"),
+            ]
+            with self.assertLogs(build_adapter.__name__, level="INFO") as captured:
+                self.assertEqual(build_adapter.main(args), 0)
+
+            expected = (
+                "dropped 1 HydroRIVERS reaches with HYBAS_L12 absent "
+                "from the unit set"
+            )
+            self.assertEqual(sum(expected in message for message in captured.output), 1)
+            catchment_ids = set(
+                pq.read_table(root / "out" / "catchments.parquet", columns=["id"])
+                .column("id")
+                .to_pylist()
+            )
+            snap = gpd.read_parquet(root / "out" / "aux" / "snap_stems.parquet")
+            self.assertTrue(set(snap["unit_id"]) <= catchment_ids)
+            self.assertEqual(set(snap["unit_id"]), {101, 202, 204})
+            self.assertNotIn(999, snap["unit_id"].tolist())
+            self.assertFalse(
+                any(
+                    geometry.equals_exact(authored["unresolved"], 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+            expected_by_unit = {
+                101: authored["gr_tied"],
+                202: authored["af_tied"],
+                204: authored["af_local"],
+            }
+            for unit_id, geometry in zip(snap["unit_id"], snap.geometry, strict=True):
+                self.assertTrue(
+                    geometry.equals_exact(expected_by_unit[unit_id], 0.0)
+                )
+
+    def test_all_regions_resolves_one_rivers_layer_per_selected_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = _write_two_region_snap_fixture(root)
+            args = _selector_args(["--all-regions"], root) + [
+                "--rivers",
+                str(root / "rivers"),
+            ]
+            self.assertEqual(build_adapter.main(args), 0)
+
+            with (root / "out" / "manifest.json").open(encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            snap = gpd.read_parquet(root / "out" / "aux" / "snap_stems.parquet")
+            self.assertEqual(manifest["region"], "af,gr")
+            self.assertEqual(len(manifest["auxiliary"]), 1)
+            self.assertEqual(set(snap["unit_id"]), {101, 202, 204})
+            for expected in (authored["gr_tied"], authored["af_tied"]):
+                self.assertTrue(
+                    any(
+                        geometry.equals_exact(expected, 0.0)
+                        for geometry in snap.geometry
+                    )
+                )
+
+    def test_multi_region_rivers_layer_count_is_enforced_per_selected_directory(
+        self,
+    ) -> None:
+        selectors = (["--regions", "gr,af"], ["--all-regions"])
+        for selector in selectors:
+            for match_count in (0, 2):
+                with self.subTest(selector=selector, match_count=match_count):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        _write_two_region_snap_fixture(root)
+                        if match_count == 0:
+                            selected_dir = root / "rivers" / "gr"
+                            for path in selected_dir.rglob("*"):
+                                if path.is_file():
+                                    path.unlink()
+                        else:
+                            selected_dir = root / "rivers" / "af"
+                            _write_rivers(
+                                selected_dir,
+                                layer_path=selected_dir / "second" / "duplicate.shp",
+                                hyriv_id=[9001],
+                                hybas_l12=[202],
+                                upland_skm=[1.0],
+                                next_down=[0],
+                                geometries=[
+                                    LineString([(20.2, 0.2), (20.8, 0.8)])
+                                ],
+                            )
+                        args = _selector_args(selector, root) + [
+                            "--rivers",
+                            str(root / "rivers"),
+                        ]
+                        with self.assertRaises(build_adapter.AdapterError) as caught:
+                            build_adapter.main(args)
+                        self.assertIn(str(selected_dir), str(caught.exception))
+                        self.assertIn(f"found {match_count}", str(caught.exception))
+                        self.assertFalse((root / "out").exists())
+
+    def test_two_region_build_without_rivers_remains_core_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_two_region_snap_fixture(root)
+            self.assertEqual(
+                build_adapter.main(_selector_args(["--regions", "gr,af"], root)),
+                0,
+            )
+
+            out_dir = root / "out"
+            for filename in ("catchments.parquet", "graph.parquet", "manifest.json"):
+                self.assertTrue((out_dir / filename).is_file())
+            self.assertFalse((out_dir / "aux").exists())
+            with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertNotIn("auxiliary", manifest)
+            catchments = pq.read_table(out_dir / "catchments.parquet")
+            graph = pq.read_table(out_dir / "graph.parquet")
+            catchment_ids = catchments.column("id").to_pylist()
+            self.assertEqual(set(catchment_ids), {101, 103, 202, 204})
+            self.assertEqual(graph.column("id").to_pylist(), catchment_ids)
+            self.assertEqual(manifest["region"], "gr,af")
+            self.assertEqual(manifest["unit_count"], 4)
+
     def test_no_rivers_preserves_core_only_artifacts(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1076,26 +1326,105 @@ class HydroRiversSnapTests(unittest.TestCase):
         with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
             self.assertNotIn("auxiliary", json.load(stream))
 
-    def test_rivers_rejects_multi_region_before_loading_or_writing(self) -> None:
+    def test_two_regions_merge_rivers_against_merged_unit_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            selectors = (
-                ["--regions", "gr"],
-                ["--regions", "gr", "eu"],
-                ["--all-regions"],
+            basins_dir = root / "basins"
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            out_dir = root / "out"
+            basins_dir.mkdir()
+
+            _write_layer(
+                basins_dir,
+                region="gr",
+                ids=[101, 103],
+                next_down=[202, 0],
+                geometries=[box(20, 0, 21, 1), box(0, 0, 1, 1)],
             )
-            for selector in selectors:
-                with self.subTest(selector=selector):
-                    args = _selector_args(selector, root) + [
-                        "--rivers",
-                        str(root / "rivers"),
-                    ]
-                    with self.assertRaisesRegex(
-                        build_adapter.AdapterError,
-                        "HydroRIVERS currently requires --region",
-                    ):
-                        build_adapter.main(args)
-                    self.assertFalse((root / "out").exists())
+            _write_layer(
+                basins_dir,
+                region="af",
+                ids=[202, 204],
+                next_down=[0, 0],
+                geometries=[box(10, 0, 11, 1), box(30, 0, 31, 1)],
+            )
+            _write_pour_points(
+                pour_points_dir / "gr",
+                ids=[101, 103],
+                points=[Point(20.5, 0.5), Point(0.5, 0.5)],
+            )
+            _write_pour_points(
+                pour_points_dir / "af",
+                ids=[202, 204],
+                points=[Point(10.5, 0.5), Point(30.5, 0.5)],
+            )
+
+            gr_local_geometry = LineString([(20.1, 0.2), (20.9, 0.8)])
+            cross_region_geometry = LineString([(10.1, 0.2), (10.9, 0.8)])
+            af_local_geometry = LineString([(30.1, 0.2), (30.9, 0.8)])
+            _write_rivers(
+                rivers_dir / "gr",
+                layer_path=rivers_dir / "gr" / "nested" / "HydroRIVERS_v10_gr.shp",
+                hyriv_id=[1001, 1002],
+                hybas_l12=[101, 202],
+                upland_skm=[11.0, 22.0],
+                next_down=[0, 0],
+                geometries=[gr_local_geometry, cross_region_geometry],
+            )
+            _write_rivers(
+                rivers_dir / "af",
+                layer_path=rivers_dir / "af" / "nested" / "HydroRIVERS_v10_af.shp",
+                hyriv_id=[2001],
+                hybas_l12=[204],
+                upland_skm=[33.0],
+                next_down=[0],
+                geometries=[af_local_geometry],
+            )
+
+            args = _selector_args(["--regions", "gr,af"], root) + [
+                "--rivers",
+                str(rivers_dir),
+            ]
+            self.assertEqual(build_adapter.main(args), 0)
+
+            catchment_ids = set(
+                pq.read_table(out_dir / "catchments.parquet", columns=["id"])
+                .column("id")
+                .to_pylist()
+            )
+            snap = gpd.read_parquet(out_dir / "aux" / "snap_stems.parquet")
+            self.assertEqual(set(snap["unit_id"]), {101, 202, 204})
+            self.assertEqual(snap["id"].tolist(), list(range(1, len(snap) + 1)))
+            self.assertTrue(set(snap["unit_id"]) <= catchment_ids)
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(gr_local_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(cross_region_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+            self.assertTrue(
+                any(
+                    geometry.equals_exact(af_local_geometry, 0.0)
+                    for geometry in snap.geometry
+                )
+            )
+
+            with (out_dir / "manifest.json").open(encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(manifest["region"], "gr,af")
+            self.assertEqual(len(manifest["auxiliary"]), 1)
+            self.assertEqual(manifest["auxiliary"][0]["schema"], "hfx.aux.snap.v2")
+            self.assertEqual(
+                manifest["auxiliary"][0]["artifacts"],
+                {"snap": "aux/snap_stems.parquet"},
+            )
 
 
 class HydroRiversNormalizationTests(unittest.TestCase):
