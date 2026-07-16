@@ -880,7 +880,9 @@ def write_manifest(
         manifest["bbox"] = list(PLANETARY_BBOX)
     else:
         manifest["region"] = region_label
-        manifest["bbox"] = [float(value) for value in units.geometry.total_bounds]
+        manifest["bbox"] = [
+            float(np.float32(v)) for v in units.geometry.total_bounds
+        ]
     if snap_path is not None:
         manifest["auxiliary"] = [
             {
