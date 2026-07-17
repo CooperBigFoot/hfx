@@ -21,7 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from geoparquet_io.core.validate import validate_geoparquet
-from shapely import make_valid
+from shapely import get_coordinates, make_valid, set_coordinates
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
@@ -39,6 +39,7 @@ HAS_SNAP = False
 ROW_GROUP_MIN = 4096
 ROW_GROUP_MAX = 8192
 SNAP_BBOX_EPSILON = 1e-4
+COORDINATE_DOMAIN_TOLERANCE_DEGREES = 15.0 / 3600.0
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
 STANDARD_REGION_CODES = ("af", "ar", "as", "au", "eu", "gr", "na", "sa", "si")
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,100 @@ LOGGER = logging.getLogger(__name__)
 
 class AdapterError(RuntimeError):
     """Report a HydroBASINS source-contract violation."""
+
+
+def _clamp_coordinate_domain(
+    geometry: gpd.GeoSeries,
+    *,
+    layer: str,
+    source_ids: pd.Series,
+    source_id_field: str,
+) -> gpd.GeoSeries:
+    """Clamp marginal EPSG:4326 coordinate overshoot at a source boundary."""
+    coordinates_by_feature: list[np.ndarray] = []
+    for feature_geometry, source_id in zip(
+        geometry,
+        source_ids,
+        strict=True,
+    ):
+        coordinates = get_coordinates(feature_geometry, include_z=True)
+        coordinates_by_feature.append(coordinates)
+        for coordinate in coordinates:
+            x = float(coordinate[0])
+            y = float(coordinate[1])
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise AdapterError(
+                    "non-finite coordinate at source boundary: "
+                    f"layer={layer}, {source_id_field}={source_id}, "
+                    f"coordinate=({x}, {y})"
+                )
+            longitude_excess = max(-180.0 - x, x - 180.0, 0.0)
+            latitude_excess = max(-90.0 - y, y - 90.0, 0.0)
+            if (
+                longitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
+                or latitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
+            ):
+                raise AdapterError(
+                    "coordinate-domain overshoot exceeds tolerance: "
+                    f"layer={layer}, {source_id_field}={source_id}, "
+                    f"coordinate=({x}, {y}), "
+                    f"longitude_excess={longitude_excess}, "
+                    f"latitude_excess={latitude_excess}, "
+                    "tolerance="
+                    f"{COORDINATE_DOMAIN_TOLERANCE_DEGREES}"
+                )
+
+    normalized_geometry: list[BaseGeometry] = []
+    altered_vertices = 0
+    altered_source_ids: set[object] = set()
+    for feature_geometry, coordinates, source_id in zip(
+        geometry,
+        coordinates_by_feature,
+        source_ids,
+        strict=True,
+    ):
+        normalized_coordinates = coordinates.copy()
+        normalized_coordinates[:, 0] = np.clip(
+            normalized_coordinates[:, 0],
+            -180.0,
+            180.0,
+        )
+        normalized_coordinates[:, 1] = np.clip(
+            normalized_coordinates[:, 1],
+            -90.0,
+            90.0,
+        )
+        altered = np.any(
+            normalized_coordinates[:, :2] != coordinates[:, :2],
+            axis=1,
+        )
+        count = int(np.count_nonzero(altered))
+        if count:
+            altered_vertices += count
+            altered_source_ids.add(source_id)
+        normalized_geometry.append(
+            set_coordinates(feature_geometry, normalized_coordinates)
+        )
+
+    if altered_vertices:
+        sorted_source_ids = sorted(
+            altered_source_ids,
+            key=lambda value: str(value),
+        )
+        LOGGER.warning(
+            "clamped coordinate-domain overshoot: layer=%s, "
+            "altered_vertices=%d, %s=%s",
+            layer,
+            altered_vertices,
+            f"{source_id_field}s",
+            sorted_source_ids,
+        )
+
+    return gpd.GeoSeries(
+        normalized_geometry,
+        index=geometry.index,
+        crs=geometry.crs,
+    )
 
 
 def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
@@ -336,6 +431,19 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     if not units.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).all():
         raise AdapterError("non-polygonal geometries remain after repair")
 
+    units["geometry"] = _clamp_coordinate_domain(
+        units.geometry,
+        layer="HydroBASINS units",
+        source_ids=units["HYBAS_ID"],
+        source_id_field="HYBAS_ID",
+    )
+    if units.geometry.isna().any() or units.geometry.is_empty.any():
+        raise AdapterError("null or empty geometries remain after coordinate clamp")
+    if (~units.geometry.is_valid).any():
+        raise AdapterError("invalid geometries remain after coordinate clamp")
+    if not units.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).all():
+        raise AdapterError("non-polygonal geometries remain after coordinate clamp")
+
     units["id"] = _normalize_ids(units["HYBAS_ID"])
     units["level"] = pd.Series(0, index=units.index, dtype="int64")
     units["parent_id"] = pd.Series(pd.NA, index=units.index, dtype="Int64")
@@ -412,6 +520,16 @@ def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
         )
 
     normalized = pour_points.copy()
+    normalized["geometry"] = _clamp_coordinate_domain(
+        normalized.geometry,
+        layer="HydroBASINS pour points",
+        source_ids=normalized[join_key],
+        source_id_field=join_key,
+    )
+    if normalized.geometry.isna().any() or normalized.geometry.is_empty.any():
+        raise AdapterError("invalid geometry remains after pour-point coordinate clamp")
+    if not normalized.geometry.geom_type.eq("Point").all():
+        raise AdapterError("non-Point geometry remains after pour-point coordinate clamp")
     normalized["id"] = _normalize_ids(
         normalized[join_key], reject_duplicates=False
     )
@@ -502,6 +620,16 @@ def _normalize_rivers_layer(rivers: pd.DataFrame) -> gpd.GeoDataFrame:
         )
 
     rivers = rivers.copy()
+    rivers["geometry"] = _clamp_coordinate_domain(
+        rivers.geometry,
+        layer="HydroRIVERS reaches",
+        source_ids=rivers["HYRIV_ID"],
+        source_id_field="HYRIV_ID",
+    )
+    if rivers.geometry.isna().any() or rivers.geometry.is_empty.any():
+        raise AdapterError("invalid geometry remains after HydroRIVERS coordinate clamp")
+    if not rivers.geometry.geom_type.eq("LineString").all():
+        raise AdapterError("non-LineString geometry remains after HydroRIVERS coordinate clamp")
     rivers["HYRIV_ID"] = _normalize_ids(
         rivers["HYRIV_ID"],
         reject_duplicates=True,
