@@ -2558,6 +2558,155 @@ class LoadRegionUnitsTests(unittest.TestCase):
         self.assertEqual(first.index.tolist(), list(range(len(first))))
 
 
+class CoordinateDomainClampTests(unittest.TestCase):
+    """Exercise coordinate-domain normalization through real source layers."""
+
+    def test_au_fiji_polygon_vertices_are_clamped(self) -> None:
+        fiji_ids = [5120082160, 5120082230]
+        fiji_polygons = [
+            Polygon([
+                (179.8, -17.9),
+                (179.9, -18.0),
+                (180.0006, -17.9),
+                (179.9, -17.8),
+                (179.8, -17.9),
+            ]),
+            Polygon([
+                (179.7, -16.9),
+                (179.8, -17.0),
+                (180.0006, -16.9),
+                (179.8, -16.8),
+                (179.7, -16.9),
+            ]),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            basins_dir = Path(temporary)
+            _write_layer(
+                basins_dir,
+                region="au",
+                ids=fiji_ids,
+                geometries=fiji_polygons,
+            )
+
+            with self.assertLogs(build_adapter.__name__, level="WARNING") as captured:
+                units = build_adapter.load_region_units("au", basins_dir)
+
+        self.assertLessEqual(
+            units.total_bounds[2],
+            180.0,
+            "180.0006 remained above 180.0 after source normalization",
+        )
+        self.assertEqual(set(units["id"]), set(fiji_ids))
+        self.assertTrue(units.geometry.is_valid.all())
+        self.assertTrue(units.geometry.geom_type.eq("Polygon").all())
+        self.assertTrue(
+            all(
+                -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0
+                for polygon in units.geometry
+                for x, y in polygon.exterior.coords
+            )
+        )
+        self.assertEqual(
+            sum(
+                x == 180.0
+                for polygon in units.geometry
+                for x, _ in polygon.exterior.coords
+            ),
+            2,
+        )
+        warning = "\n".join(captured.output)
+        self.assertIn("HydroBASINS units", warning)
+        self.assertIn("altered_vertices=2", warning)
+        self.assertIn("HYBAS_IDs", warning)
+        for identifier in fiji_ids:
+            self.assertIn(str(identifier), warning)
+
+    def test_marginal_overshoot_is_clamped_at_point_and_river_boundaries(
+        self,
+    ) -> None:
+        fiji_ids = [5120082160, 5120082230]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pour_points_dir = root / "pour_points"
+            rivers_dir = root / "rivers"
+            _write_pour_points(
+                pour_points_dir,
+                ids=fiji_ids,
+                points=[Point(180.0006, -17.9), Point(180.0006, -16.9)],
+            )
+            _write_rivers(
+                rivers_dir,
+                hyriv_id=[9001, 9002],
+                hybas_l12=fiji_ids,
+                upland_skm=[1.0, 2.0],
+                next_down=[0, 0],
+                geometries=[
+                    LineString([(179.9, -17.9), (180.0006, -17.8)]),
+                    LineString([(179.8, -16.9), (180.0006, -16.8)]),
+                ],
+            )
+
+            pour_points = build_adapter.load_pour_points(pour_points_dir)
+            rivers = build_adapter.load_rivers(rivers_dir)
+
+        self.assertEqual(pour_points.geometry.x.tolist(), [180.0, 180.0])
+        self.assertEqual(pour_points["outlet_lon"].tolist(), [180.0, 180.0])
+        self.assertEqual(pour_points["outlet_lat"].tolist(), [-17.9, -16.9])
+        self.assertTrue(
+            all(
+                -180.0 <= point.x <= 180.0 and -90.0 <= point.y <= 90.0
+                for point in pour_points.geometry
+            )
+        )
+        self.assertTrue(rivers.geometry.geom_type.eq("LineString").all())
+        self.assertTrue(
+            all(
+                -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0
+                for line in rivers.geometry
+                for x, y in line.coords
+            )
+        )
+        self.assertEqual([line.coords[-1][0] for line in rivers.geometry], [180.0, 180.0])
+
+    def test_over_tolerance_coordinates_are_rejected_at_the_source_boundary(
+        self,
+    ) -> None:
+        cases = (
+            (Point(180.005, 0.0), "180.005"),
+            (Point(-180.005, 0.0), "-180.005"),
+            (Point(0.0, 90.005), "90.005"),
+            (Point(0.0, -90.005), "-90.005"),
+        )
+        for point, coordinate_text in cases:
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as temporary:
+                pour_points_dir = Path(temporary)
+                _write_pour_points(
+                    pour_points_dir,
+                    ids=[5120082160],
+                    points=[point],
+                )
+
+                with self.assertRaises(build_adapter.AdapterError) as caught:
+                    build_adapter.load_pour_points(pour_points_dir)
+
+                message = str(caught.exception)
+                self.assertIn("HydroBASINS pour points", message)
+                self.assertIn("HYBAS_ID=5120082160", message)
+                self.assertIn(coordinate_text, message)
+                self.assertIn("excess", message)
+                self.assertIn("tolerance", message)
+
+    def test_in_domain_geometry_does_not_emit_a_clamp_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            basins_dir = Path(temporary)
+            _write_layer(basins_dir)
+
+            with patch.object(build_adapter.LOGGER, "warning") as warning:
+                build_adapter.load_region_units("gr", basins_dir)
+
+        warning.assert_not_called()
+
+
 class BuildCatchmentsTests(unittest.TestCase):
     """Prove the command path writes the required GeoParquet slice."""
 
@@ -3070,15 +3219,20 @@ class PourPointTests(unittest.TestCase):
             with self.subTest(point=bad_point), tempfile.TemporaryDirectory() as temporary:
                 ids, points = _ordinary_points()
                 points[0] = bad_point
-                with self.assertRaisesRegex(build_adapter.AdapterError, "30.*invalid"):
+                with self.assertRaises(build_adapter.AdapterError) as caught:
                     self._build_fixture(Path(temporary), ids=ids, points=points)
+                message = str(caught.exception)
+                self.assertIn("HydroBASINS pour points", message)
+                self.assertIn("HYBAS_ID=30", message)
+                self.assertIn("excess", message)
+                self.assertIn("tolerance", message)
 
         with tempfile.TemporaryDirectory() as temporary:
             ids, points = _ordinary_points()
             path = self._build_fixture(
                 Path(temporary),
                 ids=ids + [999],
-                points=points + [Point(181.0, 91.0)],
+                points=points + [Point(170.0, 80.0)],
             )
             self.assertEqual(set(gpd.read_parquet(path)["id"]), set(ids))
 
