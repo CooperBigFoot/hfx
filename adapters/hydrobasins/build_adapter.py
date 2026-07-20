@@ -1083,6 +1083,7 @@ def write_manifest(
     region_label: str,
     planetary: bool,
     snap_path: Path | None = None,
+    snap_references_level: int | None = None,
 ) -> Path:
     """Write the HFX dataset manifest with regional or planetary semantics."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1105,6 +1106,8 @@ def write_manifest(
             float(np.float32(v)) for v in units.geometry.total_bounds
         ]
     if snap_path is not None:
+        if snap_references_level is None:
+            raise AdapterError("snap reference level is required when snap is present")
         manifest["auxiliary"] = [
             {
                 "schema": "hfx.aux.snap.v2",
@@ -1112,7 +1115,7 @@ def write_manifest(
                 "metadata": {
                     "name": "stems",
                     "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = mainstem/tributary derived from NEXT_DOWN confluences.",
-                    "references_levels": [0],
+                    "references_levels": [snap_references_level],
                     "weight_semantics": "drainage_area_km2",
                 },
             }
@@ -1270,6 +1273,10 @@ def _prepare_level_frames(
 
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
+    if args.rivers is not None and 12 not in args.levels.source_levels:
+        raise AdapterError(
+            "--rivers requires --levels to include source Pfaf level 12"
+        )
     regions = resolve_build_regions(args)
     prepared = _prepare_level_frames(args, regions)
     units = gpd.GeoDataFrame(
@@ -1307,9 +1314,9 @@ def build_dataset(args: argparse.Namespace) -> None:
             geometry="geometry",
             crs=CRS,
         )
-        merged_unit_ids = set(int(identifier) for identifier in units["id"])
+        pfaf_12_unit_ids = set(int(identifier) for identifier in prepared[12]["id"])
         snap_rivers = rivers.loc[
-            rivers["HYBAS_L12"].isin(merged_unit_ids)
+            rivers["HYBAS_L12"].isin(pfaf_12_unit_ids)
         ].copy()
         dropped = len(rivers) - len(snap_rivers)
         LOGGER.info(
@@ -1319,14 +1326,17 @@ def build_dataset(args: argparse.Namespace) -> None:
     write_catchments(units, args.out)
     write_graph(units, args.out)
     snap_path = None
+    snap_references_level = None
     if snap_rivers is not None:
         snap_path = write_snap_stems(snap_rivers, units, args.out)
+        snap_references_level = args.levels.hfx_level(12)
     write_manifest(
         units,
         args.out,
         region_label=",".join(regions),
         planetary=args.planetary,
         snap_path=snap_path,
+        snap_references_level=snap_references_level,
     )
 
 
