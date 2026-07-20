@@ -451,13 +451,13 @@ def _normalize_topology_integers(
 
 
 def _hilbert_sort(units: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Sort units stably by centroid Hilbert distance and ID."""
+    """Sort units stably by level, complete-union Hilbert distance, and ID."""
     sorted_units = units.copy()
     sorted_units["_hilbert"] = sorted_units.geometry.centroid.hilbert_distance(
-        total_bounds=sorted_units.total_bounds
+        total_bounds=sorted_units.geometry.total_bounds
     )
     sorted_units = sorted_units.sort_values(
-        ["_hilbert", "id"], kind="mergesort"
+        ["level", "_hilbert", "id"], kind="mergesort"
     )
     return sorted_units.drop(columns=["_hilbert"]).reset_index(drop=True)
 
@@ -903,7 +903,7 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     columns = [
         pa.array(units["id"].to_numpy(), type=pa.int64()),
         pa.array(units["level"].to_numpy(dtype="int16"), type=pa.int16()),
-        pa.nulls(row_count, type=pa.int64()),
+        pa.array(units["parent_id"], type=pa.int64(), from_pandas=True),
         pa.array(units["area_km2"].to_numpy(dtype="float32"), type=pa.float32()),
         pa.array(
             units["up_area_km2"].to_numpy(dtype="float32"),
@@ -946,38 +946,52 @@ def _assert_acyclic(outgoing: dict[int, int]) -> None:
         visited.update(path)
 
 
+def _build_level_upstream(units: gpd.GeoDataFrame) -> dict[int, list[int]]:
+    """Build and validate upstream adjacency independently for every HFX level."""
+    unit_ids = [int(identifier) for identifier in units["id"]]
+    upstream: dict[int, list[int]] = {identifier: [] for identifier in unit_ids}
+    for level, level_units in units.groupby("level", sort=True):
+        hfx_level = int(level)
+        id_set = set(int(identifier) for identifier in level_units["id"])
+        outgoing: dict[int, int] = {}
+        for unit in level_units.itertuples(index=False):
+            source_id = int(unit.id)
+            downstream_id = int(unit.NEXT_DOWN)
+            endo = int(unit.ENDO)
+            if downstream_id == 0:
+                continue
+            if downstream_id < 0:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has negative "
+                    f"NEXT_DOWN value {downstream_id}"
+                )
+            if downstream_id == source_id:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has a topology "
+                    "self-link cycle"
+                )
+            if endo == 2:
+                continue
+            if downstream_id not in id_set:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has downstream ID "
+                    f"{downstream_id}, which is absent from this level"
+                )
+            outgoing[source_id] = downstream_id
+            upstream[downstream_id].append(source_id)
+        try:
+            _assert_acyclic(outgoing)
+        except AdapterError as error:
+            raise AdapterError(f"HFX level {hfx_level}: {error}") from error
+    for identifiers in upstream.values():
+        identifiers.sort()
+    return upstream
+
+
 def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     """Write the cut, acyclic HydroBASINS tree as HFX graph Parquet."""
     unit_ids = [int(identifier) for identifier in units["id"]]
-    id_set = set(unit_ids)
-    upstream: dict[int, list[int]] = {identifier: [] for identifier in unit_ids}
-    outgoing: dict[int, int] = {}
-
-    for unit in units.itertuples(index=False):
-        source_id = int(unit.id)
-        downstream_id = int(unit.NEXT_DOWN)
-        endo = int(unit.ENDO)
-        if downstream_id == 0:
-            continue
-        if endo == 2:
-            continue
-        if downstream_id < 0:
-            raise AdapterError(
-                f"unit {source_id} has negative NEXT_DOWN value {downstream_id}"
-            )
-        if downstream_id == source_id:
-            raise AdapterError(f"unit {source_id} has a topology self-link cycle")
-        if downstream_id not in id_set:
-            raise AdapterError(
-                f"unit {source_id} has downstream ID {downstream_id}, "
-                "which is absent from this dataset"
-            )
-        outgoing[source_id] = downstream_id
-        upstream[downstream_id].append(source_id)
-
-    _assert_acyclic(outgoing)
-    for identifiers in upstream.values():
-        identifiers.sort()
+    upstream = _build_level_upstream(units)
 
     bounds = units.reset_index(drop=True).geometry.bounds
     list_type = pa.list_(pa.field("item", pa.int64(), nullable=True))
@@ -1258,11 +1272,19 @@ def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
     regions = resolve_build_regions(args)
     prepared = _prepare_level_frames(args, regions)
-    if len(prepared) > 1:
-        raise AdapterError(
-            "multi-level artifact emission is deferred to M2-S3"
-        )
-    units = next(iter(prepared.values()))
+    units = gpd.GeoDataFrame(
+        pd.concat([prepared[level] for level in sorted(prepared)], ignore_index=True),
+        geometry="geometry",
+        crs=CRS,
+    )
+    duplicates = sorted(
+        int(identifier)
+        for identifier in units.loc[
+            units["id"].duplicated(keep=False), "id"
+        ].unique()
+    )
+    if duplicates:
+        raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
     rivers_frames: list[gpd.GeoDataFrame] = []
     for region_index, region in enumerate(regions):
         if args.rivers is not None:
@@ -1277,6 +1299,7 @@ def build_dataset(args: argparse.Namespace) -> None:
 
     units = _hilbert_sort(units)
     guard_antimeridian(units, strict_build=args.strict_build)
+    _build_level_upstream(units)
     snap_rivers: gpd.GeoDataFrame | None = None
     if args.rivers is not None:
         rivers = gpd.GeoDataFrame(
@@ -1423,7 +1446,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--levels",
         type=parse_level_range,
         action=_UniqueLevelRangeAction,
-        default="12",  # M2-S3, not this step, flips the default to "1-12".
+        default="1-12",
         help="singleton or contiguous source-Pfaf range N or N-M",
     )
     build.add_argument(
