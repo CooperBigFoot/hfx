@@ -127,8 +127,9 @@ fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8Ra
         .into_iter()
         .flatten()
         .enumerate()
-        .filter(|(_, entry)| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1"))
-        .map(|(idx, entry)| {
+        .filter(|(_, entry)| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v2"))
+        .filter_map(|(idx, entry)| {
+            parse_d8_raster_metadata(entry)?;
             let flow_dir_artifact = entry
                 .artifacts
                 .as_ref()
@@ -141,7 +142,7 @@ fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8Ra
                 .cloned();
             let name = d8_raster_label(idx, entry, flow_dir_artifact.as_deref());
 
-            D8RasterEntry {
+            Some(D8RasterEntry {
                 name,
                 flow_dir_path: existing_safe_artifact_path(dir, flow_dir_artifact.as_deref()),
                 flow_acc_path: existing_safe_artifact_path(dir, flow_acc_artifact.as_deref()),
@@ -149,9 +150,28 @@ fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8Ra
                 flow_acc_artifact,
                 flow_dir: None,
                 flow_acc: None,
-            }
+            })
         })
         .collect()
+}
+
+fn parse_d8_raster_metadata(entry: &RawAuxEntry) -> Option<hfx::D8RasterMetadataV2> {
+    let metadata = entry
+        .metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    hfx::D8RasterMetadataV2::parse(
+        metadata
+            .and_then(|values| values.get("crs"))
+            .and_then(serde_json::Value::as_str),
+        metadata
+            .and_then(|values| values.get("flow_dir_encoding"))
+            .and_then(serde_json::Value::as_str),
+        metadata
+            .and_then(|values| values.get("flow_acc_units"))
+            .and_then(serde_json::Value::as_str),
+    )
+    .ok()
 }
 
 fn existing_safe_artifact_path(dir: &Path, rel_path: Option<&str>) -> Option<std::path::PathBuf> {
