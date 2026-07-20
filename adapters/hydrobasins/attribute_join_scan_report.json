@@ -1,0 +1,771 @@
+{
+  "checks": [
+    {
+      "evaluated_children": 3786218,
+      "evaluated_pairs": 99,
+      "finding_count": 0,
+      "name": "adjacent-level-pfaf-parent",
+      "status": "pass"
+    },
+    {
+      "evaluated_basins": 3786228,
+      "evaluated_levels": 12,
+      "finding_count": 0,
+      "name": "per-level-pour-point-coverage",
+      "status": "pass"
+    },
+    {
+      "evaluated_basins": 3786228,
+      "evaluated_layers": 108,
+      "finding_count": 0,
+      "name": "global-hybas-id-collision-freedom",
+      "status": "pass"
+    }
+  ],
+  "findings": {
+    "input_not_staged": [],
+    "source_contract": []
+  },
+  "inputs": {
+    "basins": [
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_af/hybas_af_lev01_v1c.shp",
+        "level": "01",
+        "region": "af"
+      },
+      {
+        "feature_count": 8,
+        "layer": "extract/hybas_af/hybas_af_lev02_v1c.shp",
+        "level": "02",
+        "region": "af"
+      },
+      {
+        "feature_count": 49,
+        "layer": "extract/hybas_af/hybas_af_lev03_v1c.shp",
+        "level": "03",
+        "region": "af"
+      },
+      {
+        "feature_count": 251,
+        "layer": "extract/hybas_af/hybas_af_lev04_v1c.shp",
+        "level": "04",
+        "region": "af"
+      },
+      {
+        "feature_count": 1028,
+        "layer": "extract/hybas_af/hybas_af_lev05_v1c.shp",
+        "level": "05",
+        "region": "af"
+      },
+      {
+        "feature_count": 3597,
+        "layer": "extract/hybas_af/hybas_af_lev06_v1c.shp",
+        "level": "06",
+        "region": "af"
+      },
+      {
+        "feature_count": 12345,
+        "layer": "extract/hybas_af/hybas_af_lev07_v1c.shp",
+        "level": "07",
+        "region": "af"
+      },
+      {
+        "feature_count": 41372,
+        "layer": "extract/hybas_af/hybas_af_lev08_v1c.shp",
+        "level": "08",
+        "region": "af"
+      },
+      {
+        "feature_count": 111127,
+        "layer": "extract/hybas_af/hybas_af_lev09_v1c.shp",
+        "level": "09",
+        "region": "af"
+      },
+      {
+        "feature_count": 209368,
+        "layer": "extract/hybas_af/hybas_af_lev10_v1c.shp",
+        "level": "10",
+        "region": "af"
+      },
+      {
+        "feature_count": 229572,
+        "layer": "extract/hybas_af/hybas_af_lev11_v1c.shp",
+        "level": "11",
+        "region": "af"
+      },
+      {
+        "feature_count": 230028,
+        "layer": "extract/hybas_af/hybas_af_lev12_v1c.shp",
+        "level": "12",
+        "region": "af"
+      },
+      {
+        "feature_count": 2,
+        "layer": "extract/hybas_ar/hybas_ar_lev01_v1c.shp",
+        "level": "01",
+        "region": "ar"
+      },
+      {
+        "feature_count": 7,
+        "layer": "extract/hybas_ar/hybas_ar_lev02_v1c.shp",
+        "level": "02",
+        "region": "ar"
+      },
+      {
+        "feature_count": 19,
+        "layer": "extract/hybas_ar/hybas_ar_lev03_v1c.shp",
+        "level": "03",
+        "region": "ar"
+      },
+      {
+        "feature_count": 68,
+        "layer": "extract/hybas_ar/hybas_ar_lev04_v1c.shp",
+        "level": "04",
+        "region": "ar"
+      },
+      {
+        "feature_count": 241,
+        "layer": "extract/hybas_ar/hybas_ar_lev05_v1c.shp",
+        "level": "05",
+        "region": "ar"
+      },
+      {
+        "feature_count": 849,
+        "layer": "extract/hybas_ar/hybas_ar_lev06_v1c.shp",
+        "level": "06",
+        "region": "ar"
+      },
+      {
+        "feature_count": 2702,
+        "layer": "extract/hybas_ar/hybas_ar_lev07_v1c.shp",
+        "level": "07",
+        "region": "ar"
+      },
+      {
+        "feature_count": 8877,
+        "layer": "extract/hybas_ar/hybas_ar_lev08_v1c.shp",
+        "level": "08",
+        "region": "ar"
+      },
+      {
+        "feature_count": 23563,
+        "layer": "extract/hybas_ar/hybas_ar_lev09_v1c.shp",
+        "level": "09",
+        "region": "ar"
+      },
+      {
+        "feature_count": 43100,
+        "layer": "extract/hybas_ar/hybas_ar_lev10_v1c.shp",
+        "level": "10",
+        "region": "ar"
+      },
+      {
+        "feature_count": 46814,
+        "layer": "extract/hybas_ar/hybas_ar_lev11_v1c.shp",
+        "level": "11",
+        "region": "ar"
+      },
+      {
+        "feature_count": 46882,
+        "layer": "extract/hybas_ar/hybas_ar_lev12_v1c.shp",
+        "level": "12",
+        "region": "ar"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_as/hybas_as_lev01_v1c.shp",
+        "level": "01",
+        "region": "as"
+      },
+      {
+        "feature_count": 9,
+        "layer": "extract/hybas_as/hybas_as_lev02_v1c.shp",
+        "level": "02",
+        "region": "as"
+      },
+      {
+        "feature_count": 45,
+        "layer": "extract/hybas_as/hybas_as_lev03_v1c.shp",
+        "level": "03",
+        "region": "as"
+      },
+      {
+        "feature_count": 199,
+        "layer": "extract/hybas_as/hybas_as_lev04_v1c.shp",
+        "level": "04",
+        "region": "as"
+      },
+      {
+        "feature_count": 711,
+        "layer": "extract/hybas_as/hybas_as_lev05_v1c.shp",
+        "level": "05",
+        "region": "as"
+      },
+      {
+        "feature_count": 2489,
+        "layer": "extract/hybas_as/hybas_as_lev06_v1c.shp",
+        "level": "06",
+        "region": "as"
+      },
+      {
+        "feature_count": 8811,
+        "layer": "extract/hybas_as/hybas_as_lev07_v1c.shp",
+        "level": "07",
+        "region": "as"
+      },
+      {
+        "feature_count": 28907,
+        "layer": "extract/hybas_as/hybas_as_lev08_v1c.shp",
+        "level": "08",
+        "region": "as"
+      },
+      {
+        "feature_count": 77849,
+        "layer": "extract/hybas_as/hybas_as_lev09_v1c.shp",
+        "level": "09",
+        "region": "as"
+      },
+      {
+        "feature_count": 145651,
+        "layer": "extract/hybas_as/hybas_as_lev10_v1c.shp",
+        "level": "10",
+        "region": "as"
+      },
+      {
+        "feature_count": 160077,
+        "layer": "extract/hybas_as/hybas_as_lev11_v1c.shp",
+        "level": "11",
+        "region": "as"
+      },
+      {
+        "feature_count": 160508,
+        "layer": "extract/hybas_as/hybas_as_lev12_v1c.shp",
+        "level": "12",
+        "region": "as"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_au/hybas_au_lev01_v1c.shp",
+        "level": "01",
+        "region": "au"
+      },
+      {
+        "feature_count": 7,
+        "layer": "extract/hybas_au/hybas_au_lev02_v1c.shp",
+        "level": "02",
+        "region": "au"
+      },
+      {
+        "feature_count": 47,
+        "layer": "extract/hybas_au/hybas_au_lev03_v1c.shp",
+        "level": "03",
+        "region": "au"
+      },
+      {
+        "feature_count": 143,
+        "layer": "extract/hybas_au/hybas_au_lev04_v1c.shp",
+        "level": "04",
+        "region": "au"
+      },
+      {
+        "feature_count": 457,
+        "layer": "extract/hybas_au/hybas_au_lev05_v1c.shp",
+        "level": "05",
+        "region": "au"
+      },
+      {
+        "feature_count": 1425,
+        "layer": "extract/hybas_au/hybas_au_lev06_v1c.shp",
+        "level": "06",
+        "region": "au"
+      },
+      {
+        "feature_count": 4670,
+        "layer": "extract/hybas_au/hybas_au_lev07_v1c.shp",
+        "level": "07",
+        "region": "au"
+      },
+      {
+        "feature_count": 15233,
+        "layer": "extract/hybas_au/hybas_au_lev08_v1c.shp",
+        "level": "08",
+        "region": "au"
+      },
+      {
+        "feature_count": 40722,
+        "layer": "extract/hybas_au/hybas_au_lev09_v1c.shp",
+        "level": "09",
+        "region": "au"
+      },
+      {
+        "feature_count": 75877,
+        "layer": "extract/hybas_au/hybas_au_lev10_v1c.shp",
+        "level": "10",
+        "region": "au"
+      },
+      {
+        "feature_count": 83690,
+        "layer": "extract/hybas_au/hybas_au_lev11_v1c.shp",
+        "level": "11",
+        "region": "au"
+      },
+      {
+        "feature_count": 83929,
+        "layer": "extract/hybas_au/hybas_au_lev12_v1c.shp",
+        "level": "12",
+        "region": "au"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_eu/hybas_eu_lev01_v1c.shp",
+        "level": "01",
+        "region": "eu"
+      },
+      {
+        "feature_count": 9,
+        "layer": "extract/hybas_eu/hybas_eu_lev02_v1c.shp",
+        "level": "02",
+        "region": "eu"
+      },
+      {
+        "feature_count": 50,
+        "layer": "extract/hybas_eu/hybas_eu_lev03_v1c.shp",
+        "level": "03",
+        "region": "eu"
+      },
+      {
+        "feature_count": 240,
+        "layer": "extract/hybas_eu/hybas_eu_lev04_v1c.shp",
+        "level": "04",
+        "region": "eu"
+      },
+      {
+        "feature_count": 674,
+        "layer": "extract/hybas_eu/hybas_eu_lev05_v1c.shp",
+        "level": "05",
+        "region": "eu"
+      },
+      {
+        "feature_count": 2240,
+        "layer": "extract/hybas_eu/hybas_eu_lev06_v1c.shp",
+        "level": "06",
+        "region": "eu"
+      },
+      {
+        "feature_count": 7820,
+        "layer": "extract/hybas_eu/hybas_eu_lev07_v1c.shp",
+        "level": "07",
+        "region": "eu"
+      },
+      {
+        "feature_count": 25315,
+        "layer": "extract/hybas_eu/hybas_eu_lev08_v1c.shp",
+        "level": "08",
+        "region": "eu"
+      },
+      {
+        "feature_count": 66964,
+        "layer": "extract/hybas_eu/hybas_eu_lev09_v1c.shp",
+        "level": "09",
+        "region": "eu"
+      },
+      {
+        "feature_count": 124502,
+        "layer": "extract/hybas_eu/hybas_eu_lev10_v1c.shp",
+        "level": "10",
+        "region": "eu"
+      },
+      {
+        "feature_count": 137347,
+        "layer": "extract/hybas_eu/hybas_eu_lev11_v1c.shp",
+        "level": "11",
+        "region": "eu"
+      },
+      {
+        "feature_count": 137658,
+        "layer": "extract/hybas_eu/hybas_eu_lev12_v1c.shp",
+        "level": "12",
+        "region": "eu"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_gr/hybas_gr_lev01_v1c.shp",
+        "level": "01",
+        "region": "gr"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_gr/hybas_gr_lev02_v1c.shp",
+        "level": "02",
+        "region": "gr"
+      },
+      {
+        "feature_count": 4,
+        "layer": "extract/hybas_gr/hybas_gr_lev03_v1c.shp",
+        "level": "03",
+        "region": "gr"
+      },
+      {
+        "feature_count": 37,
+        "layer": "extract/hybas_gr/hybas_gr_lev04_v1c.shp",
+        "level": "04",
+        "region": "gr"
+      },
+      {
+        "feature_count": 95,
+        "layer": "extract/hybas_gr/hybas_gr_lev05_v1c.shp",
+        "level": "05",
+        "region": "gr"
+      },
+      {
+        "feature_count": 302,
+        "layer": "extract/hybas_gr/hybas_gr_lev06_v1c.shp",
+        "level": "06",
+        "region": "gr"
+      },
+      {
+        "feature_count": 1882,
+        "layer": "extract/hybas_gr/hybas_gr_lev07_v1c.shp",
+        "level": "07",
+        "region": "gr"
+      },
+      {
+        "feature_count": 6390,
+        "layer": "extract/hybas_gr/hybas_gr_lev08_v1c.shp",
+        "level": "08",
+        "region": "gr"
+      },
+      {
+        "feature_count": 13440,
+        "layer": "extract/hybas_gr/hybas_gr_lev09_v1c.shp",
+        "level": "09",
+        "region": "gr"
+      },
+      {
+        "feature_count": 16684,
+        "layer": "extract/hybas_gr/hybas_gr_lev10_v1c.shp",
+        "level": "10",
+        "region": "gr"
+      },
+      {
+        "feature_count": 16968,
+        "layer": "extract/hybas_gr/hybas_gr_lev11_v1c.shp",
+        "level": "11",
+        "region": "gr"
+      },
+      {
+        "feature_count": 16990,
+        "layer": "extract/hybas_gr/hybas_gr_lev12_v1c.shp",
+        "level": "12",
+        "region": "gr"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_na/hybas_na_lev01_v1c.shp",
+        "level": "01",
+        "region": "na"
+      },
+      {
+        "feature_count": 8,
+        "layer": "extract/hybas_na/hybas_na_lev02_v1c.shp",
+        "level": "02",
+        "region": "na"
+      },
+      {
+        "feature_count": 29,
+        "layer": "extract/hybas_na/hybas_na_lev03_v1c.shp",
+        "level": "03",
+        "region": "na"
+      },
+      {
+        "feature_count": 185,
+        "layer": "extract/hybas_na/hybas_na_lev04_v1c.shp",
+        "level": "04",
+        "region": "na"
+      },
+      {
+        "feature_count": 624,
+        "layer": "extract/hybas_na/hybas_na_lev05_v1c.shp",
+        "level": "05",
+        "region": "na"
+      },
+      {
+        "feature_count": 2043,
+        "layer": "extract/hybas_na/hybas_na_lev06_v1c.shp",
+        "level": "06",
+        "region": "na"
+      },
+      {
+        "feature_count": 6938,
+        "layer": "extract/hybas_na/hybas_na_lev07_v1c.shp",
+        "level": "07",
+        "region": "na"
+      },
+      {
+        "feature_count": 22533,
+        "layer": "extract/hybas_na/hybas_na_lev08_v1c.shp",
+        "level": "08",
+        "region": "na"
+      },
+      {
+        "feature_count": 59630,
+        "layer": "extract/hybas_na/hybas_na_lev09_v1c.shp",
+        "level": "09",
+        "region": "na"
+      },
+      {
+        "feature_count": 111181,
+        "layer": "extract/hybas_na/hybas_na_lev10_v1c.shp",
+        "level": "10",
+        "region": "na"
+      },
+      {
+        "feature_count": 122028,
+        "layer": "extract/hybas_na/hybas_na_lev11_v1c.shp",
+        "level": "11",
+        "region": "na"
+      },
+      {
+        "feature_count": 122251,
+        "layer": "extract/hybas_na/hybas_na_lev12_v1c.shp",
+        "level": "12",
+        "region": "na"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_sa/hybas_sa_lev01_v1c.shp",
+        "level": "01",
+        "region": "sa"
+      },
+      {
+        "feature_count": 7,
+        "layer": "extract/hybas_sa/hybas_sa_lev02_v1c.shp",
+        "level": "02",
+        "region": "sa"
+      },
+      {
+        "feature_count": 31,
+        "layer": "extract/hybas_sa/hybas_sa_lev03_v1c.shp",
+        "level": "03",
+        "region": "sa"
+      },
+      {
+        "feature_count": 147,
+        "layer": "extract/hybas_sa/hybas_sa_lev04_v1c.shp",
+        "level": "04",
+        "region": "sa"
+      },
+      {
+        "feature_count": 496,
+        "layer": "extract/hybas_sa/hybas_sa_lev05_v1c.shp",
+        "level": "05",
+        "region": "sa"
+      },
+      {
+        "feature_count": 1946,
+        "layer": "extract/hybas_sa/hybas_sa_lev06_v1c.shp",
+        "level": "06",
+        "region": "sa"
+      },
+      {
+        "feature_count": 7036,
+        "layer": "extract/hybas_sa/hybas_sa_lev07_v1c.shp",
+        "level": "07",
+        "region": "sa"
+      },
+      {
+        "feature_count": 23783,
+        "layer": "extract/hybas_sa/hybas_sa_lev08_v1c.shp",
+        "level": "08",
+        "region": "sa"
+      },
+      {
+        "feature_count": 65566,
+        "layer": "extract/hybas_sa/hybas_sa_lev09_v1c.shp",
+        "level": "09",
+        "region": "sa"
+      },
+      {
+        "feature_count": 123438,
+        "layer": "extract/hybas_sa/hybas_sa_lev10_v1c.shp",
+        "level": "10",
+        "region": "sa"
+      },
+      {
+        "feature_count": 135748,
+        "layer": "extract/hybas_sa/hybas_sa_lev11_v1c.shp",
+        "level": "11",
+        "region": "sa"
+      },
+      {
+        "feature_count": 136157,
+        "layer": "extract/hybas_sa/hybas_sa_lev12_v1c.shp",
+        "level": "12",
+        "region": "sa"
+      },
+      {
+        "feature_count": 1,
+        "layer": "extract/hybas_si/hybas_si_lev01_v1c.shp",
+        "level": "01",
+        "region": "si"
+      },
+      {
+        "feature_count": 6,
+        "layer": "extract/hybas_si/hybas_si_lev02_v1c.shp",
+        "level": "02",
+        "region": "si"
+      },
+      {
+        "feature_count": 18,
+        "layer": "extract/hybas_si/hybas_si_lev03_v1c.shp",
+        "level": "03",
+        "region": "si"
+      },
+      {
+        "feature_count": 72,
+        "layer": "extract/hybas_si/hybas_si_lev04_v1c.shp",
+        "level": "04",
+        "region": "si"
+      },
+      {
+        "feature_count": 408,
+        "layer": "extract/hybas_si/hybas_si_lev05_v1c.shp",
+        "level": "05",
+        "region": "si"
+      },
+      {
+        "feature_count": 1506,
+        "layer": "extract/hybas_si/hybas_si_lev06_v1c.shp",
+        "level": "06",
+        "region": "si"
+      },
+      {
+        "feature_count": 5442,
+        "layer": "extract/hybas_si/hybas_si_lev07_v1c.shp",
+        "level": "07",
+        "region": "si"
+      },
+      {
+        "feature_count": 18265,
+        "layer": "extract/hybas_si/hybas_si_lev08_v1c.shp",
+        "level": "08",
+        "region": "si"
+      },
+      {
+        "feature_count": 49329,
+        "layer": "extract/hybas_si/hybas_si_lev09_v1c.shp",
+        "level": "09",
+        "region": "si"
+      },
+      {
+        "feature_count": 91211,
+        "layer": "extract/hybas_si/hybas_si_lev10_v1c.shp",
+        "level": "10",
+        "region": "si"
+      },
+      {
+        "feature_count": 99541,
+        "layer": "extract/hybas_si/hybas_si_lev11_v1c.shp",
+        "level": "11",
+        "region": "si"
+      },
+      {
+        "feature_count": 99680,
+        "layer": "extract/hybas_si/hybas_si_lev12_v1c.shp",
+        "level": "12",
+        "region": "si"
+      }
+    ],
+    "pour_points": [
+      {
+        "feature_count": 4285340,
+        "layer": "extract/pour/hybas_pour_lev01_v1.shp",
+        "level": "01"
+      },
+      {
+        "feature_count": 4285346,
+        "layer": "extract/pour/hybas_pour_lev02_v1.shp",
+        "level": "02"
+      },
+      {
+        "feature_count": 4285375,
+        "layer": "extract/pour/hybas_pour_lev03_v1.shp",
+        "level": "03"
+      },
+      {
+        "feature_count": 4285885,
+        "layer": "extract/pour/hybas_pour_lev04_v1.shp",
+        "level": "04"
+      },
+      {
+        "feature_count": 4288411,
+        "layer": "extract/pour/hybas_pour_lev05_v1.shp",
+        "level": "05"
+      },
+      {
+        "feature_count": 4297955,
+        "layer": "extract/pour/hybas_pour_lev06_v1.shp",
+        "level": "06"
+      },
+      {
+        "feature_count": 4334513,
+        "layer": "extract/pour/hybas_pour_lev07_v1.shp",
+        "level": "07"
+      },
+      {
+        "feature_count": 4457593,
+        "layer": "extract/pour/hybas_pour_lev08_v1.shp",
+        "level": "08"
+      },
+      {
+        "feature_count": 4759827,
+        "layer": "extract/pour/hybas_pour_lev09_v1.shp",
+        "level": "09"
+      },
+      {
+        "feature_count": 5182169,
+        "layer": "extract/pour/hybas_pour_lev10_v1.shp",
+        "level": "10"
+      },
+      {
+        "feature_count": 5269349,
+        "layer": "extract/pour/hybas_pour_lev11_v1.shp",
+        "level": "11"
+      },
+      {
+        "feature_count": 5271492,
+        "layer": "extract/pour/hybas_pour_lev12_v1.shp",
+        "level": "12"
+      }
+    ]
+  },
+  "inventory_complete": true,
+  "levels": [
+    "01",
+    "02",
+    "03",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08",
+    "09",
+    "10",
+    "11",
+    "12"
+  ],
+  "regions": [
+    "af",
+    "ar",
+    "as",
+    "au",
+    "eu",
+    "gr",
+    "na",
+    "sa",
+    "si"
+  ],
+  "schema_version": 1,
+  "status": "pass"
+}
