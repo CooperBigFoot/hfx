@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -26,9 +27,13 @@ GAPPED_EAST_TRANSFORM = Affine(30, 0, 90, 0, -30, 60)
 FLOW_DIR_WEST = np.array([[1, 2], [3, 255]], dtype=np.uint8)
 FLOW_DIR_EAST = np.array([[4, 8], [0, 7]], dtype=np.uint8)
 FLOW_DIR_NODATA = 255
-FLOW_ACC_WEST = np.array([[10, 20], [30, -9999]], dtype=np.int32)
-FLOW_ACC_EAST = np.array([[40, 50], [60, 70]], dtype=np.int32)
-FLOW_ACC_NODATA = -9999
+FLOW_ACC_WEST = np.array(
+    [[10.0, 20.0], [30.0, np.nan]], dtype=np.float32
+)
+FLOW_ACC_EAST = np.array(
+    [[40.0, 50.0], [0.0009, 70.0]], dtype=np.float32
+)
+FLOW_ACC_NODATA = float("nan")
 
 SNAP_AUXILIARY = [
     {
@@ -71,7 +76,7 @@ def _write_tile(
     path: Path,
     values: np.ndarray,
     transform: Affine,
-    nodata: int | None,
+    nodata: int | float | None,
 ) -> None:
     profile = {
         "driver": "GTiff",
@@ -105,7 +110,7 @@ def raster_archives(tmp_path: Path) -> tuple[Path, Path]:
     _write_tile(direction_west, FLOW_DIR_WEST, WEST_TRANSFORM, FLOW_DIR_NODATA)
     _write_tile(direction_east, FLOW_DIR_EAST, EAST_TRANSFORM, FLOW_DIR_NODATA)
     _write_tile(accumulation_west, FLOW_ACC_WEST, WEST_TRANSFORM, FLOW_ACC_NODATA)
-    _write_tile(accumulation_east, FLOW_ACC_EAST, EAST_TRANSFORM, FLOW_ACC_NODATA)
+    _write_tile(accumulation_east, FLOW_ACC_EAST, EAST_TRANSFORM, None)
 
     direction_archive = tmp_path / "flow_dir_tiles.zip"
     accumulation_archive = tmp_path / "flow_acc_tiles.zip"
@@ -191,22 +196,36 @@ def test_build_d8_raster_pair_preserves_native_grid_and_values(
         [[1, 2, 4, 8], [3, 255, 0, 7]], dtype=np.uint8
     )
     expected_accumulation = np.array(
-        [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
+        [
+            [10.0, 20.0, 40.0, 50.0],
+            [30.0, np.nan, 0.0009, 70.0],
+        ],
+        dtype=np.float32,
     )
 
     with rasterio.open(direction_path) as direction, rasterio.open(
         accumulation_path
     ) as accumulation:
         assert direction.dtypes == ("uint8",)
-        assert accumulation.dtypes == ("int32",)
+        assert accumulation.dtypes == ("float32",)
         assert direction.nodata == 255
-        assert accumulation.nodata == -9999
+        assert math.isnan(accumulation.nodata)
         assert_array_equal(direction.read(1), expected_direction)
-        assert_array_equal(accumulation.read(1), expected_accumulation)
+        actual = accumulation.read(1)
+        expected_nan = np.isnan(expected_accumulation)
+        assert np.array_equal(np.isnan(actual), expected_nan)
+        assert np.array_equal(
+            actual[~expected_nan], expected_accumulation[~expected_nan]
+        )
         assert_array_equal(direction.read(1, window=Window(0, 0, 2, 2)), FLOW_DIR_WEST)
         assert_array_equal(direction.read(1, window=Window(2, 0, 2, 2)), FLOW_DIR_EAST)
-        assert_array_equal(accumulation.read(1, window=Window(0, 0, 2, 2)), FLOW_ACC_WEST)
-        assert_array_equal(accumulation.read(1, window=Window(2, 0, 2, 2)), FLOW_ACC_EAST)
+        actual_west = accumulation.read(1, window=Window(0, 0, 2, 2))
+        west_nan = np.isnan(FLOW_ACC_WEST)
+        assert np.array_equal(np.isnan(actual_west), west_nan)
+        assert np.array_equal(actual_west[~west_nan], FLOW_ACC_WEST[~west_nan])
+        assert np.array_equal(
+            accumulation.read(1, window=Window(2, 0, 2, 2)), FLOW_ACC_EAST
+        )
 
         assert direction.crs.to_epsg() == 8857
         assert accumulation.crs.to_epsg() == 8857
@@ -245,8 +264,11 @@ def test_build_d8_raster_pair_reads_sparse_union_gap_as_nodata(
         [[1, 2, 255, 4, 8], [3, 255, 255, 0, 7]], dtype=np.uint8
     )
     expected_gapped_flow_acc = np.array(
-        [[10, 20, -9999, 40, 50], [30, -9999, -9999, 60, 70]],
-        dtype=np.int32,
+        [
+            [10.0, 20.0, np.nan, 40.0, 50.0],
+            [30.0, np.nan, np.nan, 0.0009, 70.0],
+        ],
+        dtype=np.float32,
     )
 
     with rasterio.open(direction_path) as direction, rasterio.open(
@@ -256,14 +278,18 @@ def test_build_d8_raster_pair_reads_sparse_union_gap_as_nodata(
         assert direction.height == accumulation.height == 2
         assert direction.transform == accumulation.transform == WEST_TRANSFORM
         assert_array_equal(direction.read(1), expected_gapped_flow_dir)
-        assert_array_equal(accumulation.read(1), expected_gapped_flow_acc)
+        actual = accumulation.read(1)
+        expected_nan = np.isnan(expected_gapped_flow_acc)
+        assert np.array_equal(np.isnan(actual), expected_nan)
+        assert np.array_equal(
+            actual[~expected_nan], expected_gapped_flow_acc[~expected_nan]
+        )
         # Guard the GDAL sparse-block nodata semantics the planetary build relies on.
         assert_array_equal(
             direction.read(1)[:, 2], np.array([255, 255], dtype=np.uint8)
         )
-        assert_array_equal(
-            accumulation.read(1)[:, 2], np.array([-9999, -9999], dtype=np.int32)
-        )
+        gap = accumulation.read(1)[:, 2]
+        assert np.array_equal(np.isnan(gap), np.array([True, True]))
         assert direction.read(1)[1, 3] == 0
 
 
@@ -362,7 +388,11 @@ def test_tagless_direction_source_with_valid_codes_is_accepted(
         [[1, 2, 4, 8], [3, 255, 6, 7]], dtype=np.uint8
     )
     expected_accumulation = np.array(
-        [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
+        [
+            [10.0, 20.0, 40.0, 50.0],
+            [30.0, np.nan, 0.0009, 70.0],
+        ],
+        dtype=np.float32,
     )
     with rasterio.open(direction_path) as direction, rasterio.open(
         accumulation_path
@@ -370,9 +400,75 @@ def test_tagless_direction_source_with_valid_codes_is_accepted(
         assert direction.dtypes == ("uint8",)
         assert direction.nodata == 255
         assert_array_equal(direction.read(1), expected_direction)
-        assert accumulation.dtypes == ("int32",)
-        assert accumulation.nodata == -9999
-        assert_array_equal(accumulation.read(1), expected_accumulation)
+        assert accumulation.dtypes == ("float32",)
+        assert math.isnan(accumulation.nodata)
+        actual = accumulation.read(1)
+        expected_nan = np.isnan(expected_accumulation)
+        assert np.array_equal(np.isnan(actual), expected_nan)
+        assert np.array_equal(
+            actual[~expected_nan], expected_accumulation[~expected_nan]
+        )
+
+
+def test_tagless_accumulation_source_with_nan_value_fails_before_output_creation(
+    tmp_path: Path,
+    raster_archives: tuple[Path, Path],
+) -> None:
+    direction_archive, _ = raster_archives
+    source_dir = tmp_path / "tagless-accumulation-rejection-sources"
+    source_dir.mkdir()
+    tagged_source = source_dir / "accumulation_tagged_west.tif"
+    tagless_source = source_dir / "accumulation_missing_nodata_east.tif"
+    tagged_accumulation_west = np.array(
+        [[10.0, 20.0], [30.0, np.nan]], dtype=np.float32
+    )
+    tagged_accumulation_west_nodata = float("nan")
+    tagged_accumulation_west_transform = WEST_TRANSFORM
+    tagless_accumulation_east = np.array(
+        [[40.0, 50.0], [np.nan, 70.0]], dtype=np.float32
+    )
+    tagless_accumulation_east_nodata = None
+    tagless_accumulation_east_transform = EAST_TRANSFORM
+    _write_tile(
+        tagged_source,
+        tagged_accumulation_west,
+        tagged_accumulation_west_transform,
+        tagged_accumulation_west_nodata,
+    )
+    _write_tile(
+        tagless_source,
+        tagless_accumulation_east,
+        tagless_accumulation_east_transform,
+        tagless_accumulation_east_nodata,
+    )
+    accumulation_archive = tmp_path / "missing_accumulation_nodata.zip"
+    _archive(
+        accumulation_archive,
+        [
+            (tagged_source, "synthetic/drainage_area_tagged_west.tif"),
+            (
+                tagless_source,
+                "synthetic/drainage_area_missing_nodata_east.tif",
+            ),
+        ],
+    )
+    output_dir = tmp_path / "output"
+
+    with pytest.raises(
+        AdapterError,
+        match=(
+            r"tag-less flow_acc source .*drainage_area_missing_nodata_east\.tif "
+            r"contains the family's common tagged nodata nan"
+        ),
+    ):
+        build_d8_raster_pair(
+            [direction_archive],
+            [accumulation_archive],
+            tmp_path / "work",
+            output_dir,
+        )
+
+    assert not output_dir.exists()
 
 
 def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
@@ -439,15 +535,19 @@ def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
         [[1, 2, 4, 8], [3, 255, 0, 7]], dtype=np.uint8
     )
     expected_accumulation = np.array(
-        [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
+        [
+            [10.0, 20.0, 40.0, 50.0],
+            [30.0, np.nan, 0.0009, 70.0],
+        ],
+        dtype=np.float32,
     )
     with rasterio.open(direction_path) as direction, rasterio.open(
         accumulation_path
     ) as accumulation:
         assert direction.dtypes == ("uint8",)
-        assert accumulation.dtypes == ("int32",)
+        assert accumulation.dtypes == ("float32",)
         assert direction.nodata == 255
-        assert accumulation.nodata == -9999
+        assert math.isnan(accumulation.nodata)
         assert direction.crs.to_epsg() == accumulation.crs.to_epsg() == 8857
         assert direction.width == accumulation.width == 4
         assert direction.height == accumulation.height == 2
@@ -455,7 +555,12 @@ def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
         assert direction.res == accumulation.res == (30.0, 30.0)
         assert direction.bounds == accumulation.bounds
         assert_array_equal(direction.read(1), expected_direction)
-        assert_array_equal(accumulation.read(1), expected_accumulation)
+        actual = accumulation.read(1)
+        expected_nan = np.isnan(expected_accumulation)
+        assert np.array_equal(np.isnan(actual), expected_nan)
+        assert np.array_equal(
+            actual[~expected_nan], expected_accumulation[~expected_nan]
+        )
 
     amended_manifest = json.loads(manifest_path.read_text())
     assert amended_manifest["format_version"] == "0.3.0"
