@@ -1,6 +1,8 @@
 # /// script
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
+#   "numpy>=1.26.0,<3.0.0",
+#   "rasterio>=1.4.0,<2.0.0",
 #   "shapely>=2.0.0",
 #   "pyarrow>=12.0.0,<23.0.0",
 # ]
@@ -17,9 +19,12 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import rasterio
 import shapely.wkb
+from rasterio.transform import from_origin
 from shapely.geometry import Point, box
 
 CREATED_AT = "2026-01-01T00:00:00Z"
@@ -328,6 +333,7 @@ def snap_aux(name: str, rel_path: str, levels: list[int]) -> dict:
 def write_manifest(
     out_dir: Path,
     *,
+    fabric_name: str = FABRIC_NAME,
     crs: str = "EPSG:4326",
     version: str = "0.3.0",
     has_up_area: bool = False,
@@ -335,7 +341,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "format_version": version,
-        "fabric_name": FABRIC_NAME,
+        "fabric_name": fabric_name,
         "crs": crs,
         "has_up_area": has_up_area,
         "topology": "tree",
@@ -360,6 +366,78 @@ def generate_valid_tiny() -> None:
     write_graph(out, VALID_UPSTREAM)
     write_manifest(out)
     write_readme(out, "Valid tiny v0.3.0 fixture", "none")
+
+
+def write_projected_d8_cogs(out_dir: Path) -> None:
+    raster_dir = out_dir / "aux" / "d8" / "projected"
+    raster_dir.mkdir(parents=True)
+
+    rows, cols = np.indices((256, 256))
+    flow_dir = ((rows + cols) % 8 + 1).astype(np.int8)
+    flow_dir[0, :] *= -1
+    flow_dir[128, 128] = 0
+    flow_dir[255, 255] = -128
+
+    flow_acc = (rows * 256 + cols + 1).astype(np.int32)
+    flow_acc[255, 255] = -2147483648
+
+    common = {
+        "mode": "w",
+        "driver": "COG",
+        "width": 256,
+        "height": 256,
+        "count": 1,
+        "crs": "EPSG:8857",
+        "transform": from_origin(0.0, 256000.0, 1000.0, 1000.0),
+        "compress": "DEFLATE",
+        "predictor": 2,
+        "blocksize": 256,
+        "overviews": "NONE",
+    }
+    with rasterio.open(
+        raster_dir / "flow_dir.tif", dtype=np.int8, nodata=-128, **common
+    ) as dataset:
+        dataset.write(flow_dir, 1)
+    with rasterio.open(
+        raster_dir / "flow_acc.tif",
+        dtype=np.int32,
+        nodata=-2147483648,
+        **common,
+    ) as dataset:
+        dataset.write(flow_acc, 1)
+
+
+def generate_valid_projected_grass_d8() -> None:
+    out = SCRIPT_DIR / "valid" / "tiny-with-aux-d8-projected-grass"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-projected-grass",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "EPSG:8857",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "km2",
+                },
+            }
+        ],
+    )
+    write_projected_d8_cogs(out)
+    (out / "README.md").write_text(
+        "# Valid tiny v0.3.0 fixture with projected GRASS D8 auxiliary rasters\n"
+        "\n"
+        "This fixture contains core catchment and graph data in EPSG:4326.\n"
+        "Its D8 auxiliary pair uses an EPSG:8857 grid, GRASS flow-direction encoding, and integer square-kilometer flow accumulation.\n"
+        "Expected diagnostic: `none`.\n"
+    )
 
 
 def generate_valid_grit_two_level() -> None:
@@ -634,6 +712,7 @@ def main() -> None:
     generate_valid_grit_two_level()
     generate_valid_grit_two_snap()
     generate_valid_up_area_partial_nulls()
+    generate_valid_projected_grass_d8()
     generate_invalid_dangling()
     generate_invalid_crs()
     generate_invalid_parent_cycle()
