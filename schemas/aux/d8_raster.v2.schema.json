@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hfx.dev/schemas/aux/d8_raster.v2.schema.json",
+  "title": "HFX D8 Raster Auxiliary Metadata v2",
+  "description": "Metadata schema for hfx.aux.d8_raster.v2 auxiliary declarations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["crs", "flow_dir_encoding", "flow_acc_units"],
+  "properties": {
+    "crs": {
+      "type": "string",
+      "pattern": "^EPSG:[1-9][0-9]*$"
+    },
+    "flow_dir_encoding": {
+      "type": "string",
+      "enum": ["esri", "taudem", "grass"]
+    },
+    "flow_acc_units": {
+      "type": "string",
+      "enum": ["cells", "km2"]
+    }
+  }
+}

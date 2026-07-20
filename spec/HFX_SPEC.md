@@ -50,7 +50,7 @@ drainage unit. The outlet is distinct from optional snap features.
 Auxiliary artifacts such as D8 rasters are not first-class core files. They are
 declared in `manifest.json` under `auxiliary[]` and validated according to their
 schema. HFX v0.3.0 blesses two auxiliary schemas:
-[`hfx.aux.d8_raster.v1`](./aux/d8_raster/v1.md) for D8 rasters and
+[`hfx.aux.d8_raster.v2`](./aux/d8_raster/v2.md) for D8 rasters and
 [`hfx.aux.snap.v2`](./aux/snap/v2.md) for optional snap features.
 
 ---
@@ -281,13 +281,15 @@ Traversal policies and refinement policies are engine runtime parameters.
   "adapter_version": "0.2.0",
   "auxiliary": [
     {
-      "schema": "hfx.aux.d8_raster.v1",
+      "schema": "hfx.aux.d8_raster.v2",
       "artifacts": {
         "flow_dir": "flow_dir.tif",
         "flow_acc": "flow_acc.tif"
       },
       "metadata": {
-        "flow_dir_encoding": "esri"
+        "crs": "EPSG:4326",
+        "flow_dir_encoding": "esri",
+        "flow_acc_units": "cells"
       }
     }
   ]
@@ -448,8 +450,8 @@ still enforce these invariants during ETL.
 - Known `hfx.aux.*` schemas receive dedicated validation.
 - Known `hfx.x.*` schemas MAY receive dedicated validation.
 - Unknown third-party schemas receive structural validation only.
-- `hfx.aux.d8_raster.v1` requires `flow_dir` and `flow_acc` artifacts and a
-  valid metadata block as defined in [`spec/aux/d8_raster/v1.md`](./aux/d8_raster/v1.md).
+- `hfx.aux.d8_raster.v2` requires `flow_dir` and `flow_acc` artifacts and a
+  valid metadata block as defined in [`spec/aux/d8_raster/v2.md`](./aux/d8_raster/v2.md).
 - `hfx.aux.snap.v2` requires one `snap` artifact and a valid metadata block as
   defined in [`spec/aux/snap/v2.md`](./aux/snap/v2.md).
 
