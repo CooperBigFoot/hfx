@@ -37,7 +37,7 @@ from shapely.geometry.base import BaseGeometry
 
 FABRIC_NAME = "grit"
 FABRIC_VERSION = "1.0.0"
-ADAPTER_VERSION = "grit-global-2.0.0"
+ADAPTER_VERSION = "grit-global-2.1.0"
 FORMAT_VERSION = "0.3.0"
 TOPOLOGY = "dag"
 CRS = "EPSG:4326"
@@ -404,6 +404,53 @@ def build_d8_raster_pair(
         accumulation_temporary.unlink(missing_ok=True)
     _validate_raster_pair(direction_output, accumulation_output)
     return direction_output, accumulation_output
+
+
+def _amend_manifest_with_d8_rasters(dataset_dir: Path) -> None:
+    """Canonicalize the D8 raster declaration in an existing manifest."""
+    manifest_path = Path(dataset_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        raise AdapterError(f"manifest {manifest_path} does not exist")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AdapterError(f"manifest {manifest_path} is not valid JSON: {error}") from error
+    if not isinstance(manifest, dict):
+        raise AdapterError(f"manifest {manifest_path} must decode to a JSON object")
+    if manifest.get("format_version") != FORMAT_VERSION:
+        raise AdapterError(
+            f"manifest {manifest_path} format_version must equal {FORMAT_VERSION}"
+        )
+    auxiliary = manifest.get("auxiliary")
+    if not isinstance(auxiliary, list):
+        raise AdapterError(f"manifest {manifest_path} auxiliary must be a JSON array")
+
+    manifest["adapter_version"] = ADAPTER_VERSION
+    manifest["auxiliary"] = [
+        entry
+        for entry in auxiliary
+        if not (
+            isinstance(entry, dict) and entry.get("schema") == "hfx.aux.d8_raster.v2"
+        )
+    ]
+    manifest["auxiliary"].append(
+        {
+            "schema": "hfx.aux.d8_raster.v2",
+            "artifacts": {
+                "flow_dir": "aux/d8/flow_dir.tif",
+                "flow_acc": "aux/d8/flow_acc.tif",
+            },
+            "metadata": {
+                "crs": "EPSG:8857",
+                "flow_dir_encoding": "grass",
+                "flow_acc_units": "km2",
+            },
+        }
+    )
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    except OSError as error:
+        raise AdapterError(f"failed to write manifest {manifest_path}: {error}") from error
 
 
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
@@ -1692,6 +1739,18 @@ def _parse_args() -> argparse.Namespace:
     validate_parser.add_argument("--sample-pct", type=float, default=100.0)
     validate_parser.add_argument("--strict", action="store_true", default=True)
 
+    raster = subparsers.add_parser(
+        "raster", help="attach D8 rasters to an existing compiled dataset"
+    )
+    raster.add_argument(
+        "--flow-dir-archive", action="append", type=Path, required=True
+    )
+    raster.add_argument(
+        "--flow-acc-archive", action="append", type=Path, required=True
+    )
+    raster.add_argument("--dataset-dir", type=Path, required=True)
+    raster.add_argument("--work-dir", type=Path, required=True)
+
     return parser.parse_args()
 
 
@@ -1718,6 +1777,37 @@ def main() -> int:
     root = args.root.expanduser().resolve()
     if args.command == "probe":
         probe_reach_schema(root)
+        return 0
+    if args.command == "raster":
+        flow_dir_archives = [path.expanduser().resolve() for path in args.flow_dir_archive]
+        flow_acc_archives = [path.expanduser().resolve() for path in args.flow_acc_archive]
+        dataset_dir = args.dataset_dir.expanduser().resolve()
+        work_dir = args.work_dir.expanduser().resolve()
+        manifest_path = dataset_dir / "manifest.json"
+        if not dataset_dir.is_dir():
+            raise AdapterError(f"dataset directory {dataset_dir} does not exist")
+        if not manifest_path.is_file():
+            raise AdapterError(f"manifest {manifest_path} does not exist")
+        output_dir = dataset_dir / "aux" / "d8"
+        direction_path, accumulation_path = build_d8_raster_pair(
+            flow_dir_archives,
+            flow_acc_archives,
+            work_dir,
+            output_dir,
+        )
+        expected_direction = output_dir / "flow_dir.tif"
+        expected_accumulation = output_dir / "flow_acc.tif"
+        if (
+            direction_path != expected_direction
+            or accumulation_path != expected_accumulation
+            or not direction_path.is_file()
+            or not accumulation_path.is_file()
+        ):
+            raise AdapterError(
+                "raster builder returned paths outside the required dataset artifacts: "
+                f"{direction_path}, {accumulation_path}"
+            )
+        _amend_manifest_with_d8_rasters(dataset_dir)
         return 0
     if args.command == "stage1":
         source = stage_1_inspect_source(args.outer_archive.expanduser().resolve(), root, args.regions)
