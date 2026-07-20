@@ -72,18 +72,25 @@ This manifest shows optional source-fabric and auxiliary fields:
   "adapter_version": "0.2.0",
   "auxiliary": [
     {
-      "schema": "hfx.aux.d8_raster.v1",
+      "schema": "hfx.aux.d8_raster.v2",
       "artifacts": {
         "flow_dir": "flow_dir.tif",
         "flow_acc": "flow_acc.tif"
       },
       "metadata": {
-        "flow_dir_encoding": "esri"
+        "crs": "EPSG:8857",
+        "flow_dir_encoding": "grass",
+        "flow_acc_units": "km2"
       }
     }
   ]
 }
 ```
+
+The top-level `crs` describes the core vector coordinates in EPSG:4326.
+The D8 entry's `metadata.crs` describes its raster pair and may name a different EPSG CRS.
+The raster headers are authoritative for dtype and nodata, so the auxiliary metadata declares neither property.
+Each D8 raster header carries a nodata tag.
 
 ## The machine-readable schema
 

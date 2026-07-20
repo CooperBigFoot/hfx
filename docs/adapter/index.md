@@ -33,7 +33,7 @@ An HFX 0.3.0 dataset is a flat directory with three required core artifacts and 
 
 HFX 0.3.0 carries snap features and raster refinement inputs as auxiliary data.
 Snap features use the [`hfx.aux.snap.v2`](../spec/aux/snap/v2.md) schema.
-The blessed D8 raster schema is [`hfx.aux.d8_raster.v1`](../spec/aux/d8_raster/v1.md).
+The blessed D8 raster schema is [`hfx.aux.d8_raster.v2`](../spec/aux/d8_raster/v2.md).
 
 ## Glossary
 
@@ -50,7 +50,7 @@ The blessed D8 raster schema is [`hfx.aux.d8_raster.v1`](../spec/aux/d8_raster/v
 | `up_area_km2` | The inclusive cumulative upstream area at the same level |
 | Hilbert sort | Row ordering by Hilbert curve index on centroid coordinates, which lets a consumer skip row groups |
 | Bounding-box covering | A GeoParquet 1.1 struct column that stores each row's bounding box for spatial pruning |
-| Auxiliary schema | A declared non-core data contract such as `hfx.aux.d8_raster.v1` |
+| Auxiliary schema | A declared non-core data contract such as `hfx.aux.d8_raster.v2` |
 
 ## Pipeline overview
 
@@ -181,23 +181,32 @@ Provide snap features when the source has useful reach or node geometries.
 Snap features use the [`hfx.aux.snap.v2`](../spec/aux/snap/v2.md) schema.
 Read that schema page for its column contract.
 
-For D8 rasters, declare the [`hfx.aux.d8_raster.v1`](../spec/aux/d8_raster/v1.md) schema:
+For D8 rasters, declare the [`hfx.aux.d8_raster.v2`](../spec/aux/d8_raster/v2.md) schema:
 
 ```json
 {
-  "schema": "hfx.aux.d8_raster.v1",
+  "schema": "hfx.aux.d8_raster.v2",
   "artifacts": {
     "flow_dir": "flow_dir.tif",
     "flow_acc": "flow_acc.tif"
   },
   "metadata": {
-    "flow_dir_encoding": "esri"
+    "crs": "EPSG:8857",
+    "flow_dir_encoding": "grass",
+    "flow_acc_units": "km2"
   }
 }
 ```
 
-Write `flow_dir.tif` as a cloud-optimized GeoTIFF, `uint8`, with NoData `255`, in EPSG:4326, internally tiled.
-Write `flow_acc.tif` as a cloud-optimized GeoTIFF, `float32`, with NoData `-1.0`, sharing the same CRS and tiling.
+Set `metadata.crs` to the uppercase EPSG authority string resolved by both raster headers.
+Set `metadata.flow_dir_encoding` to `esri`, `taudem`, or `grass` and set `metadata.flow_acc_units` to `cells` or `km2`.
+Keep the D8 pair on the source grid where its neighbor pointers were derived.
+Write both files as internally tiled Cloud-Optimized GeoTIFFs with the same CRS, dimensions, affine transform, pixel dimensions, and grid alignment.
+Use `uint8` or `int8` for the `flow_dir` header dtype.
+Use `float32` or `int32` for the `flow_acc` header dtype.
+An entry with `flow_acc_units` set to `cells` requires `float32`; an entry set to `km2` permits `int32` or `float32`.
+Give each raster header a nodata tag with a producer-selected value.
+The GeoTIFF headers are authoritative for dtype and nodata, so omit both properties from auxiliary metadata.
 
 ### Write manifest.json
 
@@ -309,7 +318,8 @@ An incorrect value produces a silent correctness bug, and an absent value stays 
 - [ ] Each `auxiliary` entry has a `schema`, a non-empty `artifacts` map, and an object `metadata`.
 - [ ] Snap features, when present, follow `hfx.aux.snap.v2`.
 - [ ] Artifact paths are relative and stay inside the dataset root.
-- [ ] An `hfx.aux.d8_raster.v1` entry contains `flow_dir`, `flow_acc`, and `metadata.flow_dir_encoding`.
+- [ ] An `hfx.aux.d8_raster.v2` entry contains `flow_dir`, `flow_acc`, `metadata.crs`, `metadata.flow_dir_encoding`, and `metadata.flow_acc_units`.
+- [ ] Each D8 raster header supplies its authoritative dtype and nodata tag, and both headers resolve to the declared EPSG CRS.
 - [ ] A third-party schema uses a reverse-DNS style identifier.
 
 ### Manifest

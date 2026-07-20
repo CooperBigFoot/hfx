@@ -130,13 +130,16 @@ Cross-level relationships live in `parent_id`.
 Finally, inspect the manifest for auxiliary artifacts, optional declared data that an HFX dataset may carry.
 The tiny dataset declares zero `auxiliary[]` entries and ships zero auxiliary files.
 
-HFX blesses `hfx.aux.d8_raster.v1`, a paired D8 flow-direction raster and flow-accumulation raster.
+HFX blesses `hfx.aux.d8_raster.v2`, a paired D8 flow-direction raster and flow-accumulation raster.
 D8 is an eight-direction flow-routing convention where each cell points to one of eight neighbors.
 This auxiliary schema requires artifact keys `flow_dir` and `flow_acc`, and both paths point at Cloud-Optimized GeoTIFF files.
-Its metadata requires `flow_dir_encoding`, with value `"esri"` or `"taudem"`.
-The `flow_dir` raster is `uint8` with NoData `255`.
-The `flow_acc` raster is `float32` with NoData `-1.0`.
-Read the schema at [`spec/aux/d8_raster/v1.md`](../spec/aux/d8_raster/v1.md).
+Its metadata requires `crs`, `flow_dir_encoding`, and `flow_acc_units`.
+The `crs` value is an uppercase EPSG authority string resolved by both raster headers.
+The flow-direction encoding is `esri`, `taudem`, or `grass`, and the flow-accumulation units are `cells` or `km2`.
+Each GeoTIFF header is authoritative for its dtype and nodata value, and each raster carries a nodata tag.
+The `flow_dir` header dtype is `uint8` or `int8`.
+The `flow_acc` header dtype is `float32` or `int32`; `cells` requires `float32`, while `km2` permits either dtype.
+Read the schema at [`spec/aux/d8_raster/v2.md`](../spec/aux/d8_raster/v2.md).
 
 HFX also blesses `hfx.aux.snap.v2`, optional reach or node geometries used to attach an outlet point to a drainage unit.
 This auxiliary schema requires the artifact key `snap`, which points at a Parquet file.
