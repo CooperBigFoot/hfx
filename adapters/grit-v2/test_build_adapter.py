@@ -23,10 +23,12 @@ WEST_TRANSFORM = Affine(30, 0, 0, 0, -30, 60)
 EAST_TRANSFORM = Affine(30, 0, 60, 0, -30, 60)
 GAPPED_EAST_TRANSFORM = Affine(30, 0, 90, 0, -30, 60)
 
-FLOW_DIR_WEST = np.array([[-1, 2], [3, -128]], dtype=np.int8)
-FLOW_DIR_EAST = np.array([[4, -8], [0, 7]], dtype=np.int8)
+FLOW_DIR_WEST = np.array([[1, 2], [3, 255]], dtype=np.uint8)
+FLOW_DIR_EAST = np.array([[4, 8], [0, 7]], dtype=np.uint8)
+FLOW_DIR_NODATA = 255
 FLOW_ACC_WEST = np.array([[10, 20], [30, -9999]], dtype=np.int32)
 FLOW_ACC_EAST = np.array([[40, 50], [60, 70]], dtype=np.int32)
+FLOW_ACC_NODATA = -9999
 
 SNAP_AUXILIARY = [
     {
@@ -100,10 +102,10 @@ def raster_archives(tmp_path: Path) -> tuple[Path, Path]:
     direction_east = source_dir / "direction_east.tif"
     accumulation_west = source_dir / "accumulation_west.tif"
     accumulation_east = source_dir / "accumulation_east.tif"
-    _write_tile(direction_west, FLOW_DIR_WEST, WEST_TRANSFORM, -128)
-    _write_tile(direction_east, FLOW_DIR_EAST, EAST_TRANSFORM, -128)
-    _write_tile(accumulation_west, FLOW_ACC_WEST, WEST_TRANSFORM, -9999)
-    _write_tile(accumulation_east, FLOW_ACC_EAST, EAST_TRANSFORM, -9999)
+    _write_tile(direction_west, FLOW_DIR_WEST, WEST_TRANSFORM, FLOW_DIR_NODATA)
+    _write_tile(direction_east, FLOW_DIR_EAST, EAST_TRANSFORM, FLOW_DIR_NODATA)
+    _write_tile(accumulation_west, FLOW_ACC_WEST, WEST_TRANSFORM, FLOW_ACC_NODATA)
+    _write_tile(accumulation_east, FLOW_ACC_EAST, EAST_TRANSFORM, FLOW_ACC_NODATA)
 
     direction_archive = tmp_path / "flow_dir_tiles.zip"
     accumulation_archive = tmp_path / "flow_acc_tiles.zip"
@@ -132,10 +134,17 @@ def gapped_raster_archives(tmp_path: Path) -> tuple[Path, Path]:
     direction_east = source_dir / "direction_gapped_east.tif"
     accumulation_west = source_dir / "accumulation_west.tif"
     accumulation_east = source_dir / "accumulation_gapped_east.tif"
-    _write_tile(direction_west, FLOW_DIR_WEST, WEST_TRANSFORM, -128)
-    _write_tile(direction_east, FLOW_DIR_EAST, GAPPED_EAST_TRANSFORM, -128)
-    _write_tile(accumulation_west, FLOW_ACC_WEST, WEST_TRANSFORM, -9999)
-    _write_tile(accumulation_east, FLOW_ACC_EAST, GAPPED_EAST_TRANSFORM, -9999)
+    _write_tile(direction_west, FLOW_DIR_WEST, WEST_TRANSFORM, FLOW_DIR_NODATA)
+    _write_tile(
+        direction_east, FLOW_DIR_EAST, GAPPED_EAST_TRANSFORM, FLOW_DIR_NODATA
+    )
+    _write_tile(accumulation_west, FLOW_ACC_WEST, WEST_TRANSFORM, FLOW_ACC_NODATA)
+    _write_tile(
+        accumulation_east,
+        FLOW_ACC_EAST,
+        GAPPED_EAST_TRANSFORM,
+        FLOW_ACC_NODATA,
+    )
 
     direction_archive = tmp_path / "gapped_flow_dir_tiles.zip"
     accumulation_archive = tmp_path / "gapped_flow_acc_tiles.zip"
@@ -179,7 +188,7 @@ def test_build_d8_raster_pair_preserves_native_grid_and_values(
     assert accumulation_path.is_file()
 
     expected_direction = np.array(
-        [[-1, 2, 4, -8], [3, -128, 0, 7]], dtype=np.int8
+        [[1, 2, 4, 8], [3, 255, 0, 7]], dtype=np.uint8
     )
     expected_accumulation = np.array(
         [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
@@ -188,9 +197,9 @@ def test_build_d8_raster_pair_preserves_native_grid_and_values(
     with rasterio.open(direction_path) as direction, rasterio.open(
         accumulation_path
     ) as accumulation:
-        assert direction.dtypes == ("int8",)
+        assert direction.dtypes == ("uint8",)
         assert accumulation.dtypes == ("int32",)
-        assert direction.nodata == -128
+        assert direction.nodata == 255
         assert accumulation.nodata == -9999
         assert_array_equal(direction.read(1), expected_direction)
         assert_array_equal(accumulation.read(1), expected_accumulation)
@@ -233,8 +242,7 @@ def test_build_d8_raster_pair_reads_sparse_union_gap_as_nodata(
     )
 
     expected_gapped_flow_dir = np.array(
-        [[-1, 2, -128, 4, -8], [3, -128, -128, 0, 7]],
-        dtype=np.int8,
+        [[1, 2, 255, 4, 8], [3, 255, 255, 0, 7]], dtype=np.uint8
     )
     expected_gapped_flow_acc = np.array(
         [[10, 20, -9999, 40, 50], [30, -9999, -9999, 60, 70]],
@@ -251,7 +259,7 @@ def test_build_d8_raster_pair_reads_sparse_union_gap_as_nodata(
         assert_array_equal(accumulation.read(1), expected_gapped_flow_acc)
         # Guard the GDAL sparse-block nodata semantics the planetary build relies on.
         assert_array_equal(
-            direction.read(1)[:, 2], np.array([-128, -128], dtype=np.int8)
+            direction.read(1)[:, 2], np.array([255, 255], dtype=np.uint8)
         )
         assert_array_equal(
             accumulation.read(1)[:, 2], np.array([-9999, -9999], dtype=np.int32)
@@ -259,24 +267,47 @@ def test_build_d8_raster_pair_reads_sparse_union_gap_as_nodata(
         assert direction.read(1)[1, 3] == 0
 
 
-def test_missing_source_nodata_fails_before_output_creation(
+def test_tagless_direction_source_with_nodata_value_fails_before_output_creation(
     tmp_path: Path,
     raster_archives: tuple[Path, Path],
 ) -> None:
     _, accumulation_archive = raster_archives
-    missing_source = tmp_path / "direction_missing_nodata.tif"
+    source_dir = tmp_path / "tagless-rejection-sources"
+    source_dir.mkdir()
+    tagged_source = source_dir / "direction_tagged_west.tif"
+    tagless_source = source_dir / "direction_missing_nodata_east.tif"
     _write_tile(
-        missing_source,
-        np.array([[1, 2], [3, 4]], dtype=np.int8),
+        tagged_source,
+        np.array([[1, 2], [3, 0]], dtype=np.uint8),
         WEST_TRANSFORM,
+        FLOW_DIR_NODATA,
+    )
+    _write_tile(
+        tagless_source,
+        np.array([[4, 8], [255, 7]], dtype=np.uint8),
+        EAST_TRANSFORM,
         None,
     )
     missing_archive = tmp_path / "missing_nodata.zip"
-    member_name = "synthetic/drainage_direction_missing_nodata.tif"
-    _archive(missing_archive, [(missing_source, member_name)])
+    _archive(
+        missing_archive,
+        [
+            (tagged_source, "synthetic/drainage_direction_tagged_west.tif"),
+            (
+                tagless_source,
+                "synthetic/drainage_direction_missing_nodata_east.tif",
+            ),
+        ],
+    )
     output_dir = tmp_path / "output"
 
-    with pytest.raises(AdapterError, match=r"drainage_direction_missing_nodata\.tif.*nodata"):
+    with pytest.raises(
+        AdapterError,
+        match=(
+            r"drainage_direction_missing_nodata_east\.tif.*"
+            r"255.*valid data domain 0 through 8"
+        ),
+    ):
         build_d8_raster_pair(
             [missing_archive],
             [accumulation_archive],
@@ -285,6 +316,63 @@ def test_missing_source_nodata_fails_before_output_creation(
         )
 
     assert not output_dir.exists()
+
+
+def test_tagless_direction_source_with_valid_codes_is_accepted(
+    tmp_path: Path,
+    raster_archives: tuple[Path, Path],
+) -> None:
+    _, accumulation_archive = raster_archives
+    source_dir = tmp_path / "tagless-acceptance-sources"
+    source_dir.mkdir()
+    tagged_source = source_dir / "direction_tagged_west.tif"
+    tagless_source = source_dir / "direction_missing_nodata_east.tif"
+    _write_tile(
+        tagged_source,
+        np.array([[1, 2], [3, 255]], dtype=np.uint8),
+        WEST_TRANSFORM,
+        FLOW_DIR_NODATA,
+    )
+    _write_tile(
+        tagless_source,
+        np.array([[4, 8], [6, 7]], dtype=np.uint8),
+        EAST_TRANSFORM,
+        None,
+    )
+    direction_archive = tmp_path / "valid_tagless_direction.zip"
+    _archive(
+        direction_archive,
+        [
+            (tagged_source, "synthetic/drainage_direction_tagged_west.tif"),
+            (
+                tagless_source,
+                "synthetic/drainage_direction_missing_nodata_east.tif",
+            ),
+        ],
+    )
+
+    direction_path, accumulation_path = build_d8_raster_pair(
+        [direction_archive],
+        [accumulation_archive],
+        tmp_path / "valid-tagless-work",
+        tmp_path / "valid-tagless-output",
+    )
+
+    expected_direction = np.array(
+        [[1, 2, 4, 8], [3, 255, 6, 7]], dtype=np.uint8
+    )
+    expected_accumulation = np.array(
+        [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
+    )
+    with rasterio.open(direction_path) as direction, rasterio.open(
+        accumulation_path
+    ) as accumulation:
+        assert direction.dtypes == ("uint8",)
+        assert direction.nodata == 255
+        assert_array_equal(direction.read(1), expected_direction)
+        assert accumulation.dtypes == ("int32",)
+        assert accumulation.nodata == -9999
+        assert_array_equal(accumulation.read(1), expected_accumulation)
 
 
 def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
@@ -348,7 +436,7 @@ def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
     assert direction_path.is_file()
     assert accumulation_path.is_file()
     expected_direction = np.array(
-        [[-1, 2, 4, -8], [3, -128, 0, 7]], dtype=np.int8
+        [[1, 2, 4, 8], [3, 255, 0, 7]], dtype=np.uint8
     )
     expected_accumulation = np.array(
         [[10, 20, 40, 50], [30, -9999, 60, 70]], dtype=np.int32
@@ -356,9 +444,9 @@ def test_raster_cli_attaches_pair_without_touching_vector_artifacts(
     with rasterio.open(direction_path) as direction, rasterio.open(
         accumulation_path
     ) as accumulation:
-        assert direction.dtypes == ("int8",)
+        assert direction.dtypes == ("uint8",)
         assert accumulation.dtypes == ("int32",)
-        assert direction.nodata == -128
+        assert direction.nodata == 255
         assert accumulation.nodata == -9999
         assert direction.crs.to_epsg() == accumulation.crs.to_epsg() == 8857
         assert direction.width == accumulation.width == 4
