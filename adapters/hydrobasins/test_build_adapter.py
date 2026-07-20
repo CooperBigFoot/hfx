@@ -33,6 +33,17 @@ import build_adapter
 LAYER_NAME = "hybas_gr_lev12_v1c.shp"
 POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
 RIVERS_LAYER_NAME = "HydroRIVERS_v10_gr.shp"
+CANONICAL_SOURCE_ROOT = Path("~/data/hydrobasins-src").expanduser().resolve()
+CANONICAL_GR_BASINS_DIR = CANONICAL_SOURCE_ROOT / "extract" / "hybas_gr"
+CANONICAL_POUR_POINTS_DIR = CANONICAL_SOURCE_ROOT / "extract" / "pour"
+CANONICAL_FULL_DEPTH_GR_DATA = (
+    CANONICAL_GR_BASINS_DIR.is_dir()
+    and all(
+        (CANONICAL_GR_BASINS_DIR / f"hybas_gr_lev{level:02d}_v1c.shp").is_file()
+        and (CANONICAL_POUR_POINTS_DIR / f"hybas_pour_lev{level:02d}_v1.shp").is_file()
+        for level in range(1, 13)
+    )
+)
 
 
 def _write_layer(
@@ -421,6 +432,99 @@ def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
         "gr_tied": gr_tied,
         "af_tied": af_tied,
         "unresolved": unresolved_inside_af_unit,
+        "af_local": af_local,
+    }
+
+
+def _write_two_region_multilevel_snap_fixture(
+    root: Path,
+) -> dict[str, LineString]:
+    basins_dir = root / "extract"
+    pour_points_dir = basins_dir / "pour"
+    rivers_dir = root / "rivers"
+
+    _write_layer(
+        basins_dir,
+        region="gr",
+        level=11,
+        ids=[1101],
+        pfaf_ids=[11111111111],
+        next_down=[0],
+        geometries=[box(0, 0, 11, 1)],
+    )
+    _write_layer(
+        basins_dir,
+        region="gr",
+        level=12,
+        ids=[101, 103],
+        pfaf_ids=[111111111111, 111111111112],
+        next_down=[0, 0],
+        geometries=[box(0, 0, 1, 1), box(10, 0, 11, 1)],
+    )
+    _write_layer(
+        basins_dir,
+        region="af",
+        level=11,
+        ids=[1202],
+        pfaf_ids=[22222222222],
+        next_down=[0],
+        geometries=[box(20, 0, 31, 1)],
+    )
+    _write_layer(
+        basins_dir,
+        region="af",
+        level=12,
+        ids=[202, 204],
+        pfaf_ids=[222222222221, 222222222222],
+        next_down=[0, 0],
+        geometries=[box(20, 0, 21, 1), box(30, 0, 31, 1)],
+    )
+    _write_pour_points(
+        pour_points_dir,
+        level=11,
+        ids=[1101, 1202],
+        points=[Point(5.5, 0.5), Point(25.5, 0.5)],
+    )
+    _write_pour_points(
+        pour_points_dir,
+        level=12,
+        ids=[101, 103, 202, 204],
+        points=[
+            Point(0.5, 0.5),
+            Point(10.5, 0.5),
+            Point(20.5, 0.5),
+            Point(30.5, 0.5),
+        ],
+    )
+
+    gr_tied = LineString([(4.8, 0.2), (5.2, 0.8)])
+    coarse_decoy = LineString([(5.1, 0.2), (5.9, 0.8)])
+    unresolved = LineString([(30.1, 0.2), (30.9, 0.8)])
+    af_tied = LineString([(4.8, 0.8), (5.2, 0.2)])
+    af_local = LineString([(20.1, 0.2), (20.9, 0.8)])
+    _write_rivers(
+        rivers_dir / "gr",
+        layer_path=rivers_dir / "gr" / "nested" / "HydroRIVERS_v10_gr.shp",
+        hyriv_id=[1001, 1002, 1003],
+        hybas_l12=[101, 1101, 999],
+        upland_skm=[11.0, 55.0, 99.0],
+        next_down=[0, 0, 0],
+        geometries=[gr_tied, coarse_decoy, unresolved],
+    )
+    _write_rivers(
+        rivers_dir / "af",
+        layer_path=rivers_dir / "af" / "nested" / "HydroRIVERS_v10_af.shp",
+        hyriv_id=[2001, 2002],
+        hybas_l12=[202, 204],
+        upland_skm=[22.0, 33.0],
+        next_down=[0, 0],
+        geometries=[af_tied, af_local],
+    )
+    return {
+        "gr_tied": gr_tied,
+        "coarse_decoy": coarse_decoy,
+        "unresolved": unresolved,
+        "af_tied": af_tied,
         "af_local": af_local,
     }
 
@@ -1208,6 +1312,135 @@ class ConformanceTests(unittest.TestCase):
         self._assert_multilevel_conformance(range(6, 13), ["--levels", "6-12"])
 
 
+@unittest.skipUnless(
+    CANONICAL_FULL_DEPTH_GR_DATA,
+    "canonical full-depth gr HydroBASINS and pour-point sources not present",
+)
+class FullDepthGreekSourceIntegrationTests(unittest.TestCase):
+    """Exercise the canonical Greek source tree through the public build command."""
+
+    def test_default_full_range_build_emits_observed_source_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            out_dir = Path(temporary) / "out"
+            self.assertEqual(
+                build_adapter.main(
+                    [
+                        "build",
+                        "--region",
+                        "gr",
+                        "--basins",
+                        str(CANONICAL_SOURCE_ROOT / "extract"),
+                        "--pour-points",
+                        str(CANONICAL_POUR_POINTS_DIR),
+                        "--out",
+                        str(out_dir),
+                    ]
+                ),
+                0,
+            )
+
+            levels = pq.read_table(
+                out_dir / "catchments.parquet", columns=["level"]
+            ).column("level").to_pylist()
+            counts = pd.Series(levels).value_counts().to_dict()
+            self.assertEqual(set(counts), set(range(12)))
+            self.assertEqual(counts[0], 1)
+            self.assertEqual(counts[5], 302)
+            self.assertEqual(counts[11], 16_990)
+
+            catchment_count = len(levels)
+            manifest = json.loads(
+                (out_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["unit_count"], catchment_count)
+            self.assertEqual(
+                pq.ParquetFile(out_dir / "graph.parquet").metadata.num_rows,
+                catchment_count,
+            )
+
+
+class SnapLevelGatingTests(unittest.TestCase):
+    """Exercise Pfaf-12 snap range gating through the public build command."""
+
+    def test_rivers_without_pfaf_12_is_fatal_before_source_loading_or_artifact_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = _selector_args(["--region", "gr"], root) + [
+                "--levels",
+                "11",
+                "--rivers",
+                str(root / "rivers"),
+            ]
+            with (
+                patch("build_adapter.resolve_build_regions") as resolve_regions,
+                patch("build_adapter._prepare_level_frames") as prepare_frames,
+                self.assertRaises(build_adapter.AdapterError) as caught,
+            ):
+                build_adapter.main(args)
+
+            self.assertEqual(
+                str(caught.exception),
+                "--rivers requires --levels to include source Pfaf level 12",
+            )
+            resolve_regions.assert_not_called()
+            prepare_frames.assert_not_called()
+            self.assertFalse((root / "out").exists())
+            for relative_path in (
+                "catchments.parquet",
+                "graph.parquet",
+                "manifest.json",
+                "aux/snap_stems.parquet",
+            ):
+                self.assertFalse((root / "out" / relative_path).exists())
+
+    def test_default_and_6_12_snap_reference_pfaf_12_and_preserve_hybas_l12_ids(
+        self,
+    ) -> None:
+        cases = ((range(1, 13), [], 11), (range(6, 13), ["--levels", "6-12"], 6))
+        for source_levels, level_args, expected_reference in cases:
+            with self.subTest(levels=level_args or ["default"]):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    _write_level_chain(root, source_levels)
+                    retained = LineString([(0.2, 0.2), (1.8, 1.8)])
+                    coarse = LineString([(0.2, 1.8), (1.8, 0.2)])
+                    _write_rivers(
+                        root / "rivers",
+                        hyriv_id=[101, 102],
+                        hybas_l12=[12001, 6001],
+                        upland_skm=[12.0, 6.0],
+                        next_down=[0, 0],
+                        geometries=[retained, coarse],
+                    )
+                    args = _selector_args(["--region", "gr"], root) + [
+                        *level_args,
+                        "--rivers",
+                        str(root / "rivers"),
+                    ]
+                    self.assertEqual(build_adapter.main(args), 0)
+
+                    manifest = json.loads(
+                        (root / "out" / "manifest.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        manifest["auxiliary"][0]["metadata"]["references_levels"],
+                        [expected_reference],
+                    )
+                    snap = gpd.read_parquet(
+                        root / "out" / "aux" / "snap_stems.parquet"
+                    )
+                    self.assertEqual(snap["id"].tolist(), [1])
+                    self.assertEqual(snap["unit_id"].tolist(), [12001])
+                    self.assertNotIn(6001, snap["unit_id"].tolist())
+                    self.assertTrue(snap.geometry.iloc[0].equals_exact(retained, 0.0))
+                    catchment_ids = pq.read_table(
+                        root / "out" / "catchments.parquet", columns=["id"]
+                    ).column("id").to_pylist()
+                    self.assertIn(6001, catchment_ids)
+
+
 class HydroRiversSnapTests(unittest.TestCase):
     """Exercise HydroRIVERS snap emission through the public build command."""
 
@@ -1844,6 +2077,88 @@ class HydroRiversSnapTests(unittest.TestCase):
                     for geometry in frames[0].geometry
                 )
             )
+
+    def test_two_region_multi_level_snap_filters_only_pfaf_12_ids_in_deterministic_order(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authored = _write_two_region_multilevel_snap_fixture(root)
+            tables: list[pa.Table] = []
+            frames: list[gpd.GeoDataFrame] = []
+
+            for output_name in ("out_first", "out_second"):
+                out_dir = root / output_name
+                args = _selector_args(["--regions", "gr,af"], root)[:-1] + [
+                    str(out_dir),
+                    "--levels",
+                    "11-12",
+                    "--rivers",
+                    str(root / "rivers"),
+                ]
+                with self.assertLogs(build_adapter.__name__, level="INFO") as captured:
+                    self.assertEqual(build_adapter.main(args), 0)
+                expected_log = (
+                    "dropped 2 HydroRIVERS reaches with HYBAS_L12 absent "
+                    "from the unit set"
+                )
+                self.assertEqual(
+                    sum(expected_log in message for message in captured.output), 1
+                )
+                snap_path = out_dir / "aux" / "snap_stems.parquet"
+                tables.append(pq.read_table(snap_path))
+                frames.append(gpd.read_parquet(snap_path))
+                manifest = json.loads(
+                    (out_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    manifest["auxiliary"][0]["metadata"]["references_levels"],
+                    [1],
+                )
+
+            first, second = tables
+            self.assertTrue(first.equals(second))
+            self.assertEqual(first.column("id").to_pylist(), [1, 2, 3])
+            unit_ids = first.column("unit_id").to_pylist()
+            self.assertEqual(set(unit_ids), {101, 202, 204})
+            self.assertLess(unit_ids.index(101), unit_ids.index(202))
+
+            catchments = pq.read_table(
+                root / "out_first" / "catchments.parquet", columns=["id", "level"]
+            ).to_pydict()
+            self.assertIn(
+                (1101, 0),
+                set(zip(catchments["id"], catchments["level"], strict=True)),
+            )
+            self.assertNotIn(1101, unit_ids)
+            self.assertNotIn(999, unit_ids)
+            self.assertFalse(
+                any(
+                    geometry.equals_exact(excluded, 0.0)
+                    for geometry in frames[0].geometry
+                    for excluded in (authored["coarse_decoy"], authored["unresolved"])
+                )
+            )
+            expected_by_unit = {
+                101: authored["gr_tied"],
+                202: authored["af_tied"],
+                204: authored["af_local"],
+            }
+            for unit_id, geometry in zip(
+                frames[0]["unit_id"], frames[0].geometry, strict=True
+            ):
+                self.assertTrue(
+                    geometry.equals_exact(expected_by_unit[unit_id], 0.0)
+                )
+            tied = frames[0].geometry.iloc[
+                [unit_ids.index(101), unit_ids.index(202)]
+            ]
+            distances = tied.centroid.hilbert_distance(
+                total_bounds=gpd.read_parquet(
+                    root / "out_first" / "catchments.parquet"
+                ).geometry.total_bounds
+            )
+            self.assertEqual(distances.iloc[0], distances.iloc[1])
 
     def test_two_region_unresolved_reach_is_dropped_against_merged_units_without_reassignment(
         self,
