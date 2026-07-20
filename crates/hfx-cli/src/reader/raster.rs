@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use gdal::spatial_ref::SpatialRef;
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 use gdal::{Dataset, GeoTransformEx};
 use tracing::{debug, warn};
 
@@ -20,7 +20,7 @@ use crate::diagnostic::{Artifact, Category, Diagnostic};
 #[derive(Debug)]
 struct RasterSpatialMeta {
     spatial_ref: String,
-    bbox: RasterBoundingBox,
+    bbox_wgs84: RasterBoundingBox,
     pixel_width: f64,
     pixel_height: f64,
 }
@@ -48,12 +48,12 @@ enum RasterSpatialReadError {
         source: gdal::errors::GdalError,
     },
 
-    /// Returned when the spatial reference cannot be normalized for comparison.
-    #[error("cannot normalize spatial reference from {path}: {source}")]
+    /// Returned when the spatial reference authority cannot be resolved.
+    #[error("cannot resolve spatial reference authority from {path}: {source}")]
     SpatialRefNormalize {
-        /// Raster path whose spatial reference could not be normalized.
+        /// Raster path whose spatial reference authority could not be resolved.
         path: String,
-        /// GDAL error returned by normalization.
+        /// GDAL error returned while resolving the authority.
         #[source]
         source: gdal::errors::GdalError,
     },
@@ -64,6 +64,16 @@ enum RasterSpatialReadError {
         /// Raster path missing geotransform metadata.
         path: String,
         /// GDAL error returned by the geotransform lookup.
+        #[source]
+        source: gdal::errors::GdalError,
+    },
+
+    /// Returned when the raster perimeter cannot be transformed to EPSG:4326.
+    #[error("cannot transform raster footprint from {path} to EPSG:4326: {source}")]
+    FootprintTransform {
+        /// Raster path whose footprint could not be transformed.
+        path: String,
+        /// GDAL error returned while constructing or applying the transform.
         #[source]
         source: gdal::errors::GdalError,
     },
@@ -164,31 +174,31 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
 
     let nodata = read_nodata(&mut decoder);
 
-    let (spatial_ref, bbox, pixel_width, pixel_height, diagnostics) = match read_spatial_meta(path)
-    {
-        Ok(spatial) => (
-            Some(spatial.spatial_ref),
-            Some(spatial.bbox),
-            Some(spatial.pixel_width),
-            Some(spatial.pixel_height),
-            vec![],
-        ),
-        Err(err) => {
-            warn!(path = %path.display(), error = %err, "cannot read GDAL spatial metadata");
-            (
-                None,
-                None,
-                None,
-                None,
-                vec![Diagnostic::error(
-                    "raster.parse",
-                    Category::Raster,
-                    artifact,
-                    format!("cannot read GDAL spatial metadata from {file_label}: {err}"),
-                )],
-            )
-        }
-    };
+    let (spatial_ref, bbox_wgs84, pixel_width, pixel_height, diagnostics) =
+        match read_spatial_meta(path) {
+            Ok(spatial) => (
+                Some(spatial.spatial_ref),
+                Some(spatial.bbox_wgs84),
+                Some(spatial.pixel_width),
+                Some(spatial.pixel_height),
+                vec![],
+            ),
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "cannot read GDAL spatial metadata");
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![Diagnostic::error(
+                        "raster.parse",
+                        Category::Raster,
+                        artifact,
+                        format!("cannot read GDAL spatial metadata from {file_label}: {err}"),
+                    )],
+                )
+            }
+        };
 
     let meta = RasterMeta {
         path: path.to_path_buf(),
@@ -201,7 +211,7 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         tile_height,
         nodata,
         spatial_ref,
-        bbox,
+        bbox_wgs84,
         pixel_width,
         pixel_height,
     };
@@ -212,7 +222,7 @@ pub fn read_raster_meta(path: &Path, file_label: &str) -> (Option<RasterMeta>, V
         bits_per_sample,
         is_tiled,
         has_spatial_ref = meta.spatial_ref.is_some(),
-        has_bbox = meta.bbox.is_some(),
+        has_bbox_wgs84 = meta.bbox_wgs84.is_some(),
         "raster metadata read complete"
     );
 
@@ -230,14 +240,14 @@ fn read_spatial_meta(path: &Path) -> Result<RasterSpatialMeta, RasterSpatialRead
         source,
     })?;
 
-    let spatial_ref =
+    let mut spatial_ref =
         dataset
             .spatial_ref()
             .map_err(|source| RasterSpatialReadError::SpatialRef {
                 path: path_display.clone(),
                 source,
             })?;
-    let spatial_ref = normalize_spatial_ref(&spatial_ref).map_err(|source| {
+    let canonical_spatial_ref = normalize_spatial_ref(&mut spatial_ref).map_err(|source| {
         RasterSpatialReadError::SpatialRefNormalize {
             path: path_display.clone(),
             source,
@@ -248,65 +258,101 @@ fn read_spatial_meta(path: &Path) -> Result<RasterSpatialMeta, RasterSpatialRead
         dataset
             .geo_transform()
             .map_err(|source| RasterSpatialReadError::GeoTransform {
-                path: path_display,
+                path: path_display.clone(),
                 source,
             })?;
-    let bbox = bbox_from_geo_transform(&geo_transform, dataset.raster_size());
+    let bbox_wgs84 = footprint_bbox_wgs84(&spatial_ref, &geo_transform, dataset.raster_size())
+        .map_err(|source| RasterSpatialReadError::FootprintTransform {
+            path: path_display,
+            source,
+        })?;
     let pixel_width = geo_transform[1].hypot(geo_transform[4]);
     let pixel_height = geo_transform[2].hypot(geo_transform[5]);
 
     Ok(RasterSpatialMeta {
-        spatial_ref,
-        bbox,
+        spatial_ref: canonical_spatial_ref,
+        bbox_wgs84,
         pixel_width,
         pixel_height,
     })
 }
 
-fn normalize_spatial_ref(spatial_ref: &SpatialRef) -> Result<String, gdal::errors::GdalError> {
+fn normalize_spatial_ref(spatial_ref: &mut SpatialRef) -> Result<String, gdal::errors::GdalError> {
     if let Ok(authority) = spatial_ref.authority() {
         return Ok(authority);
     }
 
-    if let Ok(expected) = SpatialRef::from_epsg(4326)
-        && spatial_ref == &expected
-    {
-        return Ok("EPSG:4326".to_string());
-    }
-
-    spatial_ref.to_wkt()
+    spatial_ref.auto_identify_epsg()?;
+    spatial_ref.authority()
 }
 
-fn bbox_from_geo_transform(
+const EDGE_SAMPLES_PER_SIDE: usize = 21;
+
+fn densified_edge_points(raster_size: (usize, usize)) -> Vec<(f64, f64)> {
+    let width = raster_size.0 as f64;
+    let height = raster_size.1 as f64;
+    let samples = (0..EDGE_SAMPLES_PER_SIDE).map(|i| {
+        let t = i as f64 / (EDGE_SAMPLES_PER_SIDE - 1) as f64;
+        (t, 1.0 - t)
+    });
+
+    samples
+        .clone()
+        .map(|(t, _)| (t * width, 0.0))
+        .chain(samples.clone().map(|(t, _)| (width, t * height)))
+        .chain(
+            samples
+                .clone()
+                .map(|(_, inverse_t)| (inverse_t * width, height)),
+        )
+        .chain(samples.map(|(_, inverse_t)| (0.0, inverse_t * height)))
+        .collect()
+}
+
+fn footprint_bbox_wgs84(
+    source: &SpatialRef,
     geo_transform: &[f64; 6],
     raster_size: (usize, usize),
-) -> RasterBoundingBox {
-    let (width, height) = (raster_size.0 as f64, raster_size.1 as f64);
-    let corners = [
-        geo_transform.apply(0.0, 0.0),
-        geo_transform.apply(width, 0.0),
-        geo_transform.apply(0.0, height),
-        geo_transform.apply(width, height),
-    ];
+) -> Result<RasterBoundingBox, gdal::errors::GdalError> {
+    let mut source = source.clone();
+    source.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let mut target = SpatialRef::from_epsg(4326)?;
+    target.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let transform = CoordTransform::new(&source, &target)?;
+    let (mut xs, mut ys): (Vec<_>, Vec<_>) = densified_edge_points(raster_size)
+        .into_iter()
+        .map(|(pixel_x, pixel_y)| geo_transform.apply(pixel_x, pixel_y))
+        .unzip();
+    transform.transform_coords(&mut xs, &mut ys, &mut [])?;
 
-    let min_x = corners
+    let finite_coords: Vec<_> = xs
+        .into_iter()
+        .zip(ys)
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .collect();
+    if finite_coords.is_empty() {
+        return Err(gdal::errors::GdalError::BadArgument(
+            "raster footprint transform returned no finite coordinates".to_owned(),
+        ));
+    }
+    let min_x = finite_coords
         .iter()
         .map(|(x, _)| *x)
         .fold(f64::INFINITY, f64::min);
-    let min_y = corners
+    let min_y = finite_coords
         .iter()
         .map(|(_, y)| *y)
         .fold(f64::INFINITY, f64::min);
-    let max_x = corners
+    let max_x = finite_coords
         .iter()
         .map(|(x, _)| *x)
         .fold(f64::NEG_INFINITY, f64::max);
-    let max_y = corners
+    let max_y = finite_coords
         .iter()
         .map(|(_, y)| *y)
         .fold(f64::NEG_INFINITY, f64::max);
 
-    RasterBoundingBox::new(min_x, min_y, max_x, max_y)
+    Ok(RasterBoundingBox::new(min_x, min_y, max_x, max_y))
 }
 
 /// Map a file label to the matching [Artifact] variant.
@@ -372,3 +418,58 @@ fn read_nodata<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Op
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use gdal::GeoTransformEx;
+    use gdal::spatial_ref::{AxisMappingStrategy, SpatialRef};
+
+    use super::{EDGE_SAMPLES_PER_SIDE, densified_edge_points, footprint_bbox_wgs84};
+
+    #[test]
+    fn densified_edges_use_full_outer_pixel_boundaries() {
+        let points = densified_edge_points((200, 100));
+
+        assert_eq!(points.len(), 4 * EDGE_SAMPLES_PER_SIDE);
+        assert_eq!(points[0], (0.0, 0.0));
+        assert_eq!(points[10], (100.0, 0.0));
+        assert_eq!(points[20], (200.0, 0.0));
+        assert_eq!(points[21], (200.0, 0.0));
+        assert_eq!(points[31], (200.0, 50.0));
+        assert_eq!(points[41], (200.0, 100.0));
+        assert_eq!(points[42], (200.0, 100.0));
+        assert_eq!(points[62], (0.0, 100.0));
+        assert_eq!(points[63], (0.0, 100.0));
+        assert_eq!(points[83], (0.0, 0.0));
+    }
+
+    #[test]
+    fn rotated_sheared_wgs84_footprint_encloses_every_edge_sample() {
+        let geo_transform = [10.0, 0.01, 0.003, 20.0, -0.002, -0.01];
+        let mut source = SpatialRef::from_epsg(4326).unwrap();
+        source.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+
+        let bbox = footprint_bbox_wgs84(&source, &geo_transform, (200, 100)).unwrap();
+
+        for (pixel_x, pixel_y) in densified_edge_points((200, 100)) {
+            let (x, y) = geo_transform.apply(pixel_x, pixel_y);
+            assert!(x >= bbox.min_x && x <= bbox.max_x);
+            assert!(y >= bbox.min_y && y <= bbox.max_y);
+        }
+    }
+
+    #[test]
+    fn projected_equal_earth_footprint_transforms_to_finite_wgs84_bbox() {
+        let geo_transform = [-100_000.0, 1_000.0, 0.0, 100_000.0, 0.0, -1_000.0];
+        let mut source = SpatialRef::from_epsg(8857).unwrap();
+        source.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+
+        let bbox = footprint_bbox_wgs84(&source, &geo_transform, (200, 200)).unwrap();
+
+        assert!(bbox.min_x.is_finite() && bbox.min_y.is_finite());
+        assert!(bbox.max_x.is_finite() && bbox.max_y.is_finite());
+        assert!(bbox.min_x <= bbox.max_x && bbox.min_y <= bbox.max_y);
+        assert!(bbox.min_x <= 0.0 && bbox.max_x >= 0.0);
+        assert!(bbox.min_y <= 0.0 && bbox.max_y >= 0.0);
+    }
+}

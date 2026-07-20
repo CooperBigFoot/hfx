@@ -129,7 +129,7 @@ fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8Ra
         .enumerate()
         .filter(|(_, entry)| entry.schema.as_deref() == Some("hfx.aux.d8_raster.v2"))
         .filter_map(|(idx, entry)| {
-            parse_d8_raster_metadata(entry)?;
+            let metadata = parse_d8_raster_metadata(entry)?;
             let flow_dir_artifact = entry
                 .artifacts
                 .as_ref()
@@ -144,6 +144,7 @@ fn discover_d8_rasters(dir: &Path, manifest: &manifest::RawManifest) -> Vec<D8Ra
 
             Some(D8RasterEntry {
                 name,
+                metadata,
                 flow_dir_path: existing_safe_artifact_path(dir, flow_dir_artifact.as_deref()),
                 flow_acc_path: existing_safe_artifact_path(dir, flow_acc_artifact.as_deref()),
                 flow_dir_artifact,
