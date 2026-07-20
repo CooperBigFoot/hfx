@@ -29,6 +29,21 @@ Breaking MINOR bump over 0.2.1 (see the
 - `format_version` const changed from `"0.2.1"` to `"0.3.0"` in the manifest
   JSON Schema (`schemas/manifest.schema.json`).
 
+### D8 raster v2 — 2026-07-20
+
+Breaking auxiliary-schema update within HFX 0.3.0. The manifest
+`format_version` remains `0.3.0`.
+
+- [`hfx.aux.d8_raster.v2`](./aux/d8_raster/v2.md) replaces v1 as the blessed D8
+  raster schema. Raster CRS, flow-direction encoding, and flow-accumulation
+  units are required manifest metadata. Dtype and nodata are authoritative in
+  each GeoTIFF header. `hfx.aux.d8_raster.v1`
+  ([`spec/aux/d8_raster/v1.md`](./aux/d8_raster/v1.md)) is retained for
+  historical reference.
+- D8 raster entries may declare different EPSG CRSs. Flow direction admits
+  `esri`, `taudem`, and `grass` encodings. Flow accumulation admits `cells` and
+  `km2` units with the dtype coupling defined by the v2 schema.
+
 ## 0.2.1 — 2026-05-25
 
 Hard-cut manifest version over 0.2.0.

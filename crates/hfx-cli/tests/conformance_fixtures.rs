@@ -83,6 +83,15 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
         ("aux-snap-bad-geometry", "geometry.snap_wrong_type"),
         ("aux-snap-weight-negative", "aux.snap.weight_invalid"),
         ("v02-format-version", "manifest.unsupported_format_version"),
+        (
+            "tiny-with-aux-d8-missing-crs",
+            "auxiliary.d8_raster_metadata",
+        ),
+        (
+            "tiny-with-aux-d8-malformed-crs",
+            "auxiliary.d8_raster_metadata",
+        ),
+        ("tiny-with-legacy-aux-d8-v1", "manifest.auxiliary_schema"),
     ];
 
     for (name, expected) in cases {
@@ -94,6 +103,22 @@ fn conformance_invalid_fixtures_emit_expected_diagnostic() {
             "fixture {name} missing {expected}; got {:#?}",
             report.diagnostics()
         );
+        let expected_message = match name {
+            "tiny-with-aux-d8-missing-crs" => {
+                Some("missing or non-string D8 raster v2 metadata field \"crs\"")
+            }
+            "tiny-with-aux-d8-malformed-crs" => Some("invalid D8 raster v2 crs"),
+            _ => None,
+        };
+        if let Some(expected_message) = expected_message {
+            assert!(
+                report.diagnostics().iter().any(|diagnostic| {
+                    diagnostic.check_id == expected && diagnostic.message.contains(expected_message)
+                }),
+                "fixture {name} missing {expected} message fragment {expected_message:?}; got {:#?}",
+                report.diagnostics()
+            );
+        }
     }
 }
 
@@ -130,6 +155,82 @@ fn conformance_bad_second_d8_fixture_reports_named_entry() {
             diag.check_id == "raster.flow_dir_dtype" && diag.message.contains("bad_second:")
         }),
         "expected raster.flow_dir_dtype diagnostic tagged with bad_second; got {:#?}",
+        report.diagnostics()
+    );
+}
+
+#[test]
+fn conformance_d8_crs_mismatch_fixture_emits_expected_diagnostic() {
+    let p = fixture_path("invalid", "tiny-with-aux-d8-crs-mismatch");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected D8 CRS mismatch fixture to be invalid"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.check_id == "raster.crs_mismatch"),
+        "expected raster.crs_mismatch diagnostic; got {:#?}",
+        report.diagnostics()
+    );
+}
+
+#[test]
+fn conformance_d8_disallowed_dtype_fixture_emits_expected_diagnostic() {
+    let p = fixture_path("invalid", "tiny-with-aux-d8-disallowed-dtype");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected D8 disallowed dtype fixture to be invalid"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.check_id == "raster.flow_dir_dtype"),
+        "expected raster.flow_dir_dtype diagnostic; got {:#?}",
+        report.diagnostics()
+    );
+}
+
+#[test]
+fn conformance_d8_missing_nodata_fixture_emits_expected_diagnostic() {
+    let p = fixture_path("invalid", "tiny-with-aux-d8-missing-nodata");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected D8 missing nodata fixture to be invalid"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.check_id == "raster.flow_acc_nodata"),
+        "expected raster.flow_acc_nodata diagnostic; got {:#?}",
+        report.diagnostics()
+    );
+}
+
+#[test]
+fn conformance_d8_cells_int32_fixture_emits_expected_diagnostic() {
+    let p = fixture_path("invalid", "tiny-with-aux-d8-cells-int32");
+    let report = validate(&p, false, false, 100.0);
+
+    assert!(
+        !report.is_valid(),
+        "expected D8 cells int32 fixture to be invalid"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.check_id == "raster.flow_acc_units_dtype"),
+        "expected raster.flow_acc_units_dtype diagnostic; got {:#?}",
         report.diagnostics()
     );
 }
