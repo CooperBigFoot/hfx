@@ -7,14 +7,14 @@ import argparse
 import gc
 import json
 import math
-import subprocess
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
-from zipfile import ZipFile
+from typing import Iterable, Sequence
+from zipfile import ZipFile, ZipInfo
 
 import geopandas as gpd
 import numpy as np
@@ -22,8 +22,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyogrio
+import rasterio
+from affine import Affine
 from geoparquet_io.core.validate import validate_geoparquet
 from geopandas import GeoSeries
+from rasterio.windows import Window
+from rio_cogeo.cogeo import cog_translate, cog_validate
+from rio_cogeo.profiles import cog_profiles
 from shapely import make_valid
 import shapely
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon
@@ -32,7 +37,7 @@ from shapely.geometry.base import BaseGeometry
 
 FABRIC_NAME = "grit"
 FABRIC_VERSION = "1.0.0"
-ADAPTER_VERSION = "grit-global-2.0.0"
+ADAPTER_VERSION = "grit-global-2.1.0"
 FORMAT_VERSION = "0.3.0"
 TOPOLOGY = "dag"
 CRS = "EPSG:4326"
@@ -84,6 +89,19 @@ class SourceData:
     reach_rows: int
 
 
+@dataclass(frozen=True)
+class RasterMosaicLayout:
+    """Describe a validated same-grid raster union."""
+
+    sources: tuple[Path, ...]
+    dtype: str
+    nodata: int | float
+    transform: Affine
+    width: int
+    height: int
+    offsets: tuple[tuple[int, int], ...]
+
+
 def log(message: str) -> None:
     """Emit a flushed adapter log line."""
     print(f"[grit-v2] {message}", flush=True)
@@ -92,6 +110,347 @@ def log(message: str) -> None:
 def ensure_dir(path: Path) -> None:
     """Create a directory and its parents."""
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_tiff_members(archive_path: Path) -> list[ZipInfo]:
+    """Return deterministic TIFF members after rejecting unsafe archive paths."""
+    try:
+        with ZipFile(archive_path) as archive:
+            archive_members = archive.infolist()
+        for info in archive_members:
+            normalized = info.filename.replace("\\", "/")
+            parts = normalized.split("/")
+            has_empty_component = "" in parts[:-1] or (not info.is_dir() and "" in parts)
+            if (
+                normalized.startswith("/")
+                or ".." in parts
+                or has_empty_component
+                or (parts and parts[0].endswith(":"))
+            ):
+                raise AdapterError(
+                    f"archive {archive_path} has path-traversing member {info.filename}"
+                )
+        members = sorted(
+            (
+                info
+                for info in archive_members
+                if not info.is_dir()
+                and Path(info.filename).suffix.lower() in {".tif", ".tiff"}
+            ),
+            key=lambda info: info.filename,
+        )
+        if not members:
+            raise AdapterError(f"archive {archive_path} contains no TIFF members")
+        return members
+    except AdapterError:
+        raise
+    except Exception as error:
+        raise AdapterError(f"failed to inspect archive {archive_path}: {error}") from error
+
+
+def _extract_raster_archives(
+    archive_paths: Sequence[Path],
+    extraction_root: Path,
+    artifact_name: str,
+) -> tuple[Path, ...]:
+    """Extract nested TIFF members into an artifact-specific work tree."""
+    archives = sorted((Path(path) for path in archive_paths), key=lambda path: str(path))
+    if not archives:
+        raise AdapterError(f"{artifact_name} archive list is empty")
+
+    extracted: list[Path] = []
+    for archive_index, archive_path in enumerate(archives):
+        members = _safe_tiff_members(archive_path)
+        archive_root = extraction_root / f"{archive_index:04d}"
+        with ZipFile(archive_path) as archive:
+            for info in members:
+                relative_path = Path(*info.filename.replace("\\", "/").split("/"))
+                output_path = archive_root / relative_path
+                ensure_dir(output_path.parent)
+                with archive.open(info) as source, output_path.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
+                extracted.append(output_path)
+    return tuple(extracted)
+
+
+def _integer_grid_offset(value: float, source_path: Path, invariant: str) -> int:
+    rounded = round(value)
+    if not math.isclose(value, rounded, rel_tol=0.0, abs_tol=1e-8):
+        raise AdapterError(
+            f"source {source_path} is not aligned to the common pixel grid ({invariant})"
+        )
+    return int(rounded)
+
+
+def _validate_raster_sources(
+    source_paths: Sequence[Path],
+    expected_dtype: str,
+    artifact_name: str,
+) -> RasterMosaicLayout:
+    """Validate source headers and compute their exact native-grid union."""
+    first_transform: Affine | None = None
+    common_nodata: int | float | None = None
+    source_offsets: list[tuple[int, int, int, int]] = []
+
+    for source_path in source_paths:
+        try:
+            with rasterio.open(source_path) as source:
+                if source.count != 1:
+                    raise AdapterError(
+                        f"source {source_path} must be single-band, found {source.count} bands"
+                    )
+                if source.dtypes != (expected_dtype,):
+                    raise AdapterError(
+                        f"source {source_path} has dtype {source.dtypes[0]}, expected {expected_dtype} for {artifact_name}"
+                    )
+                if source.nodata is None:
+                    raise AdapterError(f"source {source_path} lacks a nodata tag")
+                if source.crs is None or source.crs.to_epsg() != 8857:
+                    raise AdapterError(
+                        f"source {source_path} has CRS {source.crs}, expected EPSG:8857"
+                    )
+                transform = source.transform
+                if not math.isclose(transform.b, 0.0, abs_tol=1e-12) or not math.isclose(
+                    transform.d, 0.0, abs_tol=1e-12
+                ):
+                    raise AdapterError(f"source {source_path} has rotated or skewed pixels")
+                if transform.a <= 0 or transform.e >= 0:
+                    raise AdapterError(
+                        f"source {source_path} has unsupported pixel basis {transform}"
+                    )
+
+                if first_transform is None:
+                    first_transform = transform
+                    common_nodata = source.nodata
+                else:
+                    same_x_basis = math.isclose(
+                        transform.a, first_transform.a, rel_tol=0.0, abs_tol=1e-12
+                    )
+                    same_y_basis = math.isclose(
+                        transform.e, first_transform.e, rel_tol=0.0, abs_tol=1e-12
+                    )
+                    if not same_x_basis or not same_y_basis:
+                        raise AdapterError(
+                            f"source {source_path} has a different pixel basis or resolution"
+                        )
+                    if source.nodata != common_nodata:
+                        raise AdapterError(
+                            f"source {source_path} has nodata {source.nodata}, expected common nodata {common_nodata}"
+                        )
+
+                col = _integer_grid_offset(
+                    (transform.c - first_transform.c) / first_transform.a,
+                    source_path,
+                    "x origin",
+                )
+                row = _integer_grid_offset(
+                    (transform.f - first_transform.f) / first_transform.e,
+                    source_path,
+                    "y origin",
+                )
+                source_offsets.append((col, row, source.width, source.height))
+        except AdapterError:
+            raise
+        except Exception as error:
+            raise AdapterError(f"failed to inspect source {source_path}: {error}") from error
+
+    if first_transform is None or common_nodata is None:
+        raise AdapterError(f"{artifact_name} has no extracted TIFF sources")
+
+    for source_index, (col, row, width, height) in enumerate(source_offsets):
+        for previous_index, (
+            previous_col,
+            previous_row,
+            previous_width,
+            previous_height,
+        ) in enumerate(source_offsets[:source_index]):
+            overlaps = (
+                col < previous_col + previous_width
+                and previous_col < col + width
+                and row < previous_row + previous_height
+                and previous_row < row + height
+            )
+            if overlaps:
+                raise AdapterError(
+                    f"source {source_paths[source_index]} overlaps source "
+                    f"{source_paths[previous_index]}; lossless mosaics require disjoint source windows"
+                )
+
+    min_col = min(col for col, _, _, _ in source_offsets)
+    min_row = min(row for _, row, _, _ in source_offsets)
+    max_col = max(col + width for col, _, width, _ in source_offsets)
+    max_row = max(row + height for _, row, _, height in source_offsets)
+    transform = first_transform * Affine.translation(min_col, min_row)
+    offsets = tuple((col - min_col, row - min_row) for col, row, _, _ in source_offsets)
+    return RasterMosaicLayout(
+        sources=tuple(source_paths),
+        dtype=expected_dtype,
+        nodata=common_nodata,
+        transform=transform,
+        width=max_col - min_col,
+        height=max_row - min_row,
+        offsets=offsets,
+    )
+
+
+def _write_native_mosaic(layout: RasterMosaicLayout, output_path: Path) -> None:
+    """Copy validated source blocks into their exact destination windows."""
+    ensure_dir(output_path.parent)
+    with rasterio.open(
+        output_path,
+        "w",
+        driver="GTiff",
+        width=layout.width,
+        height=layout.height,
+        count=1,
+        dtype=layout.dtype,
+        nodata=layout.nodata,
+        crs="EPSG:8857",
+        transform=layout.transform,
+    ) as mosaic:
+        for source_path, (destination_col, destination_row) in zip(
+            layout.sources, layout.offsets, strict=True
+        ):
+            with rasterio.open(source_path) as source:
+                for _, source_window in source.block_windows(1):
+                    destination_window = Window(
+                        destination_col + source_window.col_off,
+                        destination_row + source_window.row_off,
+                        source_window.width,
+                        source_window.height,
+                    )
+                    mosaic.write(source.read(1, window=source_window), 1, window=destination_window)
+
+
+def _translate_and_validate_cog(source_path: Path, output_path: Path) -> None:
+    """Translate one native mosaic to the required BigTIFF COG profile."""
+    profile = cog_profiles.get("deflate")
+    profile.update(blockxsize=512, blockysize=512, BIGTIFF="YES")
+    try:
+        cog_translate(
+            source_path,
+            output_path,
+            profile,
+            overview_resampling="nearest",
+            resampling="nearest",
+            in_memory=False,
+            quiet=True,
+        )
+        valid, errors, warnings = cog_validate(output_path)
+    except Exception as error:
+        raise AdapterError(f"COG translation failed for {output_path}: {error}") from error
+    if not valid or errors:
+        raise AdapterError(
+            f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
+        )
+
+
+def _validate_raster_pair(direction_path: Path, accumulation_path: Path) -> None:
+    """Require both completed rasters to use one identical grid."""
+    with rasterio.open(direction_path) as direction, rasterio.open(
+        accumulation_path
+    ) as accumulation:
+        if direction.crs != accumulation.crs:
+            raise AdapterError(
+                f"raster pair CRS differs: {direction_path}={direction.crs}, {accumulation_path}={accumulation.crs}"
+            )
+        if (direction.width, direction.height) != (
+            accumulation.width,
+            accumulation.height,
+        ):
+            raise AdapterError(
+                f"raster pair dimensions differ: {direction_path}={direction.width}x{direction.height}, "
+                f"{accumulation_path}={accumulation.width}x{accumulation.height}"
+            )
+        if direction.transform != accumulation.transform:
+            raise AdapterError(
+                f"raster pair affine transforms differ: {direction_path}={direction.transform}, "
+                f"{accumulation_path}={accumulation.transform}"
+            )
+
+
+def build_d8_raster_pair(
+    flow_dir_archives: Sequence[Path],
+    flow_acc_archives: Sequence[Path],
+    work_dir: Path,
+    output_dir: Path,
+) -> tuple[Path, Path]:
+    """Build lossless native-grid COGs from ZIP-packaged GRIT raster tiles."""
+    work_dir = Path(work_dir)
+    output_dir = Path(output_dir)
+    direction_sources = _extract_raster_archives(
+        flow_dir_archives, work_dir / "flow_dir" / "extracted", "flow_dir"
+    )
+    accumulation_sources = _extract_raster_archives(
+        flow_acc_archives, work_dir / "flow_acc" / "extracted", "flow_acc"
+    )
+    direction_layout = _validate_raster_sources(direction_sources, "int8", "flow_dir")
+    accumulation_layout = _validate_raster_sources(
+        accumulation_sources, "int32", "flow_acc"
+    )
+
+    direction_output = output_dir / "flow_dir.tif"
+    accumulation_output = output_dir / "flow_acc.tif"
+    direction_temporary = work_dir / "flow_dir" / "mosaic.tif"
+    accumulation_temporary = work_dir / "flow_acc" / "mosaic.tif"
+    ensure_dir(output_dir)
+    try:
+        _write_native_mosaic(direction_layout, direction_temporary)
+        _translate_and_validate_cog(direction_temporary, direction_output)
+        _write_native_mosaic(accumulation_layout, accumulation_temporary)
+        _translate_and_validate_cog(accumulation_temporary, accumulation_output)
+    finally:
+        direction_temporary.unlink(missing_ok=True)
+        accumulation_temporary.unlink(missing_ok=True)
+    _validate_raster_pair(direction_output, accumulation_output)
+    return direction_output, accumulation_output
+
+
+def _amend_manifest_with_d8_rasters(dataset_dir: Path) -> None:
+    """Canonicalize the D8 raster declaration in an existing manifest."""
+    manifest_path = Path(dataset_dir) / "manifest.json"
+    if not manifest_path.is_file():
+        raise AdapterError(f"manifest {manifest_path} does not exist")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AdapterError(f"manifest {manifest_path} is not valid JSON: {error}") from error
+    if not isinstance(manifest, dict):
+        raise AdapterError(f"manifest {manifest_path} must decode to a JSON object")
+    if manifest.get("format_version") != FORMAT_VERSION:
+        raise AdapterError(
+            f"manifest {manifest_path} format_version must equal {FORMAT_VERSION}"
+        )
+    auxiliary = manifest.get("auxiliary")
+    if not isinstance(auxiliary, list):
+        raise AdapterError(f"manifest {manifest_path} auxiliary must be a JSON array")
+
+    manifest["adapter_version"] = ADAPTER_VERSION
+    manifest["auxiliary"] = [
+        entry
+        for entry in auxiliary
+        if not (
+            isinstance(entry, dict) and entry.get("schema") == "hfx.aux.d8_raster.v2"
+        )
+    ]
+    manifest["auxiliary"].append(
+        {
+            "schema": "hfx.aux.d8_raster.v2",
+            "artifacts": {
+                "flow_dir": "aux/d8/flow_dir.tif",
+                "flow_acc": "aux/d8/flow_acc.tif",
+            },
+            "metadata": {
+                "crs": "EPSG:8857",
+                "flow_dir_encoding": "grass",
+                "flow_acc_units": "km2",
+            },
+        }
+    )
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    except OSError as error:
+        raise AdapterError(f"failed to write manifest {manifest_path}: {error}") from error
 
 
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
@@ -1380,6 +1739,18 @@ def _parse_args() -> argparse.Namespace:
     validate_parser.add_argument("--sample-pct", type=float, default=100.0)
     validate_parser.add_argument("--strict", action="store_true", default=True)
 
+    raster = subparsers.add_parser(
+        "raster", help="attach D8 rasters to an existing compiled dataset"
+    )
+    raster.add_argument(
+        "--flow-dir-archive", action="append", type=Path, required=True
+    )
+    raster.add_argument(
+        "--flow-acc-archive", action="append", type=Path, required=True
+    )
+    raster.add_argument("--dataset-dir", type=Path, required=True)
+    raster.add_argument("--work-dir", type=Path, required=True)
+
     return parser.parse_args()
 
 
@@ -1406,6 +1777,37 @@ def main() -> int:
     root = args.root.expanduser().resolve()
     if args.command == "probe":
         probe_reach_schema(root)
+        return 0
+    if args.command == "raster":
+        flow_dir_archives = [path.expanduser().resolve() for path in args.flow_dir_archive]
+        flow_acc_archives = [path.expanduser().resolve() for path in args.flow_acc_archive]
+        dataset_dir = args.dataset_dir.expanduser().resolve()
+        work_dir = args.work_dir.expanduser().resolve()
+        manifest_path = dataset_dir / "manifest.json"
+        if not dataset_dir.is_dir():
+            raise AdapterError(f"dataset directory {dataset_dir} does not exist")
+        if not manifest_path.is_file():
+            raise AdapterError(f"manifest {manifest_path} does not exist")
+        output_dir = dataset_dir / "aux" / "d8"
+        direction_path, accumulation_path = build_d8_raster_pair(
+            flow_dir_archives,
+            flow_acc_archives,
+            work_dir,
+            output_dir,
+        )
+        expected_direction = output_dir / "flow_dir.tif"
+        expected_accumulation = output_dir / "flow_acc.tif"
+        if (
+            direction_path != expected_direction
+            or accumulation_path != expected_accumulation
+            or not direction_path.is_file()
+            or not accumulation_path.is_file()
+        ):
+            raise AdapterError(
+                "raster builder returned paths outside the required dataset artifacts: "
+                f"{direction_path}, {accumulation_path}"
+            )
+        _amend_manifest_with_d8_rasters(dataset_dir)
         return 0
     if args.command == "stage1":
         source = stage_1_inspect_source(args.outer_archive.expanduser().resolve(), root, args.regions)
