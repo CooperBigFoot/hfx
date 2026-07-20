@@ -186,11 +186,17 @@ def _validate_raster_sources(
     source_paths: Sequence[Path],
     expected_dtype: str,
     artifact_name: str,
+    required_nodata: int | float | None = None,
+    valid_data_range: tuple[int, int] | None = None,
 ) -> RasterMosaicLayout:
     """Validate source headers and compute their exact native-grid union."""
     first_transform: Affine | None = None
-    common_nodata: int | float | None = None
     source_offsets: list[tuple[int, int, int, int]] = []
+    tagged_nodata: list[tuple[Path, int | float]] = []
+    tagless_sources: list[Path] = []
+
+    if not source_paths:
+        raise AdapterError(f"{artifact_name} has no extracted TIFF sources")
 
     for source_path in source_paths:
         try:
@@ -203,8 +209,6 @@ def _validate_raster_sources(
                     raise AdapterError(
                         f"source {source_path} has dtype {source.dtypes[0]}, expected {expected_dtype} for {artifact_name}"
                     )
-                if source.nodata is None:
-                    raise AdapterError(f"source {source_path} lacks a nodata tag")
                 if source.crs is None or source.crs.to_epsg() != 8857:
                     raise AdapterError(
                         f"source {source_path} has CRS {source.crs}, expected EPSG:8857"
@@ -221,7 +225,6 @@ def _validate_raster_sources(
 
                 if first_transform is None:
                     first_transform = transform
-                    common_nodata = source.nodata
                 else:
                     same_x_basis = math.isclose(
                         transform.a, first_transform.a, rel_tol=0.0, abs_tol=1e-12
@@ -233,10 +236,11 @@ def _validate_raster_sources(
                         raise AdapterError(
                             f"source {source_path} has a different pixel basis or resolution"
                         )
-                    if source.nodata != common_nodata:
-                        raise AdapterError(
-                            f"source {source_path} has nodata {source.nodata}, expected common nodata {common_nodata}"
-                        )
+
+                if source.nodata is None:
+                    tagless_sources.append(source_path)
+                else:
+                    tagged_nodata.append((source_path, source.nodata))
 
                 col = _integer_grid_offset(
                     (transform.c - first_transform.c) / first_transform.a,
@@ -254,8 +258,60 @@ def _validate_raster_sources(
         except Exception as error:
             raise AdapterError(f"failed to inspect source {source_path}: {error}") from error
 
-    if first_transform is None or common_nodata is None:
+    if first_transform is None:
         raise AdapterError(f"{artifact_name} has no extracted TIFF sources")
+    if not tagged_nodata:
+        raise AdapterError(
+            f"{artifact_name} has no source nodata tags; no common nodata can be derived"
+        )
+
+    common_nodata_path, common_nodata = tagged_nodata[0]
+    for source_path, source_nodata in tagged_nodata[1:]:
+        if source_nodata != common_nodata:
+            raise AdapterError(
+                f"source {source_path} has nodata {source_nodata}, expected common nodata {common_nodata}"
+            )
+    if required_nodata is not None and common_nodata != required_nodata:
+        raise AdapterError(
+            f"source {common_nodata_path} has nodata {common_nodata}, "
+            f"expected required nodata {required_nodata} for {artifact_name}"
+        )
+
+    tagless_source_set = set(tagless_sources)
+    for source_path in source_paths:
+        with rasterio.open(source_path) as source:
+            for _, source_window in source.block_windows(1):
+                values = source.read(1, window=source_window)
+                if valid_data_range is not None:
+                    minimum, maximum = valid_data_range
+                    if source_path in tagless_source_set:
+                        invalid = (values < minimum) | (values > maximum)
+                        if np.any(invalid):
+                            invalid_value = values[invalid][0].item()
+                            raise AdapterError(
+                                f"tag-less {artifact_name} source {source_path} contains value "
+                                f"{invalid_value} outside the valid data domain {minimum} through {maximum}; "
+                                f"nodata {common_nodata} requires a source tag"
+                            )
+                    else:
+                        invalid = (
+                            ((values < minimum) | (values > maximum))
+                            & (values != common_nodata)
+                        )
+                        if np.any(invalid):
+                            invalid_value = values[invalid][0].item()
+                            raise AdapterError(
+                                f"source {source_path} contains value {invalid_value}; "
+                                f"{artifact_name} permits data codes {minimum} through {maximum} "
+                                f"and declared nodata {common_nodata}"
+                            )
+                elif source_path in tagless_source_set and np.any(
+                    values == common_nodata
+                ):
+                    raise AdapterError(
+                        f"tag-less {artifact_name} source {source_path} contains the family's "
+                        f"common tagged nodata {common_nodata}"
+                    )
 
     for source_index, (col, row, width, height) in enumerate(source_offsets):
         for previous_index, (
@@ -384,7 +440,13 @@ def build_d8_raster_pair(
     accumulation_sources = _extract_raster_archives(
         flow_acc_archives, work_dir / "flow_acc" / "extracted", "flow_acc"
     )
-    direction_layout = _validate_raster_sources(direction_sources, "int8", "flow_dir")
+    direction_layout = _validate_raster_sources(
+        direction_sources,
+        "uint8",
+        "flow_dir",
+        required_nodata=255,
+        valid_data_range=(0, 8),
+    )
     accumulation_layout = _validate_raster_sources(
         accumulation_sources, "int32", "flow_acc"
     )
