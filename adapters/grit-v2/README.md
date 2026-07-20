@@ -47,6 +47,7 @@ Subcommands, in pipeline order:
 | `stage2` | Dense ID assignment over existing shards, then Hilbert sort |
 | `phase25` | Resolve graph edges and compute reach upstream areas |
 | `write` | Stages 6–9: write the final HFX artifacts (`--out` overrides the output directory) |
+| `raster` | Attach native-grid D8 rasters to an existing compiled HFX dataset |
 | `validate` | Run the Rust HFX validator over the output |
 
 `stage1`, `stage2`, `phase25`, and `write` accept `--regions` (comma-separated region codes, or `all`; default is all seven).
@@ -59,10 +60,63 @@ Subcommands, in pipeline order:
 - `aux/snap_segments.parquet` — `hfx.aux.snap.v2` index `segment-stems` (references level 0)
 - `aux/snap_reaches.parquet` — `hfx.aux.snap.v2` index `reach-stems` (references level 1)
 
+## Attach D8 Rasters
+
+The `raster` subcommand attaches the GRIT v1.0 raster products from [Zenodo record 15715535](https://zenodo.org/records/15715535) to an existing compiled HFX dataset. It requires:
+
+- every applicable `drainage_direction` ZIP archive, passed once per archive with `--flow-dir-archive`;
+- every applicable width-partitioned `drainage_area` ZIP archive, passed once per archive with `--flow-acc-archive`;
+- the existing compiled dataset directory, passed with `--dataset-dir`;
+- a disposable raster work directory, passed with `--work-dir`.
+
+Run from the repo root:
+
+```bash
+uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py raster \
+    --flow-dir-archive /path/to/drainage-direction-archive-1.zip \
+    --flow-dir-archive /path/to/drainage-direction-archive-2.zip \
+    --flow-acc-archive /path/to/drainage-area-archive-1.zip \
+    --flow-acc-archive /path/to/drainage-area-archive-2.zip \
+    --dataset-dir /path/to/existing-compiled-hfx \
+    --work-dir /path/to/raster-work
+```
+
+The command mosaics the source rasters directly on their native EPSG:8857 grid and writes:
+
+- `aux/d8/flow_dir.tif`
+- `aux/d8/flow_acc.tif`
+
+The operation preserves source values and nodata tags. `flow_dir.tif` remains `int8`, including negative GRASS flow-direction codes, and `flow_acc.tif` remains `int32` in km2. The native-grid mosaic performs direct cell copies and COG retiling, with the source CRS, resolution, alignment, and values preserved.
+
+The command amends the existing `manifest.json` idempotently. Repeated runs converge to exactly one `hfx.aux.d8_raster.v2` entry:
+
+```json
+{
+  "schema": "hfx.aux.d8_raster.v2",
+  "artifacts": {
+    "flow_dir": "aux/d8/flow_dir.tif",
+    "flow_acc": "aux/d8/flow_acc.tif"
+  },
+  "metadata": {
+    "crs": "EPSG:8857",
+    "flow_dir_encoding": "grass",
+    "flow_acc_units": "km2"
+  }
+}
+```
+
+The amended manifest retains `format_version` 0.3.0 and records `adapter_version` `grit-global-2.1.0`. Existing vector artifacts remain byte-identical.
+
 ## Validate Locally
 
 ```bash
 cargo run -p hfx-cli -- /path/to/dataset --strict
+```
+
+## Test the Adapter
+
+```bash
+uv run --project adapters/grit-v2 pytest adapters/grit-v2
 ```
 
 ## License and Attribution
