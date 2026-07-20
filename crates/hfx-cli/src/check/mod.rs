@@ -117,6 +117,11 @@ pub fn run_checks(
         let manifest_ref = dataset.manifest.as_ref();
 
         for entry in &dataset.d8_rasters {
+            all.extend(label_diagnostics(
+                &entry.name,
+                raster::check_crs_consistency(entry),
+            ));
+
             if let Some(ref flow_dir_meta) = entry.flow_dir {
                 all.extend(label_diagnostics(
                     &entry.name,
@@ -137,7 +142,7 @@ pub fn run_checks(
             if let Some(ref flow_acc_meta) = entry.flow_acc {
                 all.extend(label_diagnostics(
                     &entry.name,
-                    raster::check_flow_acc(flow_acc_meta),
+                    raster::check_flow_acc(flow_acc_meta, entry.metadata.flow_acc_units()),
                 ));
                 if let Some(manifest) = manifest_ref {
                     all.extend(label_diagnostics(
@@ -208,7 +213,7 @@ mod tests {
             tile_height: Some(256),
             nodata: Some(255.0),
             spatial_ref: None,
-            bbox: None,
+            bbox_wgs84: None,
             pixel_width: None,
             pixel_height: None,
         }
@@ -217,6 +222,12 @@ mod tests {
     fn d8_entry(name: &str, flow_dir: RasterMeta) -> D8RasterEntry {
         D8RasterEntry {
             name: name.to_owned(),
+            metadata: hfx::D8RasterMetadataV2::parse(
+                Some("EPSG:4326"),
+                Some("esri"),
+                Some("cells"),
+            )
+            .unwrap(),
             flow_dir_artifact: Some(format!("aux/d8/{name}/flow_dir.tif")),
             flow_acc_artifact: None,
             flow_dir_path: Some(PathBuf::from(format!("aux/d8/{name}/flow_dir.tif"))),

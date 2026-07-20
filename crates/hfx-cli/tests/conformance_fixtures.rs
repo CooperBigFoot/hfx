@@ -19,6 +19,7 @@ fn conformance_valid_fixtures_pass() {
         "tiny-with-aux-d8",
         "tiny-with-two-aux-d8",
         "tiny-with-two-aux-d8-tiled",
+        "tiny-with-aux-d8-projected-grass",
         "grit-two-level",
         "grit-two-snap",
     ] {
@@ -34,13 +35,14 @@ fn conformance_valid_fixtures_pass() {
 
 #[test]
 fn conformance_d8_raster_fixtures_pass_with_raster_checks_enabled() {
-    for name in [
-        "tiny-with-aux-d8",
-        "tiny-with-two-aux-d8",
-        "tiny-with-two-aux-d8-tiled",
+    for (name, strict) in [
+        ("tiny-with-aux-d8", false),
+        ("tiny-with-two-aux-d8", false),
+        ("tiny-with-two-aux-d8-tiled", false),
+        ("tiny-with-aux-d8-projected-grass", true),
     ] {
         let p = fixture_path("valid", name);
-        let report = validate(&p, false, false, 100.0);
+        let report = validate(&p, strict, false, 100.0);
         assert!(
             report.is_valid(),
             "expected {name} to be valid with raster checks, diagnostics: {:#?}",

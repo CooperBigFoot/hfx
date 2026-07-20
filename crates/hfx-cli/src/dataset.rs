@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use hfx::{BoundingBox, Manifest};
+use hfx::{BoundingBox, D8RasterMetadataV2, Manifest};
 
 use crate::diagnostic::Diagnostic;
 use crate::reader::manifest::RawManifest;
@@ -75,7 +75,7 @@ pub struct RasterMeta {
     pub tile_height: Option<u32>,
     pub nodata: Option<f64>,
     pub spatial_ref: Option<String>,
-    pub bbox: Option<RasterBoundingBox>,
+    pub bbox_wgs84: Option<RasterBoundingBox>,
     pub pixel_width: Option<f64>,
     pub pixel_height: Option<f64>,
 }
@@ -93,6 +93,7 @@ pub enum RasterSampleFormat {
 #[derive(Debug, Clone)]
 pub struct D8RasterEntry {
     pub name: String,
+    pub metadata: D8RasterMetadataV2,
     pub flow_dir_artifact: Option<String>,
     pub flow_acc_artifact: Option<String>,
     pub flow_dir_path: Option<PathBuf>,
