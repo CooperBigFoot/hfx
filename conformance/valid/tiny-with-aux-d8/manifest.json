@@ -15,13 +15,15 @@
   "adapter_version": "conformance-fixture-v2",
   "auxiliary": [
     {
-      "schema": "hfx.aux.d8_raster.v1",
+      "schema": "hfx.aux.d8_raster.v2",
       "artifacts": {
         "flow_dir": "aux/d8/tiny/flow_dir.tif",
         "flow_acc": "aux/d8/tiny/flow_acc.tif"
       },
       "metadata": {
-        "flow_dir_encoding": "esri"
+        "crs": "EPSG:4326",
+        "flow_dir_encoding": "esri",
+        "flow_acc_units": "cells"
       }
     }
   ]

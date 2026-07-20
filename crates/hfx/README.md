@@ -14,7 +14,7 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
   - `id.rs`: `UnitId`, `SnapId`, `IdError`
   - `area.rs`: `AreaKm2`, `Weight`, `MeasureError`
   - `geo.rs`: `Longitude`, `Latitude`, `BoundingBox`, `WkbGeometry`, `GeoError`
-  - `raster.rs`: `FlowDirEncoding`, `FlowDirEncodingError`
+  - `raster.rs`: `EpsgCode`, `FlowDirEncoding`, `FlowAccumulationUnits`, `D8RasterMetadataV2`, and their parse errors
 - Composite modules:
   - `catchment.rs`: `CatchmentUnit`
   - `snap.rs`: `SnapTarget`, `StemRole`
@@ -52,7 +52,10 @@ The crate has no I/O dependencies. Deserialization from Parquet, Arrow, JSON, an
 | `StemRole` | `snap` | Enum (`Mainstem` / `Tributary` / `Distributary` / `Unknown`) — replaces a `bool` flag so call sites are self-documenting |
 | `AdjacencyRow` | `graph` | One node in the adjacency graph — atom ID and its upstream neighbour IDs |
 | `DrainageGraph` | `graph` | HashMap-indexed adjacency over all units; O(1) lookup by `UnitId`. Optimised for validation, not traversal — engines are expected to convert to CSR at load time |
-| `FlowDirEncoding` | `raster` | D8 convention enum (`Esri` / `Taudem`); stored in `RasterAvailability::Present` so encoding is only expressible when rasters actually exist |
+| `EpsgCode` | `raster` | Validated uppercase EPSG authority string for a raster CRS |
+| `FlowDirEncoding` | `raster` | D8 convention enum (`Esri` / `Taudem` / `Grass`) |
+| `FlowAccumulationUnits` | `raster` | Flow-accumulation units enum (`Cells` / `Km2`) |
+| `D8RasterMetadataV2` | `raster` | Typed parsing boundary for required D8 raster v2 metadata |
 | `Manifest` | `manifest` | Parsed `manifest.json`; constructed exclusively via `ManifestBuilder` |
 | `ManifestBuilder` | `manifest` | Builder for `Manifest` — required fields validated in `new()`, optional fields set via chainable `with_*` methods |
 | `HasBbox` | `lib` | Trait for generic spatial filtering over any artifact row type |

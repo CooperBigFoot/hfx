@@ -187,19 +187,29 @@ def write_catchments(
 
 
 def migrate_prebuilt_d8_fixture(out_dir: Path) -> None:
-    """Migrate a pre-built D8-raster fixture to format_version 0.3.0 in place.
+    """Migrate a pre-built D8-raster fixture to format v0.3.0 and D8 v2 in place.
 
     These fixtures ship hand-authored GeoTIFF rasters under aux/d8/ (committed
     binaries with no generator) plus a hand-written README, so they MUST NOT be
     reset_dir()'d. Only catchments.parquet (flat bbox -> struct covering) and
-    manifest.json::format_version are rewritten; the aux/ rasters, graph.parquet,
-    README.md, fabric_name, and the auxiliary[] d8 entries are preserved
-    byte-for-byte.
+    manifest declarations are rewritten; raster bytes, graph.parquet, README.md,
+    fabric_name, auxiliary artifact entry order, and artifact paths are preserved.
     """
     write_catchments(out_dir)
     manifest_path = out_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["format_version"] = "0.3.0"
+    for entry in manifest.get("auxiliary", []):
+        if entry.get("schema") in {
+            "hfx.aux.d8_raster.v1",
+            "hfx.aux.d8_raster.v2",
+        }:
+            entry["schema"] = "hfx.aux.d8_raster.v2"
+            entry["metadata"] = {
+                "crs": "EPSG:4326",
+                "flow_dir_encoding": "esri",
+                "flow_acc_units": "cells",
+            }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 

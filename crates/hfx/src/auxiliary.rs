@@ -33,7 +33,7 @@ pub enum AuxiliaryError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlessedAuxSchema {
     /// Paired D8 flow-direction and flow-accumulation rasters.
-    D8RasterV1,
+    D8RasterV2,
     /// Optional snap features for outlet snapping.
     SnapV2,
 }
@@ -41,7 +41,7 @@ pub enum BlessedAuxSchema {
 impl std::fmt::Display for BlessedAuxSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BlessedAuxSchema::D8RasterV1 => write!(f, "hfx.aux.d8_raster.v1"),
+            BlessedAuxSchema::D8RasterV2 => write!(f, "hfx.aux.d8_raster.v2"),
             BlessedAuxSchema::SnapV2 => write!(f, "hfx.aux.snap.v2"),
         }
     }
@@ -72,7 +72,7 @@ impl AuxiliarySchemaId {
             return Err(AuxiliaryError::EmptySchemaId);
         }
         match raw {
-            "hfx.aux.d8_raster.v1" => Ok(Self::Blessed(BlessedAuxSchema::D8RasterV1)),
+            "hfx.aux.d8_raster.v2" => Ok(Self::Blessed(BlessedAuxSchema::D8RasterV2)),
             "hfx.aux.snap.v2" => Ok(Self::Blessed(BlessedAuxSchema::SnapV2)),
             value if value.starts_with("hfx.aux.") => Err(AuxiliaryError::MalformedSchemaId {
                 value: value.to_owned(),
@@ -112,8 +112,8 @@ pub struct AuxiliaryDecl {
 impl AuxiliaryDecl {
     /// Construct an [`AuxiliaryDecl`] from a schema and artifact map.
     ///
-    /// Metadata is intentionally not modeled in `hfx`; schema-specific
-    /// metadata parsing belongs at the manifest deserialization boundary.
+    /// This declaration does not retain metadata. Schema-specific boundary
+    /// models such as [`crate::D8RasterMetadataV2`] live in their domain module.
     ///
     /// # Errors
     ///
@@ -154,9 +154,18 @@ mod tests {
     #[test]
     fn parse_blessed_d8_raster() {
         assert_eq!(
-            AuxiliarySchemaId::parse("hfx.aux.d8_raster.v1").unwrap(),
-            AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV1)
+            AuxiliarySchemaId::parse("hfx.aux.d8_raster.v2").unwrap(),
+            AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV2)
         );
+    }
+
+    #[test]
+    fn parse_legacy_d8_raster_v1_fails() {
+        assert!(matches!(
+            AuxiliarySchemaId::parse("hfx.aux.d8_raster.v1"),
+            Err(AuxiliaryError::MalformedSchemaId { value })
+                if value == "hfx.aux.d8_raster.v1"
+        ));
     }
 
     #[test]
@@ -210,7 +219,7 @@ mod tests {
         artifacts.insert("flow_dir".to_string(), String::new());
         assert!(matches!(
             AuxiliaryDecl::new(
-                AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV1),
+                AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV2),
                 artifacts
             ),
             Err(AuxiliaryError::EmptyArtifactPath { key }) if key == "flow_dir"

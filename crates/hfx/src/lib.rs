@@ -29,7 +29,10 @@ pub use manifest::{
     Crs, FormatVersion, Manifest, ManifestBuilder, ManifestError, Topology, UnitCount,
     UpAreaAvailability,
 };
-pub use raster::{FlowDirEncoding, FlowDirEncodingError};
+pub use raster::{
+    D8RasterMetadataV2, D8RasterMetadataV2Error, EpsgCode, EpsgCodeError, FlowAccumulationUnits,
+    FlowAccumulationUnitsError, FlowDirEncoding, FlowDirEncodingError,
+};
 pub use snap::{SnapError, SnapTarget, StemRole};
 
 /// Trait for types that carry a spatial bounding box.
