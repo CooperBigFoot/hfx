@@ -55,7 +55,8 @@ nav:
       - Specification: spec/HFX_SPEC.md
       - Manifest and schema: spec/manifest.md
       - Versioning: spec/versioning.md
-      - "Auxiliary: D8 raster v1": spec/aux/d8_raster/v1.md
+      - "Auxiliary: D8 raster v2": spec/aux/d8_raster/v2.md
+      - "Auxiliary: D8 raster v1 (historical)": spec/aux/d8_raster/v1.md
       - "Auxiliary: snap v2": spec/aux/snap/v2.md
       - "Auxiliary: snap v1 (historical)": spec/aux/snap/v1.md
       - Changelog: spec/CHANGELOG.md
