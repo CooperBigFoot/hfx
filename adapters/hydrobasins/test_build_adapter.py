@@ -217,6 +217,124 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
     )
 
 
+def _nested_args(root: Path) -> list[str]:
+    return [
+        *_selector_args(["--regions", "gr,af"], root),
+        "--levels",
+        "6-7",
+    ]
+
+
+def _write_nested_fixture(
+    root: Path,
+    *,
+    unresolved_greek_parent: bool = False,
+    missing_level_7_pour: bool = False,
+    duplicate_greek_parent: bool = False,
+) -> None:
+    extract_dir = root / "extract"
+    _write_layer(
+        extract_dir,
+        region="gr",
+        level=6,
+        ids=[6001, 6002],
+        pfaf_ids=[123456, 123456 if duplicate_greek_parent else 654321],
+        geometries=[box(0, 0, 1, 1), box(2, 0, 3, 1)],
+    )
+    _write_layer(
+        extract_dir,
+        region="gr",
+        level=7,
+        ids=[7001, 7002, 7003],
+        pfaf_ids=[
+            9999991 if unresolved_greek_parent else 1234561,
+            1234562,
+            6543211,
+        ],
+        geometries=[
+            box(0, 0, 0.4, 0.4),
+            box(0.6, 0.6, 1, 1),
+            box(2, 0, 3, 1),
+        ],
+    )
+    _write_layer(
+        extract_dir,
+        region="af",
+        level=6,
+        ids=[16001, 16002],
+        pfaf_ids=[999999 if unresolved_greek_parent else 123456, 777777],
+        geometries=[box(20, 0, 21, 1), box(22, 0, 23, 1)],
+    )
+    _write_layer(
+        extract_dir,
+        region="af",
+        level=7,
+        ids=[17001, 17002],
+        pfaf_ids=[
+            9999991 if unresolved_greek_parent else 1234563,
+            7777771,
+        ],
+        geometries=[box(20, 0, 21, 1), box(22, 0, 23, 1)],
+    )
+    _write_pour_points(
+        extract_dir / "pour",
+        level=6,
+        ids=[6001, 6001, 6002, 16001, 16002],
+        points=[
+            Point(0.25, 0.50),
+            Point(0.75, 0.50),
+            Point(2.50, 0.50),
+            Point(20.50, 0.50),
+            Point(22.50, 0.50),
+        ],
+    )
+    point_rows = [
+        (7001, Point(0.90, 0.90)),
+        (7002, Point(0.10, 0.10)),
+        (7003, Point(2.60, 0.50)),
+        (7003, Point(2.90, 0.90)),
+        (17001, Point(20.60, 0.60)),
+        (17002, Point(22.60, 0.60)),
+    ]
+    if missing_level_7_pour:
+        point_rows = [row for row in point_rows if row[0] != 7002]
+        point_rows.append((99999, Point(10, 10)))
+    _write_pour_points(
+        extract_dir / "pour",
+        level=7,
+        ids=[row[0] for row in point_rows],
+        points=[row[1] for row in point_rows],
+    )
+    _write_layer(
+        extract_dir,
+        region="gr",
+        level=12,
+        ids=[12001],
+        pfaf_ids=[123456100001],
+        geometries=[box(0, 0, 1, 1)],
+    )
+    _write_layer(
+        extract_dir,
+        region="af",
+        level=12,
+        ids=[12002],
+        pfaf_ids=[123456300001],
+        geometries=[box(20, 0, 21, 1)],
+    )
+    _write_pour_points(
+        extract_dir / "pour",
+        level=12,
+        ids=[12001, 12002],
+        points=[Point(0.5, 0.5), Point(20.5, 0.5)],
+    )
+
+
+def _prepare_nested(root: Path) -> dict[int, gpd.GeoDataFrame]:
+    args = build_adapter.build_arg_parser().parse_args(_nested_args(root))
+    regions = build_adapter.resolve_build_regions(args)
+    return build_adapter._prepare_level_frames(args, regions)
+
+
 def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
     basins_dir = root / "extract"
     pour_points_dir = basins_dir / "pour"
@@ -317,6 +435,214 @@ def _build_synthetic_dataset(
         if not (out_dir / filename).is_file():
             raise AssertionError(f"synthetic build did not create {filename}")
     return out_dir
+
+
+class MultiLevelBuildOrchestrationTests(unittest.TestCase):
+    def test_explicit_levels_load_every_region_layer_and_each_global_pour_layer_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root)
+            args = build_adapter.build_arg_parser().parse_args(_nested_args(root))
+            regions = build_adapter.resolve_build_regions(args)
+            with (
+                patch(
+                    "build_adapter.load_regional_layer",
+                    wraps=build_adapter.load_regional_layer,
+                ) as regional_loader,
+                patch(
+                    "build_adapter.load_pour_points",
+                    wraps=build_adapter.load_pour_points,
+                ) as pour_loader,
+            ):
+                prepared = build_adapter._prepare_level_frames(args, regions)
+
+            regional_calls = [
+                (call.args[0], call.kwargs["source_level"])
+                for call in regional_loader.call_args_list
+            ]
+            pour_calls = [
+                call.kwargs["source_level"]
+                for call in pour_loader.call_args_list
+            ]
+            self.assertEqual(
+                regional_calls,
+                [("gr", 6), ("af", 6), ("gr", 7), ("af", 7)],
+            )
+            self.assertEqual(pour_calls, [6, 7])
+            self.assertEqual(list(prepared), [6, 7])
+            self.assertEqual(set(prepared[6]["level"]), {0})
+            self.assertEqual(set(prepared[7]["level"]), {1})
+            self.assertEqual(set(prepared[6]["id"]), {6001, 6002, 16001, 16002})
+            self.assertEqual(set(prepared[7]["id"]), {7001, 7002, 7003, 17001, 17002})
+            for frame in prepared.values():
+                for column in ("id", "PFAF_ID", "NEXT_DOWN", "ENDO"):
+                    self.assertTrue(pd.api.types.is_integer_dtype(frame[column]))
+                self.assertEqual(frame["SUB_AREA"].dtype, np.dtype("float64"))
+                self.assertEqual(frame["UP_AREA"].dtype, np.dtype("float64"))
+                self.assertEqual(str(frame["parent_id"].dtype), "Int64")
+                self.assertEqual(frame["outlet_lon"].dtype, np.dtype("float64"))
+                self.assertEqual(frame["outlet_lat"].dtype, np.dtype("float64"))
+
+    def test_explicit_multi_level_build_stops_before_artifact_emission(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root)
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(_nested_args(root))
+            self.assertIn("multi-level artifact emission", str(caught.exception))
+            self.assertIn("deferred to M2-S3", str(caught.exception))
+            self.assertFalse((root / "out").exists())
+
+
+class NestedParentAssignmentTests(unittest.TestCase):
+    def test_explicit_levels_assign_region_scoped_prefix_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root)
+            prepared = _prepare_nested(root)
+            self.assertTrue(prepared[6]["parent_id"].isna().all())
+            parents = {
+                int(row.id): int(row.parent_id)
+                for row in prepared[7].itertuples(index=False)
+            }
+            self.assertEqual(
+                parents,
+                {7001: 6001, 7002: 6001, 7003: 6002, 17001: 16001, 17002: 16002},
+            )
+            self.assertEqual(
+                int(prepared[7].loc[prepared[7]["PFAF_ID"] == 1234561, "parent_id"].iloc[0]),
+                6001,
+            )
+            self.assertEqual(
+                int(prepared[7].loc[prepared[7]["PFAF_ID"] == 1234563, "parent_id"].iloc[0]),
+                16001,
+            )
+
+    def test_unresolved_parent_is_fatal_before_artifact_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root, unresolved_greek_parent=True)
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(_nested_args(root))
+            message = str(caught.exception)
+            for detail in ("7001", "9999991", "gr", "999999", "6", "7"):
+                self.assertIn(detail, message)
+            self.assertFalse((root / "out").exists())
+
+    def test_duplicate_coarser_pfaf_id_is_fatal_before_parent_resolution_or_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root, duplicate_greek_parent=True)
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(_nested_args(root))
+            message = str(caught.exception)
+            self.assertIn("duplicate PFAF_ID values", message)
+            self.assertIn("123456", message)
+            self.assertFalse((root / "out").exists())
+
+
+class LevelSpecificOutletTests(unittest.TestCase):
+    def test_each_level_uses_its_own_global_pour_points_and_independent_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root)
+            prepared = _prepare_nested(root)
+            outlets_6 = {
+                int(row.id): (float(row.outlet_lon), float(row.outlet_lat))
+                for row in prepared[6].itertuples(index=False)
+            }
+            outlets_7 = {
+                int(row.id): (float(row.outlet_lon), float(row.outlet_lat))
+                for row in prepared[7].itertuples(index=False)
+            }
+            self.assertEqual(outlets_6[6001], (0.25, 0.50))
+            self.assertNotIn(outlets_6[6001], {outlets_7[7001], outlets_7[7002]})
+            self.assertEqual(
+                outlets_7,
+                {
+                    7001: (0.90, 0.90),
+                    7002: (0.10, 0.10),
+                    7003: (2.60, 0.50),
+                    17001: (20.60, 0.60),
+                    17002: (22.60, 0.60),
+                },
+            )
+
+    def test_missing_pour_point_at_any_selected_level_is_fatal_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root, missing_level_7_pour=True)
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter.main(_nested_args(root))
+            message = str(caught.exception)
+            self.assertIn("7002", message)
+            self.assertNotIn("99999", message)
+            self.assertFalse((root / "out").exists())
+
+    def test_per_level_polygon_and_pour_layers_clamp_before_parent_and_outlet_joins(self) -> None:
+        tolerance = build_adapter.COORDINATE_DOMAIN_TOLERANCE_DEGREES
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_nested_fixture(root)
+            _write_layer(
+                root / "extract",
+                region="gr",
+                level=6,
+                ids=[6001, 6002],
+                pfaf_ids=[123456, 654321],
+                geometries=[
+                    box(179.5, 0, 180 + tolerance / 2, 1),
+                    box(2, 0, 3, 1),
+                ],
+            )
+            _write_pour_points(
+                root / "extract" / "pour",
+                level=6,
+                ids=[6001, 6002, 16001, 16002],
+                points=[
+                    Point(180 + tolerance / 2, 0.5),
+                    Point(2.5, 0.5),
+                    Point(20.5, 0.5),
+                    Point(22.5, 0.5),
+                ],
+            )
+            prepared = _prepare_nested(root)
+            unit = prepared[6].loc[prepared[6]["id"] == 6001].iloc[0]
+            self.assertEqual(unit.geometry.bounds[2], 180.0)
+            self.assertEqual(unit.outlet_lon, 180.0)
+
+        for layer in ("polygon", "pour"):
+            with self.subTest(layer=layer), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _write_nested_fixture(root)
+                if layer == "polygon":
+                    _write_layer(
+                        root / "extract",
+                        region="gr",
+                        level=6,
+                        ids=[6001, 6002],
+                        pfaf_ids=[123456, 654321],
+                        geometries=[
+                            box(179.5, 0, 180 + tolerance * 2, 1),
+                            box(2, 0, 3, 1),
+                        ],
+                    )
+                else:
+                    _write_pour_points(
+                        root / "extract" / "pour",
+                        level=6,
+                        ids=[6001, 6002, 16001, 16002],
+                        points=[
+                            Point(180 + tolerance * 2, 0.5),
+                            Point(2.5, 0.5),
+                            Point(20.5, 0.5),
+                            Point(22.5, 0.5),
+                        ],
+                    )
+                with self.assertRaises(build_adapter.AdapterError) as caught:
+                    build_adapter.main(_nested_args(root))
+                self.assertIn("coordinate-domain", str(caught.exception))
+                self.assertFalse((root / "out").exists())
 
 
 class LevelRangeTests(unittest.TestCase):
