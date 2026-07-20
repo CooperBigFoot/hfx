@@ -182,6 +182,18 @@ def _integer_grid_offset(value: float, source_path: Path, invariant: str) -> int
     return int(rounded)
 
 
+def _nodata_values_equal(left: int | float, right: int | float) -> bool:
+    """Compare scalar nodata values while treating two NaNs as equal."""
+    return (math.isnan(left) and math.isnan(right)) or left == right
+
+
+def _nodata_mask(values: np.ndarray, nodata: int | float) -> np.ndarray:
+    """Locate nodata cells while supporting NaN family nodata."""
+    if math.isnan(nodata):
+        return np.isnan(values)
+    return values == nodata
+
+
 def _validate_raster_sources(
     source_paths: Sequence[Path],
     expected_dtype: str,
@@ -267,11 +279,13 @@ def _validate_raster_sources(
 
     common_nodata_path, common_nodata = tagged_nodata[0]
     for source_path, source_nodata in tagged_nodata[1:]:
-        if source_nodata != common_nodata:
+        if not _nodata_values_equal(source_nodata, common_nodata):
             raise AdapterError(
                 f"source {source_path} has nodata {source_nodata}, expected common nodata {common_nodata}"
             )
-    if required_nodata is not None and common_nodata != required_nodata:
+    if required_nodata is not None and not _nodata_values_equal(
+        common_nodata, required_nodata
+    ):
         raise AdapterError(
             f"source {common_nodata_path} has nodata {common_nodata}, "
             f"expected required nodata {required_nodata} for {artifact_name}"
@@ -296,7 +310,7 @@ def _validate_raster_sources(
                     else:
                         invalid = (
                             ((values < minimum) | (values > maximum))
-                            & (values != common_nodata)
+                            & ~_nodata_mask(values, common_nodata)
                         )
                         if np.any(invalid):
                             invalid_value = values[invalid][0].item()
@@ -306,7 +320,7 @@ def _validate_raster_sources(
                                 f"and declared nodata {common_nodata}"
                             )
                 elif source_path in tagless_source_set and np.any(
-                    values == common_nodata
+                    _nodata_mask(values, common_nodata)
                 ):
                     raise AdapterError(
                         f"tag-less {artifact_name} source {source_path} contains the family's "
@@ -448,7 +462,7 @@ def build_d8_raster_pair(
         valid_data_range=(0, 8),
     )
     accumulation_layout = _validate_raster_sources(
-        accumulation_sources, "int32", "flow_acc"
+        accumulation_sources, "float32", "flow_acc"
     )
 
     direction_output = output_dir / "flow_dir.tif"
