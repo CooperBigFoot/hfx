@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -47,6 +48,71 @@ LOGGER = logging.getLogger(__name__)
 
 class AdapterError(RuntimeError):
     """Report a HydroBASINS source-contract violation."""
+
+
+@dataclass(frozen=True)
+class LevelRange:
+    """Represent one inclusive contiguous source-Pfaf level range."""
+
+    minimum: int
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if self.minimum < 1 or self.maximum > 12:
+            raise AdapterError("levels must be within 1-12")
+        if self.minimum > self.maximum:
+            raise AdapterError("level range must be ascending")
+
+    @property
+    def source_levels(self) -> tuple[int, ...]:
+        """Return the selected source Pfaf levels in ascending order."""
+        return tuple(range(self.minimum, self.maximum + 1))
+
+    def hfx_level(self, pfaf_level: int) -> int:
+        """Map one contained source Pfaf level to its zero-based HFX level."""
+        if pfaf_level < self.minimum or pfaf_level > self.maximum:
+            raise AdapterError(
+                f"source Pfaf level {pfaf_level} is outside selected range "
+                f"{self.minimum}-{self.maximum}"
+            )
+        return pfaf_level - self.minimum
+
+
+def parse_level_range(value: str) -> LevelRange:
+    """Parse a singleton or contiguous inclusive source-Pfaf range."""
+    match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", value)
+    if match is None:
+        raise AdapterError(
+            f"invalid --levels '{value}': expected a singleton N or contiguous range N-M"
+        )
+    minimum = int(match.group(1))
+    maximum = int(match.group(2) or match.group(1))
+    if minimum < 1 or maximum > 12:
+        raise AdapterError(
+            f"invalid --levels '{value}': levels must be within 1-12"
+        )
+    if minimum > maximum:
+        raise AdapterError(
+            f"invalid --levels '{value}': range must be ascending"
+        )
+    return LevelRange(minimum, maximum)
+
+
+class _UniqueLevelRangeAction(argparse.Action):
+    """Store one level selector while rejecting repeated occurrences."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: LevelRange,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        if getattr(namespace, "_levels_seen", False):
+            raise AdapterError("--levels may be specified only once")
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_levels_seen", True)
 
 
 def _clamp_coordinate_domain(
@@ -241,26 +307,24 @@ def _write_table(
             writer.write_table(table.slice(start, stop - start))
 
 
-def _source_path(region: str, basins_dir: Path) -> Path:
-    filename = f"hybas_{region}_lev12_v1.shp"
-    matches = sorted(basins_dir.glob(filename))
-    if len(matches) != 1:
+def _source_path(region: str, basins_dir: Path, source_level: int) -> Path:
+    filename = f"hybas_{region}_lev{source_level:02d}_v1c.shp"
+    source_path = basins_dir / f"hybas_{region}" / filename
+    if not source_path.is_file():
         raise AdapterError(
-            f"expected exactly one {filename} layer under {basins_dir}, "
-            f"found {len(matches)}"
+            f"expected exactly one {source_path} layer under {source_path.parent}, found 0"
         )
-    return matches[0]
+    return source_path
 
 
-def _pour_points_source_path(pour_points_dir: Path) -> Path:
-    filename = "hybas_pour_lev12_v1.shp"
-    matches = sorted(pour_points_dir.rglob(filename))
-    if len(matches) != 1:
+def _pour_points_source_path(pour_points_dir: Path, source_level: int) -> Path:
+    filename = f"hybas_pour_lev{source_level:02d}_v1.shp"
+    source_path = pour_points_dir / filename
+    if not source_path.is_file():
         raise AdapterError(
-            f"expected exactly one {filename} layer under {pour_points_dir}, "
-            f"found {len(matches)}"
+            f"expected exactly one {filename} layer under {pour_points_dir}, found 0"
         )
-    return matches[0]
+    return source_path
 
 
 def _rivers_source_path(rivers_dir: Path) -> Path:
@@ -387,26 +451,32 @@ def _normalize_topology_integers(
 
 
 def _hilbert_sort(units: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Sort units stably by centroid Hilbert distance and ID."""
+    """Sort units stably by level, complete-union Hilbert distance, and ID."""
     sorted_units = units.copy()
     sorted_units["_hilbert"] = sorted_units.geometry.centroid.hilbert_distance(
-        total_bounds=sorted_units.total_bounds
+        total_bounds=sorted_units.geometry.total_bounds
     )
     sorted_units = sorted_units.sort_values(
-        ["_hilbert", "id"], kind="mergesort"
+        ["level", "_hilbert", "id"], kind="mergesort"
     )
     return sorted_units.drop(columns=["_hilbert"]).reset_index(drop=True)
 
 
-def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
-    """Load and normalize one HydroBASINS Pfaf-12 regional polygon layer."""
-    source_path = _source_path(region, basins_dir)
+def load_regional_layer(
+    region: str,
+    basins_dir: Path,
+    *,
+    source_level: int,
+    levels: LevelRange,
+) -> gpd.GeoDataFrame:
+    """Load and normalize one regional HydroBASINS source-Pfaf layer."""
+    source_path = _source_path(region, basins_dir, source_level)
     try:
         units = gpd.read_file(source_path, engine="pyogrio")
     except Exception as error:
         raise AdapterError(f"failed to read HydroBASINS layer {source_path}: {error}") from error
 
-    required = {"HYBAS_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"}
+    required = {"HYBAS_ID", "PFAF_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"}
     missing = sorted(required - set(units.columns))
     if missing:
         raise AdapterError(f"HydroBASINS layer missing required columns: {missing}")
@@ -445,7 +515,12 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
         raise AdapterError("non-polygonal geometries remain after coordinate clamp")
 
     units["id"] = _normalize_ids(units["HYBAS_ID"])
-    units["level"] = pd.Series(0, index=units.index, dtype="int64")
+    units["PFAF_ID"] = _normalize_ids(
+        units["PFAF_ID"], source_name="PFAF_ID"
+    )
+    units["level"] = pd.Series(
+        levels.hfx_level(source_level), index=units.index, dtype="int64"
+    )
     units["parent_id"] = pd.Series(pd.NA, index=units.index, dtype="Int64")
     units["area_km2"] = _normalize_area(units["SUB_AREA"], "SUB_AREA")
     units["up_area_km2"] = _normalize_area(units["UP_AREA"], "UP_AREA")
@@ -463,9 +538,13 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     return _hilbert_sort(units)
 
 
-def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
-    """Load and normalize the HydroBASINS Pfaf-12 ancillary pour points."""
-    source_path = _pour_points_source_path(pour_points_dir)
+def load_pour_points(
+    pour_points_dir: Path,
+    *,
+    source_level: int,
+) -> gpd.GeoDataFrame:
+    """Load and normalize one HydroBASINS ancillary pour-point level."""
+    source_path = _pour_points_source_path(pour_points_dir, source_level)
     try:
         pour_points = gpd.read_file(source_path, engine="pyogrio")
     except Exception as error:
@@ -824,7 +903,7 @@ def write_catchments(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     columns = [
         pa.array(units["id"].to_numpy(), type=pa.int64()),
         pa.array(units["level"].to_numpy(dtype="int16"), type=pa.int16()),
-        pa.nulls(row_count, type=pa.int64()),
+        pa.array(units["parent_id"], type=pa.int64(), from_pandas=True),
         pa.array(units["area_km2"].to_numpy(dtype="float32"), type=pa.float32()),
         pa.array(
             units["up_area_km2"].to_numpy(dtype="float32"),
@@ -867,38 +946,52 @@ def _assert_acyclic(outgoing: dict[int, int]) -> None:
         visited.update(path)
 
 
+def _build_level_upstream(units: gpd.GeoDataFrame) -> dict[int, list[int]]:
+    """Build and validate upstream adjacency independently for every HFX level."""
+    unit_ids = [int(identifier) for identifier in units["id"]]
+    upstream: dict[int, list[int]] = {identifier: [] for identifier in unit_ids}
+    for level, level_units in units.groupby("level", sort=True):
+        hfx_level = int(level)
+        id_set = set(int(identifier) for identifier in level_units["id"])
+        outgoing: dict[int, int] = {}
+        for unit in level_units.itertuples(index=False):
+            source_id = int(unit.id)
+            downstream_id = int(unit.NEXT_DOWN)
+            endo = int(unit.ENDO)
+            if downstream_id == 0:
+                continue
+            if downstream_id < 0:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has negative "
+                    f"NEXT_DOWN value {downstream_id}"
+                )
+            if downstream_id == source_id:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has a topology "
+                    "self-link cycle"
+                )
+            if endo == 2:
+                continue
+            if downstream_id not in id_set:
+                raise AdapterError(
+                    f"HFX level {hfx_level}: unit {source_id} has downstream ID "
+                    f"{downstream_id}, which is absent from this level"
+                )
+            outgoing[source_id] = downstream_id
+            upstream[downstream_id].append(source_id)
+        try:
+            _assert_acyclic(outgoing)
+        except AdapterError as error:
+            raise AdapterError(f"HFX level {hfx_level}: {error}") from error
+    for identifiers in upstream.values():
+        identifiers.sort()
+    return upstream
+
+
 def write_graph(units: gpd.GeoDataFrame, out_dir: Path) -> Path:
     """Write the cut, acyclic HydroBASINS tree as HFX graph Parquet."""
     unit_ids = [int(identifier) for identifier in units["id"]]
-    id_set = set(unit_ids)
-    upstream: dict[int, list[int]] = {identifier: [] for identifier in unit_ids}
-    outgoing: dict[int, int] = {}
-
-    for unit in units.itertuples(index=False):
-        source_id = int(unit.id)
-        downstream_id = int(unit.NEXT_DOWN)
-        endo = int(unit.ENDO)
-        if downstream_id == 0:
-            continue
-        if endo == 2:
-            continue
-        if downstream_id < 0:
-            raise AdapterError(
-                f"unit {source_id} has negative NEXT_DOWN value {downstream_id}"
-            )
-        if downstream_id == source_id:
-            raise AdapterError(f"unit {source_id} has a topology self-link cycle")
-        if downstream_id not in id_set:
-            raise AdapterError(
-                f"unit {source_id} has downstream ID {downstream_id}, "
-                "which is absent from this dataset"
-            )
-        outgoing[source_id] = downstream_id
-        upstream[downstream_id].append(source_id)
-
-    _assert_acyclic(outgoing)
-    for identifiers in upstream.values():
-        identifiers.sort()
+    upstream = _build_level_upstream(units)
 
     bounds = units.reset_index(drop=True).geometry.bounds
     list_type = pa.list_(pa.field("item", pa.int64(), nullable=True))
@@ -990,6 +1083,7 @@ def write_manifest(
     region_label: str,
     planetary: bool,
     snap_path: Path | None = None,
+    snap_references_level: int | None = None,
 ) -> Path:
     """Write the HFX dataset manifest with regional or planetary semantics."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1012,6 +1106,8 @@ def write_manifest(
             float(np.float32(v)) for v in units.geometry.total_bounds
         ]
     if snap_path is not None:
+        if snap_references_level is None:
+            raise AdapterError("snap reference level is required when snap is present")
         manifest["auxiliary"] = [
             {
                 "schema": "hfx.aux.snap.v2",
@@ -1019,7 +1115,7 @@ def write_manifest(
                 "metadata": {
                     "name": "stems",
                     "description": "Unclipped HydroRIVERS reach centerlines for HydroBASINS Pfaf-12 snapping. HydroRIVERS and HydroBASINS are HydroSHEDS products covered by the HydroSHEDS License Agreement. weight = UPLAND_SKM (km^2). stem_role = mainstem/tributary derived from NEXT_DOWN confluences.",
-                    "references_levels": [0],
+                    "references_levels": [snap_references_level],
                     "weight_semantics": "drainage_area_km2",
                 },
             }
@@ -1055,7 +1151,11 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
     regions = [
         code
         for code in STANDARD_REGION_CODES
-        if (args.basins / f"hybas_{code}_lev12_v1.shp").is_file()
+        if (
+            args.basins
+            / f"hybas_{code}"
+            / f"hybas_{code}_lev12_v1c.shp"
+        ).is_file()
     ]
     if not regions:
         raise AdapterError(
@@ -1064,30 +1164,123 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
     return regions
 
 
+def _assign_parent_ids(
+    region: str,
+    child_units: gpd.GeoDataFrame,
+    parent_units: gpd.GeoDataFrame,
+    *,
+    parent_source_level: int,
+    child_source_level: int,
+) -> gpd.GeoDataFrame:
+    """Resolve each child's decimal-prefix parent within one region."""
+    duplicate_codes = sorted(
+        int(code)
+        for code in parent_units.loc[
+            parent_units["PFAF_ID"].duplicated(keep=False), "PFAF_ID"
+        ].unique()
+    )
+    if duplicate_codes:
+        raise AdapterError(
+            f"region {region} source levels {parent_source_level}-{child_source_level} "
+            f"contain ambiguous parent PFAF_ID values: {duplicate_codes}"
+        )
+
+    parent_by_prefix = {
+        int(row.PFAF_ID): int(row.id)
+        for row in parent_units.itertuples(index=False)
+    }
+    parent_ids: list[int] = []
+    unresolved: list[tuple[int, int, int]] = []
+    for child in child_units.itertuples(index=False):
+        child_id = int(child.id)
+        child_pfaf = int(child.PFAF_ID)
+        prefix = child_pfaf // 10
+        parent_id = parent_by_prefix.get(prefix)
+        if parent_id is None:
+            unresolved.append((child_id, child_pfaf, prefix))
+        else:
+            parent_ids.append(parent_id)
+    if unresolved:
+        details = ", ".join(
+            f"child HYBAS_ID {child_id}, child PFAF_ID {child_pfaf}, "
+            f"missing prefix {prefix}"
+            for child_id, child_pfaf, prefix in sorted(unresolved)
+        )
+        raise AdapterError(
+            f"unresolved parent in region {region} between source levels "
+            f"{parent_source_level}-{child_source_level}: {details}"
+        )
+
+    assigned = child_units.copy()
+    assigned["parent_id"] = pd.Series(
+        parent_ids,
+        index=assigned.index,
+        dtype="Int64",
+    )
+    return assigned
+
+
+def _prepare_level_frames(
+    args: argparse.Namespace,
+    regions: list[str],
+) -> dict[int, gpd.GeoDataFrame]:
+    """Prepare normalized, parented, and outleted frames by source Pfaf level."""
+    prepared: dict[int, gpd.GeoDataFrame] = {}
+    previous_by_region: dict[str, gpd.GeoDataFrame] = {}
+    for source_level in args.levels.source_levels:
+        pour_points = load_pour_points(
+            args.pour_points,
+            source_level=source_level,
+        )
+        regional_frames: list[gpd.GeoDataFrame] = []
+        current_by_region: dict[str, gpd.GeoDataFrame] = {}
+        for region in regions:
+            units = load_regional_layer(
+                region,
+                args.basins,
+                source_level=source_level,
+                levels=args.levels,
+            )
+            if previous_by_region:
+                units = _assign_parent_ids(
+                    region,
+                    units,
+                    previous_by_region[region],
+                    parent_source_level=source_level - 1,
+                    child_source_level=source_level,
+                )
+            assigned = assign_outlets(units, pour_points)
+            regional_frames.append(assigned)
+            current_by_region[region] = assigned
+
+        merged = gpd.GeoDataFrame(
+            pd.concat(regional_frames, ignore_index=True),
+            geometry="geometry",
+            crs=CRS,
+        )
+        duplicates = sorted(
+            int(identifier)
+            for identifier in merged.loc[
+                merged["id"].duplicated(keep=False), "id"
+            ].unique()
+        )
+        if duplicates:
+            raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
+        prepared[source_level] = merged
+        previous_by_region = current_by_region
+    return prepared
+
+
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
-    regions = resolve_build_regions(args)
-    assigned_frames: list[gpd.GeoDataFrame] = []
-    rivers_frames: list[gpd.GeoDataFrame] = []
-    for region_index, region in enumerate(regions):
-        units = load_region_units(region, args.basins)
-        pour_points_dir = (
-            args.pour_points if args.region is not None else args.pour_points / region
+    if args.rivers is not None and 12 not in args.levels.source_levels:
+        raise AdapterError(
+            "--rivers requires --levels to include source Pfaf level 12"
         )
-        pour_points = load_pour_points(pour_points_dir)
-        assigned_frames.append(assign_outlets(units, pour_points))
-        if args.rivers is not None:
-            rivers_dir = (
-                args.rivers if args.region is not None else args.rivers / region
-            )
-            rivers = load_rivers(rivers_dir)
-            roles = _stem_roles(rivers)
-            rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
-            rivers["_region_index"] = region_index
-            rivers_frames.append(rivers)
-
+    regions = resolve_build_regions(args)
+    prepared = _prepare_level_frames(args, regions)
     units = gpd.GeoDataFrame(
-        pd.concat(assigned_frames, ignore_index=True),
+        pd.concat([prepared[level] for level in sorted(prepared)], ignore_index=True),
         geometry="geometry",
         crs=CRS,
     )
@@ -1099,9 +1292,21 @@ def build_dataset(args: argparse.Namespace) -> None:
     )
     if duplicates:
         raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
+    rivers_frames: list[gpd.GeoDataFrame] = []
+    for region_index, region in enumerate(regions):
+        if args.rivers is not None:
+            rivers_dir = (
+                args.rivers if args.region is not None else args.rivers / region
+            )
+            rivers = load_rivers(rivers_dir)
+            roles = _stem_roles(rivers)
+            rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
+            rivers["_region_index"] = region_index
+            rivers_frames.append(rivers)
 
     units = _hilbert_sort(units)
     guard_antimeridian(units, strict_build=args.strict_build)
+    _build_level_upstream(units)
     snap_rivers: gpd.GeoDataFrame | None = None
     if args.rivers is not None:
         rivers = gpd.GeoDataFrame(
@@ -1109,9 +1314,9 @@ def build_dataset(args: argparse.Namespace) -> None:
             geometry="geometry",
             crs=CRS,
         )
-        merged_unit_ids = set(int(identifier) for identifier in units["id"])
+        pfaf_12_unit_ids = set(int(identifier) for identifier in prepared[12]["id"])
         snap_rivers = rivers.loc[
-            rivers["HYBAS_L12"].isin(merged_unit_ids)
+            rivers["HYBAS_L12"].isin(pfaf_12_unit_ids)
         ].copy()
         dropped = len(rivers) - len(snap_rivers)
         LOGGER.info(
@@ -1121,21 +1326,24 @@ def build_dataset(args: argparse.Namespace) -> None:
     write_catchments(units, args.out)
     write_graph(units, args.out)
     snap_path = None
+    snap_references_level = None
     if snap_rivers is not None:
         snap_path = write_snap_stems(snap_rivers, units, args.out)
+        snap_references_level = args.levels.hfx_level(12)
     write_manifest(
         units,
         args.out,
         region_label=",".join(regions),
         planetary=args.planetary,
         snap_path=snap_path,
+        snap_references_level=snap_references_level,
     )
 
 
 def extract_dataset(args: argparse.Namespace) -> None:
     """Inspect one regional polygon layer and its ancillary pour points."""
-    basins_path = _source_path(args.region, args.basins)
-    pour_points_path = _pour_points_source_path(args.pour_points)
+    basins_path = _source_path(args.region, args.basins, 12)
+    pour_points_path = _pour_points_source_path(args.pour_points, 12)
 
     try:
         basins = gpd.read_file(basins_path, engine="pyogrio")
@@ -1216,10 +1424,10 @@ def validate_dataset(dataset: Path, report_dir: Path) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the HydroBASINS adapter command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Build standard without-lakes HydroBASINS Pfaf-12 HFX datasets."
+        description="Build standard without-lakes HydroBASINS source-Pfaf HFX datasets."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    build = subparsers.add_parser("build", help="build a Pfaf-12 dataset")
+    build = subparsers.add_parser("build", help="build a source-Pfaf range dataset")
     region_selector = build.add_mutually_exclusive_group(required=True)
     region_selector.add_argument("--region", help="HydroBASINS region code")
     region_selector.add_argument(
@@ -1236,13 +1444,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basins",
         type=Path,
         required=True,
-        help="directory containing the regional Pfaf-12 polygon layer",
+        help="extract/ directory containing canonical regional polygon layers",
     )
     build.add_argument(
         "--pour-points",
         type=Path,
         required=True,
-        help="directory containing hybas_pour_lev12_v1.shp",
+        help="global extract/pour/ directory containing canonical pour layers",
+    )
+    build.add_argument(
+        "--levels",
+        type=parse_level_range,
+        action=_UniqueLevelRangeAction,
+        default="1-12",
+        help="singleton or contiguous source-Pfaf range N or N-M",
     )
     build.add_argument(
         "--rivers",
@@ -1272,13 +1487,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basins",
         type=Path,
         required=True,
-        help="directory containing the regional Pfaf-12 polygon layer",
+        help="extract/ directory containing the regional Pfaf-12 polygon layer",
     )
     extract.add_argument(
         "--pour-points",
         type=Path,
         required=True,
-        help="directory containing hybas_pour_lev12_v1.shp",
+        help="global extract/pour/ directory containing hybas_pour_lev12_v1.shp",
     )
     validate = subparsers.add_parser(
         "validate", help="run strict validation and persist reports"
