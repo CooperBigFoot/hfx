@@ -1147,25 +1147,124 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
     return regions
 
 
+def _assign_parent_ids(
+    region: str,
+    child_units: gpd.GeoDataFrame,
+    parent_units: gpd.GeoDataFrame,
+    *,
+    parent_source_level: int,
+    child_source_level: int,
+) -> gpd.GeoDataFrame:
+    """Resolve each child's decimal-prefix parent within one region."""
+    duplicate_codes = sorted(
+        int(code)
+        for code in parent_units.loc[
+            parent_units["PFAF_ID"].duplicated(keep=False), "PFAF_ID"
+        ].unique()
+    )
+    if duplicate_codes:
+        raise AdapterError(
+            f"region {region} source levels {parent_source_level}-{child_source_level} "
+            f"contain ambiguous parent PFAF_ID values: {duplicate_codes}"
+        )
+
+    parent_by_prefix = {
+        int(row.PFAF_ID): int(row.id)
+        for row in parent_units.itertuples(index=False)
+    }
+    parent_ids: list[int] = []
+    unresolved: list[tuple[int, int, int]] = []
+    for child in child_units.itertuples(index=False):
+        child_id = int(child.id)
+        child_pfaf = int(child.PFAF_ID)
+        prefix = child_pfaf // 10
+        parent_id = parent_by_prefix.get(prefix)
+        if parent_id is None:
+            unresolved.append((child_id, child_pfaf, prefix))
+        else:
+            parent_ids.append(parent_id)
+    if unresolved:
+        details = ", ".join(
+            f"child HYBAS_ID {child_id}, child PFAF_ID {child_pfaf}, "
+            f"missing prefix {prefix}"
+            for child_id, child_pfaf, prefix in sorted(unresolved)
+        )
+        raise AdapterError(
+            f"unresolved parent in region {region} between source levels "
+            f"{parent_source_level}-{child_source_level}: {details}"
+        )
+
+    assigned = child_units.copy()
+    assigned["parent_id"] = pd.Series(
+        parent_ids,
+        index=assigned.index,
+        dtype="Int64",
+    )
+    return assigned
+
+
+def _prepare_level_frames(
+    args: argparse.Namespace,
+    regions: list[str],
+) -> dict[int, gpd.GeoDataFrame]:
+    """Prepare normalized, parented, and outleted frames by source Pfaf level."""
+    prepared: dict[int, gpd.GeoDataFrame] = {}
+    previous_by_region: dict[str, gpd.GeoDataFrame] = {}
+    for source_level in args.levels.source_levels:
+        pour_points = load_pour_points(
+            args.pour_points,
+            source_level=source_level,
+        )
+        regional_frames: list[gpd.GeoDataFrame] = []
+        current_by_region: dict[str, gpd.GeoDataFrame] = {}
+        for region in regions:
+            units = load_regional_layer(
+                region,
+                args.basins,
+                source_level=source_level,
+                levels=args.levels,
+            )
+            if previous_by_region:
+                units = _assign_parent_ids(
+                    region,
+                    units,
+                    previous_by_region[region],
+                    parent_source_level=source_level - 1,
+                    child_source_level=source_level,
+                )
+            assigned = assign_outlets(units, pour_points)
+            regional_frames.append(assigned)
+            current_by_region[region] = assigned
+
+        merged = gpd.GeoDataFrame(
+            pd.concat(regional_frames, ignore_index=True),
+            geometry="geometry",
+            crs=CRS,
+        )
+        duplicates = sorted(
+            int(identifier)
+            for identifier in merged.loc[
+                merged["id"].duplicated(keep=False), "id"
+            ].unique()
+        )
+        if duplicates:
+            raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
+        prepared[source_level] = merged
+        previous_by_region = current_by_region
+    return prepared
+
+
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
     regions = resolve_build_regions(args)
-    source_level = 12
-    compatibility_levels = LevelRange(12, 12)
-    pour_points = load_pour_points(
-        args.pour_points,
-        source_level=source_level,
-    )
-    assigned_frames: list[gpd.GeoDataFrame] = []
+    prepared = _prepare_level_frames(args, regions)
+    if len(prepared) > 1:
+        raise AdapterError(
+            "multi-level artifact emission is deferred to M2-S3"
+        )
+    units = next(iter(prepared.values()))
     rivers_frames: list[gpd.GeoDataFrame] = []
     for region_index, region in enumerate(regions):
-        units = load_regional_layer(
-            region,
-            args.basins,
-            source_level=source_level,
-            levels=compatibility_levels,
-        )
-        assigned_frames.append(assign_outlets(units, pour_points))
         if args.rivers is not None:
             rivers_dir = (
                 args.rivers if args.region is not None else args.rivers / region
@@ -1175,20 +1274,6 @@ def build_dataset(args: argparse.Namespace) -> None:
             rivers["stem_role"] = rivers["HYRIV_ID"].map(roles)
             rivers["_region_index"] = region_index
             rivers_frames.append(rivers)
-
-    units = gpd.GeoDataFrame(
-        pd.concat(assigned_frames, ignore_index=True),
-        geometry="geometry",
-        crs=CRS,
-    )
-    duplicates = sorted(
-        int(identifier)
-        for identifier in units.loc[
-            units["id"].duplicated(keep=False), "id"
-        ].unique()
-    )
-    if duplicates:
-        raise AdapterError(f"duplicate HYBAS_ID values: {duplicates}")
 
     units = _hilbert_sort(units)
     guard_antimeridian(units, strict_build=args.strict_build)
