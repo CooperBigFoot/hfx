@@ -368,18 +368,27 @@ def generate_valid_tiny() -> None:
     write_readme(out, "Valid tiny v0.3.0 fixture", "none")
 
 
-def write_projected_d8_cogs(out_dir: Path) -> None:
+def write_projected_d8_cogs(
+    out_dir: Path,
+    *,
+    flow_dir_dtype: str = "int8",
+    flow_dir_nodata: int | float | None = -128,
+    flow_acc_dtype: str = "int32",
+    flow_acc_nodata: int | float | None = -2147483648,
+) -> None:
     raster_dir = out_dir / "aux" / "d8" / "projected"
     raster_dir.mkdir(parents=True)
 
     rows, cols = np.indices((256, 256))
-    flow_dir = ((rows + cols) % 8 + 1).astype(np.int8)
+    flow_dir = ((rows + cols) % 8 + 1).astype(flow_dir_dtype)
     flow_dir[0, :] *= -1
     flow_dir[128, 128] = 0
-    flow_dir[255, 255] = -128
+    if flow_dir_nodata is not None:
+        flow_dir[255, 255] = flow_dir_nodata
 
-    flow_acc = (rows * 256 + cols + 1).astype(np.int32)
-    flow_acc[255, 255] = -2147483648
+    flow_acc = (rows * 256 + cols + 1).astype(flow_acc_dtype)
+    if flow_acc_nodata is not None:
+        flow_acc[255, 255] = flow_acc_nodata
 
     common = {
         "mode": "w",
@@ -395,13 +404,16 @@ def write_projected_d8_cogs(out_dir: Path) -> None:
         "overviews": "NONE",
     }
     with rasterio.open(
-        raster_dir / "flow_dir.tif", dtype=np.int8, nodata=-128, **common
+        raster_dir / "flow_dir.tif",
+        dtype=flow_dir_dtype,
+        nodata=flow_dir_nodata,
+        **common,
     ) as dataset:
         dataset.write(flow_dir, 1)
     with rasterio.open(
         raster_dir / "flow_acc.tif",
-        dtype=np.int32,
-        nodata=-2147483648,
+        dtype=flow_acc_dtype,
+        nodata=flow_acc_nodata,
         **common,
     ) as dataset:
         dataset.write(flow_acc, 1)
@@ -437,6 +449,225 @@ def generate_valid_projected_grass_d8() -> None:
         "This fixture contains core catchment and graph data in EPSG:4326.\n"
         "Its D8 auxiliary pair uses an EPSG:8857 grid, GRASS flow-direction encoding, and integer square-kilometer flow accumulation.\n"
         "Expected diagnostic: `none`.\n"
+    )
+
+
+def generate_invalid_d8_missing_crs() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-missing-crs"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-missing-crs",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "km2",
+                },
+            }
+        ],
+    )
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with missing CRS metadata",
+        "auxiliary.d8_raster_metadata",
+    )
+
+
+def generate_invalid_d8_malformed_crs() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-malformed-crs"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-malformed-crs",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "epsg:8857",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "km2",
+                },
+            }
+        ],
+    )
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with malformed CRS metadata",
+        "auxiliary.d8_raster_metadata",
+    )
+
+
+def generate_invalid_d8_crs_mismatch() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-crs-mismatch"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-crs-mismatch",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "EPSG:4326",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "km2",
+                },
+            }
+        ],
+    )
+    write_projected_d8_cogs(out)
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with a declared and header CRS mismatch",
+        "raster.crs_mismatch",
+    )
+
+
+def generate_invalid_d8_disallowed_dtype() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-disallowed-dtype"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-disallowed-dtype",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "EPSG:8857",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "km2",
+                },
+            }
+        ],
+    )
+    write_projected_d8_cogs(
+        out,
+        flow_dir_dtype="float32",
+        flow_dir_nodata=-9999.0,
+    )
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with a disallowed flow direction dtype",
+        "raster.flow_dir_dtype",
+    )
+
+
+def generate_invalid_d8_missing_nodata() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-missing-nodata"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-missing-nodata",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "EPSG:8857",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "cells",
+                },
+            }
+        ],
+    )
+    write_projected_d8_cogs(
+        out,
+        flow_acc_dtype="float32",
+        flow_acc_nodata=None,
+    )
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with missing flow accumulation nodata",
+        "raster.flow_acc_nodata",
+    )
+
+
+def generate_invalid_d8_cells_int32() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-aux-d8-cells-int32"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-d8-cells-int32",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v2",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "crs": "EPSG:8857",
+                    "flow_dir_encoding": "grass",
+                    "flow_acc_units": "cells",
+                },
+            }
+        ],
+    )
+    write_projected_d8_cogs(out)
+    write_readme(
+        out,
+        "Invalid D8 v2 fixture with cells units and int32 accumulation",
+        "raster.flow_acc_units_dtype",
+    )
+
+
+def generate_invalid_legacy_d8_v1() -> None:
+    out = SCRIPT_DIR / "invalid" / "tiny-with-legacy-aux-d8-v1"
+    reset_dir(out)
+    write_catchments(out)
+    write_graph(out, VALID_UPSTREAM)
+    write_manifest(
+        out,
+        fabric_name="conformance-tiny-legacy-d8-v1",
+        auxiliary=[
+            {
+                "schema": "hfx.aux.d8_raster.v1",
+                "artifacts": {
+                    "flow_dir": "aux/d8/projected/flow_dir.tif",
+                    "flow_acc": "aux/d8/projected/flow_acc.tif",
+                },
+                "metadata": {
+                    "flow_dir_encoding": "esri",
+                },
+            }
+        ],
+    )
+    write_readme(
+        out,
+        "Invalid fixture with a legacy D8 v1 declaration",
+        "manifest.auxiliary_schema",
     )
 
 
@@ -713,6 +944,13 @@ def main() -> None:
     generate_valid_grit_two_snap()
     generate_valid_up_area_partial_nulls()
     generate_valid_projected_grass_d8()
+    generate_invalid_d8_missing_crs()
+    generate_invalid_d8_malformed_crs()
+    generate_invalid_d8_crs_mismatch()
+    generate_invalid_d8_disallowed_dtype()
+    generate_invalid_d8_missing_nodata()
+    generate_invalid_d8_cells_int32()
+    generate_invalid_legacy_d8_v1()
     generate_invalid_dangling()
     generate_invalid_crs()
     generate_invalid_parent_cycle()
