@@ -30,7 +30,7 @@ from shapely.geometry import (
 import build_adapter
 
 
-LAYER_NAME = "hybas_gr_lev12_v1.shp"
+LAYER_NAME = "hybas_gr_lev12_v1c.shp"
 POUR_POINTS_LAYER_NAME = "hybas_pour_lev12_v1.shp"
 RIVERS_LAYER_NAME = "HydroRIVERS_v10_gr.shp"
 
@@ -39,7 +39,9 @@ def _write_layer(
     basins_dir: Path,
     *,
     region: str = "gr",
+    level: int = 12,
     ids: list[object] | None = None,
+    pfaf_ids: list[object] | None = None,
     next_down: list[object] | None = None,
     endo: list[object] | None = None,
     omit: str | None = None,
@@ -67,10 +69,8 @@ def _write_layer(
         "ENDO": endo if endo is not None else (
             [0, 0, 0, 2] if default_fixture else [0] * size
         ),
-        "PFAF_ID": (
-            [111, 112, 113, 114]
-            if default_fixture
-            else list(range(1, size + 1))
+        "PFAF_ID": pfaf_ids if pfaf_ids is not None else (
+            [111, 112, 113, 114] if default_fixture else list(range(1, size + 1))
         ),
     }
     if omit is not None:
@@ -83,8 +83,10 @@ def _write_layer(
             box(20, 0, 21, 1),
         ]
     frame = gpd.GeoDataFrame(rows, geometry=geometries, crs=crs)
+    region_dir = basins_dir / f"hybas_{region}"
+    region_dir.mkdir(parents=True, exist_ok=True)
     frame.to_file(
-        basins_dir / f"hybas_{region}_lev12_v1.shp",
+        region_dir / f"hybas_{region}_lev{level:02d}_v1c.shp",
         driver="ESRI Shapefile",
         engine="pyogrio",
         index=False,
@@ -96,9 +98,9 @@ def _selector_args(selector: list[str], root: Path) -> list[str]:
         "build",
         *selector,
         "--basins",
-        str(root / "basins"),
+        str(root / "extract"),
         "--pour-points",
-        str(root / "pour_points"),
+        str(root / "extract" / "pour"),
         "--out",
         str(root / "out"),
     ]
@@ -109,6 +111,7 @@ def _write_pour_points(
     *,
     ids: list[object],
     points: list[object],
+    level: int = 12,
     key_name: str = "HYBAS_ID",
     crs: str | None = "EPSG:4326",
     extra_columns: dict[str, list[object]] | None = None,
@@ -119,7 +122,7 @@ def _write_pour_points(
         rows.update(extra_columns)
     frame = gpd.GeoDataFrame(rows, geometry=points, crs=crs)
     frame.to_file(
-        pour_points_dir / POUR_POINTS_LAYER_NAME,
+        pour_points_dir / f"hybas_pour_lev{level:02d}_v1.shp",
         driver="ESRI Shapefile",
         engine="pyogrio",
         index=False,
@@ -215,8 +218,8 @@ def _ordinary_points() -> tuple[list[int], list[Point]]:
 
 
 def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
-    basins_dir = root / "basins"
-    pour_points_dir = root / "pour_points"
+    basins_dir = root / "extract"
+    pour_points_dir = basins_dir / "pour"
     rivers_dir = root / "rivers"
     basins_dir.mkdir()
 
@@ -235,14 +238,12 @@ def _write_two_region_snap_fixture(root: Path) -> dict[str, LineString]:
         geometries=[box(20, 0, 21, 1), box(30, 0, 31, 1)],
     )
     _write_pour_points(
-        pour_points_dir / "gr",
-        ids=[101, 103],
-        points=[Point(0.5, 0.5), Point(10.5, 0.5)],
-    )
-    _write_pour_points(
-        pour_points_dir / "af",
-        ids=[202, 204],
-        points=[Point(20.5, 0.5), Point(30.5, 0.5)],
+        pour_points_dir,
+        ids=[101, 103, 202, 204],
+        points=[
+            Point(0.5, 0.5), Point(10.5, 0.5),
+            Point(20.5, 0.5), Point(30.5, 0.5),
+        ],
     )
 
     gr_tied = LineString([(4.8, 0.2), (5.2, 0.8)])
@@ -281,8 +282,8 @@ def _build_synthetic_dataset(
     *,
     geometries: list[Polygon] | None = None,
 ) -> Path:
-    basins_dir = tmpdir / "basins"
-    pour_points_dir = tmpdir / "pour_points"
+    basins_dir = tmpdir / "extract"
+    pour_points_dir = tmpdir / "extract" / "pour"
     rivers_dir = tmpdir / "rivers"
     out_dir = tmpdir / "out"
     basins_dir.mkdir()
@@ -318,14 +319,139 @@ def _build_synthetic_dataset(
     return out_dir
 
 
+class LevelRangeTests(unittest.TestCase):
+    """Exercise the build selector's central source-level representation."""
+
+    def test_documented_singleton_and_contiguous_ranges_parse_and_map_levels(self) -> None:
+        root = Path("/unused")
+        cases = (
+            ("12", (12, 12), (12,), ((12, 0),)),
+            ("6-12", (6, 12), tuple(range(6, 13)), ((6, 0), (12, 6))),
+            ("1-12", (1, 12), tuple(range(1, 13)), ((1, 0), (12, 11))),
+        )
+        for value, bounds, source_levels, mappings in cases:
+            with self.subTest(value=value):
+                args = build_adapter.build_arg_parser().parse_args(
+                    [*_selector_args(["--region", "gr"], root), "--levels", value]
+                )
+                self.assertIsInstance(args.levels, build_adapter.LevelRange)
+                self.assertEqual((args.levels.minimum, args.levels.maximum), bounds)
+                self.assertEqual(args.levels.source_levels, source_levels)
+                for source_level, hfx_level in mappings:
+                    self.assertEqual(args.levels.hfx_level(source_level), hfx_level)
+
+    def test_build_parser_defaults_to_singleton_level_12(self) -> None:
+        args = build_adapter.build_arg_parser().parse_args(
+            _selector_args(["--region", "gr"], Path("/unused"))
+        )
+        self.assertEqual(args.levels, build_adapter.LevelRange(minimum=12, maximum=12))
+        self.assertEqual(args.levels.source_levels, (12,))
+        self.assertEqual(args.levels.hfx_level(12), 0)
+
+    def test_invalid_level_selectors_raise_exact_adapter_errors(self) -> None:
+        syntax_values = ("", "six", "6-", "-12", "1-2-3", "1,2", "1,3", "1 3", " 12 ")
+        cases = [
+            *(
+                (value, f"invalid --levels '{value}': expected a singleton N or contiguous range N-M")
+                for value in syntax_values
+            ),
+            ("12-6", "invalid --levels '12-6': range must be ascending"),
+            *(
+                (value, f"invalid --levels '{value}': levels must be within 1-12")
+                for value in ("0", "13", "0-12", "1-13")
+            ),
+        ]
+        parser = build_adapter.build_arg_parser()
+        for value, message in cases:
+            with self.subTest(value=value), self.assertRaises(build_adapter.AdapterError) as caught:
+                parser.parse_args(
+                    [*_selector_args(["--region", "gr"], Path("/unused")), "--levels", value]
+                )
+            self.assertEqual(str(caught.exception), message)
+
+
+class CanonicalSourceLayoutTests(unittest.TestCase):
+    """Pin direct, level-specific scanner-proven source paths."""
+
+    def test_source_paths_resolve_extract_layout_for_requested_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extract_dir = Path(temporary) / "extract"
+            region_dir = extract_dir / "hybas_gr"
+            region_dir.mkdir(parents=True)
+            expected = {}
+            for level in (1, 6, 12):
+                path = region_dir / f"hybas_gr_lev{level:02d}_v1c.shp"
+                path.touch()
+                expected[level] = path
+            for level, path in expected.items():
+                self.assertEqual(build_adapter._source_path("gr", extract_dir, level), path)
+
+            (extract_dir / "hybas_gr_lev12_v1.shp").touch()
+            expected[12].unlink()
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter._source_path("gr", extract_dir, 12)
+            self.assertIn(str(expected[12]), str(caught.exception))
+            self.assertIn("found 0", str(caught.exception))
+
+    def test_global_pour_path_is_direct_and_level_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pour_dir = Path(temporary) / "extract" / "pour"
+            pour_dir.mkdir(parents=True)
+            expected = {}
+            for level in (1, 6, 12):
+                path = pour_dir / f"hybas_pour_lev{level:02d}_v1.shp"
+                path.touch()
+                expected[level] = path
+            decoy = pour_dir / "gr" / POUR_POINTS_LAYER_NAME
+            decoy.parent.mkdir()
+            decoy.touch()
+            for level, path in expected.items():
+                self.assertEqual(build_adapter._pour_points_source_path(pour_dir, level), path)
+
+            expected[12].unlink()
+            with self.assertRaises(build_adapter.AdapterError) as caught:
+                build_adapter._pour_points_source_path(pour_dir, 12)
+            self.assertIn(POUR_POINTS_LAYER_NAME, str(caught.exception))
+            self.assertIn("found 0", str(caught.exception))
+
+    def test_default_and_explicit_level_12_builds_are_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            extract_dir = root / "extract"
+            pour_dir = extract_dir / "pour"
+            _write_layer(extract_dir)
+            ids, points = _ordinary_points()
+            _write_pour_points(pour_dir, ids=ids, points=points)
+            default_out = root / "default"
+            explicit_out = root / "explicit"
+            instant = datetime.fromisoformat("2026-07-20T12:00:00+00:00")
+            with patch("build_adapter.datetime") as frozen_datetime:
+                frozen_datetime.now.return_value = instant
+                self.assertEqual(
+                    build_adapter.main(_build_args(extract_dir, pour_dir, default_out)), 0
+                )
+                explicit_args = _build_args(extract_dir, pour_dir, explicit_out)
+                explicit_args.extend(["--levels", "12"])
+                self.assertEqual(build_adapter.main(explicit_args), 0)
+
+            default_files = sorted(path.relative_to(default_out) for path in default_out.rglob("*") if path.is_file())
+            explicit_files = sorted(path.relative_to(explicit_out) for path in explicit_out.rglob("*") if path.is_file())
+            self.assertEqual(default_files, explicit_files)
+            for relative_path in default_files:
+                self.assertEqual(
+                    (default_out / relative_path).read_bytes(),
+                    (explicit_out / relative_path).read_bytes(),
+                )
+
+
 class ExtractCommandTests(unittest.TestCase):
     """Exercise read-only source inspection through the public CLI."""
 
     def test_extract_reports_sources_without_writing_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = basins_dir / "pour"
             sentinel = root / "candidate-output"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -366,8 +492,8 @@ class ExtractCommandTests(unittest.TestCase):
     def test_extract_rejects_missing_polygon_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             basins_dir.mkdir()
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points)
@@ -380,8 +506,8 @@ class ExtractCommandTests(unittest.TestCase):
     def test_extract_rejects_missing_pour_points_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             basins_dir.mkdir()
             pour_points_dir.mkdir()
             _write_layer(basins_dir)
@@ -394,10 +520,14 @@ class ExtractCommandTests(unittest.TestCase):
     def test_extract_translates_unreadable_polygon_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             basins_dir.mkdir()
-            (basins_dir / LAYER_NAME).write_text("not a shapefile", encoding="utf-8")
+            region_dir = basins_dir / "hybas_gr"
+            region_dir.mkdir()
+            (region_dir / LAYER_NAME).write_text(
+                "not a shapefile", encoding="utf-8"
+            )
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points)
             with self.assertRaisesRegex(
@@ -411,8 +541,8 @@ class ExtractCommandTests(unittest.TestCase):
     def test_extract_translates_unreadable_pour_points_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             basins_dir.mkdir()
             pour_points_dir.mkdir()
             _write_layer(basins_dir)
@@ -615,8 +745,8 @@ class HydroRiversSnapTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = root / "extract" / "pour"
         rivers_dir = root / "rivers"
         out_dir = root / "out"
         basins_dir.mkdir()
@@ -635,8 +765,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_well_formed_confluence_emits_largest_upstream_as_mainstem(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -680,8 +810,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -744,8 +874,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_single_contributor_chain_remains_mainstem(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -785,8 +915,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_terminal_zero_remains_mainstem(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -820,8 +950,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_null_next_down_is_rejected_without_snap_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -853,8 +983,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_missing_next_down_is_rejected_without_snap_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -886,8 +1016,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_dangling_positive_next_down_emits_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -1115,8 +1245,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_snap_order_is_stable_for_hilbert_ties_after_drops(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -1368,8 +1498,8 @@ class HydroRiversSnapTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = root / "extract" / "pour"
         out_dir = root / "out"
         basins_dir.mkdir()
         _write_layer(basins_dir)
@@ -1387,8 +1517,8 @@ class HydroRiversSnapTests(unittest.TestCase):
     def test_two_regions_merge_rivers_against_merged_unit_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = basins_dir / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -1408,14 +1538,12 @@ class HydroRiversSnapTests(unittest.TestCase):
                 geometries=[box(10, 0, 11, 1), box(30, 0, 31, 1)],
             )
             _write_pour_points(
-                pour_points_dir / "gr",
-                ids=[101, 103],
-                points=[Point(20.5, 0.5), Point(0.5, 0.5)],
-            )
-            _write_pour_points(
-                pour_points_dir / "af",
-                ids=[202, 204],
-                points=[Point(10.5, 0.5), Point(30.5, 0.5)],
+                pour_points_dir,
+                ids=[101, 103, 202, 204],
+                points=[
+                    Point(20.5, 0.5), Point(0.5, 0.5),
+                    Point(10.5, 0.5), Point(30.5, 0.5),
+                ],
             )
 
             gr_local_geometry = LineString([(20.1, 0.2), (20.9, 0.8)])
@@ -1800,8 +1928,8 @@ class HydroRiversNormalizationTests(unittest.TestCase):
     def test_unresolved_ids_are_counted_once_without_spatial_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             out_dir = root / "out"
             basins_dir.mkdir()
@@ -1891,10 +2019,12 @@ class BuildSelectorTests(unittest.TestCase):
     def test_all_regions_selects_present_layers_in_standard_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
+            basins_dir = root / "extract"
             basins_dir.mkdir()
             for region in ("si", "af", "eu"):
-                (basins_dir / f"hybas_{region}_lev12_v1.shp").touch()
+                region_dir = basins_dir / f"hybas_{region}"
+                region_dir.mkdir()
+                (region_dir / f"hybas_{region}_lev12_v1c.shp").touch()
             self.assertEqual(
                 self._parse_and_resolve(["--all-regions"], root),
                 ["af", "eu", "si"],
@@ -1926,7 +2056,7 @@ class BuildSelectorTests(unittest.TestCase):
     def test_all_regions_rejects_an_empty_basins_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "basins").mkdir()
+            (root / "extract").mkdir()
             with self.assertRaisesRegex(build_adapter.AdapterError, "no regions found"):
                 self._parse_and_resolve(["--all-regions"], root)
 
@@ -1953,8 +2083,8 @@ class MergedBuildTests(unittest.TestCase):
     """Exercise deterministic normalization and graph construction across regions."""
 
     def _write_two_regions(self, root: Path) -> tuple[Path, Path]:
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = basins_dir / "pour"
         basins_dir.mkdir()
         _write_layer(
             basins_dir,
@@ -1970,14 +2100,12 @@ class MergedBuildTests(unittest.TestCase):
             geometries=[box(10, 0, 11, 1), box(30, 0, 31, 1)],
         )
         _write_pour_points(
-            pour_points_dir / "gr",
-            ids=[101, 103],
-            points=[Point(20.5, 0.5), Point(0.5, 0.5)],
-        )
-        _write_pour_points(
-            pour_points_dir / "af",
-            ids=[202, 204],
-            points=[Point(10.5, 0.5), Point(30.5, 0.5)],
+            pour_points_dir,
+            ids=[101, 103, 202, 204],
+            points=[
+                Point(20.5, 0.5), Point(0.5, 0.5),
+                Point(10.5, 0.5), Point(30.5, 0.5),
+            ],
         )
         return basins_dir, pour_points_dir
 
@@ -2036,8 +2164,8 @@ class MergedBuildTests(unittest.TestCase):
     def test_duplicate_ids_across_regions_are_rejected_before_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = basins_dir / "pour"
             basins_dir.mkdir()
             for region, offset in (("gr", 0), ("af", 10)):
                 _write_layer(
@@ -2046,11 +2174,11 @@ class MergedBuildTests(unittest.TestCase):
                     ids=[22, 11],
                     geometries=[box(offset, 0, offset + 1, 1), box(offset + 2, 0, offset + 3, 1)],
                 )
-                _write_pour_points(
-                    pour_points_dir / region,
-                    ids=[22, 11],
-                    points=[Point(offset + 0.5, 0.5), Point(offset + 2.5, 0.5)],
-                )
+            _write_pour_points(
+                pour_points_dir,
+                ids=[22, 11],
+                points=[Point(0.5, 0.5), Point(2.5, 0.5)],
+            )
             with self.assertRaises(build_adapter.AdapterError) as caught:
                 build_adapter.main(_selector_args(["--regions", "gr,af"], root))
             message = str(caught.exception)
@@ -2061,8 +2189,8 @@ class MergedBuildTests(unittest.TestCase):
     def test_all_regions_builds_every_present_standard_region_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = basins_dir / "pour"
             basins_dir.mkdir()
             fixtures = (("si", 303, 30), ("af", 101, 0), ("eu", 202, 15))
             for region, identifier, x in fixtures:
@@ -2072,11 +2200,11 @@ class MergedBuildTests(unittest.TestCase):
                     ids=[identifier],
                     geometries=[box(x, 0, x + 1, 1)],
                 )
-                _write_pour_points(
-                    pour_points_dir / region,
-                    ids=[identifier],
-                    points=[Point(x + 0.5, 0.5)],
-                )
+            _write_pour_points(
+                pour_points_dir,
+                ids=[identifier for _, identifier, _ in fixtures],
+                points=[Point(x + 0.5, 0.5) for _, _, x in fixtures],
+            )
             self.assertEqual(
                 build_adapter.main(_selector_args(["--all-regions"], root)), 0
             )
@@ -2110,8 +2238,8 @@ class AntimeridianGuardTests(unittest.TestCase):
             test.assertFalse((out_dir / filename).exists())
 
     def _write_wrapping_region(self, root: Path) -> tuple[Path, Path]:
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = basins_dir / "pour"
         basins_dir.mkdir()
         _write_layer(
             basins_dir,
@@ -2128,8 +2256,8 @@ class AntimeridianGuardTests(unittest.TestCase):
         return basins_dir, pour_points_dir
 
     def _write_two_regions_with_wrap(self, root: Path) -> None:
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = basins_dir / "pour"
         basins_dir.mkdir()
         _write_layer(
             basins_dir,
@@ -2147,22 +2275,20 @@ class AntimeridianGuardTests(unittest.TestCase):
             geometries=[box(-179.0, 0.0, 179.0, 1.0), box(30, 0, 31, 1)],
         )
         _write_pour_points(
-            pour_points_dir / "gr",
-            ids=[101, 103],
-            points=[Point(20.5, 0.5), Point(0.5, 0.5)],
-        )
-        _write_pour_points(
-            pour_points_dir / "af",
-            ids=[902, 204],
-            points=[Point(0.0, 0.5), Point(30.5, 0.5)],
+            pour_points_dir,
+            ids=[101, 103, 902, 204],
+            points=[
+                Point(20.5, 0.5), Point(0.5, 0.5),
+                Point(0.0, 0.5), Point(30.5, 0.5),
+            ],
         )
 
     def test_ordinary_geometry_is_silent_in_both_modes(self) -> None:
         for strict_build in (False, True):
             with self.subTest(strict_build=strict_build), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                basins_dir = root / "basins"
-                pour_points_dir = root / "pour_points"
+                basins_dir = root / "extract"
+                pour_points_dir = root / "extract" / "pour"
                 out_dir = root / "out"
                 basins_dir.mkdir()
                 _write_layer(basins_dir)
@@ -2261,8 +2387,8 @@ class LargeRowGroupTests(unittest.TestCase):
         width = 0.005
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             basins_dir.mkdir()
             ids = list(range(1, count + 1))
             geometries = [
@@ -2430,57 +2556,76 @@ class LargeRowGroupTests(unittest.TestCase):
                     self.assertTrue(statistics.has_min_max)
 
 
-class LoadRegionUnitsTests(unittest.TestCase):
+class LoadRegionalLayerTests(unittest.TestCase):
     """Exercise normalization through real ESRI Shapefile I/O."""
 
     def test_missing_required_column_names_field(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
-            _write_layer(basins_dir, omit="UP_AREA")
+        for field in ("UP_AREA", "PFAF_ID"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                basins_dir = Path(temporary) / "extract"
+                _write_layer(basins_dir, omit=field)
 
-            with self.assertRaisesRegex(build_adapter.AdapterError, "UP_AREA"):
-                build_adapter.load_region_units("gr", basins_dir)
+                with self.assertRaisesRegex(build_adapter.AdapterError, field):
+                    build_adapter.load_regional_layer(
+                        "gr", basins_dir, source_level=12,
+                        levels=build_adapter.LevelRange(12, 12),
+                    )
 
     def test_missing_next_down_names_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir, omit="NEXT_DOWN")
 
             with self.assertRaisesRegex(build_adapter.AdapterError, "NEXT_DOWN"):
-                build_adapter.load_region_units("gr", basins_dir)
+                build_adapter.load_regional_layer(
+                    "gr", basins_dir, source_level=12,
+                    levels=build_adapter.LevelRange(12, 12),
+                )
 
     def test_missing_endo_names_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir, omit="ENDO")
 
             with self.assertRaisesRegex(build_adapter.AdapterError, "ENDO"):
-                build_adapter.load_region_units("gr", basins_dir)
+                build_adapter.load_regional_layer(
+                    "gr", basins_dir, source_level=12,
+                    levels=build_adapter.LevelRange(12, 12),
+                )
 
     def test_non_positive_and_non_integral_ids_are_rejected(self) -> None:
         cases = ([0, 10, 20, 40], [-1, 10, 20, 40], [1.5, 10, 20, 40])
         for ids in cases:
             with self.subTest(ids=ids), tempfile.TemporaryDirectory() as temporary:
-                basins_dir = Path(temporary)
+                basins_dir = Path(temporary) / "extract"
                 _write_layer(basins_dir, ids=ids)
 
                 with self.assertRaises(build_adapter.AdapterError):
-                    build_adapter.load_region_units("gr", basins_dir)
+                    build_adapter.load_regional_layer(
+                        "gr", basins_dir, source_level=12,
+                        levels=build_adapter.LevelRange(12, 12),
+                    )
 
     def test_duplicate_ids_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir, ids=[30, 10, 20, 10])
 
             with self.assertRaisesRegex(build_adapter.AdapterError, "duplicate"):
-                build_adapter.load_region_units("gr", basins_dir)
+                build_adapter.load_regional_layer(
+                    "gr", basins_dir, source_level=12,
+                    levels=build_adapter.LevelRange(12, 12),
+                )
 
     def test_attributes_are_mapped_with_contract_dtypes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir)
 
-            units = build_adapter.load_region_units("gr", basins_dir)
+            units = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
         by_id = units.set_index("id")
         self.assertEqual(by_id.loc[10, "area_km2"], 1.5)
@@ -2496,10 +2641,13 @@ class LoadRegionUnitsTests(unittest.TestCase):
 
     def test_single_level_defaults_use_nullable_parent_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir)
 
-            units = build_adapter.load_region_units("gr", basins_dir)
+            units = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
         self.assertTrue((units["level"] == 0).all())
         self.assertTrue(pd.api.types.is_integer_dtype(units["level"].dtype))
@@ -2514,10 +2662,13 @@ class LoadRegionUnitsTests(unittest.TestCase):
             box(20000, 0, 21000, 1000),
         ]
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir, crs="EPSG:3857", geometries=geometries)
 
-            units = build_adapter.load_region_units("gr", basins_dir)
+            units = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
         self.assertEqual(units.crs.to_epsg(), 4326)
         self.assertLess(units.total_bounds[2], 1.0)
@@ -2531,10 +2682,13 @@ class LoadRegionUnitsTests(unittest.TestCase):
             box(7, 0, 8, 1),
         ]
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir, geometries=geometries)
 
-            units = build_adapter.load_region_units("gr", basins_dir)
+            units = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
         self.assertTrue(units.geometry.is_valid.all())
         self.assertTrue((~units.geometry.is_empty).all())
@@ -2542,11 +2696,17 @@ class LoadRegionUnitsTests(unittest.TestCase):
 
     def test_hilbert_order_is_deterministic_with_id_tie_break(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir)
 
-            first = build_adapter.load_region_units("gr", basins_dir)
-            second = build_adapter.load_region_units("gr", basins_dir)
+            first = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
+            second = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
         self.assertEqual(first["id"].tolist(), second["id"].tolist())
         distances = first.geometry.centroid.hilbert_distance(
@@ -2556,6 +2716,75 @@ class LoadRegionUnitsTests(unittest.TestCase):
         tied_ids = first.loc[first["id"].isin([10, 30]), "id"].tolist()
         self.assertEqual(tied_ids, [10, 30])
         self.assertEqual(first.index.tolist(), list(range(len(first))))
+
+    def test_requested_level_sets_hfx_level_and_normalizes_one_to_twelve_digit_pfaf_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            extract_dir = Path(temporary) / "extract"
+            pfaf_ids = [1, 12, 123456, 123456789012]
+            _write_layer(extract_dir, level=6, pfaf_ids=pfaf_ids)
+            levels = build_adapter.LevelRange(1, 12)
+            units = build_adapter.load_regional_layer(
+                "gr", extract_dir, source_level=6, levels=levels
+            )
+            self.assertIn("lev06_v1c", str(build_adapter._source_path("gr", extract_dir, 6)))
+            self.assertTrue((units["level"] == 5).all())
+            self.assertEqual(sorted(units["PFAF_ID"].tolist()), sorted(pfaf_ids))
+            self.assertEqual(units["PFAF_ID"].dtype, "int64")
+
+            _write_layer(extract_dir, level=1)
+            level_one = build_adapter.load_regional_layer(
+                "gr", extract_dir, source_level=1, levels=levels
+            )
+            _write_layer(extract_dir, level=12)
+            level_twelve = build_adapter.load_regional_layer(
+                "gr", extract_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
+            self.assertTrue((level_one["level"] == 0).all())
+            self.assertTrue((level_twelve["level"] == 0).all())
+
+    def test_requested_coarse_level_preserves_crs_repair_and_coordinate_clamp(self) -> None:
+        tolerance = build_adapter.COORDINATE_DOMAIN_TOLERANCE_DEGREES
+        geometries = [
+            Polygon([(0, 0), (2, 2), (0, 2), (2, 0), (0, 0)]),
+            box(3, 0, 4, 1),
+            box(5, 0, 6, 1),
+            box(7, 0, 8, 1),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            extract_dir = Path(temporary) / "extract"
+            _write_layer(
+                extract_dir, level=6, crs="EPSG:3857", geometries=geometries
+            )
+            repaired = build_adapter.load_regional_layer(
+                "gr", extract_dir, source_level=6,
+                levels=build_adapter.LevelRange(1, 12),
+            )
+            self.assertEqual(repaired.crs.to_epsg(), 4326)
+            self.assertTrue(repaired.geometry.is_valid.all())
+            self.assertTrue(repaired.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).all())
+
+            marginal = [
+                box(179.0, 0.0, 180.0 + tolerance / 2, 1.0),
+                box(3, 0, 4, 1), box(5, 0, 6, 1), box(7, 0, 8, 1),
+            ]
+            _write_layer(extract_dir, level=6, geometries=marginal)
+            clamped = build_adapter.load_regional_layer(
+                "gr", extract_dir, source_level=6,
+                levels=build_adapter.LevelRange(1, 12),
+            )
+            self.assertLessEqual(clamped.total_bounds[2], 180.0)
+
+            excessive = [
+                box(179.0, 0.0, 180.0 + tolerance * 2, 1.0),
+                box(3, 0, 4, 1), box(5, 0, 6, 1), box(7, 0, 8, 1),
+            ]
+            _write_layer(extract_dir, level=6, geometries=excessive)
+            with self.assertRaises(build_adapter.AdapterError):
+                build_adapter.load_regional_layer(
+                    "gr", extract_dir, source_level=6,
+                    levels=build_adapter.LevelRange(1, 12),
+                )
 
 
 class CoordinateDomainClampTests(unittest.TestCase):
@@ -2580,7 +2809,7 @@ class CoordinateDomainClampTests(unittest.TestCase):
             ]),
         ]
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(
                 basins_dir,
                 region="au",
@@ -2589,7 +2818,10 @@ class CoordinateDomainClampTests(unittest.TestCase):
             )
 
             with self.assertLogs(build_adapter.__name__, level="WARNING") as captured:
-                units = build_adapter.load_region_units("au", basins_dir)
+                units = build_adapter.load_regional_layer(
+                    "au", basins_dir, source_level=12,
+                    levels=build_adapter.LevelRange(12, 12),
+                )
 
         self.assertLessEqual(
             units.total_bounds[2],
@@ -2627,7 +2859,7 @@ class CoordinateDomainClampTests(unittest.TestCase):
         fiji_ids = [5120082160, 5120082230]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            pour_points_dir = root / "pour_points"
+            pour_points_dir = root / "extract" / "pour"
             rivers_dir = root / "rivers"
             _write_pour_points(
                 pour_points_dir,
@@ -2646,7 +2878,9 @@ class CoordinateDomainClampTests(unittest.TestCase):
                 ],
             )
 
-            pour_points = build_adapter.load_pour_points(pour_points_dir)
+            pour_points = build_adapter.load_pour_points(
+                pour_points_dir, source_level=12
+            )
             rivers = build_adapter.load_rivers(rivers_dir)
 
         self.assertEqual(pour_points.geometry.x.tolist(), [180.0, 180.0])
@@ -2679,7 +2913,7 @@ class CoordinateDomainClampTests(unittest.TestCase):
         )
         for point, coordinate_text in cases:
             with self.subTest(point=point), tempfile.TemporaryDirectory() as temporary:
-                pour_points_dir = Path(temporary)
+                pour_points_dir = Path(temporary) / "extract" / "pour"
                 _write_pour_points(
                     pour_points_dir,
                     ids=[5120082160],
@@ -2687,7 +2921,9 @@ class CoordinateDomainClampTests(unittest.TestCase):
                 )
 
                 with self.assertRaises(build_adapter.AdapterError) as caught:
-                    build_adapter.load_pour_points(pour_points_dir)
+                    build_adapter.load_pour_points(
+                        pour_points_dir, source_level=12
+                    )
 
                 message = str(caught.exception)
                 self.assertIn("HydroBASINS pour points", message)
@@ -2698,11 +2934,14 @@ class CoordinateDomainClampTests(unittest.TestCase):
 
     def test_in_domain_geometry_does_not_emit_a_clamp_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            basins_dir = Path(temporary)
+            basins_dir = Path(temporary) / "extract"
             _write_layer(basins_dir)
 
             with patch.object(build_adapter.LOGGER, "warning") as warning:
-                build_adapter.load_region_units("gr", basins_dir)
+                build_adapter.load_regional_layer(
+                    "gr", basins_dir, source_level=12,
+                    levels=build_adapter.LevelRange(12, 12),
+                )
 
         warning.assert_not_called()
 
@@ -2713,15 +2952,18 @@ class BuildCatchmentsTests(unittest.TestCase):
     def test_build_writes_conformant_catchments_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points)
 
-            expected = build_adapter.load_region_units("gr", basins_dir)
+            expected = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
             return_code = build_adapter.main(
                 _build_args(basins_dir, pour_points_dir, out_dir)
             )
@@ -2962,14 +3204,17 @@ class BuildManifestTests(unittest.TestCase):
     def test_regional_manifest_describes_built_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points)
-            units = build_adapter.load_region_units("gr", basins_dir)
+            units = build_adapter.load_regional_layer(
+                "gr", basins_dir, source_level=12,
+                levels=build_adapter.LevelRange(12, 12),
+            )
 
             return_code = build_adapter.main(
                 _build_args(basins_dir, pour_points_dir, out_dir)
@@ -3000,8 +3245,8 @@ class BuildManifestTests(unittest.TestCase):
     def test_planetary_manifest_omits_region_and_uses_global_bbox(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -3046,8 +3291,8 @@ class BuildGraphErrorTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = root / "extract" / "pour"
         out_dir = root / "out"
         basins_dir.mkdir()
         _write_layer(basins_dir, next_down=next_down, endo=endo)
@@ -3093,8 +3338,8 @@ class PourPointTests(unittest.TestCase):
         crs: str | None = "EPSG:4326",
         extra_columns: dict[str, list[object]] | None = None,
     ) -> Path:
-        basins_dir = root / "basins"
-        pour_points_dir = root / "pour_points"
+        basins_dir = root / "extract"
+        pour_points_dir = root / "extract" / "pour"
         out_dir = root / "out"
         basins_dir.mkdir()
         _write_layer(basins_dir)
@@ -3135,8 +3380,8 @@ class PourPointTests(unittest.TestCase):
     def test_ambiguous_case_insensitive_join_keys_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -3161,8 +3406,8 @@ class PourPointTests(unittest.TestCase):
     def test_exact_join_key_is_preferred(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            basins_dir = root / "basins"
-            pour_points_dir = root / "pour_points"
+            basins_dir = root / "extract"
+            pour_points_dir = root / "extract" / "pour"
             out_dir = root / "out"
             basins_dir.mkdir()
             _write_layer(basins_dir)
@@ -3236,39 +3481,47 @@ class PourPointTests(unittest.TestCase):
             )
             self.assertEqual(set(gpd.read_parquet(path)["id"]), set(ids))
 
-    def test_point_layer_match_count_is_enforced(self) -> None:
+    def test_point_layer_uses_exact_direct_level_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            pour_points_dir = Path(temporary)
+            pour_points_dir = Path(temporary) / "extract" / "pour"
             with self.assertRaisesRegex(build_adapter.AdapterError, "found 0"):
-                build_adapter.load_pour_points(pour_points_dir)
+                build_adapter.load_pour_points(
+                    pour_points_dir, source_level=12
+                )
 
         with tempfile.TemporaryDirectory() as temporary:
-            pour_points_dir = Path(temporary)
+            pour_points_dir = Path(temporary) / "extract" / "pour"
             nested = pour_points_dir / "nested"
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points)
             _write_pour_points(nested, ids=ids, points=points)
-            with self.assertRaisesRegex(build_adapter.AdapterError, "found 2"):
-                build_adapter.load_pour_points(pour_points_dir)
+            points_frame = build_adapter.load_pour_points(
+                pour_points_dir, source_level=12
+            )
+            self.assertEqual(len(points_frame), 4)
 
     def test_point_layer_requires_declared_crs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            pour_points_dir = Path(temporary)
+            pour_points_dir = Path(temporary) / "extract" / "pour"
             ids, points = _ordinary_points()
             _write_pour_points(pour_points_dir, ids=ids, points=points, crs=None)
             with self.assertRaisesRegex(build_adapter.AdapterError, "no declared CRS"):
-                build_adapter.load_pour_points(pour_points_dir)
+                build_adapter.load_pour_points(
+                    pour_points_dir, source_level=12
+                )
 
     def test_point_layer_crs_is_transformed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            pour_points_dir = Path(temporary)
+            pour_points_dir = Path(temporary) / "extract" / "pour"
             _write_pour_points(
                 pour_points_dir,
                 ids=[30],
                 points=[Point(111319.490793, 111325.142866)],
                 crs="EPSG:3857",
             )
-            points = build_adapter.load_pour_points(pour_points_dir)
+            points = build_adapter.load_pour_points(
+                pour_points_dir, source_level=12
+            )
 
         self.assertEqual(points.crs.to_epsg(), 4326)
         self.assertAlmostEqual(points.loc[0, "outlet_lon"], 1.0, places=6)
@@ -3280,10 +3533,12 @@ class PourPointTests(unittest.TestCase):
         cases = (None, Point(), LineString([(0, 0), (1, 1)]))
         for geometry in cases:
             with self.subTest(geometry=geometry), tempfile.TemporaryDirectory() as temporary:
-                pour_points_dir = Path(temporary)
+                pour_points_dir = Path(temporary) / "extract" / "pour"
                 _write_pour_points(pour_points_dir, ids=[30], points=[geometry])
                 with self.assertRaisesRegex(build_adapter.AdapterError, "geometry"):
-                    build_adapter.load_pour_points(pour_points_dir)
+                    build_adapter.load_pour_points(
+                        pour_points_dir, source_level=12
+                    )
 
 
 if __name__ == "__main__":
