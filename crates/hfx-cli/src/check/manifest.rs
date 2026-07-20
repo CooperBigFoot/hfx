@@ -407,3 +407,44 @@ fn is_valid_rfc3339(s: &str) -> bool {
         && bytes.get(16) == Some(&b':')
         && (s.ends_with('Z') || s.rfind(['+', '-']).is_some_and(|idx| idx > 18))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::{RawAuxEntry, RawManifest, check_manifest};
+
+    #[test]
+    fn legacy_d8_raster_v1_uses_malformed_schema_diagnostic() {
+        let raw = RawManifest {
+            format_version: Some("0.3.0".to_owned()),
+            fabric_name: Some("test".to_owned()),
+            fabric_version: None,
+            crs: Some("EPSG:4326".to_owned()),
+            has_up_area: Some(false),
+            topology: Some("tree".to_owned()),
+            region: None,
+            bbox: Some(vec![0.0, 0.0, 1.0, 1.0]),
+            unit_count: Some(1),
+            created_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            adapter_version: Some("test".to_owned()),
+            auxiliary: Some(vec![RawAuxEntry {
+                schema: Some("hfx.aux.d8_raster.v1".to_owned()),
+                artifacts: Some(BTreeMap::from([
+                    ("flow_dir".to_owned(), "flow_dir.tif".to_owned()),
+                    ("flow_acc".to_owned(), "flow_acc.tif".to_owned()),
+                ])),
+                metadata: Some(json!({"flow_dir_encoding": "esri"})),
+            }]),
+        };
+
+        assert!(check_manifest(&raw).iter().any(|diagnostic| {
+            diagnostic.check_id == "manifest.auxiliary_schema"
+                && diagnostic
+                    .message
+                    .contains("auxiliary[0] has malformed schema id \"hfx.aux.d8_raster.v1\"")
+        }));
+    }
+}

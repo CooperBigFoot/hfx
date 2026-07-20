@@ -88,7 +88,7 @@ fn check_entry(
         }
     }
 
-    if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v1") {
+    if entry.schema.as_deref() == Some("hfx.aux.d8_raster.v2") {
         check_d8_raster(idx, entry, diags);
     } else if entry.schema.as_deref() == Some("hfx.aux.snap.v2") {
         check_snap_v2(idx, entry, dataset_root, catchments, diags);
@@ -104,7 +104,7 @@ fn check_d8_raster(idx: usize, entry: &RawAuxEntry, diags: &mut Vec<Diagnostic>)
                     "auxiliary.d8_raster_missing_artifact_key",
                     Category::Manifest,
                     Artifact::Manifest,
-                    format!("hfx.aux.d8_raster.v1 auxiliary[{idx}] missing artifact key {key:?}"),
+                    format!("hfx.aux.d8_raster.v2 auxiliary[{idx}] missing artifact key {key:?}"),
                 )
                 .at(Location::Field {
                     name: "auxiliary".into(),
@@ -113,18 +113,28 @@ fn check_d8_raster(idx: usize, entry: &RawAuxEntry, diags: &mut Vec<Diagnostic>)
         }
     }
 
-    let encoding = entry
+    let metadata = entry
         .metadata
         .as_ref()
-        .and_then(|m| m.get("flow_dir_encoding"))
-        .and_then(serde_json::Value::as_str);
-    if !matches!(encoding, Some("esri" | "taudem")) {
+        .and_then(serde_json::Value::as_object);
+    let parsed = hfx::D8RasterMetadataV2::parse(
+        metadata
+            .and_then(|values| values.get("crs"))
+            .and_then(serde_json::Value::as_str),
+        metadata
+            .and_then(|values| values.get("flow_dir_encoding"))
+            .and_then(serde_json::Value::as_str),
+        metadata
+            .and_then(|values| values.get("flow_acc_units"))
+            .and_then(serde_json::Value::as_str),
+    );
+    if let Err(error) = parsed {
         diags.push(
             Diagnostic::error(
-                "auxiliary.d8_raster_flow_dir_encoding",
+                "auxiliary.d8_raster_metadata",
                 Category::Manifest,
                 Artifact::Manifest,
-                format!("hfx.aux.d8_raster.v1 auxiliary[{idx}] requires flow_dir_encoding \"esri\" or \"taudem\""),
+                format!("hfx.aux.d8_raster.v2 auxiliary[{idx}] has invalid metadata: {error}"),
             )
             .at(Location::Field {
                 name: "auxiliary".into(),

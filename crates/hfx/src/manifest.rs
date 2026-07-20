@@ -563,7 +563,7 @@ mod tests {
         artifacts.insert("flow_dir".to_string(), "flow_dir.tif".to_string());
         artifacts.insert("flow_acc".to_string(), "flow_acc.tif".to_string());
         let auxiliary = AuxiliaryDecl::new(
-            AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV1),
+            AuxiliarySchemaId::Blessed(BlessedAuxSchema::D8RasterV2),
             artifacts,
         )
         .unwrap();
