@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -47,6 +48,71 @@ LOGGER = logging.getLogger(__name__)
 
 class AdapterError(RuntimeError):
     """Report a HydroBASINS source-contract violation."""
+
+
+@dataclass(frozen=True)
+class LevelRange:
+    """Represent one inclusive contiguous source-Pfaf level range."""
+
+    minimum: int
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if self.minimum < 1 or self.maximum > 12:
+            raise AdapterError("levels must be within 1-12")
+        if self.minimum > self.maximum:
+            raise AdapterError("level range must be ascending")
+
+    @property
+    def source_levels(self) -> tuple[int, ...]:
+        """Return the selected source Pfaf levels in ascending order."""
+        return tuple(range(self.minimum, self.maximum + 1))
+
+    def hfx_level(self, pfaf_level: int) -> int:
+        """Map one contained source Pfaf level to its zero-based HFX level."""
+        if pfaf_level < self.minimum or pfaf_level > self.maximum:
+            raise AdapterError(
+                f"source Pfaf level {pfaf_level} is outside selected range "
+                f"{self.minimum}-{self.maximum}"
+            )
+        return pfaf_level - self.minimum
+
+
+def parse_level_range(value: str) -> LevelRange:
+    """Parse a singleton or contiguous inclusive source-Pfaf range."""
+    match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", value)
+    if match is None:
+        raise AdapterError(
+            f"invalid --levels '{value}': expected a singleton N or contiguous range N-M"
+        )
+    minimum = int(match.group(1))
+    maximum = int(match.group(2) or match.group(1))
+    if minimum < 1 or maximum > 12:
+        raise AdapterError(
+            f"invalid --levels '{value}': levels must be within 1-12"
+        )
+    if minimum > maximum:
+        raise AdapterError(
+            f"invalid --levels '{value}': range must be ascending"
+        )
+    return LevelRange(minimum, maximum)
+
+
+class _UniqueLevelRangeAction(argparse.Action):
+    """Store one level selector while rejecting repeated occurrences."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: LevelRange,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        if getattr(namespace, "_levels_seen", False):
+            raise AdapterError("--levels may be specified only once")
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_levels_seen", True)
 
 
 def _clamp_coordinate_domain(
@@ -241,26 +307,24 @@ def _write_table(
             writer.write_table(table.slice(start, stop - start))
 
 
-def _source_path(region: str, basins_dir: Path) -> Path:
-    filename = f"hybas_{region}_lev12_v1.shp"
-    matches = sorted(basins_dir.glob(filename))
-    if len(matches) != 1:
+def _source_path(region: str, basins_dir: Path, source_level: int) -> Path:
+    filename = f"hybas_{region}_lev{source_level:02d}_v1c.shp"
+    source_path = basins_dir / f"hybas_{region}" / filename
+    if not source_path.is_file():
         raise AdapterError(
-            f"expected exactly one {filename} layer under {basins_dir}, "
-            f"found {len(matches)}"
+            f"expected exactly one {source_path} layer under {source_path.parent}, found 0"
         )
-    return matches[0]
+    return source_path
 
 
-def _pour_points_source_path(pour_points_dir: Path) -> Path:
-    filename = "hybas_pour_lev12_v1.shp"
-    matches = sorted(pour_points_dir.rglob(filename))
-    if len(matches) != 1:
+def _pour_points_source_path(pour_points_dir: Path, source_level: int) -> Path:
+    filename = f"hybas_pour_lev{source_level:02d}_v1.shp"
+    source_path = pour_points_dir / filename
+    if not source_path.is_file():
         raise AdapterError(
-            f"expected exactly one {filename} layer under {pour_points_dir}, "
-            f"found {len(matches)}"
+            f"expected exactly one {filename} layer under {pour_points_dir}, found 0"
         )
-    return matches[0]
+    return source_path
 
 
 def _rivers_source_path(rivers_dir: Path) -> Path:
@@ -398,15 +462,21 @@ def _hilbert_sort(units: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return sorted_units.drop(columns=["_hilbert"]).reset_index(drop=True)
 
 
-def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
-    """Load and normalize one HydroBASINS Pfaf-12 regional polygon layer."""
-    source_path = _source_path(region, basins_dir)
+def load_regional_layer(
+    region: str,
+    basins_dir: Path,
+    *,
+    source_level: int,
+    levels: LevelRange,
+) -> gpd.GeoDataFrame:
+    """Load and normalize one regional HydroBASINS source-Pfaf layer."""
+    source_path = _source_path(region, basins_dir, source_level)
     try:
         units = gpd.read_file(source_path, engine="pyogrio")
     except Exception as error:
         raise AdapterError(f"failed to read HydroBASINS layer {source_path}: {error}") from error
 
-    required = {"HYBAS_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"}
+    required = {"HYBAS_ID", "PFAF_ID", "SUB_AREA", "UP_AREA", "NEXT_DOWN", "ENDO"}
     missing = sorted(required - set(units.columns))
     if missing:
         raise AdapterError(f"HydroBASINS layer missing required columns: {missing}")
@@ -445,7 +515,12 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
         raise AdapterError("non-polygonal geometries remain after coordinate clamp")
 
     units["id"] = _normalize_ids(units["HYBAS_ID"])
-    units["level"] = pd.Series(0, index=units.index, dtype="int64")
+    units["PFAF_ID"] = _normalize_ids(
+        units["PFAF_ID"], source_name="PFAF_ID"
+    )
+    units["level"] = pd.Series(
+        levels.hfx_level(source_level), index=units.index, dtype="int64"
+    )
     units["parent_id"] = pd.Series(pd.NA, index=units.index, dtype="Int64")
     units["area_km2"] = _normalize_area(units["SUB_AREA"], "SUB_AREA")
     units["up_area_km2"] = _normalize_area(units["UP_AREA"], "UP_AREA")
@@ -463,9 +538,13 @@ def load_region_units(region: str, basins_dir: Path) -> gpd.GeoDataFrame:
     return _hilbert_sort(units)
 
 
-def load_pour_points(pour_points_dir: Path) -> gpd.GeoDataFrame:
-    """Load and normalize the HydroBASINS Pfaf-12 ancillary pour points."""
-    source_path = _pour_points_source_path(pour_points_dir)
+def load_pour_points(
+    pour_points_dir: Path,
+    *,
+    source_level: int,
+) -> gpd.GeoDataFrame:
+    """Load and normalize one HydroBASINS ancillary pour-point level."""
+    source_path = _pour_points_source_path(pour_points_dir, source_level)
     try:
         pour_points = gpd.read_file(source_path, engine="pyogrio")
     except Exception as error:
@@ -1055,7 +1134,11 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
     regions = [
         code
         for code in STANDARD_REGION_CODES
-        if (args.basins / f"hybas_{code}_lev12_v1.shp").is_file()
+        if (
+            args.basins
+            / f"hybas_{code}"
+            / f"hybas_{code}_lev12_v1c.shp"
+        ).is_file()
     ]
     if not regions:
         raise AdapterError(
@@ -1067,14 +1150,21 @@ def resolve_build_regions(args: argparse.Namespace) -> list[str]:
 def build_dataset(args: argparse.Namespace) -> None:
     """Load, normalize, merge, and write the selected regional polygon layers."""
     regions = resolve_build_regions(args)
+    source_level = 12
+    compatibility_levels = LevelRange(12, 12)
+    pour_points = load_pour_points(
+        args.pour_points,
+        source_level=source_level,
+    )
     assigned_frames: list[gpd.GeoDataFrame] = []
     rivers_frames: list[gpd.GeoDataFrame] = []
     for region_index, region in enumerate(regions):
-        units = load_region_units(region, args.basins)
-        pour_points_dir = (
-            args.pour_points if args.region is not None else args.pour_points / region
+        units = load_regional_layer(
+            region,
+            args.basins,
+            source_level=source_level,
+            levels=compatibility_levels,
         )
-        pour_points = load_pour_points(pour_points_dir)
         assigned_frames.append(assign_outlets(units, pour_points))
         if args.rivers is not None:
             rivers_dir = (
@@ -1134,8 +1224,8 @@ def build_dataset(args: argparse.Namespace) -> None:
 
 def extract_dataset(args: argparse.Namespace) -> None:
     """Inspect one regional polygon layer and its ancillary pour points."""
-    basins_path = _source_path(args.region, args.basins)
-    pour_points_path = _pour_points_source_path(args.pour_points)
+    basins_path = _source_path(args.region, args.basins, 12)
+    pour_points_path = _pour_points_source_path(args.pour_points, 12)
 
     try:
         basins = gpd.read_file(basins_path, engine="pyogrio")
@@ -1216,10 +1306,10 @@ def validate_dataset(dataset: Path, report_dir: Path) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the HydroBASINS adapter command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Build standard without-lakes HydroBASINS Pfaf-12 HFX datasets."
+        description="Build standard without-lakes HydroBASINS source-Pfaf HFX datasets."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    build = subparsers.add_parser("build", help="build a Pfaf-12 dataset")
+    build = subparsers.add_parser("build", help="build a source-Pfaf range dataset")
     region_selector = build.add_mutually_exclusive_group(required=True)
     region_selector.add_argument("--region", help="HydroBASINS region code")
     region_selector.add_argument(
@@ -1236,13 +1326,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basins",
         type=Path,
         required=True,
-        help="directory containing the regional Pfaf-12 polygon layer",
+        help="extract/ directory containing canonical regional polygon layers",
     )
     build.add_argument(
         "--pour-points",
         type=Path,
         required=True,
-        help="directory containing hybas_pour_lev12_v1.shp",
+        help="global extract/pour/ directory containing canonical pour layers",
+    )
+    build.add_argument(
+        "--levels",
+        type=parse_level_range,
+        action=_UniqueLevelRangeAction,
+        default="12",  # M2-S3, not this step, flips the default to "1-12".
+        help="singleton or contiguous source-Pfaf range N or N-M",
     )
     build.add_argument(
         "--rivers",
@@ -1272,13 +1369,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basins",
         type=Path,
         required=True,
-        help="directory containing the regional Pfaf-12 polygon layer",
+        help="extract/ directory containing the regional Pfaf-12 polygon layer",
     )
     extract.add_argument(
         "--pour-points",
         type=Path,
         required=True,
-        help="directory containing hybas_pour_lev12_v1.shp",
+        help="global extract/pour/ directory containing hybas_pour_lev12_v1.shp",
     )
     validate = subparsers.add_parser(
         "validate", help="run strict validation and persist reports"
