@@ -34,6 +34,9 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | Level range | The single contiguous Pfafstetter level range (source numbering 1–12) a HydroBASINS build compiles, default the full `1-12`. Arbitrary non-contiguous level sets are not legal selections. |
 | Declarative auxiliary | An auxiliary schema that describes its source data as-is — CRS, encoding, and units are declared in manifest metadata — instead of requiring adapter normalization. `hfx.aux.d8_raster.v2` is the first; core artifacts remain normalized. |
 | Header-authoritative property | A physical raster property (dtype, nodata) whose source of truth is the raster file header. The spec constrains its allowed values; the manifest never duplicates it. |
+| TDX-Hydro reach catchment | One polygon per TauDEM stream reach (5 km² delineation threshold) in NGA's TDX-Hydro `basins` product; the sole resolution tier the source ships, compiling to a level-0 drainage unit. |
+| TDX-Hydro processing basin | One of the 62 HydroBASINS level-2 boundaries the NGA distribution is tiled by. A distribution/processing partition inherited from HydroSHEDS, not a drainage-unit level of the TDX product. |
+| Build campaign | One provision → bootstrap → wrangle → deliver → teardown lifecycle of the ephemeral fsn1 build VM. The unit of cost accounting and teardown discipline; nothing durable survives a campaign on the VM, since every input is re-fetchable and every output re-creatable. |
 
 ## Aliases to avoid
 
@@ -44,6 +47,7 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | graph.arrow | graph.parquet | `graph.arrow` is the legacy v0.1 artifact; not valid in v0.2+. |
 | root-level snap.parquet | `hfx.aux.snap.v2` auxiliary | A root `snap.parquet` is legacy v0.2; snap features must be declared as the `hfx.aux.snap.v2` auxiliary. |
 | has_rasters / has_snap | auxiliary declaration | These v0.1 manifest flags were removed; presence is declared via `auxiliary[]` entries instead. |
+| basin (bare, in TDX-Hydro context) | TDX-Hydro reach catchment / TDX-Hydro processing basin | NGA's `basins` product holds reach catchments while the 62 level-2 tiles are processing basins; bare "basin" hides which one is meant. |
 
 ## Relationships
 
