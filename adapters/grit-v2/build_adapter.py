@@ -28,8 +28,10 @@ import rasterio
 from affine import Affine
 from geoparquet_io.core.validate import validate_geoparquet
 from geopandas import GeoSeries
-from rio_cogeo.cogeo import cog_translate, cog_validate
-from rio_cogeo.profiles import cog_profiles
+from rasterio.enums import Resampling
+from rasterio.shutil import copy as rio_copy
+from rio_cogeo.cogeo import cog_validate
+from rio_cogeo.utils import get_maximum_overview_level
 from shapely import make_valid
 import shapely
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon
@@ -163,14 +165,34 @@ def _extract_raster_archives(
     for archive_index, archive_path in enumerate(archives):
         members = _safe_tiff_members(archive_path)
         archive_root = extraction_root / f"{archive_index:04d}"
-        with ZipFile(archive_path) as archive:
-            for info in members:
-                relative_path = Path(*info.filename.replace("\\", "/").split("/"))
-                output_path = archive_root / relative_path
-                ensure_dir(output_path.parent)
-                with archive.open(info) as source, output_path.open("wb") as destination:
-                    shutil.copyfileobj(source, destination, length=1024 * 1024)
-                extracted.append(output_path)
+        try:
+            with ZipFile(archive_path) as archive:
+                for info in members:
+                    relative_path = Path(*info.filename.replace("\\", "/").split("/"))
+                    output_path = archive_root / relative_path
+                    ensure_dir(output_path.parent)
+                    try:
+                        with archive.open(info) as source, output_path.open("wb") as destination:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
+                        extracted_size = output_path.stat().st_size
+                        if extracted_size != info.file_size:
+                            raise AdapterError(
+                                f"archive {archive_path} member {info.filename} extracted to "
+                                f"{extracted_size} bytes, expected {info.file_size}"
+                            )
+                    except AdapterError:
+                        output_path.unlink(missing_ok=True)
+                        raise
+                    except Exception as error:
+                        output_path.unlink(missing_ok=True)
+                        raise AdapterError(
+                            f"failed to extract archive {archive_path} member {info.filename}: {error}"
+                        ) from error
+                    extracted.append(output_path)
+        except AdapterError:
+            raise
+        except Exception as error:
+            raise AdapterError(f"failed to read archive {archive_path}: {error}") from error
     return tuple(extracted)
 
 
@@ -432,41 +454,84 @@ def _write_native_mosaic_vrt(layout: RasterMosaicLayout, output_path: Path) -> N
 
 
 def _translate_and_validate_cog(
-    source_vrt: Path, output_path: Path, temp_folder: Path
+    source_vrt: Path,
+    output_path: Path,
+    temp_folder: Path,
+    disable_disk_free_space_check: bool = False,
 ) -> None:
     """Translate one native mosaic to the required BigTIFF COG profile."""
     ensure_dir(temp_folder)
     staged_output = temp_folder / "translated.tif"
+    external_overviews = Path(f"{source_vrt}.ovr")
     staged_output.unlink(missing_ok=True)
-    profile = cog_profiles.get("deflate")
-    profile.update(blockxsize=512, blockysize=512, BIGTIFF="YES")
+    external_overviews.unlink(missing_ok=True)
     try:
-        cog_translate(
-            source_vrt,
-            staged_output,
-            profile,
-            overview_resampling="nearest",
-            resampling="nearest",
-            in_memory=False,
-            config={
-                "CHECK_DISK_FREE_SPACE": "TRUE",
-                "CPL_TMPDIR": str(temp_folder),
-            },
-            quiet=True,
-        )
+        with rasterio.open(source_vrt) as source:
+            overview_count = get_maximum_overview_level(
+                source.width, source.height, minsize=512
+            )
+        overview_factors = [2**level for level in range(1, overview_count + 1)]
+        disk_check = "FALSE" if disable_disk_free_space_check else "TRUE"
+        with rasterio.Env(
+            CHECK_DISK_FREE_SPACE=disk_check,
+            CPL_TMPDIR=str(temp_folder),
+            COMPRESS_OVERVIEW="DEFLATE",
+            GDAL_TIFF_OVR_BLOCKSIZE="512",
+            TIFF_USE_OVR="YES",
+            BIGTIFF_OVERVIEW="YES",
+        ):
+            if overview_factors:
+                with rasterio.open(source_vrt, "r+") as source:
+                    source.update_tags(OVERVIEW_RESAMPLING="NEAREST")
+                    source.build_overviews(overview_factors, Resampling.nearest)
+            rio_copy(
+                source_vrt,
+                staged_output,
+                driver="GTiff",
+                TILED="YES",
+                BLOCKXSIZE="512",
+                BLOCKYSIZE="512",
+                COMPRESS="DEFLATE",
+                BIGTIFF="YES",
+                COPY_SRC_OVERVIEWS="YES",
+            )
         valid, errors, warnings = cog_validate(staged_output)
         if not valid or errors:
             raise AdapterError(
                 f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
             )
+        with rasterio.open(staged_output) as translated:
+            actual_overviews = translated.overviews(1)
+        if actual_overviews != overview_factors:
+            raise AdapterError(
+                f"COG overview factors differ for {output_path}: "
+                f"expected={overview_factors}; actual={actual_overviews}"
+            )
         ensure_dir(output_path.parent)
-        shutil.move(staged_output, output_path)
+        if temp_folder.stat().st_dev != output_path.parent.stat().st_dev:
+            raise AdapterError(
+                f"raster work directory {temp_folder} and output directory "
+                f"{output_path.parent} must be on one filesystem"
+            )
+        os.replace(staged_output, output_path)
     except AdapterError:
         raise
     except Exception as error:
         raise AdapterError(f"COG translation failed for {output_path}: {error}") from error
     finally:
         staged_output.unlink(missing_ok=True)
+        external_overviews.unlink(missing_ok=True)
+
+
+def _remove_verified_input(path: Path, artifact_name: str) -> None:
+    """Remove an opted-in input tree and require it to be absent."""
+    try:
+        shutil.rmtree(path)
+    except Exception as error:
+        raise AdapterError(f"failed to reclaim {artifact_name} input {path}: {error}") from error
+    if path.exists():
+        raise AdapterError(f"failed to reclaim {artifact_name} input {path}")
+    log(f"reclaimed {artifact_name} extraction tree {path}")
 
 
 def _validate_raster_pair(direction_path: Path, accumulation_path: Path) -> None:
@@ -498,6 +563,9 @@ def build_d8_raster_pair(
     flow_acc_archives: Sequence[Path],
     work_dir: Path,
     output_dir: Path,
+    consume_archives: bool = False,
+    reclaim_extracted: bool = False,
+    disable_disk_free_space_check: bool = False,
 ) -> tuple[Path, Path]:
     """Build lossless native-grid COGs from ZIP-packaged GRIT raster tiles."""
     work_dir = Path(work_dir)
@@ -508,6 +576,21 @@ def build_d8_raster_pair(
     accumulation_sources = _extract_raster_archives(
         flow_acc_archives, work_dir / "flow_acc" / "extracted", "flow_acc"
     )
+    if consume_archives:
+        archive_paths = sorted(
+            {Path(path) for path in (*flow_dir_archives, *flow_acc_archives)},
+            key=lambda path: str(path),
+        )
+        for archive_path in archive_paths:
+            try:
+                archive_path.unlink()
+            except Exception as error:
+                raise AdapterError(
+                    f"failed to consume verified raster archive {archive_path}: {error}"
+                ) from error
+            if archive_path.exists():
+                raise AdapterError(f"failed to consume verified raster archive {archive_path}")
+            log(f"consumed verified raster archive {archive_path}")
     direction_layout = _validate_raster_sources(
         direction_sources,
         "uint8",
@@ -525,12 +608,22 @@ def build_d8_raster_pair(
     accumulation_vrt = work_dir / "flow_acc" / "mosaic.vrt"
     _write_native_mosaic_vrt(direction_layout, direction_vrt)
     _translate_and_validate_cog(
-        direction_vrt, direction_output, work_dir / "flow_dir"
+        direction_vrt,
+        direction_output,
+        work_dir / "flow_dir",
+        disable_disk_free_space_check,
     )
+    if reclaim_extracted:
+        _remove_verified_input(work_dir / "flow_dir" / "extracted", "flow_dir")
     _write_native_mosaic_vrt(accumulation_layout, accumulation_vrt)
     _translate_and_validate_cog(
-        accumulation_vrt, accumulation_output, work_dir / "flow_acc"
+        accumulation_vrt,
+        accumulation_output,
+        work_dir / "flow_acc",
+        disable_disk_free_space_check,
     )
+    if reclaim_extracted:
+        _remove_verified_input(work_dir / "flow_acc" / "extracted", "flow_acc")
     _validate_raster_pair(direction_output, accumulation_output)
     return direction_output, accumulation_output
 
@@ -1879,6 +1972,21 @@ def _parse_args() -> argparse.Namespace:
     )
     raster.add_argument("--dataset-dir", type=Path, required=True)
     raster.add_argument("--work-dir", type=Path, required=True)
+    raster.add_argument(
+        "--consume-archives",
+        action="store_true",
+        help="Delete source raster archives after all direction and accumulation members are extracted and ZIP size/CRC verification succeeds; archives are re-downloadable scratch copies.",
+    )
+    raster.add_argument(
+        "--reclaim-extracted",
+        action="store_true",
+        help="Delete each family's extraction tree after that family's output COG passes validation; direction is reclaimed before accumulation translation.",
+    )
+    raster.add_argument(
+        "--disable-disk-free-space-check",
+        action="store_true",
+        help="Set GDAL CHECK_DISK_FREE_SPACE=FALSE for this invocation; for authorized compressed-streaming runs whose raw destination estimate exceeds free space.",
+    )
 
     return parser.parse_args()
 
@@ -1923,6 +2031,9 @@ def main() -> int:
             flow_acc_archives,
             work_dir,
             output_dir,
+            consume_archives=args.consume_archives,
+            reclaim_extracted=args.reclaim_extracted,
+            disable_disk_free_space_check=args.disable_disk_free_space_check,
         )
         expected_direction = output_dir / "flow_dir.tif"
         expected_accumulation = output_dir / "flow_acc.tif"
