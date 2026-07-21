@@ -7,9 +7,11 @@ import argparse
 import gc
 import json
 import math
+import os
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +28,6 @@ import rasterio
 from affine import Affine
 from geoparquet_io.core.validate import validate_geoparquet
 from geopandas import GeoSeries
-from rasterio.windows import Window
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
 from shapely import make_valid
@@ -363,56 +364,109 @@ def _validate_raster_sources(
     )
 
 
-def _write_native_mosaic(layout: RasterMosaicLayout, output_path: Path) -> None:
-    """Copy validated source blocks into their exact destination windows."""
+def _write_native_mosaic_vrt(layout: RasterMosaicLayout, output_path: Path) -> None:
+    """Describe validated source tiles as an exact native-grid VRT mosaic."""
     ensure_dir(output_path.parent)
-    with rasterio.open(
-        output_path,
-        "w",
-        driver="GTiff",
-        width=layout.width,
-        height=layout.height,
-        count=1,
-        dtype=layout.dtype,
-        nodata=layout.nodata,
-        crs="EPSG:8857",
-        transform=layout.transform,
-    ) as mosaic:
-        for source_path, (destination_col, destination_row) in zip(
-            layout.sources, layout.offsets, strict=True
-        ):
-            with rasterio.open(source_path) as source:
-                for _, source_window in source.block_windows(1):
-                    destination_window = Window(
-                        destination_col + source_window.col_off,
-                        destination_row + source_window.row_off,
-                        source_window.width,
-                        source_window.height,
-                    )
-                    mosaic.write(source.read(1, window=source_window), 1, window=destination_window)
+    vrt_dtypes = {"uint8": "Byte", "float32": "Float32"}
+    try:
+        vrt_dtype = vrt_dtypes[layout.dtype]
+    except KeyError as error:
+        raise AdapterError(f"unsupported VRT mosaic dtype {layout.dtype}") from error
+
+    root = ET.Element(
+        "VRTDataset",
+        rasterXSize=str(layout.width),
+        rasterYSize=str(layout.height),
+    )
+    ET.SubElement(root, "SRS").text = "EPSG:8857"
+    ET.SubElement(root, "GeoTransform").text = ", ".join(
+        format(value, ".17g")
+        for value in (
+            layout.transform.c,
+            layout.transform.a,
+            layout.transform.b,
+            layout.transform.f,
+            layout.transform.d,
+            layout.transform.e,
+        )
+    )
+    band = ET.SubElement(root, "VRTRasterBand", dataType=vrt_dtype, band="1")
+    ET.SubElement(band, "NoDataValue").text = (
+        "nan" if math.isnan(layout.nodata) else format(layout.nodata, ".17g")
+    )
+
+    for source_path, (destination_col, destination_row) in zip(
+        layout.sources, layout.offsets, strict=True
+    ):
+        with rasterio.open(source_path) as source:
+            source_width = source.width
+            source_height = source.height
+        simple_source = ET.SubElement(band, "SimpleSource")
+        relative_path = Path(
+            os.path.relpath(source_path, start=output_path.parent)
+        ).as_posix()
+        ET.SubElement(
+            simple_source, "SourceFilename", relativeToVRT="1"
+        ).text = relative_path
+        ET.SubElement(simple_source, "SourceBand").text = "1"
+        ET.SubElement(
+            simple_source,
+            "SrcRect",
+            xOff="0",
+            yOff="0",
+            xSize=str(source_width),
+            ySize=str(source_height),
+        )
+        ET.SubElement(
+            simple_source,
+            "DstRect",
+            xOff=str(destination_col),
+            yOff=str(destination_row),
+            xSize=str(source_width),
+            ySize=str(source_height),
+        )
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
 
 
-def _translate_and_validate_cog(source_path: Path, output_path: Path) -> None:
+def _translate_and_validate_cog(
+    source_vrt: Path, output_path: Path, temp_folder: Path
+) -> None:
     """Translate one native mosaic to the required BigTIFF COG profile."""
+    ensure_dir(temp_folder)
+    staged_output = temp_folder / "translated.tif"
+    staged_output.unlink(missing_ok=True)
     profile = cog_profiles.get("deflate")
     profile.update(blockxsize=512, blockysize=512, BIGTIFF="YES")
     try:
         cog_translate(
-            source_path,
-            output_path,
+            source_vrt,
+            staged_output,
             profile,
             overview_resampling="nearest",
             resampling="nearest",
             in_memory=False,
+            config={
+                "CHECK_DISK_FREE_SPACE": "TRUE",
+                "CPL_TMPDIR": str(temp_folder),
+            },
             quiet=True,
         )
-        valid, errors, warnings = cog_validate(output_path)
+        valid, errors, warnings = cog_validate(staged_output)
+        if not valid or errors:
+            raise AdapterError(
+                f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
+            )
+        ensure_dir(output_path.parent)
+        shutil.move(staged_output, output_path)
+    except AdapterError:
+        raise
     except Exception as error:
         raise AdapterError(f"COG translation failed for {output_path}: {error}") from error
-    if not valid or errors:
-        raise AdapterError(
-            f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
-        )
+    finally:
+        staged_output.unlink(missing_ok=True)
 
 
 def _validate_raster_pair(direction_path: Path, accumulation_path: Path) -> None:
@@ -467,17 +521,16 @@ def build_d8_raster_pair(
 
     direction_output = output_dir / "flow_dir.tif"
     accumulation_output = output_dir / "flow_acc.tif"
-    direction_temporary = work_dir / "flow_dir" / "mosaic.tif"
-    accumulation_temporary = work_dir / "flow_acc" / "mosaic.tif"
-    ensure_dir(output_dir)
-    try:
-        _write_native_mosaic(direction_layout, direction_temporary)
-        _translate_and_validate_cog(direction_temporary, direction_output)
-        _write_native_mosaic(accumulation_layout, accumulation_temporary)
-        _translate_and_validate_cog(accumulation_temporary, accumulation_output)
-    finally:
-        direction_temporary.unlink(missing_ok=True)
-        accumulation_temporary.unlink(missing_ok=True)
+    direction_vrt = work_dir / "flow_dir" / "mosaic.vrt"
+    accumulation_vrt = work_dir / "flow_acc" / "mosaic.vrt"
+    _write_native_mosaic_vrt(direction_layout, direction_vrt)
+    _translate_and_validate_cog(
+        direction_vrt, direction_output, work_dir / "flow_dir"
+    )
+    _write_native_mosaic_vrt(accumulation_layout, accumulation_vrt)
+    _translate_and_validate_cog(
+        accumulation_vrt, accumulation_output, work_dir / "flow_acc"
+    )
     _validate_raster_pair(direction_output, accumulation_output)
     return direction_output, accumulation_output
 
