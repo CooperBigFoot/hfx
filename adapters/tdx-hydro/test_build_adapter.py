@@ -1,21 +1,37 @@
+import json
 import math
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pyogrio
+from geoparquet_io.core.validate import validate_geoparquet
+from jsonschema import Draft202012Validator, FormatChecker
 from pyproj import Geod
-from shapely import get_coordinates
+from shapely import from_wkb, get_coordinates
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
 from build_adapter import (
+    ADAPTER_VERSION,
+    BBOX_LEAF_NAMES,
     COORDINATE_DOMAIN_TOLERANCE_DEGREES,
+    CRS,
+    FABRIC_NAME,
+    FORMAT_VERSION,
+    HAS_UP_AREA,
     LayerClampDiagnostics,
+    TOPOLOGY,
+    CoreBuildResult,
     StreamnetDiagnostics,
     StreamnetUnit,
     build_streamnet_model,
+    compile_core_hfx,
     global_linkno,
     load_header_crosswalk,
     load_tdx_geopackages,
@@ -811,6 +827,343 @@ class StreamnetTopologyRejectionTests(unittest.TestCase):
             build_streamnet_model(
                 basins, streamnet, header_number=71, endpoint_tolerance=0.001
             )
+
+
+class CoreHfxCompilationTests(unittest.TestCase):
+    created_at = datetime(2026, 7, 21, 12, 34, 56, tzinfo=timezone.utc)
+    basin_id = "7020000010"
+    fabric_version = "synthetic-2026.07"
+
+    def compile_fixture(
+        self,
+        directory: Path,
+        out_dir: Path,
+        *,
+        isolated_roots: bool = False,
+    ):
+        directory.mkdir()
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        if isolated_roots:
+            streamnet["DSLINKNO"] = [-1, -1]
+            streamnet["DSContArea"] = [
+                area_200_m2 / 1_000_000,
+                area_100_m2 / 1_000_000,
+            ]
+        source = load_tdx_geopackages(*write_pair(directory, basins, streamnet))
+        model = build_streamnet_model(
+            source.basins,
+            source.streamnet,
+            header_number=71,
+            endpoint_tolerance=0.001,
+        )
+        result = compile_core_hfx(
+            source,
+            model,
+            out_dir,
+            processing_basin_id=self.basin_id,
+            fabric_version=self.fabric_version,
+            created_at=self.created_at,
+        )
+        return source, model, result, basins
+
+    def test_compile_core_hfx_writes_deterministic_artifacts_and_preserves_diagnostics(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source, model, first, _ = self.compile_fixture(
+                root / "source-a", root / "output-a"
+            )
+            _, _, second, _ = self.compile_fixture(
+                root / "source-b", root / "output-b"
+            )
+            expected_names = {
+                "catchments.parquet",
+                "graph.parquet",
+                "manifest.json",
+            }
+            self.assertEqual(
+                {path.name for path in (root / "output-a").iterdir()},
+                expected_names,
+            )
+            self.assertEqual(
+                {path.name for path in (root / "output-b").iterdir()},
+                expected_names,
+            )
+            self.assertEqual(first.catchments_path, root / "output-a/catchments.parquet")
+            self.assertEqual(first.graph_path, root / "output-a/graph.parquet")
+            self.assertEqual(first.manifest_path, root / "output-a/manifest.json")
+            for name in expected_names:
+                self.assertEqual(
+                    (root / "output-a" / name).read_bytes(),
+                    (root / "output-b" / name).read_bytes(),
+                )
+
+        self.assertIsInstance(first, CoreBuildResult)
+        self.assertIs(first.diagnostics.ingestion, source.diagnostics)
+        self.assertIs(first.diagnostics.streamnet, model.diagnostics)
+        ingestion = first.diagnostics.ingestion
+        self.assertEqual(ingestion.basins_clamp, LayerClampDiagnostics(0, ()))
+        self.assertEqual(ingestion.streamnet_clamp, LayerClampDiagnostics(0, ()))
+        self.assertEqual(ingestion.dscontarea.source_unit, "km2")
+        self.assertEqual(ingestion.dscontarea.checked_polygon_bearing_link_count, 2)
+        self.assertEqual(ingestion.dscontarea.km2_relative_error, 0.0)
+        self.assertEqual(ingestion.dscontarea.selected_relative_error, 0.0)
+        diagnostics = first.diagnostics.streamnet
+        self.assertEqual(diagnostics.polygon_bearing_link_count, 2)
+        self.assertEqual(diagnostics.root_count, 1)
+        self.assertEqual(diagnostics.contracted_edge_count, 0)
+        self.assertEqual(diagnostics.contracted_root_count, 0)
+        self.assertEqual(diagnostics.contracted_link_traversal_count, 0)
+        self.assertEqual(diagnostics.endpoint_coincidence_proven_link_count, 1)
+        self.assertEqual(diagnostics.predecessor_orientation_proven_root_count, 1)
+        self.assertEqual(diagnostics.trusted_orientation_isolated_root_count, 0)
+        self.assertEqual(
+            diagnostics.trusted_orientation_isolated_root_native_linknos, ()
+        )
+        self.assertEqual(
+            diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 0
+        )
+        self.assertEqual(
+            diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            (),
+        )
+        self.assertEqual(diagnostics.orientation_tolerance, 0.001)
+
+    def test_compile_core_hfx_writes_exact_schemas_values_and_manifest(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, result, source_basins = self.compile_fixture(
+                root / "source", root / "output"
+            )
+            catchments_file = pq.ParquetFile(result.catchments_path)
+            graph_file = pq.ParquetFile(result.graph_path)
+            catchments = catchments_file.read()
+            graph = graph_file.read()
+
+            expected_geo = {
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {
+                        "encoding": "WKB",
+                        "geometry_types": ["Polygon", "MultiPolygon"],
+                        "covering": {
+                            "bbox": {
+                                "xmin": ["bbox", "xmin"],
+                                "ymin": ["bbox", "ymin"],
+                                "xmax": ["bbox", "xmax"],
+                                "ymax": ["bbox", "ymax"],
+                            }
+                        },
+                    }
+                },
+            }
+            bbox_type = pa.struct(
+                [pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES]
+            )
+            expected_catchment_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("level", pa.int16(), nullable=False),
+                    pa.field("parent_id", pa.int64(), nullable=True),
+                    pa.field("area_km2", pa.float32(), nullable=False),
+                    pa.field("up_area_km2", pa.float32(), nullable=True),
+                    pa.field("outlet_lon", pa.float64(), nullable=False),
+                    pa.field("outlet_lat", pa.float64(), nullable=False),
+                    pa.field("bbox", bbox_type, nullable=False),
+                    pa.field("geometry", pa.binary(), nullable=False),
+                ],
+                metadata={b"geo": json.dumps(expected_geo).encode("utf-8")},
+            )
+            expected_graph_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("level", pa.int16(), nullable=False),
+                    pa.field(
+                        "upstream_ids",
+                        pa.list_(pa.field("item", pa.int64(), nullable=True)),
+                        nullable=False,
+                    ),
+                    pa.field("bbox_minx", pa.float32(), nullable=False),
+                    pa.field("bbox_miny", pa.float32(), nullable=False),
+                    pa.field("bbox_maxx", pa.float32(), nullable=False),
+                    pa.field("bbox_maxy", pa.float32(), nullable=False),
+                ]
+            )
+            self.assertEqual(catchments.schema, expected_catchment_schema)
+            self.assertEqual(graph.schema, expected_graph_schema)
+            self.assertEqual(catchments_file.num_row_groups, 1)
+            self.assertEqual(graph_file.num_row_groups, 1)
+            self.assertEqual(catchments["id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(catchments["level"].to_pylist(), [0, 0])
+            self.assertEqual(catchments["parent_id"].to_pylist(), [None, None])
+            self.assertEqual(
+                catchments["area_km2"].to_pylist(),
+                [1.2309072017669678, 1.2309072017669678],
+            )
+            self.assertEqual(
+                catchments["up_area_km2"].to_pylist(),
+                [1.2309072017669678, 2.4618144035339355],
+            )
+            self.assertEqual(
+                list(zip(catchments["outlet_lon"].to_pylist(), catchments["outlet_lat"].to_pylist())),
+                [(0.01, 0.0), (0.02, 0.0)],
+            )
+            for actual, expected in zip(
+                from_wkb(catchments["geometry"].to_pylist()),
+                [source_basins.geometry.iloc[1], source_basins.geometry.iloc[0]],
+                strict=True,
+            ):
+                self.assertTrue(actual.equals(expected))
+            expected_bounds = [
+                [0.0, 0.0, 0.009999999776482582, 0.009999999776482582],
+                [0.009999999776482582, 0.0, 0.019999999552965164, 0.009999999776482582],
+            ]
+            actual_bounds = [
+                [row[name] for name in BBOX_LEAF_NAMES]
+                for row in catchments["bbox"].to_pylist()
+            ]
+            self.assertEqual(actual_bounds, expected_bounds)
+            self.assertEqual(graph["id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(graph["level"].to_pylist(), [0, 0])
+            self.assertEqual(graph["upstream_ids"].to_pylist(), [[], [710000100]])
+            self.assertEqual(
+                list(
+                    zip(
+                        graph["bbox_minx"].to_pylist(),
+                        graph["bbox_miny"].to_pylist(),
+                        graph["bbox_maxx"].to_pylist(),
+                        graph["bbox_maxy"].to_pylist(),
+                    )
+                ),
+                [tuple(bounds) for bounds in expected_bounds],
+            )
+            distances = source_basins.geometry.centroid.hilbert_distance(
+                total_bounds=source_basins.geometry.total_bounds
+            )
+            self.assertEqual(distances.tolist(), [3489660928, 805306368])
+            for parquet_file, names in (
+                (catchments_file, [f"bbox.{name}" for name in BBOX_LEAF_NAMES]),
+                (graph_file, [f"bbox_{name}" for name in ("minx", "miny", "maxx", "maxy")]),
+            ):
+                parquet_schema = parquet_file.schema_arrow
+                for name in names:
+                    column_index = parquet_file.schema.names.index(name.split(".")[-1])
+                    statistics = parquet_file.metadata.row_group(0).column(column_index).statistics
+                    self.assertIsNotNone(statistics, name)
+                    self.assertTrue(statistics.has_min_max, name)
+                self.assertEqual(parquet_file.schema_arrow, parquet_schema)
+            self.assertEqual(
+                json.loads(catchments.schema.metadata[b"geo"].decode("utf-8")),
+                expected_geo,
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(result.catchments_path), target_version="1.1"
+                ).is_valid
+            )
+            manifest = json.loads(result.manifest_path.read_text())
+
+        expected_manifest = {
+            "format_version": "0.3.0",
+            "fabric_name": "tdx_hydro",
+            "fabric_version": "synthetic-2026.07",
+            "crs": "EPSG:4326",
+            "has_up_area": True,
+            "topology": "tree",
+            "region": "7020000010",
+            "bbox": [0.0, 0.0, 0.019999999552965164, 0.009999999776482582],
+            "unit_count": 2,
+            "created_at": "2026-07-21T12:34:56+00:00",
+            "adapter_version": "0.1.0",
+        }
+        self.assertEqual(manifest, expected_manifest)
+        self.assertEqual(FORMAT_VERSION, "0.3.0")
+        self.assertEqual(FABRIC_NAME, "tdx_hydro")
+        self.assertEqual(CRS, "EPSG:4326")
+        self.assertIs(HAS_UP_AREA, True)
+        self.assertEqual(TOPOLOGY, "tree")
+        self.assertEqual(ADAPTER_VERSION, "0.1.0")
+        schema_path = Path(__file__).resolve().parents[2] / "schemas/manifest.schema.json"
+        schema = json.loads(schema_path.read_text())
+        errors = sorted(
+            Draft202012Validator(
+                schema, format_checker=FormatChecker()
+            ).iter_errors(manifest),
+            key=lambda error: list(error.path),
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            schema["required"],
+            [
+                "format_version",
+                "fabric_name",
+                "crs",
+                "has_up_area",
+                "topology",
+                "bbox",
+                "unit_count",
+                "created_at",
+                "adapter_version",
+            ],
+        )
+
+    def test_compile_core_hfx_preserves_trusted_isolated_root_outlets(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, result, _ = self.compile_fixture(
+                root / "source", root / "output", isolated_roots=True
+            )
+            catchments = pq.read_table(result.catchments_path)
+            graph = pq.read_table(result.graph_path)
+        self.assertEqual(graph["upstream_ids"].to_pylist(), [[], []])
+        self.assertEqual(
+            list(zip(catchments["outlet_lon"].to_pylist(), catchments["outlet_lat"].to_pylist())),
+            [(0.01, 0.0), (0.02, 0.0)],
+        )
+        diagnostics = result.diagnostics.streamnet
+        self.assertEqual(diagnostics.endpoint_coincidence_proven_link_count, 0)
+        self.assertEqual(diagnostics.predecessor_orientation_proven_root_count, 0)
+        self.assertEqual(diagnostics.trusted_orientation_isolated_root_count, 2)
+        self.assertEqual(
+            diagnostics.trusted_orientation_isolated_root_native_linknos, (100, 200)
+        )
+        self.assertEqual(
+            diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 2
+        )
+        self.assertEqual(
+            diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            (100, 200),
+        )
+
+    def test_compile_core_hfx_requires_build_identity_and_aware_timestamp(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = canonical_frames()
+            source = load_tdx_geopackages(*write_pair(root, basins, streamnet))
+            model = build_streamnet_model(
+                source.basins,
+                source.streamnet,
+                header_number=71,
+                endpoint_tolerance=0.001,
+            )
+            valid = {
+                "processing_basin_id": self.basin_id,
+                "fabric_version": self.fabric_version,
+                "created_at": self.created_at,
+            }
+            for argument, value in (
+                ("fabric_version", ""),
+                ("fabric_version", "   "),
+                ("processing_basin_id", ""),
+                ("processing_basin_id", "not-digits"),
+                ("created_at", datetime(2026, 7, 21)),
+            ):
+                invalid = valid | {argument: value}
+                with self.subTest(argument=argument, value=value):
+                    with self.assertRaisesRegex(ValueError, argument):
+                        compile_core_hfx(source, model, root / "output", **invalid)
 
 
 if __name__ == "__main__":

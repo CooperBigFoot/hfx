@@ -8,19 +8,31 @@ import logging
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pyogrio
+from geoparquet_io.core.validate import validate_geoparquet
 from pyproj import Geod
 from shapely import get_coordinates, set_coordinates
 from shapely.geometry import LineString
 
 
 CROSSWALK_PATH = Path(__file__).parent / "data" / "tdx_header_numbers.json"
+FABRIC_NAME = "tdx_hydro"
+ADAPTER_VERSION = "0.1.0"
+FORMAT_VERSION = "0.3.0"
+TOPOLOGY = "tree"
+HAS_UP_AREA = True
+ROW_GROUP_MIN = 4096
+ROW_GROUP_MAX = 8192
+BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
 GLOBAL_LINKNO_STRIDE = 10_000_000
 TDX_LINKNO_SENTINEL = -1
 LOGGER = logging.getLogger("tdx-hydro")
@@ -104,6 +116,20 @@ class StreamnetModel:
     edges: tuple[tuple[int, int], ...]
     roots: tuple[int, ...]
     diagnostics: StreamnetDiagnostics
+
+
+@dataclass(frozen=True)
+class CoreBuildDiagnostics:
+    ingestion: IngestionDiagnostics
+    streamnet: StreamnetDiagnostics
+
+
+@dataclass(frozen=True)
+class CoreBuildResult:
+    catchments_path: Path
+    graph_path: Path
+    manifest_path: Path
+    diagnostics: CoreBuildDiagnostics
 
 
 def _load_single_geopackage(path: Path, layer_name: str) -> gpd.GeoDataFrame:
@@ -889,4 +915,357 @@ def build_streamnet_model(
         edges=edges,
         roots=roots,
         diagnostics=diagnostics,
+    )
+
+
+def build_geo_metadata(geometry_types: list[str]) -> dict[bytes, bytes]:
+    """Build GeoParquet 1.1 metadata with a `bbox` covering."""
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {
+            "geometry": {
+                "encoding": "WKB",
+                "geometry_types": geometry_types,
+                "covering": {
+                    "bbox": {name: ["bbox", name] for name in BBOX_LEAF_NAMES}
+                },
+            }
+        },
+    }
+    return {b"geo": json.dumps(geo).encode("utf-8")}
+
+
+def bbox_struct_type() -> pa.DataType:
+    """Return the GeoParquet covering `bbox` type with non-nullable leaves."""
+    return pa.struct(
+        [pa.field(name, pa.float32(), nullable=False) for name in BBOX_LEAF_NAMES]
+    )
+
+
+def build_bbox_struct(minx, miny, maxx, maxy) -> pa.StructArray:
+    """Build a bbox struct whose float32 leaves carry row-group statistics."""
+    return pa.StructArray.from_arrays(
+        [
+            pa.array(minx, type=pa.float32()),
+            pa.array(miny, type=pa.float32()),
+            pa.array(maxx, type=pa.float32()),
+            pa.array(maxy, type=pa.float32()),
+        ],
+        fields=[
+            pa.field(name, pa.float32(), nullable=False)
+            for name in BBOX_LEAF_NAMES
+        ],
+    )
+
+
+def balanced_row_group_bounds(
+    total_rows: int,
+    min_size: int = ROW_GROUP_MIN,
+    max_size: int = ROW_GROUP_MAX,
+) -> list[tuple[int, int]]:
+    """Split rows into balanced Parquet row groups."""
+    if total_rows <= 0:
+        return []
+
+    min_groups = math.ceil(total_rows / max_size)
+    max_groups = max(1, total_rows // min_size)
+    group_count = max_groups
+    while group_count >= min_groups:
+        base = total_rows // group_count
+        remainder = total_rows % group_count
+        if (
+            min_size <= base <= max_size
+            and base + (1 if remainder else 0) <= max_size
+        ):
+            bounds: list[tuple[int, int]] = []
+            start = 0
+            for index in range(group_count):
+                size = base + (1 if index < remainder else 0)
+                stop = start + size
+                bounds.append((start, stop))
+                start = stop
+            return bounds
+        group_count -= 1
+
+    return [(0, total_rows)]
+
+
+def _write_table(
+    path: Path,
+    schema: pa.Schema,
+    columns: list[pa.Array],
+    row_count: int,
+) -> None:
+    table = pa.Table.from_arrays(columns, schema=schema)
+    with pq.ParquetWriter(
+        path,
+        schema=schema,
+        compression="snappy",
+        write_statistics=True,
+    ) as writer:
+        for start, stop in balanced_row_group_bounds(row_count):
+            writer.write_table(table.slice(start, stop - start))
+
+
+def assert_geoparquet_valid(path: Path) -> None:
+    """Raise when a Parquet file fails GeoParquet 1.1 validation."""
+    result = validate_geoparquet(str(path), target_version="1.1")
+    if result.is_valid:
+        return
+    failures = [check for check in result.checks if check.status.value == "failed"]
+    details = "; ".join(
+        f"{check.name}: {check.message}" for check in failures
+    )
+    raise ValueError(f"GeoParquet validation failed for {path}: {details}")
+
+
+def _validate_core_model(
+    source: TdxSourceData,
+    streamnet_model: StreamnetModel,
+) -> dict[int, StreamnetUnit]:
+    basin_linknos = [int(value) for value in source.basins["streamID"].tolist()]
+    if len(basin_linknos) != len(set(basin_linknos)):
+        raise ValueError("source.basins.streamID must be unique")
+
+    units_by_native = {unit.linkno: unit for unit in streamnet_model.units}
+    if len(units_by_native) != len(streamnet_model.units):
+        raise ValueError("streamnet_model unit native linkno must be unique")
+    if set(basin_linknos) != set(units_by_native):
+        raise ValueError(
+            "source.basins.streamID must equal streamnet_model unit linkno set"
+        )
+
+    units_by_id: dict[int, StreamnetUnit] = {}
+    for unit in streamnet_model.units:
+        if unit.id <= 0:
+            raise ValueError("streamnet_model unit id must be positive")
+        if unit.id in units_by_id:
+            raise ValueError("streamnet_model unit id must be unique")
+        if unit.level != 0:
+            raise ValueError("streamnet_model unit level must equal 0")
+        if unit.parent_id is not None:
+            raise ValueError("streamnet_model unit parent_id must be None")
+        units_by_id[unit.id] = unit
+
+    _validate_edge_relation(units_by_id, streamnet_model.edges)
+    return units_by_id
+
+
+def _validate_edge_relation(
+    units_by_id: dict[int, StreamnetUnit],
+    edges: tuple[tuple[int, int], ...],
+) -> None:
+    downstream_by_upstream: dict[int, int] = {}
+    for upstream_id, downstream_id in edges:
+        if upstream_id not in units_by_id or downstream_id not in units_by_id:
+            raise ValueError("streamnet_model edge endpoint must reference a unit")
+        if upstream_id in downstream_by_upstream:
+            raise ValueError(
+                "streamnet_model source unit may have at most one downstream edge"
+            )
+        downstream_by_upstream[upstream_id] = downstream_id
+
+    for start in units_by_id:
+        seen: set[int] = set()
+        current = start
+        while current in downstream_by_upstream:
+            if current in seen:
+                raise ValueError("streamnet_model edge relation must be acyclic")
+            seen.add(current)
+            current = downstream_by_upstream[current]
+
+
+def _prepare_core_units(
+    source: TdxSourceData,
+    streamnet_model: StreamnetModel,
+) -> gpd.GeoDataFrame:
+    _validate_core_model(source, streamnet_model)
+    units_by_native = {unit.linkno: unit for unit in streamnet_model.units}
+    stream_rows: dict[int, float] = {}
+    for linkno, up_area in zip(
+        source.streamnet["LINKNO"],
+        source.streamnet["DSContArea_km2"],
+        strict=True,
+    ):
+        native_id = int(linkno)
+        if native_id in stream_rows:
+            raise ValueError("source.streamnet.LINKNO must be unique")
+        value = float(up_area)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("source.streamnet.DSContArea_km2 must be positive and finite")
+        stream_rows[native_id] = value
+    missing_stream_rows = sorted(set(units_by_native) - set(stream_rows))
+    if missing_stream_rows:
+        raise ValueError(
+            "streamnet_model unit linkno must join to source.streamnet.LINKNO: "
+            f"{missing_stream_rows[0]}"
+        )
+
+    geod = Geod(ellps="WGS84")
+    records: list[dict[str, object]] = []
+    geometries = []
+    for native_id, geometry in zip(
+        source.basins["streamID"], source.basins.geometry, strict=True
+    ):
+        unit = units_by_native[int(native_id)]
+        area_km2 = abs(geod.geometry_area_perimeter(geometry)[0]) / 1_000_000
+        if not math.isfinite(area_km2) or area_km2 <= 0.0:
+            raise ValueError("catchment geodesic area must be positive and finite")
+        area_f32 = np.float32(area_km2)
+        if not np.isfinite(area_f32) or area_f32 <= 0:
+            raise ValueError("catchment float32 area must be positive and finite")
+        up_area = stream_rows[unit.linkno]
+        up_area_f32 = np.float32(up_area)
+        if not np.isfinite(up_area_f32) or up_area_f32 <= 0:
+            raise ValueError("catchment float32 upstream area must be positive and finite")
+        records.append(
+            {
+                "native_id": unit.linkno,
+                "id": unit.id,
+                "level": unit.level,
+                "parent_id": unit.parent_id,
+                "area_km2": area_f32,
+                "up_area_km2": up_area_f32,
+                "outlet_lon": unit.outlet_lon,
+                "outlet_lat": unit.outlet_lat,
+            }
+        )
+        geometries.append(geometry)
+
+    ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
+    ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
+        total_bounds=ordered.geometry.total_bounds
+    )
+    ordered = ordered.sort_values(["_hilbert", "id"], kind="mergesort")
+    ordered = ordered.drop(columns=["_hilbert"]).reset_index(drop=True)
+    return ordered
+
+
+def _float32_bounds(units: gpd.GeoDataFrame) -> np.ndarray:
+    bounds = units.geometry.bounds.to_numpy(dtype="float64")
+    return bounds.astype("float32")
+
+
+def _write_catchments(path: Path, units: gpd.GeoDataFrame) -> np.ndarray:
+    bounds = _float32_bounds(units)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox", bbox_struct_type(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
+    columns = [
+        pa.array(units["id"], type=pa.int64()),
+        pa.array(units["level"], type=pa.int16()),
+        pa.array(units["parent_id"], type=pa.int64()),
+        pa.array(units["area_km2"], type=pa.float32()),
+        pa.array(units["up_area_km2"], type=pa.float32()),
+        pa.array(units["outlet_lon"], type=pa.float64()),
+        pa.array(units["outlet_lat"], type=pa.float64()),
+        build_bbox_struct(bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]),
+        pa.array([geometry.wkb for geometry in units.geometry], type=pa.binary()),
+    ]
+    _write_table(path, schema, columns, len(units))
+    assert_geoparquet_valid(path)
+    return bounds
+
+
+def _write_graph(
+    path: Path,
+    units: gpd.GeoDataFrame,
+    bounds: np.ndarray,
+    streamnet_model: StreamnetModel,
+) -> None:
+    units_by_id = {unit.id: unit for unit in streamnet_model.units}
+    _validate_edge_relation(units_by_id, streamnet_model.edges)
+    upstream_by_id = {int(unit_id): [] for unit_id in units["id"]}
+    for upstream_id, downstream_id in streamnet_model.edges:
+        upstream_by_id[downstream_id].append(upstream_id)
+    for upstream_ids in upstream_by_id.values():
+        upstream_ids.sort()
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field(
+                "upstream_ids",
+                pa.list_(pa.field("item", pa.int64(), nullable=True)),
+                nullable=False,
+            ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+    columns = [
+        pa.array(units["id"], type=pa.int64()),
+        pa.array(units["level"], type=pa.int16()),
+        pa.array(
+            [upstream_by_id[int(unit_id)] for unit_id in units["id"]],
+            type=pa.list_(pa.int64()),
+        ),
+        pa.array(bounds[:, 0], type=pa.float32()),
+        pa.array(bounds[:, 1], type=pa.float32()),
+        pa.array(bounds[:, 2], type=pa.float32()),
+        pa.array(bounds[:, 3], type=pa.float32()),
+    ]
+    _write_table(path, schema, columns, len(units))
+
+
+def compile_core_hfx(
+    source: TdxSourceData,
+    streamnet_model: StreamnetModel,
+    out_dir: Path,
+    *,
+    processing_basin_id: str,
+    fabric_version: str,
+    created_at: datetime,
+) -> CoreBuildResult:
+    """Compile normalized TDX-Hydro inputs into HFX v0.3.0 core artifacts."""
+    if not processing_basin_id or not processing_basin_id.isdigit():
+        raise ValueError("processing_basin_id must be a non-empty digit string")
+    if not fabric_version or not fabric_version.strip():
+        raise ValueError("fabric_version must be a non-empty, non-whitespace string")
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
+
+    units = _prepare_core_units(source, streamnet_model)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    catchments_path = out_dir / "catchments.parquet"
+    graph_path = out_dir / "graph.parquet"
+    manifest_path = out_dir / "manifest.json"
+    bounds = _write_catchments(catchments_path, units)
+    _write_graph(graph_path, units, bounds, streamnet_model)
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "fabric_name": FABRIC_NAME,
+        "fabric_version": fabric_version,
+        "crs": CRS,
+        "has_up_area": HAS_UP_AREA,
+        "topology": TOPOLOGY,
+        "region": processing_basin_id,
+        "bbox": [float(np.float32(value)) for value in units.geometry.total_bounds],
+        "unit_count": len(units),
+        "created_at": created_at.astimezone(timezone.utc).isoformat(),
+        "adapter_version": ADAPTER_VERSION,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return CoreBuildResult(
+        catchments_path=catchments_path,
+        graph_path=graph_path,
+        manifest_path=manifest_path,
+        diagnostics=CoreBuildDiagnostics(
+            ingestion=source.diagnostics,
+            streamnet=streamnet_model.diagnostics,
+        ),
     )
