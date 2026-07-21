@@ -11,6 +11,7 @@ from numbers import Integral, Real
 from pathlib import Path
 
 import pandas as pd
+from shapely.geometry import LineString
 
 
 CROSSWALK_PATH = Path(__file__).parent / "data" / "tdx_header_numbers.json"
@@ -28,6 +29,8 @@ class StreamnetUnit:
     downstream_linkno: int
     downstream_id: int
     contracted_link_count: int
+    outlet_lon: float
+    outlet_lat: float
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,9 @@ class StreamnetDiagnostics:
     contracted_edge_count: int
     contracted_root_count: int
     contracted_link_traversal_count: int
+    orientation_checked_link_count: int
+    root_orientation_checked_count: int
+    orientation_tolerance: float
 
 
 @dataclass(frozen=True)
@@ -164,12 +170,126 @@ def _resolve_downstream(
     return downstream_linkno, contracted_link_count
 
 
+def _positive_finite_tolerance(endpoint_tolerance: object) -> float:
+    if isinstance(endpoint_tolerance, bool) or not isinstance(endpoint_tolerance, Real):
+        raise ValueError("endpoint_tolerance must be a positive finite number")
+    tolerance = float(endpoint_tolerance)
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("endpoint_tolerance must be a positive finite number")
+    return tolerance
+
+
+def _streamnet_endpoints(
+    stream_linknos: list[int],
+    geometries: list[object],
+) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+    endpoints_by_linkno: dict[
+        int, tuple[tuple[float, float], tuple[float, float]]
+    ] = {}
+    for linkno, geometry in zip(stream_linknos, geometries, strict=True):
+        if not isinstance(geometry, LineString) or geometry.is_empty:
+            raise ValueError(
+                f"streamnet geometry for native LINKNO {linkno} must be a non-empty LineString"
+            )
+
+        coordinates = list(geometry.coords)
+        if len(coordinates) < 2:
+            raise ValueError(
+                f"streamnet geometry for native LINKNO {linkno} must have at least two coordinates"
+            )
+        start = coordinates[0]
+        end = coordinates[-1]
+        if (
+            len(start) != 2
+            or len(end) != 2
+            or not all(math.isfinite(float(value)) for value in (*start, *end))
+        ):
+            raise ValueError(
+                f"streamnet geometry for native LINKNO {linkno} must have finite two-dimensional endpoints"
+            )
+
+        start_xy = (float(start[0]), float(start[1]))
+        end_xy = (float(end[0]), float(end[1]))
+        if start_xy == end_xy:
+            raise ValueError(
+                f"streamnet geometry for native LINKNO {linkno} has degenerate endpoints"
+            )
+        endpoints_by_linkno[linkno] = (start_xy, end_xy)
+
+    return endpoints_by_linkno
+
+
+def _prove_native_orientation(
+    relation: dict[int, int],
+    endpoints_by_linkno: dict[
+        int, tuple[tuple[float, float], tuple[float, float]]
+    ],
+    endpoint_tolerance: float,
+) -> dict[int, tuple[float, float]]:
+    downstream_endpoints: dict[int, tuple[float, float]] = {}
+    matched_successor_endpoints: dict[int, list[int]] = {}
+
+    for linkno, downstream_linkno in relation.items():
+        if downstream_linkno == TDX_LINKNO_SENTINEL:
+            continue
+
+        current_endpoints = endpoints_by_linkno[linkno]
+        successor_endpoints = endpoints_by_linkno[downstream_linkno]
+        matches = [
+            (current_index, successor_index)
+            for current_index, current_endpoint in enumerate(current_endpoints)
+            for successor_index, successor_endpoint in enumerate(successor_endpoints)
+            if math.dist(current_endpoint, successor_endpoint) <= endpoint_tolerance
+        ]
+        if not matches:
+            raise ValueError(
+                "orientation proof for native LINKNO "
+                f"{linkno} and downstream LINKNO {downstream_linkno} is non-coincident"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                "orientation proof for native LINKNO "
+                f"{linkno} and downstream LINKNO {downstream_linkno} is ambiguous"
+            )
+
+        current_index, successor_index = matches[0]
+        downstream_endpoints[linkno] = current_endpoints[current_index]
+        matched_successor_endpoints.setdefault(downstream_linkno, []).append(
+            successor_index
+        )
+
+    for root_linkno, downstream_linkno in relation.items():
+        if downstream_linkno != TDX_LINKNO_SENTINEL:
+            continue
+
+        predecessor_matches = matched_successor_endpoints.get(root_linkno, [])
+        if not predecessor_matches:
+            raise ValueError(
+                f"orientation proof for root LINKNO {root_linkno} is unprovable without a predecessor"
+            )
+        upstream_endpoint_indexes = set(predecessor_matches)
+        if len(upstream_endpoint_indexes) > 1:
+            raise ValueError(
+                f"orientation proof for root LINKNO {root_linkno} has conflicting predecessor matches"
+            )
+
+        upstream_endpoint_index = upstream_endpoint_indexes.pop()
+        downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
+            1 - upstream_endpoint_index
+        ]
+
+    return downstream_endpoints
+
+
 def build_streamnet_model(
     basins: pd.DataFrame,
     streamnet: pd.DataFrame,
     header_number: int,
+    *,
+    endpoint_tolerance: float,
 ) -> StreamnetModel:
     """Build a deterministic contracted topology model from TDX-Hydro tables."""
+    tolerance = _positive_finite_tolerance(endpoint_tolerance)
     _require_column(basins, "basins", "streamID")
     _require_column(streamnet, "streamnet", "LINKNO")
     _require_column(streamnet, "streamnet", "DSLINKNO")
@@ -222,6 +342,14 @@ def build_streamnet_model(
             f"{missing_units[0]}"
         )
 
+    _require_column(streamnet, "streamnet", "geometry")
+    endpoints_by_linkno = _streamnet_endpoints(
+        stream_linknos, streamnet["geometry"].tolist()
+    )
+    downstream_endpoints = _prove_native_orientation(
+        relation, endpoints_by_linkno, tolerance
+    )
+
     polygon_bearing_links = set(basin_linknos)
     units: list[StreamnetUnit] = []
     for linkno in sorted(polygon_bearing_links):
@@ -237,6 +365,8 @@ def build_streamnet_model(
                 downstream_linkno=downstream_linkno,
                 downstream_id=global_linkno(downstream_linkno, header_number),
                 contracted_link_count=contracted_link_count,
+                outlet_lon=downstream_endpoints[linkno][0],
+                outlet_lat=downstream_endpoints[linkno][1],
             )
         )
 
@@ -271,15 +401,26 @@ def build_streamnet_model(
         contracted_link_traversal_count=sum(
             unit.contracted_link_count for unit in unit_tuple
         ),
+        orientation_checked_link_count=len(relation),
+        root_orientation_checked_count=sum(
+            downstream_linkno == TDX_LINKNO_SENTINEL
+            for downstream_linkno in relation.values()
+        ),
+        orientation_tolerance=tolerance,
     )
     LOGGER.info(
         "streamnet_model polygon_bearing_links=%d roots=%d contracted_edges=%d "
-        "contracted_roots=%d contracted_link_traversals=%d",
+        "contracted_roots=%d contracted_link_traversals=%d "
+        "orientation_checked_links=%d root_orientation_checks=%d "
+        "orientation_tolerance=%s",
         diagnostics.polygon_bearing_link_count,
         diagnostics.root_count,
         diagnostics.contracted_edge_count,
         diagnostics.contracted_root_count,
         diagnostics.contracted_link_traversal_count,
+        diagnostics.orientation_checked_link_count,
+        diagnostics.root_orientation_checked_count,
+        diagnostics.orientation_tolerance,
     )
     return StreamnetModel(
         units=unit_tuple,
