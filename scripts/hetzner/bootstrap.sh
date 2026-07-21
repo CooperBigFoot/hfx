@@ -269,7 +269,7 @@ packages = {
     "geoparquet-io": ("geoparquet_io", "1.0.0b2"),
     "numpy": ("numpy", "2.4.6"),
     "pandas": ("pandas", "3.0.3"),
-    "polars": ("polars", "1.41.0"),
+    "polars": ("polars", "1.41.1"),
     "pyarrow": ("pyarrow", "22.0.0"),
     "pyogrio": ("pyogrio", "0.12.1"),
     "rasterio": ("rasterio", "1.5.0"),
@@ -295,7 +295,7 @@ else
     bootstrap_log 'installing exact geo package set'
     /usr/local/bin/uv pip install --python /opt/hfx-geo/bin/python \
         geopandas==1.1.3 geoparquet-io==1.0.0b2 numpy==2.4.6 pandas==3.0.3 \
-        polars==1.41.0 pyarrow==22.0.0 pyogrio==0.12.1 rasterio==1.5.0 \
+        polars==1.41.1 pyarrow==22.0.0 pyogrio==0.12.1 rasterio==1.5.0 \
         rio-cogeo==7.0.2 shapely==2.1.2 || bootstrap_die 'geo package installation failed; inspect uv output and rerun bootstrap'
     verify_geo_packages || bootstrap_die 'geo package verification failed after installation; inspect package output and rerun bootstrap'
 fi
