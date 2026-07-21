@@ -145,7 +145,7 @@ Pinned versions are:
 | Python | `3.12.11` |
 | rustup | `1.28.2` |
 | Rust toolchain, rustc, cargo | `1.88.0` |
-| Python geo packages | `geopandas==1.1.3`, `geoparquet-io==1.0.0b2`, `numpy==2.4.6`, `pandas==3.0.3`, `polars==1.41.0`, `pyarrow==22.0.0`, `pyogrio==0.12.1`, `rasterio==1.5.0`, `rio-cogeo==7.0.2`, `shapely==2.1.2` |
+| Python geo packages | `geopandas==1.1.3`, `geoparquet-io==1.0.0b2`, `numpy==2.4.6`, `pandas==3.0.3`, `polars==1.41.1`, `pyarrow==22.0.0`, `pyogrio==0.12.1`, `rasterio==1.5.0`, `rio-cogeo==7.0.2`, `shapely==2.1.2` |
 
 Success prints the frozen paths, installed tool versions, built CLI version,
 and `campaign <campaign> bootstrap complete`.
