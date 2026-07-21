@@ -93,8 +93,8 @@ validate_server() {
         fi
     done
 
-    if ! jq -e --arg value "$expected_location" '.datacenter.location.name == $value' <<<"$response" >/dev/null; then
-        observed=$(json_observed '.datacenter.location.name' "$response")
+    if ! jq -e --arg value "$expected_location" '.location.name == $value' <<<"$response" >/dev/null; then
+        observed=$(json_observed '.location.name' "$response")
         resource_conflict "$server_name" location "$observed"
     fi
     if ! jq -e --arg value "$expected_type" '.server_type.name == $value' <<<"$response" >/dev/null; then
@@ -212,14 +212,14 @@ else
 fi
 
 if [[ -z "$filesystem_type" ]]; then
-    signatures=$(wipefs -n --noheadings -o TYPE -- "$device") || { printf 'wipefs inspection failed\n' >&2; exit 1; }
+    signatures=$(wipefs -n --noheadings --output TYPE -- "$device") || { printf 'wipefs inspection failed\n' >&2; exit 1; }
     [[ -z "${signatures//[[:space:]]/}" ]] || { printf 'unrecognized retained signature found; inspect the device manually\n' >&2; exit 1; }
     mkfs.ext4 -- "$device"
     filesystem_type=ext4
 fi
 [[ "$filesystem_type" == ext4 ]] || { printf 'unsupported retained filesystem; inspect the device manually and do not reformat it\n' >&2; exit 1; }
 
-expected_major_minor=$(lsblk -dn -o MAJ:MIN -- "$device")
+expected_major_minor=$(lsblk -dn -o MAJ:MIN -- "$device" | tr -d "[:space:]")
 [[ -n "$expected_major_minor" ]] || { printf 'could not identify the expected block device\n' >&2; exit 1; }
 mapfile -t device_targets < <(findmnt -rn -o TARGET,MAJ:MIN | awk -v expected="$expected_major_minor" '$2 == expected { print $1 }')
 for device_target in "${device_targets[@]}"; do
@@ -282,7 +282,7 @@ for ((attempt = 1; attempt <= 60; attempt++)); do
 done
 [[ "$(blkid -o value -s TYPE -- "$device")" == ext4 ]] || { printf 'filesystem is no longer ext4\n' >&2; exit 1; }
 resize2fs "$device"
-expected_major_minor=$(lsblk -dn -o MAJ:MIN -- "$device")
+expected_major_minor=$(lsblk -dn -o MAJ:MIN -- "$device" | tr -d "[:space:]")
 mounted_major_minor=$(findmnt -rn -M "$mount_point" -o MAJ:MIN)
 [[ -n "$expected_major_minor" && "$mounted_major_minor" == "$expected_major_minor" ]] || { printf 'grown filesystem is not mounted at the expected mount point\n' >&2; exit 1; }
 REMOTE_GROWTH
@@ -322,7 +322,7 @@ ssh_key=$HFX_DEFAULT_SSH_KEY
 image=$HFX_DEFAULT_IMAGE
 location=$HFX_DEFAULT_LOCATION
 s3_env_file=
-declare -A seen_options=()
+seen_options=" "
 
 while (($#)); do
     option=$1
@@ -333,8 +333,8 @@ while (($#)); do
             exit 0
             ;;
         --campaign | --server-type | --volume-size-gb | --ssh-key | --image | --location | --s3-env-file)
-            [[ -z "${seen_options[$option]:-}" ]] || usage_error "option $option may not be repeated"
-            seen_options[$option]=1
+            [[ "$seen_options" != *" $option "* ]] || usage_error "option $option may not be repeated"
+            seen_options+="$option "
             (($# >= 2)) || usage_error "option $option requires a value"
             [[ -n "$2" && "$2" != --* && "$2" != -h ]] || usage_error "option $option requires a value"
             case "$option" in
@@ -372,7 +372,7 @@ hfx_require_command ssh
 
 server_name=$(hfx_server_name "$campaign")
 volume_name=$(hfx_volume_name "$campaign")
-readonly campaign server_type volume_size_gb ssh_key image location s3_env_file server_name volume_name
+readonly server_type volume_size_gb ssh_key image location s3_env_file
 
 hfx_authenticate
 trap hfx_clear_auth EXIT
@@ -380,10 +380,11 @@ trap hfx_clear_auth EXIT
 hfx_hcloud location describe "$location" >/dev/null || hfx_die "invalid --location '$location'; choose an existing location"
 hfx_hcloud server-type describe "$server_type" >/dev/null || hfx_die "invalid --server-type '$server_type'; choose an available type"
 
+# Campaign server types are x86; cax* Arm types would need an architecture parameter, deliberately out of scope.
 image_response=$(hfx_hcloud image list -o json) || hfx_die "could not validate --image '$image'"
-image_matches=$(jq -cer --arg image "$image" 'if type != "array" then error("expected array") elif (all(.[]; type == "object" and (.name | type == "string") and (.type | type == "string"))) | not then error("malformed image") else [.[] | select(.name == $image and .type == "system")] end' <<<"$image_response") || hfx_die "malformed response while validating --image '$image'"
+image_matches=$(jq -cer --arg image "$image" 'if type != "array" then error("expected array") elif (all(.[]; type == "object" and (.name | type == "string") and (.type | type == "string"))) | not then error("malformed image") else [.[] | select(.name == $image and .type == "system" and .architecture == "x86")] end' <<<"$image_response") || hfx_die "malformed response while validating --image '$image'"
 image_count=$(jq -r 'length' <<<"$image_matches") || hfx_die "could not count matches for --image '$image'"
-((image_count == 1)) || hfx_die "--image '$image' must exactly identify one named system image; correct --image"
+((image_count == 1)) || hfx_die "--image '$image' must exactly identify one named x86 system image; correct --image"
 jq -e '.[0].id | type == "number" and . == floor' <<<"$image_matches" >/dev/null || hfx_die "--image '$image' has a malformed ID; correct --image"
 
 ssh_key_id=$(hfx_exact_ssh_key_id "$ssh_key")
