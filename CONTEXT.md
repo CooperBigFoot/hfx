@@ -37,6 +37,7 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | TDX-Hydro reach catchment | One polygon per TauDEM stream reach (5 km² delineation threshold) in NGA's TDX-Hydro `basins` product; the sole resolution tier the source ships, compiling to a level-0 drainage unit. |
 | TDX-Hydro processing basin | One of the 62 HydroBASINS level-2 boundaries the NGA distribution is tiled by. A distribution/processing partition inherited from HydroSHEDS, not a drainage-unit level of the TDX product. |
 | Build campaign | One provision → bootstrap → wrangle → deliver → teardown lifecycle of the ephemeral fsn1 build VM. The unit of cost accounting and teardown discipline; nothing durable survives a campaign on the VM, since every input is re-fetchable and every output re-creatable. |
+| Global LINKNO | The globally unique TDX-Hydro drainage-unit ID: native `LINKNO + header_number × 10_000_000`, where the per-processing-basin header number comes from a crosswalk vendored into this repo (GEOGLOWS numbering convention; the fabric data stays pristine NGA). Unique across all 62 processing basins; `-1` sentinel links are never transformed. |
 
 ## Aliases to avoid
 
@@ -48,6 +49,7 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | root-level snap.parquet | `hfx.aux.snap.v2` auxiliary | A root `snap.parquet` is legacy v0.2; snap features must be declared as the `hfx.aux.snap.v2` auxiliary. |
 | has_rasters / has_snap | auxiliary declaration | These v0.1 manifest flags were removed; presence is declared via `auxiliary[]` entries instead. |
 | basin (bare, in TDX-Hydro context) | TDX-Hydro reach catchment / TDX-Hydro processing basin | NGA's `basins` product holds reach catchments while the 62 level-2 tiles are processing basins; bare "basin" hides which one is meant. |
+| native LINKNO (as HFX unit id) | Global LINKNO | Native LINKNOs collide across processing basins; HFX `id` values use the global transform from the first single-basin compile onward. |
 
 ## Relationships
 
@@ -64,6 +66,7 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | HydroBASINS Pfaf level ↔ HFX level | Within a build's level range, Pfafstetter level N maps to HFX `level = N − min(range)`; the coarsest selected level is HFX level 0 with null `parent_id` (full range: Pfaf 1 → level 0 … Pfaf 12 → level 11). Snap stems remain keyed to Pfaf 12 only (`references_levels = [12 − min]`); a build whose range excludes Pfaf 12 cannot include snap (`--rivers` is then a fatal error). Engines reach coarser levels via `parent_id`, never via per-level stem duplication. |
 | HydroBASINS `parent_id` ↔ `PFAF_ID` prefix | A unit's parent is the next-coarser selected level's unit whose `PFAF_ID` is the child's code with its last digit dropped (the Pfafstetter hierarchy, analogous to USGS HUC nesting) — a per-region attribute join, never spatial containment. An unresolved or ambiguous parent is a fatal build error with no spatial fallback. |
 | HydroBASINS pour points → unit outlet (per level) | Every selected level sources outlets from its own HydroBASINS Pour Points file (`hybas_pour_lev<NN>_v1`), joined by `HYBAS_ID`; the join is total per level, and the deterministic nearest-centroid multi-point collapse applies at every level. Coarser outlets are never derived from finest-level descendants. |
+| TDX-Hydro streamnet link ↔ drainage unit | A drainage unit exists only for a streamnet link with a polygon in the `basins` layer (join on `streamID` = `LINKNO`). A `DSLINKNO` edge pointing at a polygon-less link is contracted through the polygon-less chain to the first polygon-bearing downstream link; a chain ending at `-1` makes the unit a root. Contractions are counted and reported, never silent. |
 | Manifest bbox → bounding-box covering | A partial-fabric (regional) `manifest.bbox` is the **float32** covering union, component-wise `float32(total_bounds)`. The validator's enclosure check recomputes the union from the float32 covering. Round-to-nearest can push a covering leaf one ulp beyond the float64 bounds, so a float64 manifest bbox sits *inside* the union and fails. Writing the float32 cast makes the manifest bbox equal the covering union and enclose it by equality. A global/planetary dataset uses `manifest["bbox"] = list(PLANETARY_BBOX)`, whose fixed value is `[-180.0, -90.0, 180.0, 90.0]` and encloses any in-domain covering. |
 
 ## Ambiguities
