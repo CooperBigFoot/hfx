@@ -1,6 +1,6 @@
 # GRIT planetary D8 rasters use one entry
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-07-20
 
@@ -195,3 +195,145 @@ Proposed design.
   in the shared scratch directory for M2-S2 and later milestone steps.
 - M2-S2 supplies real EU raster-pilot attachment, strict dataset validation,
   artifact sizing, and operational evidence for the final design status.
+
+## EU raster pilot evidence, 2026-07-21
+
+The pilot ran from pinned base ref
+`13a91a4c921140a97f9e13687ba3a19e5a4f419f`.
+
+### Verified inputs and invocation
+
+The direction archive at
+`/private/tmp/grit-d8-m2-scratch/archives/GRITv1.0_drainage_direction_EU_EPSG8857.zip`
+was 3,085,015,522 bytes with MD5
+`a532b7d27b3ba99f0961e3bee2e28708`. The area archive at
+`/private/tmp/grit-d8-m2-scratch/archives/GRITv1.0_drainage_area_EU_EPSG8857.zip`
+was 13,258,415,974 bytes with MD5
+`8585f7572a6263ec99e607e5e9724e82`. Both values matched unique rows in the
+retained inventory. Exact ZIP central-directory size and CRC-32 checks passed
+for all 209 extracted members in each archive.
+
+The pilot used one raster invocation, which exited 0:
+
+```bash
+/usr/bin/time -p uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py raster \
+  --flow-dir-archive /private/tmp/grit-d8-m2-scratch/archives/GRITv1.0_drainage_direction_EU_EPSG8857.zip \
+  --flow-acc-archive /private/tmp/grit-d8-m2-scratch/archives/GRITv1.0_drainage_area_EU_EPSG8857.zip \
+  --dataset-dir /private/tmp/grit-d8-m2-scratch/grit-hfx-eu-smoke \
+  --work-dir /private/tmp/grit-d8-m2-scratch/m2-s2-raster-work
+```
+
+The pre-run SHA-256 values were:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `manifest.json` | `0ba0df1e4089f957d6b8d1447578e6a56219249493fa5f863765f2d25339ec72` |
+| `catchments.parquet` | `7765451b8aafbf5f36ed0aa4a30a195a06689d8c748650180bd482be462d3aca` |
+| `graph.parquet` | `5883ed322be5500e90ee91229bae32a2343f515b4eb3ca0ecbc40997d5fb23fc` |
+| `aux/snap_segments.parquet` | `df878f2dcdc2b86e09cf8f3654f8ad5755f29bd7925ef231394993db86d7ccf5` |
+| `aux/snap_reaches.parquet` | `a24adc6c68c63ba4fbbaad03d527a3c14eed08778d21b3c584bb6f9c020ce6b9` |
+
+The amended manifest SHA-256 was
+`c7912468d2c53db7cb00d29caf45ec9a4f1fa5571d86c4ccf46ff59c008675a0`.
+The direction COG SHA-256 was
+`e55915130e7307f75ddbbb0237adf0b11d11f550126471bb5a93f06269a139f7`.
+The accumulation COG SHA-256 was
+`ef1a6664f6135dee1f595b6cb2597fb58ac012307039b1d836e647114bf4f47c`.
+The four vector SHA-256 lines were byte-identical before and after raster
+attachment.
+
+### COG, grid, manifest, and cell identity
+
+`flow_dir.tif` contained one `uint8` band with nodata 255.
+`flow_acc.tif` contained one `float32` band with NaN nodata, and the
+NaN-aware nodata assertion passed. Both COG checks returned `valid=true`,
+`errors=[]`, and `warnings=[]`. Both rasters resolved to EPSG:8857 and shared
+width 300,000, height 160,000, bounds
+`[-4500000.0, 3600000.0, 4500000.0, 8400000.0]`, and transform
+`[30.0, 0.0, -4500000.0, 0.0, -30.0, 8400000.0]`. The pair grid comparison
+passed for CRS, width, height, transform, and bounds.
+
+The manifest contained exactly one `hfx.aux.d8_raster.v2` entry. Its
+artifacts were exactly `flow_dir=aux/d8/flow_dir.tif` and
+`flow_acc=aux/d8/flow_acc.tif`. Its metadata was exactly
+`crs=EPSG:8857`, `flow_dir_encoding=grass`, and `flow_acc_units=km2`. The
+adapter version was `grit-global-2.1.0`.
+
+The fixed source tile was `E000000000N004800000`. The source-local window was
+`Window(col_off=6128, row_off=856, width=16, height=16)`, and the EU COG
+window was `Window(col_off=156128, row_off=110856, width=16, height=16)`.
+Their window transforms were identical. Exact direction array comparison
+passed. The source window contained nine direction zeros. Source column 6132
+and row 860, window column 4 and row 4, equaled 0 in source and output while
+source nodata equaled 255, proving genuine terminal data. Exact accumulation
+NaN-mask and finite `float32` comparisons passed. The source window contained
+83 NaNs, with finite minimum `0.0008999999845400453` and finite maximum
+`0.14669999480247498`.
+
+### Strict validation, timing, and sizing
+
+The validator commands were:
+
+```bash
+cargo build -p hfx-cli
+/usr/bin/time -p ./target/debug/hfx /private/tmp/grit-d8-m2-scratch/grit-hfx-eu-smoke --strict
+```
+
+The build exited 0. The strict command exited 0 and produced this complete
+report:
+
+```text
+0 error(s), 0 warning(s), 0 info(s)
+Result: VALID
+```
+
+Raster construction used 5,590.95 real, 5,392.95 user, and 91.33 sys
+seconds. Strict validation used 57.66 real, 55.42 user, and 1.47 sys seconds.
+
+| Measure | Direction | Area | Pair |
+| --- | ---: | ---: | ---: |
+| Source archive bytes | 3,085,015,522 | 13,258,415,974 | 16,343,431,496 |
+| ZIP member bytes | 3,086,726,059 | 13,267,052,711 | 16,353,778,770 |
+| Output COG bytes | 4,596,910,304 | 19,616,144,826 | 24,213,055,130 |
+| Logical EU bytes | 48,000,000,000 | 192,000,000,000 | 240,000,000,000 |
+| Source ZIP ratio, member/archive | 1.0005544663 | 1.0006514154 | n/a |
+| COG logical compression, logical/COG | 10.4417960816 | 9.7878559576 | 9.9120081589 |
+| Archive-to-COG, archive/COG | 0.6711063123 | 0.6758930509 | 0.6749842764 |
+| COG-to-archive, COG/archive | 1.4900768801 | 1.4795240144 | 1.4815159923 |
+| EU output bytes per tile | 21,994,786.1435 | 93,857,152.2775 | 115,851,938.4211 |
+| 2,039-tile linear estimate bytes | 44,847,368,946.6794 | 191,374,733,493.8469 | 236,222,102,440.5263 |
+
+The 2,039-tile scale factor was exactly `2039 / 209 = 9.75598086124402`.
+The linear raster-build estimate was 54,545.201196172246 seconds. The measured
+estimates complement the published 173,967,746,409-byte compressed archive
+proxy and planetary logical raw sizes of 535,000,000,000 direction bytes and
+2,140,000,000,000 area bytes.
+
+Pre-run scratch was 198,754,492,416 total bytes and 41,130,177,503 counted
+working-set bytes. The sampled peak was 489,237,876,736 total bytes and
+331,613,561,823 counted working-set bytes. Post-raster scratch was
+239,341,142,016 total bytes and 81,716,827,103 counted working-set bytes.
+Post-cleanup scratch was 194,728,677,376 total bytes and 37,104,362,463
+counted working-set bytes.
+
+### Accepted construction and cleanup
+
+The passing real-source cell checks, clean COG checks, exact manifest contract,
+unchanged vectors, and strict `VALID` result accept one planetary D8 entry.
+
+The VRT streaming architecture introduced by delta D4 and PR #99 uses
+extracted source members as inputs to tiny per-family VRT mosaics. The measured
+direction and accumulation VRTs were 71,929 and 70,887 bytes. Each VRT streams
+into a staged compressed `translated.tif` in its family temporary folder. The
+validated staged COG moves to its final dataset path. Planetary construction
+needs no dense 535 GB direction or 2.14 TB accumulation mosaic temporary. The
+planetary sizing implication is a compressed-output and transient-space plan,
+instead of allocation for those dense mosaics. GDAL's planetary destination
+free-space estimate may require a deliberate, documented decision during M3
+planning.
+
+Cleanup deleted
+`/private/tmp/grit-d8-m2-scratch/grit-hfx-eu-smoke` and
+`/private/tmp/grit-d8-m2-scratch/m2-s2-raster-work`. The verified 14 raster
+archives, four vector member files, outer vector ZIP, API inventories, global
+tile index, and all M2 evidence and logs remain available for M3.
