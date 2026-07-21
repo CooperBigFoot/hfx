@@ -7,9 +7,11 @@ import argparse
 import gc
 import json
 import math
+import os
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +28,6 @@ import rasterio
 from affine import Affine
 from geoparquet_io.core.validate import validate_geoparquet
 from geopandas import GeoSeries
-from rasterio.windows import Window
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
 from shapely import make_valid
@@ -182,15 +183,33 @@ def _integer_grid_offset(value: float, source_path: Path, invariant: str) -> int
     return int(rounded)
 
 
+def _nodata_values_equal(left: int | float, right: int | float) -> bool:
+    """Compare scalar nodata values while treating two NaNs as equal."""
+    return (math.isnan(left) and math.isnan(right)) or left == right
+
+
+def _nodata_mask(values: np.ndarray, nodata: int | float) -> np.ndarray:
+    """Locate nodata cells while supporting NaN family nodata."""
+    if math.isnan(nodata):
+        return np.isnan(values)
+    return values == nodata
+
+
 def _validate_raster_sources(
     source_paths: Sequence[Path],
     expected_dtype: str,
     artifact_name: str,
+    required_nodata: int | float | None = None,
+    valid_data_range: tuple[int, int] | None = None,
 ) -> RasterMosaicLayout:
     """Validate source headers and compute their exact native-grid union."""
     first_transform: Affine | None = None
-    common_nodata: int | float | None = None
     source_offsets: list[tuple[int, int, int, int]] = []
+    tagged_nodata: list[tuple[Path, int | float]] = []
+    tagless_sources: list[Path] = []
+
+    if not source_paths:
+        raise AdapterError(f"{artifact_name} has no extracted TIFF sources")
 
     for source_path in source_paths:
         try:
@@ -203,8 +222,6 @@ def _validate_raster_sources(
                     raise AdapterError(
                         f"source {source_path} has dtype {source.dtypes[0]}, expected {expected_dtype} for {artifact_name}"
                     )
-                if source.nodata is None:
-                    raise AdapterError(f"source {source_path} lacks a nodata tag")
                 if source.crs is None or source.crs.to_epsg() != 8857:
                     raise AdapterError(
                         f"source {source_path} has CRS {source.crs}, expected EPSG:8857"
@@ -221,7 +238,6 @@ def _validate_raster_sources(
 
                 if first_transform is None:
                     first_transform = transform
-                    common_nodata = source.nodata
                 else:
                     same_x_basis = math.isclose(
                         transform.a, first_transform.a, rel_tol=0.0, abs_tol=1e-12
@@ -233,10 +249,11 @@ def _validate_raster_sources(
                         raise AdapterError(
                             f"source {source_path} has a different pixel basis or resolution"
                         )
-                    if source.nodata != common_nodata:
-                        raise AdapterError(
-                            f"source {source_path} has nodata {source.nodata}, expected common nodata {common_nodata}"
-                        )
+
+                if source.nodata is None:
+                    tagless_sources.append(source_path)
+                else:
+                    tagged_nodata.append((source_path, source.nodata))
 
                 col = _integer_grid_offset(
                     (transform.c - first_transform.c) / first_transform.a,
@@ -254,8 +271,62 @@ def _validate_raster_sources(
         except Exception as error:
             raise AdapterError(f"failed to inspect source {source_path}: {error}") from error
 
-    if first_transform is None or common_nodata is None:
+    if first_transform is None:
         raise AdapterError(f"{artifact_name} has no extracted TIFF sources")
+    if not tagged_nodata:
+        raise AdapterError(
+            f"{artifact_name} has no source nodata tags; no common nodata can be derived"
+        )
+
+    common_nodata_path, common_nodata = tagged_nodata[0]
+    for source_path, source_nodata in tagged_nodata[1:]:
+        if not _nodata_values_equal(source_nodata, common_nodata):
+            raise AdapterError(
+                f"source {source_path} has nodata {source_nodata}, expected common nodata {common_nodata}"
+            )
+    if required_nodata is not None and not _nodata_values_equal(
+        common_nodata, required_nodata
+    ):
+        raise AdapterError(
+            f"source {common_nodata_path} has nodata {common_nodata}, "
+            f"expected required nodata {required_nodata} for {artifact_name}"
+        )
+
+    tagless_source_set = set(tagless_sources)
+    for source_path in source_paths:
+        with rasterio.open(source_path) as source:
+            for _, source_window in source.block_windows(1):
+                values = source.read(1, window=source_window)
+                if valid_data_range is not None:
+                    minimum, maximum = valid_data_range
+                    if source_path in tagless_source_set:
+                        invalid = (values < minimum) | (values > maximum)
+                        if np.any(invalid):
+                            invalid_value = values[invalid][0].item()
+                            raise AdapterError(
+                                f"tag-less {artifact_name} source {source_path} contains value "
+                                f"{invalid_value} outside the valid data domain {minimum} through {maximum}; "
+                                f"nodata {common_nodata} requires a source tag"
+                            )
+                    else:
+                        invalid = (
+                            ((values < minimum) | (values > maximum))
+                            & ~_nodata_mask(values, common_nodata)
+                        )
+                        if np.any(invalid):
+                            invalid_value = values[invalid][0].item()
+                            raise AdapterError(
+                                f"source {source_path} contains value {invalid_value}; "
+                                f"{artifact_name} permits data codes {minimum} through {maximum} "
+                                f"and declared nodata {common_nodata}"
+                            )
+                elif source_path in tagless_source_set and np.any(
+                    _nodata_mask(values, common_nodata)
+                ):
+                    raise AdapterError(
+                        f"tag-less {artifact_name} source {source_path} contains the family's "
+                        f"common tagged nodata {common_nodata}"
+                    )
 
     for source_index, (col, row, width, height) in enumerate(source_offsets):
         for previous_index, (
@@ -293,56 +364,109 @@ def _validate_raster_sources(
     )
 
 
-def _write_native_mosaic(layout: RasterMosaicLayout, output_path: Path) -> None:
-    """Copy validated source blocks into their exact destination windows."""
+def _write_native_mosaic_vrt(layout: RasterMosaicLayout, output_path: Path) -> None:
+    """Describe validated source tiles as an exact native-grid VRT mosaic."""
     ensure_dir(output_path.parent)
-    with rasterio.open(
-        output_path,
-        "w",
-        driver="GTiff",
-        width=layout.width,
-        height=layout.height,
-        count=1,
-        dtype=layout.dtype,
-        nodata=layout.nodata,
-        crs="EPSG:8857",
-        transform=layout.transform,
-    ) as mosaic:
-        for source_path, (destination_col, destination_row) in zip(
-            layout.sources, layout.offsets, strict=True
-        ):
-            with rasterio.open(source_path) as source:
-                for _, source_window in source.block_windows(1):
-                    destination_window = Window(
-                        destination_col + source_window.col_off,
-                        destination_row + source_window.row_off,
-                        source_window.width,
-                        source_window.height,
-                    )
-                    mosaic.write(source.read(1, window=source_window), 1, window=destination_window)
+    vrt_dtypes = {"uint8": "Byte", "float32": "Float32"}
+    try:
+        vrt_dtype = vrt_dtypes[layout.dtype]
+    except KeyError as error:
+        raise AdapterError(f"unsupported VRT mosaic dtype {layout.dtype}") from error
+
+    root = ET.Element(
+        "VRTDataset",
+        rasterXSize=str(layout.width),
+        rasterYSize=str(layout.height),
+    )
+    ET.SubElement(root, "SRS").text = "EPSG:8857"
+    ET.SubElement(root, "GeoTransform").text = ", ".join(
+        format(value, ".17g")
+        for value in (
+            layout.transform.c,
+            layout.transform.a,
+            layout.transform.b,
+            layout.transform.f,
+            layout.transform.d,
+            layout.transform.e,
+        )
+    )
+    band = ET.SubElement(root, "VRTRasterBand", dataType=vrt_dtype, band="1")
+    ET.SubElement(band, "NoDataValue").text = (
+        "nan" if math.isnan(layout.nodata) else format(layout.nodata, ".17g")
+    )
+
+    for source_path, (destination_col, destination_row) in zip(
+        layout.sources, layout.offsets, strict=True
+    ):
+        with rasterio.open(source_path) as source:
+            source_width = source.width
+            source_height = source.height
+        simple_source = ET.SubElement(band, "SimpleSource")
+        relative_path = Path(
+            os.path.relpath(source_path, start=output_path.parent)
+        ).as_posix()
+        ET.SubElement(
+            simple_source, "SourceFilename", relativeToVRT="1"
+        ).text = relative_path
+        ET.SubElement(simple_source, "SourceBand").text = "1"
+        ET.SubElement(
+            simple_source,
+            "SrcRect",
+            xOff="0",
+            yOff="0",
+            xSize=str(source_width),
+            ySize=str(source_height),
+        )
+        ET.SubElement(
+            simple_source,
+            "DstRect",
+            xOff=str(destination_col),
+            yOff=str(destination_row),
+            xSize=str(source_width),
+            ySize=str(source_height),
+        )
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
 
 
-def _translate_and_validate_cog(source_path: Path, output_path: Path) -> None:
+def _translate_and_validate_cog(
+    source_vrt: Path, output_path: Path, temp_folder: Path
+) -> None:
     """Translate one native mosaic to the required BigTIFF COG profile."""
+    ensure_dir(temp_folder)
+    staged_output = temp_folder / "translated.tif"
+    staged_output.unlink(missing_ok=True)
     profile = cog_profiles.get("deflate")
     profile.update(blockxsize=512, blockysize=512, BIGTIFF="YES")
     try:
         cog_translate(
-            source_path,
-            output_path,
+            source_vrt,
+            staged_output,
             profile,
             overview_resampling="nearest",
             resampling="nearest",
             in_memory=False,
+            config={
+                "CHECK_DISK_FREE_SPACE": "TRUE",
+                "CPL_TMPDIR": str(temp_folder),
+            },
             quiet=True,
         )
-        valid, errors, warnings = cog_validate(output_path)
+        valid, errors, warnings = cog_validate(staged_output)
+        if not valid or errors:
+            raise AdapterError(
+                f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
+            )
+        ensure_dir(output_path.parent)
+        shutil.move(staged_output, output_path)
+    except AdapterError:
+        raise
     except Exception as error:
         raise AdapterError(f"COG translation failed for {output_path}: {error}") from error
-    if not valid or errors:
-        raise AdapterError(
-            f"COG validation failed for {output_path}: errors={errors}; warnings={warnings}"
-        )
+    finally:
+        staged_output.unlink(missing_ok=True)
 
 
 def _validate_raster_pair(direction_path: Path, accumulation_path: Path) -> None:
@@ -384,24 +508,29 @@ def build_d8_raster_pair(
     accumulation_sources = _extract_raster_archives(
         flow_acc_archives, work_dir / "flow_acc" / "extracted", "flow_acc"
     )
-    direction_layout = _validate_raster_sources(direction_sources, "int8", "flow_dir")
+    direction_layout = _validate_raster_sources(
+        direction_sources,
+        "uint8",
+        "flow_dir",
+        required_nodata=255,
+        valid_data_range=(0, 8),
+    )
     accumulation_layout = _validate_raster_sources(
-        accumulation_sources, "int32", "flow_acc"
+        accumulation_sources, "float32", "flow_acc"
     )
 
     direction_output = output_dir / "flow_dir.tif"
     accumulation_output = output_dir / "flow_acc.tif"
-    direction_temporary = work_dir / "flow_dir" / "mosaic.tif"
-    accumulation_temporary = work_dir / "flow_acc" / "mosaic.tif"
-    ensure_dir(output_dir)
-    try:
-        _write_native_mosaic(direction_layout, direction_temporary)
-        _translate_and_validate_cog(direction_temporary, direction_output)
-        _write_native_mosaic(accumulation_layout, accumulation_temporary)
-        _translate_and_validate_cog(accumulation_temporary, accumulation_output)
-    finally:
-        direction_temporary.unlink(missing_ok=True)
-        accumulation_temporary.unlink(missing_ok=True)
+    direction_vrt = work_dir / "flow_dir" / "mosaic.vrt"
+    accumulation_vrt = work_dir / "flow_acc" / "mosaic.vrt"
+    _write_native_mosaic_vrt(direction_layout, direction_vrt)
+    _translate_and_validate_cog(
+        direction_vrt, direction_output, work_dir / "flow_dir"
+    )
+    _write_native_mosaic_vrt(accumulation_layout, accumulation_vrt)
+    _translate_and_validate_cog(
+        accumulation_vrt, accumulation_output, work_dir / "flow_acc"
+    )
     _validate_raster_pair(direction_output, accumulation_output)
     return direction_output, accumulation_output
 
