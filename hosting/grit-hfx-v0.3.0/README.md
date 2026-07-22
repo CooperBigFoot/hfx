@@ -64,16 +64,33 @@ artifacts byte-identical.
 ## License and citation
 
 License: CC BY-NC 4.0
-(https://creativecommons.org/licenses/by-nc/4.0/), inherited from the source
-data. NonCommercial use only.
+(https://creativecommons.org/licenses/by-nc/4.0/), inherited from both source
+datasets. The combined derived HFX dataset is available for NonCommercial use
+only.
 
-Source data citation:
+Vector source dataset:
 
 > Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.
 
-DOI: 10.5281/zenodo.17435232 (https://doi.org/10.5281/zenodo.17435232)
+Zenodo record 17435232. DOI: 10.5281/zenodo.17435232
+(https://doi.org/10.5281/zenodo.17435232)
 
-See `CITATION.txt` in this directory for the BibTeX entry.
+Raster source dataset, including the drainage_direction and width-partitioned
+drainage_area rasters used by this compilation:
+
+> Wortmann, M. et al. (2025) “Global River Topology (GRIT) raster datasets”. Zenodo. doi:10.5281/zenodo.15715535.
+
+Zenodo record 15715535. DOI: 10.5281/zenodo.15715535
+(https://doi.org/10.5281/zenodo.15715535)
+
+Related paper:
+
+> Wortmann, M. et al. (2025) “Global River Topology (GRIT): A Bifurcating River Hydrography”. Water Resources Research, 61, e2024WR038308. doi:10.1029/2024WR038308.
+
+DOI: 10.1029/2024WR038308
+(https://doi.org/10.1029/2024WR038308)
+
+See `CITATION.txt` in this directory for the plain-text and BibTeX entries.
 
 ## Validating a download
 
@@ -134,7 +151,13 @@ Fallback segment IDs:
 
 ## Provenance
 
-- Source: GRIT v1.0 (https://doi.org/10.5281/zenodo.17435232)
+- Vector source: GRIT v1.0 vector datasets, Zenodo record 17435232
+  (https://doi.org/10.5281/zenodo.17435232)
+- Raster source: GRIT v1.0 raster datasets, Zenodo record 15715535
+  (https://doi.org/10.5281/zenodo.15715535); this compilation uses
+  drainage_direction and width-partitioned drainage_area
+- Paper: Wortmann et al. 2025, Water Resources Research,
+  doi:10.1029/2024WR038308 (https://doi.org/10.1029/2024WR038308)
 - Adapter: grit-v2 (`adapters/grit-v2/build_adapter.py`, FORMAT_VERSION 0.3.0)
 - HFX spec version: 0.3.0
 - Bbox: planetary [-180, -90, 180, 90]

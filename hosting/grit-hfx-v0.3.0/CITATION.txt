@@ -1,0 +1,69 @@
+Citation for the vector source dataset: Global River Topology (GRIT) vector datasets (Zenodo record 17435232)
+
+Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.
+
+@dataset{wortmann_2025_17435232,
+  author       = {Wortmann, Michel and
+                  Slater, Louise and
+                  Hawker, Laurence and
+                  Liu, Yinxue and
+                  Neal, Jeffrey},
+  title        = {Global River Topology (GRIT) vector datasets},
+  month        = dec,
+  year         = 2025,
+  publisher    = {Zenodo},
+  version      = {1.0},
+  doi          = {10.5281/zenodo.17435232},
+  url          = {https://doi.org/10.5281/zenodo.17435232},
+}
+
+DOI: 10.5281/zenodo.17435232
+https://doi.org/10.5281/zenodo.17435232
+
+Citation for the raster source dataset: Global River Topology (GRIT) raster datasets (Zenodo record 15715535)
+
+Wortmann, M. et al. (2025) “Global River Topology (GRIT) raster datasets”. Zenodo. doi:10.5281/zenodo.15715535.
+
+@dataset{wortmann_2025_15715535,
+  author       = {Wortmann, Michel and
+                  Slater, Louise and
+                  Hawker, Laurence and
+                  Liu, Yinxue and
+                  Neal, Jeffrey},
+  title        = {Global River Topology (GRIT) raster datasets},
+  month        = dec,
+  year         = 2025,
+  publisher    = {Zenodo},
+  version      = {1.0},
+  doi          = {10.5281/zenodo.15715535},
+  url          = {https://doi.org/10.5281/zenodo.15715535},
+}
+
+DOI: 10.5281/zenodo.15715535
+https://doi.org/10.5281/zenodo.15715535
+
+Citation for the paper:
+
+Wortmann, M. et al. (2025) “Global River Topology (GRIT): A Bifurcating River Hydrography”. Water Resources Research, 61, e2024WR038308. doi:10.1029/2024WR038308.
+
+@article{wortmann_2025_grit,
+  author       = {Wortmann, Michel and
+                  Slater, Louise and
+                  Hawker, Laurence and
+                  Liu, Yinxue and
+                  Neal, Jeffrey and
+                  Zhang, Bing and others},
+  title        = {Global River Topology (GRIT): A Bifurcating River Hydrography},
+  journal      = {Water Resources Research},
+  volume       = {61},
+  pages        = {e2024WR038308},
+  year         = {2025},
+  doi          = {10.1029/2024WR038308},
+  url          = {https://doi.org/10.1029/2024WR038308},
+}
+
+DOI: 10.1029/2024WR038308
+https://doi.org/10.1029/2024WR038308
+
+License for the combined derived HFX dataset: CC BY-NC 4.0
+https://creativecommons.org/licenses/by-nc/4.0/
