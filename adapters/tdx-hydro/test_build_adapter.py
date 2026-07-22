@@ -921,6 +921,7 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 "catchments.parquet",
                 "graph.parquet",
                 "manifest.json",
+                "aux",
             }
             self.assertEqual(
                 {path.name for path in (root / "output-a").iterdir()},
@@ -930,10 +931,27 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 {path.name for path in (root / "output-b").iterdir()},
                 expected_names,
             )
+            expected_files = {
+                "catchments.parquet",
+                "graph.parquet",
+                "manifest.json",
+                "aux/snap_stems.parquet",
+            }
+            for output_name in ("output-a", "output-b"):
+                output = root / output_name
+                self.assertEqual(
+                    {
+                        path.relative_to(output).as_posix()
+                        for path in output.rglob("*")
+                        if path.is_file()
+                    },
+                    expected_files,
+                )
             self.assertEqual(first.catchments_path, root / "output-a/catchments.parquet")
             self.assertEqual(first.graph_path, root / "output-a/graph.parquet")
+            self.assertEqual(first.snap_path, root / "output-a/aux/snap_stems.parquet")
             self.assertEqual(first.manifest_path, root / "output-a/manifest.json")
-            for name in expected_names:
+            for name in expected_files:
                 self.assertEqual(
                     (root / "output-a" / name).read_bytes(),
                     (root / "output-b" / name).read_bytes(),
@@ -978,8 +996,10 @@ class CoreHfxCompilationTests(unittest.TestCase):
             )
             catchments_file = pq.ParquetFile(result.catchments_path)
             graph_file = pq.ParquetFile(result.graph_path)
+            snap_file = pq.ParquetFile(result.snap_path)
             catchments = catchments_file.read()
             graph = graph_file.read()
+            snap = snap_file.read()
 
             expected_geo = {
                 "version": "1.1.0",
@@ -1031,10 +1051,41 @@ class CoreHfxCompilationTests(unittest.TestCase):
                     pa.field("bbox_maxy", pa.float32(), nullable=False),
                 ]
             )
+            expected_snap_geo = {
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {
+                    "geometry": {
+                        "encoding": "WKB",
+                        "geometry_types": ["LineString"],
+                        "covering": {
+                            "bbox": {
+                                "xmin": ["bbox", "xmin"],
+                                "ymin": ["bbox", "ymin"],
+                                "xmax": ["bbox", "xmax"],
+                                "ymax": ["bbox", "ymax"],
+                            }
+                        },
+                    }
+                },
+            }
+            expected_snap_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("unit_id", pa.int64(), nullable=False),
+                    pa.field("weight", pa.float32(), nullable=False),
+                    pa.field("stem_role", pa.string(), nullable=True),
+                    pa.field("bbox", bbox_type, nullable=True),
+                    pa.field("geometry", pa.binary(), nullable=False),
+                ],
+                metadata={b"geo": json.dumps(expected_snap_geo).encode("utf-8")},
+            )
             self.assertEqual(catchments.schema, expected_catchment_schema)
             self.assertEqual(graph.schema, expected_graph_schema)
+            self.assertEqual(snap.schema, expected_snap_schema)
             self.assertEqual(catchments_file.num_row_groups, 1)
             self.assertEqual(graph_file.num_row_groups, 1)
+            self.assertEqual(snap_file.num_row_groups, 1)
             self.assertEqual(catchments["id"].to_pylist(), [710000100, 710000200])
             self.assertEqual(catchments["level"].to_pylist(), [0, 0])
             self.assertEqual(catchments["parent_id"].to_pylist(), [None, None])
@@ -1079,6 +1130,46 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 ),
                 [tuple(bounds) for bounds in expected_bounds],
             )
+            self.assertEqual(snap["id"].to_pylist(), [1, 2])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(
+                snap["weight"].to_pylist(),
+                [1.2309072017669678, 2.4618144035339355],
+            )
+            self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
+            self.assertEqual(
+                snap["bbox"].to_pylist(),
+                [
+                    {
+                        "xmin": 0.0,
+                        "ymin": -9.999999747378752e-05,
+                        "xmax": 0.009999999776482582,
+                        "ymax": 9.999999747378752e-05,
+                    },
+                    {
+                        "xmin": 0.009999999776482582,
+                        "ymin": -9.999999747378752e-05,
+                        "xmax": 0.019999999552965164,
+                        "ymax": 9.999999747378752e-05,
+                    },
+                ],
+            )
+            expected_stems = [
+                LineString([(0.0, 0.0), (0.01, 0.0)]),
+                LineString([(0.01, 0.0), (0.02, 0.0)]),
+            ]
+            self.assertEqual(
+                snap["geometry"].to_pylist(),
+                [geometry.wkb for geometry in expected_stems],
+            )
+            stem_distances = gpd.GeoSeries(
+                [
+                    LineString([(0.01, 0.0), (0.02, 0.0)]),
+                    LineString([(0.0, 0.0), (0.01, 0.0)]),
+                ],
+                crs=CRS,
+            ).centroid.hilbert_distance(total_bounds=source_basins.geometry.total_bounds)
+            self.assertEqual(stem_distances.tolist(), [4026531839, 268435455])
             distances = source_basins.geometry.centroid.hilbert_distance(
                 total_bounds=source_basins.geometry.total_bounds
             )
@@ -1094,13 +1185,27 @@ class CoreHfxCompilationTests(unittest.TestCase):
                     self.assertIsNotNone(statistics, name)
                     self.assertTrue(statistics.has_min_max, name)
                 self.assertEqual(parquet_file.schema_arrow, parquet_schema)
+            for name in [f"bbox.{leaf}" for leaf in BBOX_LEAF_NAMES]:
+                column_index = snap_file.schema.names.index(name.split(".")[-1])
+                statistics = snap_file.metadata.row_group(0).column(column_index).statistics
+                self.assertIsNotNone(statistics, name)
+                self.assertTrue(statistics.has_min_max, name)
             self.assertEqual(
                 json.loads(catchments.schema.metadata[b"geo"].decode("utf-8")),
                 expected_geo,
             )
+            self.assertEqual(
+                json.loads(snap.schema.metadata[b"geo"].decode("utf-8")),
+                expected_snap_geo,
+            )
             self.assertTrue(
                 validate_geoparquet(
                     str(result.catchments_path), target_version="1.1"
+                ).is_valid
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(result.snap_path), target_version="1.1"
                 ).is_valid
             )
             manifest = json.loads(result.manifest_path.read_text())
@@ -1117,6 +1222,18 @@ class CoreHfxCompilationTests(unittest.TestCase):
             "unit_count": 2,
             "created_at": "2026-07-21T12:34:56+00:00",
             "adapter_version": "0.1.0",
+            "auxiliary": [
+                {
+                    "schema": "hfx.aux.snap.v2",
+                    "artifacts": {"snap": "aux/snap_stems.parquet"},
+                    "metadata": {
+                        "name": "stems",
+                        "description": "Native TDX-Hydro LineString reaches for polygon-bearing level 0 drainage units.",
+                        "references_levels": [0],
+                        "weight_semantics": "Drainage-area weight equals inclusive DSContArea in km2; higher values indicate stronger drainage dominance.",
+                    },
+                }
+            ],
         }
         self.assertEqual(manifest, expected_manifest)
         self.assertEqual(FORMAT_VERSION, "0.3.0")
@@ -1157,10 +1274,25 @@ class CoreHfxCompilationTests(unittest.TestCase):
             )
             catchments = pq.read_table(result.catchments_path)
             graph = pq.read_table(result.graph_path)
+            snap = pq.read_table(result.snap_path)
         self.assertEqual(graph["upstream_ids"].to_pylist(), [[], []])
         self.assertEqual(
             list(zip(catchments["outlet_lon"].to_pylist(), catchments["outlet_lat"].to_pylist())),
             [(0.01, 0.0), (0.02, 0.0)],
+        )
+        self.assertEqual(snap["id"].to_pylist(), [1, 2])
+        self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+        self.assertEqual(
+            snap["weight"].to_pylist(),
+            [1.2309072017669678, 1.2309072017669678],
+        )
+        self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
+        self.assertEqual(
+            snap["geometry"].to_pylist(),
+            [
+                LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
+                LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+            ],
         )
         diagnostics = result.diagnostics.streamnet
         self.assertEqual(diagnostics.endpoint_coincidence_proven_link_count, 0)
@@ -1291,7 +1423,20 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(
                 {path.name for path in output.iterdir()},
-                {"catchments.parquet", "graph.parquet", "manifest.json"},
+                {"catchments.parquet", "graph.parquet", "manifest.json", "aux"},
+            )
+            self.assertEqual(
+                {
+                    path.relative_to(output).as_posix()
+                    for path in output.rglob("*")
+                    if path.is_file()
+                },
+                {
+                    "catchments.parquet",
+                    "graph.parquet",
+                    "manifest.json",
+                    "aux/snap_stems.parquet",
+                },
             )
             self.assertFalse(report.is_relative_to(output))
             manifest = json.loads((output / "manifest.json").read_text())
@@ -1302,13 +1447,46 @@ class BuildCliTests(unittest.TestCase):
                 "bbox": [0.0, 0.0, 0.019999999552965164, 0.009999999776482582],
                 "unit_count": 2, "created_at": "2026-07-21T12:34:56+00:00",
                 "adapter_version": "0.1.0",
+                "auxiliary": [{
+                    "schema": "hfx.aux.snap.v2",
+                    "artifacts": {"snap": "aux/snap_stems.parquet"},
+                    "metadata": {
+                        "name": "stems",
+                        "description": "Native TDX-Hydro LineString reaches for polygon-bearing level 0 drainage units.",
+                        "references_levels": [0],
+                        "weight_semantics": "Drainage-area weight equals inclusive DSContArea in km2; higher values indicate stronger drainage dominance.",
+                    },
+                }],
             })
+            snap = pq.read_table(output / "aux/snap_stems.parquet")
+            self.assertEqual(snap["id"].to_pylist(), [1, 2])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertNotIn(710000150, snap["unit_id"].to_pylist())
+            self.assertEqual(
+                snap["weight"].to_pylist(),
+                [1.2309072017669678, 2.4618144035339355],
+            )
+            self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
+            self.assertEqual(
+                snap["geometry"].to_pylist(),
+                [
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
+                    LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                ],
+            )
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output))
             self.assert_no_temporary_entries(output.parent, report.parent)
             messages = [record.getMessage() for record in captured.records]
             self.assertTrue(any("diagnostic=contracted_edge_count count=1" in message for message in messages))
             self.assertTrue(any("diagnostic=contracted_link_traversal_count count=1" in message for message in messages))
             self.assertTrue(any("diagnostic=polygonless_dropped_reach_count count=1" in message for message in messages))
+            self.assertEqual(
+                sum(
+                    "diagnostic=polygonless_dropped_reach_count count=1" in message
+                    for message in messages
+                ),
+                1,
+            )
             self.assertFalse(any("contracted_root_count" in message for message in messages))
             self.assertFalse(any("trusted_orientation" in message for message in messages))
             self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
@@ -1347,26 +1525,33 @@ class BuildCliTests(unittest.TestCase):
             self.assert_no_temporary_entries(root)
 
     def test_build_cli_rolls_back_partial_compile_failure(self) -> None:
-        for precreate_output in (False, True):
-            with self.subTest(precreate_output=precreate_output), TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                source = root / "source"
-                source.mkdir()
-                basins_path, streamnet_path = write_pair(source, *build_cli_frames())
-                output = root / "output"
-                report = root / "reports" / "report.json"
-                if precreate_output:
-                    output.mkdir()
-                with patch("build_adapter._write_graph", side_effect=RuntimeError("induced graph write failure")):
-                    with self.assertRaisesRegex(RuntimeError, "^induced graph write failure$"):
-                        main(self.build_args(basins_path, streamnet_path, output, report))
-                if precreate_output:
-                    self.assertTrue(output.is_dir())
-                    self.assertEqual(list(output.iterdir()), [])
-                else:
-                    self.assertFalse(output.exists())
-                self.assertFalse(report.exists())
-                self.assert_no_temporary_entries(root, report.parent)
+        failures = (
+            ("_write_graph", "induced graph write failure"),
+            ("_write_snap_stems", "induced snap write failure"),
+        )
+        for writer, message in failures:
+            for precreate_output in (False, True):
+                with self.subTest(writer=writer, precreate_output=precreate_output), TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    source = root / "source"
+                    source.mkdir()
+                    basins_path, streamnet_path = write_pair(source, *build_cli_frames())
+                    output = root / "output"
+                    report = root / "reports" / "report.json"
+                    if precreate_output:
+                        output.mkdir()
+                    with patch(
+                        f"build_adapter.{writer}", side_effect=RuntimeError(message)
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, f"^{message}$"):
+                            main(self.build_args(basins_path, streamnet_path, output, report))
+                    if precreate_output:
+                        self.assertTrue(output.is_dir())
+                        self.assertEqual(list(output.iterdir()), [])
+                    else:
+                        self.assertFalse(output.exists())
+                    self.assertFalse(report.exists())
+                    self.assert_no_temporary_entries(root, report.parent)
 
     def test_build_cli_reports_trusted_isolated_roots(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1382,12 +1567,27 @@ class BuildCliTests(unittest.TestCase):
                 with self.assertLogs("tdx-hydro", level="WARNING") as captured:
                     self.assertEqual(main(self.build_args(basins_path, streamnet_path, output, report)), 0)
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output, isolated=True))
+            snap = pq.read_table(output / "aux/snap_stems.parquet")
+            self.assertEqual(snap["id"].to_pylist(), [1, 2])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(
+                snap["weight"].to_pylist(),
+                [1.2309072017669678, 1.2309072017669678],
+            )
+            self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
+            self.assertEqual(
+                snap["geometry"].to_pylist(),
+                [
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
+                    LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                ],
+            )
             messages = [record.getMessage() for record in captured.records]
             self.assertTrue(any("diagnostic=trusted_orientation_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
             self.assertTrue(any("diagnostic=trusted_orientation_polygon_bearing_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
             self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
 
-    def test_validate_cli_runs_explicit_binary_and_both_parquet_checks(self) -> None:
+    def test_validate_cli_runs_explicit_binary_and_all_dataset_layer_checks(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / "source"
@@ -1410,6 +1610,7 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(validator.call_args_list, [
                 unittest.mock.call(str(output / "catchments.parquet"), target_version="1.1"),
                 unittest.mock.call(str(output / "graph.parquet"), target_version="1.1"),
+                unittest.mock.call(str(output / "aux/snap_stems.parquet"), target_version="1.1"),
             ])
             failing = root / "hfx-failing"
             failing.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(7)\n")
