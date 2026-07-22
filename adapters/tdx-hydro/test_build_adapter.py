@@ -1,9 +1,11 @@
 import json
 import math
+import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import geopandas as gpd
 import numpy as np
@@ -17,6 +19,7 @@ from pyproj import Geod
 from shapely import from_wkb, get_coordinates
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
+import build_adapter
 from build_adapter import (
     ADAPTER_VERSION,
     BBOX_LEAF_NAMES,
@@ -30,11 +33,14 @@ from build_adapter import (
     CoreBuildResult,
     StreamnetDiagnostics,
     StreamnetUnit,
+    build_dataset,
+    build_diagnostics_report,
     build_streamnet_model,
     compile_core_hfx,
     global_linkno,
     load_header_crosswalk,
     load_tdx_geopackages,
+    main,
 )
 
 
@@ -85,6 +91,29 @@ def write_pair(
         streamnet_path, layer="streamnet", driver="GPKG", engine="pyogrio"
     )
     return basins_path, streamnet_path
+
+
+def build_cli_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+    streamnet = gpd.GeoDataFrame(
+        {
+            "LINKNO": [200, 100, 150],
+            "DSLINKNO": [-1, 150, 200],
+            "DSContArea": [
+                (area_100_m2 + area_200_m2) / 1_000_000,
+                area_100_m2 / 1_000_000,
+                area_100_m2 / 1_000_000,
+            ],
+            "label": ["downstream", "upstream", "polygon-less"],
+        },
+        geometry=[
+            LineString([(0.01, 0.00), (0.02, 0.00)]),
+            LineString([(0.00, 0.00), (0.01, 0.00)]),
+            LineString([(0.01, 0.00), (0.01, 0.002)]),
+        ],
+        crs="EPSG:4326",
+    )
+    return basins, streamnet
 
 
 class GeoPackageIngestionTests(unittest.TestCase):
@@ -202,6 +231,15 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(source.diagnostics.basins_clamp, LayerClampDiagnostics(2, (100,)))
         self.assertEqual(source.diagnostics.streamnet_clamp, LayerClampDiagnostics(1, (100,)))
         self.assertEqual(len(captured.records), 2)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertIn(
+            "diagnostic=basins_clamp.altered_vertex_count count=2 native_ids=(100,)",
+            messages,
+        )
+        self.assertIn(
+            "diagnostic=streamnet_clamp.altered_vertex_count count=1 native_ids=(100,)",
+            messages,
+        )
         self.assertEqual(get_coordinates(source.basins.geometry).max(axis=0)[0], 180.0)
         self.assertEqual(get_coordinates(source.streamnet.geometry).max(axis=0)[0], 180.0)
         self.assertAlmostEqual(source.diagnostics.dscontarea.selected_relative_error, 0.0)
@@ -383,6 +421,7 @@ class StreamnetModelTests(unittest.TestCase):
             model.diagnostics,
             StreamnetDiagnostics(
                 polygon_bearing_link_count=3,
+                polygonless_dropped_reach_count=4,
                 root_count=2,
                 contracted_edge_count=1,
                 contracted_root_count=1,
@@ -396,6 +435,7 @@ class StreamnetModelTests(unittest.TestCase):
                 orientation_tolerance=0.001,
             ),
         )
+        self.assertEqual(model.diagnostics.polygonless_dropped_reach_count, 4)
         self.assertIn(
             "streamnet_model polygon_bearing_links=3 roots=2 contracted_edges=1 "
             "contracted_roots=1 contracted_link_traversals=3 "
@@ -1164,6 +1204,220 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 with self.subTest(argument=argument, value=value):
                     with self.assertRaisesRegex(ValueError, argument):
                         compile_core_hfx(source, model, root / "output", **invalid)
+
+
+class BuildCliTests(unittest.TestCase):
+    created_at = datetime(2026, 7, 21, 12, 34, 56, tzinfo=timezone.utc)
+    basin_id = "7020000010"
+    fabric_version = "synthetic-2026.07"
+
+    def build_args(
+        self, basins_path: Path, streamnet_path: Path, output: Path, report: Path
+    ) -> list[str]:
+        return [
+            "build",
+            "--basins", str(basins_path),
+            "--streamnet", str(streamnet_path),
+            "--out", str(output),
+            "--report", str(report),
+            "--processing-basin-id", self.basin_id,
+            "--fabric-version", self.fabric_version,
+        ]
+
+    def expected_report(self, output: Path, *, isolated: bool = False) -> dict[str, object]:
+        ingestion_area = (
+            2461814.409986507 if isolated else 3692721.6149797607
+        )
+        raw_area = 2.4618144099865074 if isolated else 3.692721614979761
+        streamnet = {
+            "polygon_bearing_link_count": 2,
+            "polygonless_dropped_reach_count": 0 if isolated else 1,
+            "root_count": 2 if isolated else 1,
+            "contracted_edge_count": 0 if isolated else 1,
+            "contracted_root_count": 0,
+            "contracted_link_traversal_count": 0 if isolated else 1,
+            "endpoint_coincidence_proven_link_count": 0 if isolated else 2,
+            "predecessor_orientation_proven_root_count": 0 if isolated else 1,
+            "trusted_orientation_isolated_root_count": 2 if isolated else 0,
+            "trusted_orientation_isolated_root_native_linknos": [100, 200] if isolated else [],
+            "trusted_orientation_polygon_bearing_isolated_root_count": 2 if isolated else 0,
+            "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [100, 200] if isolated else [],
+            "orientation_tolerance": 0.001,
+        }
+        return {
+            "build_identity": {
+                "processing_basin_id": self.basin_id,
+                "fabric_name": "tdx_hydro",
+                "fabric_version": self.fabric_version,
+                "created_at": "2026-07-21T12:34:56+00:00",
+                "adapter_version": "0.1.0",
+                "dataset_root": str(output.resolve()),
+            },
+            "diagnostics": {
+                "ingestion": {
+                    "basins_clamp": {"altered_vertex_count": 0, "altered_native_ids": []},
+                    "streamnet_clamp": {"altered_vertex_count": 0, "altered_native_ids": []},
+                    "dscontarea": {
+                        "source_unit": "km2",
+                        "checked_polygon_bearing_link_count": 2,
+                        "geodesic_upstream_area_sum_m2": ingestion_area,
+                        "dscontarea_sum_raw": raw_area,
+                        "m2_relative_error": 0.999999,
+                        "km2_relative_error": 0.0,
+                        "selected_relative_error": 0.0,
+                    },
+                },
+                "streamnet": streamnet,
+            },
+        }
+
+    def assert_no_temporary_entries(self, *parents: Path) -> None:
+        for parent in parents:
+            self.assertFalse(
+                any(".tmp-" in entry.name for entry in parent.iterdir()), parent
+            )
+
+    def test_build_cli_writes_dataset_and_exact_external_report(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            basins_path, streamnet_path = write_pair(source_dir, *build_cli_frames())
+            output = root / "dataset" / "output"
+            report = root / "reports" / "report.json"
+            with patch("build_adapter._utc_now", return_value=self.created_at):
+                with self.assertLogs("tdx-hydro", level="WARNING") as captured:
+                    status = main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {"catchments.parquet", "graph.parquet", "manifest.json"},
+            )
+            self.assertFalse(report.is_relative_to(output))
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest, {
+                "format_version": "0.3.0", "fabric_name": "tdx_hydro",
+                "fabric_version": self.fabric_version, "crs": "EPSG:4326",
+                "has_up_area": True, "topology": "tree", "region": self.basin_id,
+                "bbox": [0.0, 0.0, 0.019999999552965164, 0.009999999776482582],
+                "unit_count": 2, "created_at": "2026-07-21T12:34:56+00:00",
+                "adapter_version": "0.1.0",
+            })
+            self.assertEqual(json.loads(report.read_text()), self.expected_report(output))
+            self.assert_no_temporary_entries(output.parent, report.parent)
+            messages = [record.getMessage() for record in captured.records]
+            self.assertTrue(any("diagnostic=contracted_edge_count count=1" in message for message in messages))
+            self.assertTrue(any("diagnostic=contracted_link_traversal_count count=1" in message for message in messages))
+            self.assertTrue(any("diagnostic=polygonless_dropped_reach_count count=1" in message for message in messages))
+            self.assertFalse(any("contracted_root_count" in message for message in messages))
+            self.assertFalse(any("trusted_orientation" in message for message in messages))
+            self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
+
+    def test_build_cli_rejects_report_inside_dataset_before_compiling(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, *build_cli_frames())
+            for report_suffix in (Path("report.json"), Path(".")):
+                output = root / f"output-{report_suffix.name or 'equal'}"
+                report = output / report_suffix if report_suffix != Path(".") else output
+                with self.subTest(report=report):
+                    with patch("build_adapter.compile_core_hfx") as compiler:
+                        with self.assertRaisesRegex(ValueError, "report path must be outside dataset root"):
+                            main(self.build_args(basins_path, streamnet_path, output, report))
+                    compiler.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertFalse(report.exists())
+
+    def test_build_cli_rejects_nonempty_output_without_mutation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            basins_path, streamnet_path = write_pair(source, *build_cli_frames())
+            output = root / "output"
+            output.mkdir()
+            sentinel = output / "sentinel.txt"
+            sentinel.write_text("keep me\n")
+            report = root / "report.json"
+            with self.assertRaisesRegex(ValueError, "output dataset root exists and is not empty"):
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(list(output.iterdir()), [sentinel])
+            self.assertEqual(sentinel.read_text(), "keep me\n")
+            self.assertFalse(report.exists())
+            self.assert_no_temporary_entries(root)
+
+    def test_build_cli_rolls_back_partial_compile_failure(self) -> None:
+        for precreate_output in (False, True):
+            with self.subTest(precreate_output=precreate_output), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                source = root / "source"
+                source.mkdir()
+                basins_path, streamnet_path = write_pair(source, *build_cli_frames())
+                output = root / "output"
+                report = root / "reports" / "report.json"
+                if precreate_output:
+                    output.mkdir()
+                with patch("build_adapter._write_graph", side_effect=RuntimeError("induced graph write failure")):
+                    with self.assertRaisesRegex(RuntimeError, "^induced graph write failure$"):
+                        main(self.build_args(basins_path, streamnet_path, output, report))
+                if precreate_output:
+                    self.assertTrue(output.is_dir())
+                    self.assertEqual(list(output.iterdir()), [])
+                else:
+                    self.assertFalse(output.exists())
+                self.assertFalse(report.exists())
+                self.assert_no_temporary_entries(root, report.parent)
+
+    def test_build_cli_reports_trusted_isolated_roots(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+            streamnet["DSLINKNO"] = [-1, -1]
+            streamnet["DSContArea"] = [area_200_m2 / 1_000_000, area_100_m2 / 1_000_000]
+            basins_path, streamnet_path = write_pair(source, basins, streamnet)
+            output, report = root / "output", root / "report.json"
+            with patch("build_adapter._utc_now", return_value=self.created_at):
+                with self.assertLogs("tdx-hydro", level="WARNING") as captured:
+                    self.assertEqual(main(self.build_args(basins_path, streamnet_path, output, report)), 0)
+            self.assertEqual(json.loads(report.read_text()), self.expected_report(output, isolated=True))
+            messages = [record.getMessage() for record in captured.records]
+            self.assertTrue(any("diagnostic=trusted_orientation_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
+            self.assertTrue(any("diagnostic=trusted_orientation_polygon_bearing_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
+            self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
+
+    def test_validate_cli_runs_explicit_binary_and_both_parquet_checks(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            basins_path, streamnet_path = write_pair(source, *build_cli_frames())
+            output, report = root / "output", root / "report.json"
+            with patch("build_adapter._utc_now", return_value=self.created_at):
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            capture = root / "argv.json"
+            double = root / "hfx-double"
+            double.write_text(
+                f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+                f"Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            )
+            double.chmod(0o755)
+            real_validator = build_adapter.validate_geoparquet
+            with patch("build_adapter.validate_geoparquet", wraps=real_validator) as validator:
+                self.assertEqual(main(["validate", str(output), "--hfx-binary", str(double)]), 0)
+            self.assertEqual(json.loads(capture.read_text()), [str(output), "--strict", "--sample-pct", "100", "--format", "text"])
+            self.assertEqual(validator.call_args_list, [
+                unittest.mock.call(str(output / "catchments.parquet"), target_version="1.1"),
+                unittest.mock.call(str(output / "graph.parquet"), target_version="1.1"),
+            ])
+            failing = root / "hfx-failing"
+            failing.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(7)\n")
+            failing.chmod(0o755)
+            with patch("build_adapter.validate_geoparquet") as validator:
+                with self.assertRaisesRegex(RuntimeError, "return code 7"):
+                    main(["validate", str(output), "--hfx-binary", str(failing)])
+            validator.assert_not_called()
 
 
 if __name__ == "__main__":
