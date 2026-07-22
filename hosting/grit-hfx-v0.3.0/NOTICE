@@ -1,0 +1,33 @@
+NOTICE
+
+This object set is an HFX compilation of the Global River Topology (GRIT)
+vector datasets and selected raster datasets, hosted at grit/hfx-v0.3.0/ on
+basin-delineations-public.upstream.tech.
+
+Vector source data: Global River Topology (GRIT) vector datasets,
+Wortmann et al. 2025, DOI 10.5281/zenodo.17435232
+(https://doi.org/10.5281/zenodo.17435232), Zenodo record 17435232.
+
+Raster source data: Global River Topology (GRIT) raster datasets,
+Wortmann et al. 2025, DOI 10.5281/zenodo.15715535
+(https://doi.org/10.5281/zenodo.15715535), Zenodo record 15715535. This HFX
+compilation uses the drainage_direction rasters and the width-partitioned
+drainage_area rasters.
+
+Related paper: Wortmann, M. et al. (2025), “Global River Topology (GRIT): A
+Bifurcating River Hydrography”, Water Resources Research, 61,
+e2024WR038308, doi:10.1029/2024WR038308
+(https://doi.org/10.1029/2024WR038308).
+
+License: the source data is released under CC BY-NC 4.0
+(https://creativecommons.org/licenses/by-nc/4.0/). This combined derived HFX
+dataset inherits that license: CC BY-NC 4.0, NonCommercial; no commercial use
+is permitted.
+
+Attribution: any use of this dataset must credit the source data authors.
+See CITATION.txt in this directory for the exact citations in plain text and
+BibTeX form.
+
+Hosting: Upstream Tech sponsors the hosting infrastructure for these objects
+(infrastructure sponsor only). Upstream Tech is not the publisher or vendor
+of the data.
