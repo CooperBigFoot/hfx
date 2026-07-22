@@ -337,3 +337,193 @@ Cleanup deleted
 `/private/tmp/grit-d8-m2-scratch/m2-s2-raster-work`. The verified 14 raster
 archives, four vector member files, outer vector ZIP, API inventories, global
 tile index, and all M2 evidence and logs remain available for M3.
+
+## Planetary build and disk policy
+
+The accepted planetary build ran from pinned ref
+`284a209d58445a0908ee2a3108bdd9fbcc3f1894`. A local worktree at
+`/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/grit-planetary-d8-rasters-on-r2/m3-s1`
+drove `root@2.28.13.28` over SSH. The remote source tree was
+`/mnt/hfx/src/hfx`, campaign scratch was `/mnt/hfx/scratch`, and the result was
+`/mnt/hfx/scratch/grit-hfx-global`.
+
+### Remote campaign and input acquisition
+
+The retained host ran Debian 12 on the actual Hetzner `ccx33` with 8 dedicated
+vCPUs and 32 GB RAM. The approved request named `ccx43`; the dedicated-core
+quota rejected that type, and `ccx33` was provisioned. The mounted data volume
+was a 1000 GB ext4 filesystem at `/mnt/hfx`. Source was transported with
+`.git` and `.worktrees` excluded. The host received no repository, storage, or
+cloud credentials. The first-live-run provisioning record is
+`/private/tmp/grit-d8-m2-scratch/hetzner/provision-grit-d8-m3-run1.log`. Its
+seven findings cover the macOS Bash 3.2 associative-array failure, ambiguous
+Debian image selection, the `ccx43` quota rejection, readonly/local variable
+collisions, the hcloud location JSON path, the `wipefs` output option, and
+whitespace in the post-mount device identity check.
+
+Fresh Zenodo API inventories selected 14 raster archives and 28 vector
+archives. The raster inventory contained 35,005,693,158 direction bytes and
+138,962,053,251 accumulation bytes, totaling 173,967,746,409 bytes. The vector
+inventory contained 33,449,657,409 bytes. All 42 files matched API byte sizes
+and MD5 values. Acquisition used four concurrent resumable `curl` workers with
+size and MD5 verification after every transfer. At the retained-run resume,
+`existing-input-verification.json` recorded `total=42`, `verified=42`,
+`missing=0`, and `failed=0`. The Zenodo probe was skipped for that resume, as
+recorded in `zenodo-probe-skipped.txt`. The earlier detached acquisition ran
+from `2026-07-21T12:49:27Z` through `2026-07-21T14:35:28Z` and exited 0.
+
+The vector outer archive contained exactly 28 sorted top-level `ZIP_STORED`
+members. Its payload was 33,449,657,409 bytes; its complete size was
+33,449,662,473 bytes; its MD5 was
+`b658821674c40c3378cea6c02fb9a50a`. Member sizes and CRC-32 values passed, and
+all 28 inner archives were API-size and MD5 verified. Raster ZIP checks passed
+for all 2,039 direction TIFFs and all 2,039 accumulation TIFFs. Central
+directory member totals were 35,034,321,011 direction bytes and
+139,001,345,727 accumulation bytes.
+
+### Planetary vector build
+
+The global vector dataset used these exact commands, in order and with no
+region selector:
+
+```bash
+uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py --root /mnt/hfx/scratch --outer-archive /mnt/hfx/scratch/archives/17435232-global-outer.zip stage1
+uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py --root /mnt/hfx/scratch --outer-archive /mnt/hfx/scratch/archives/17435232-global-outer.zip stage2
+uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py --root /mnt/hfx/scratch --outer-archive /mnt/hfx/scratch/archives/17435232-global-outer.zip phase25
+uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py --root /mnt/hfx/scratch --outer-archive /mnt/hfx/scratch/archives/17435232-global-outer.zip write
+```
+
+The host preflight reported exactly 12 passed tests. All four stages exited 0.
+Real, user, and system seconds were 4,091.26, 1,560.55, and 802.20 for
+`stage1`; 37.44, 34.51, and 3.57 for `stage2`; 655.83, 651.78, and 12.22 for
+`phase25`; and 11,075.53, 1,052.22, and 3,180.61 for `write`. The detached
+runner spanned `2026-07-21T16:41:05Z` through `2026-07-21T21:05:25Z` and
+exited 0. The output contained 22,337,300 catchments and graph rows, 1,767,065
+segment snap rows, and 20,570,235 reach snap rows. Its pre-attach `du` was
+42,345,252 KiB.
+
+The four vector identities recorded before raster attachment were:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `catchments.parquet` | 32,508,030,908 | `50c987343181af8a848170cf121571e7ae815ac491b93bcf9cc07a04a9e12c59` |
+| `graph.parquet` | 699,720,490 | `8f61a64fb6746213638655053118eb47c939a4f89796f4a1ef017ab0fd923e81` |
+| `aux/snap_segments.parquet` | 3,674,757,248 | `cab39a2be4333cdd8e9a02b78186fa6f6ff3d55c761e670e7104605eeab4dda3` |
+| `aux/snap_reaches.parquet` | 6,478,991,001 | `afd994adb2fbfdf25e09dc51b4e1441eb74e34ed5647a6a5b3b4e2a67dc9dfc3` |
+
+The normalized post-attach identity gate matched all four byte counts and
+SHA-256 values exactly. After the baseline was recorded, the 28
+re-downloadable vector members and reconstructible outer archive were
+removed. That lifecycle reclaimed 66,899,319,882 bytes across 29 files. Peak
+swap usage sampled from `/proc/meminfo` was 64,359,752 KiB, or 65,904,386,048
+bytes, within the 64 GiB swapfile.
+
+### Compressed-streaming raster build
+
+The approved component projection was about 391 GB during extraction, 277 GB
+during direction construction, and 482 GB during accumulation construction.
+It used a 1000 GB volume with a 40,000,000,000-byte free floor, leaving about
+478 GB of simplified projected headroom. The measured sizing model included
+152,394,054,295 baseline-other bytes and 43,361,538,048 vector dataset bytes.
+It projected 543,759,005,490 extraction bytes, 429,587,736,754 direction bytes,
+and 634,770,557,506 accumulation bytes. Capacity was 1,002,031,964,160 bytes,
+permitted occupancy was 962,031,964,160 bytes, and measured-model headroom was
+327,261,406,654 bytes. The dataset and raster work directory passed the same
+`st_dev` check.
+
+The single planetary raster command was:
+
+```bash
+/usr/bin/time -p uv run --project adapters/grit-v2 python adapters/grit-v2/build_adapter.py raster \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_AF_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_AS_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_EU_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_NA_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_SA_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_SI_EPSG8857.zip \
+  --flow-dir-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_direction_SP_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_AF_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_AS_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_EU_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_NA_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_SA_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_SI_EPSG8857.zip \
+  --flow-acc-archive /mnt/hfx/scratch/archives/GRITv1.0_drainage_area_SP_EPSG8857.zip \
+  --dataset-dir /mnt/hfx/scratch/grit-hfx-global \
+  --work-dir /mnt/hfx/scratch/raster-work \
+  --consume-archives \
+  --reclaim-extracted \
+  --disable-disk-free-space-check
+```
+
+`--consume-archives` removed all 14 verified source archives after extraction
+gates passed. `--reclaim-extracted` removed both extracted family trees after
+their COGs were finalized. `--disable-disk-free-space-check` delegated the
+floor decision to the independent numeric sampler. The sampler checked the
+volume every 10 seconds, completed with zero sampler errors, and observed peak
+used space of 644,583,088,128 bytes. Every numeric sample remained above the
+40,000,000,000-byte free floor. The detached raster run spanned
+`2026-07-21T21:09:38Z` through `2026-07-22T12:09:59Z`, exited 0, and used
+54,020.98 real, 51,769.29 user, and 1,107.54 system seconds.
+
+### Planetary output identity
+
+The realized artifacts were:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `manifest.json` | 1,426 | `02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c` |
+| `aux/d8/flow_dir.tif` | 50,686,516,478 | `eace32b63c4bc09e8172f03cce6dacfbf09a86c6b51c42b50c6cccd498d4d656` |
+| `aux/d8/flow_acc.tif` | 205,069,870,081 | `30f16ba3238085289d87e72f3386fa152da7e9b56063f5d610422d20a79fc98b` |
+
+The completed dataset measured 292,107,392 KiB by `du` and contained
+299,117,889,306 regular-file bytes. Both COG validators returned
+`valid=true`, `errors=[]`, and `warnings=[]`. Each raster had one band,
+EPSG:8857, width 1,070,000, height 500,000, and transform
+`[30.0, 0.0, -15000000.0, 0.0, -30.0, 8400000.0]`. Direction was `uint8`
+with nodata 255. Accumulation was `float32` with NaN nodata, verified with a
+NaN-aware assertion.
+
+The fixed source and output windows matched exactly:
+
+| Region | Tile | Source window | Output window | Direction histogram | Area NaNs | Finite area range |
+| --- | --- | --- | --- | --- | ---: | --- |
+| AF | `E000000000N000600000` | `Window(2492, 2492, 16, 16)` | `Window(502492, 252492, 16, 16)` | `{2:1, 3:12, 4:92, 5:113, 6:36, 7:2}` | 0 | `0.0008999999845400453` to `0.3698999881744385` |
+| EU | `E000000000N004800000` | `Window(6128, 856, 16, 16)` | `Window(506128, 110856, 16, 16)` | `{0:9, 1:9, 2:14, 3:5, 4:34, 5:31, 6:36, 7:21, 8:14, 255:83}` | 83 | `0.0008999999845400453` to `0.14669999480247498` |
+| SP | `E009600000N000000000` | `Window(4992, 4992, 16, 16)` | `Window(824992, 274992, 16, 16)` | `{1:23, 2:40, 3:34, 4:51, 5:21, 6:40, 7:13, 8:34}` | 0 | `0.0008999999845400453` to `0.07109999656677246` |
+
+AF used source transform `[30, 0, 0, 0, -30, 900000]`; EU used
+`[30, 0, 0, 0, -30, 5100000]`; SP used
+`[30, 0, 9600000, 0, -30, 300000]`. Direction arrays matched with exact
+`numpy.array_equal`. Accumulation arrays had identical NaN masks and exact
+finite-cell values. Source and output window transforms matched for every
+row. EU source-local cell `(4, 4)` and its output cell both contained genuine
+direction code 0 while nodata was 255.
+
+The manifest retained `format_version=0.3.0` and
+`adapter_version=grit-global-2.1.0`. It contained exactly one
+`hfx.aux.d8_raster.v2` entry. Its artifacts were exactly
+`flow_dir=aux/d8/flow_dir.tif` and `flow_acc=aux/d8/flow_acc.tif`. Its metadata
+was exactly `crs=EPSG:8857`, `flow_dir_encoding=grass`, and
+`flow_acc_units=km2`.
+
+The final strict commands were:
+
+```bash
+cargo build -p hfx-cli
+/usr/bin/time -p ./target/debug/hfx /mnt/hfx/scratch/grit-hfx-global --strict
+```
+
+The build and strict command exited 0. Strict validation ran from
+`2026-07-22T12:44:11Z` through `2026-07-22T13:14:27Z`, using 1,815.19 real,
+1,082.33 user, and 182.18 system seconds. Its complete report was:
+
+```text
+0 error(s), 0 warning(s), 0 info(s)
+Result: VALID
+```
+
+Small evidence was returned to
+`/private/tmp/grit-d8-m2-scratch/evidence/m3-s1-remote`. The validated dataset
+remains at `/mnt/hfx/scratch/grit-hfx-global` on the retained volume pending
+the human M4 transport decision.
