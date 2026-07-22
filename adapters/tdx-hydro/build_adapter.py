@@ -54,6 +54,7 @@ TDX_SOURCE_CELL_ARCSECONDS = 0.4
 COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
 DSCONTAREA_RELATIVE_TOLERANCE = 0.05
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
+SNAP_BBOX_EPSILON = 1e-4
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,7 @@ class CoreBuildDiagnostics:
 class CoreBuildResult:
     catchments_path: Path
     graph_path: Path
+    snap_path: Path
     manifest_path: Path
     diagnostics: CoreBuildDiagnostics
 
@@ -1235,6 +1237,106 @@ def _write_graph(
     _write_table(path, schema, columns, len(units))
 
 
+def _prepare_snap_stems(
+    source: TdxSourceData,
+    streamnet_model: StreamnetModel,
+    units: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    units_by_native = {unit.linkno: unit for unit in streamnet_model.units}
+    if len(units_by_native) != len(streamnet_model.units):
+        raise ValueError("streamnet_model unit native linkno must be unique")
+
+    selected_rows: dict[int, tuple[object, float]] = {}
+    for linkno, weight, geometry in zip(
+        source.streamnet["LINKNO"],
+        source.streamnet["DSContArea_km2"],
+        source.streamnet.geometry,
+        strict=True,
+    ):
+        native_id = int(linkno)
+        if native_id not in units_by_native:
+            continue
+        if native_id in selected_rows:
+            raise ValueError("selected source.streamnet.LINKNO must be unique")
+        weight_value = float(weight)
+        if not math.isfinite(weight_value) or weight_value <= 0.0:
+            raise ValueError(
+                "selected source.streamnet.DSContArea_km2 must be positive and finite"
+            )
+        weight_f32 = np.float32(weight_value)
+        if not np.isfinite(weight_f32) or weight_f32 < 0:
+            raise ValueError(
+                "selected snap float32 weight must be finite and non-negative"
+            )
+        selected_rows[native_id] = (geometry, float(weight_f32))
+
+    missing_linknos = sorted(set(units_by_native) - set(selected_rows))
+    if missing_linknos:
+        raise ValueError(
+            "streamnet_model unit linkno must join exactly once to "
+            f"source.streamnet.LINKNO: {missing_linknos[0]}"
+        )
+    if len(selected_rows) != len(units_by_native):
+        raise ValueError("selected source.streamnet rows must match model units exactly")
+
+    records: list[dict[str, object]] = []
+    geometries = []
+    for native_id, (geometry, weight) in selected_rows.items():
+        records.append(
+            {
+                "unit_id": units_by_native[native_id].id,
+                "weight": np.float32(weight),
+                "stem_role": None,
+            }
+        )
+        geometries.append(geometry)
+
+    ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
+    ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
+        total_bounds=units.geometry.total_bounds
+    )
+    ordered = ordered.sort_values(["_hilbert", "unit_id"], kind="mergesort")
+    return ordered.drop(columns=["_hilbert"]).reset_index(drop=True)
+
+
+def _write_snap_stems(path: Path, stems: gpd.GeoDataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bounds = stems.geometry.bounds.to_numpy(dtype="float64").astype("float32")
+    x_degenerate = bounds[:, 0] == bounds[:, 2]
+    y_degenerate = bounds[:, 1] == bounds[:, 3]
+    bounds[x_degenerate, 0] -= np.float32(SNAP_BBOX_EPSILON)
+    bounds[x_degenerate, 2] += np.float32(SNAP_BBOX_EPSILON)
+    bounds[y_degenerate, 1] -= np.float32(SNAP_BBOX_EPSILON)
+    bounds[y_degenerate, 3] += np.float32(SNAP_BBOX_EPSILON)
+    if not np.isfinite(bounds).all() or not (
+        (bounds[:, 0] < bounds[:, 2]).all()
+        and (bounds[:, 1] < bounds[:, 3]).all()
+    ):
+        raise ValueError("snap float32 bbox values must be finite and ordered")
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["LineString"]))
+    row_count = len(stems)
+    columns = [
+        pa.array(np.arange(1, row_count + 1, dtype="int64"), type=pa.int64()),
+        pa.array(stems["unit_id"], type=pa.int64()),
+        pa.array(stems["weight"], type=pa.float32()),
+        pa.array(stems["stem_role"], type=pa.string()),
+        build_bbox_struct(bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]),
+        pa.array([geometry.wkb for geometry in stems.geometry], type=pa.binary()),
+    ]
+    _write_table(path, schema, columns, row_count)
+    assert_geoparquet_valid(path)
+
+
 def compile_core_hfx(
     source: TdxSourceData,
     streamnet_model: StreamnetModel,
@@ -1256,9 +1358,12 @@ def compile_core_hfx(
     out_dir.mkdir(parents=True, exist_ok=True)
     catchments_path = out_dir / "catchments.parquet"
     graph_path = out_dir / "graph.parquet"
+    snap_path = out_dir / "aux" / "snap_stems.parquet"
     manifest_path = out_dir / "manifest.json"
     bounds = _write_catchments(catchments_path, units)
     _write_graph(graph_path, units, bounds, streamnet_model)
+    stems = _prepare_snap_stems(source, streamnet_model, units)
+    _write_snap_stems(snap_path, stems)
     manifest = {
         "format_version": FORMAT_VERSION,
         "fabric_name": FABRIC_NAME,
@@ -1271,11 +1376,24 @@ def compile_core_hfx(
         "unit_count": len(units),
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "adapter_version": ADAPTER_VERSION,
+        "auxiliary": [
+            {
+                "schema": "hfx.aux.snap.v2",
+                "artifacts": {"snap": "aux/snap_stems.parquet"},
+                "metadata": {
+                    "name": "stems",
+                    "description": "Native TDX-Hydro LineString reaches for polygon-bearing level 0 drainage units.",
+                    "references_levels": [0],
+                    "weight_semantics": "Drainage-area weight equals inclusive DSContArea in km2; higher values indicate stronger drainage dominance.",
+                },
+            }
+        ],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return CoreBuildResult(
         catchments_path=catchments_path,
         graph_path=graph_path,
+        snap_path=snap_path,
         manifest_path=manifest_path,
         diagnostics=CoreBuildDiagnostics(
             ingestion=source.diagnostics,
@@ -1399,6 +1517,7 @@ def build_dataset(
         result = CoreBuildResult(
             catchments_path=output_root / "catchments.parquet",
             graph_path=output_root / "graph.parquet",
+            snap_path=output_root / "aux" / "snap_stems.parquet",
             manifest_path=output_root / "manifest.json",
             diagnostics=staging_result.diagnostics,
         )
@@ -1448,7 +1567,7 @@ def validate_dataset(
     *,
     hfx_binary: str | Path = "hfx",
 ) -> None:
-    """Run strict HFX validation and inspect both Parquet files."""
+    """Run strict HFX validation and inspect every dataset layer."""
     completed = subprocess.run(
         [
             str(hfx_binary),
@@ -1488,6 +1607,9 @@ def validate_dataset(
         raise ValueError(
             f"unexpected graph GeoParquet classification for {graph_path}: {details}"
         )
+    snap_path = dataset / "aux" / "snap_stems.parquet"
+    snap_result = validate_geoparquet(str(snap_path), target_version="1.1")
+    _assert_geoparquet_result(snap_path, snap_result)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
