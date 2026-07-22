@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
+import os
+import shutil
+import subprocess
+import tempfile
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
@@ -48,6 +53,7 @@ CRS = "EPSG:4326"
 TDX_SOURCE_CELL_ARCSECONDS = 0.4
 COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
 DSCONTAREA_RELATIVE_TOLERANCE = 0.05
+DEFAULT_ENDPOINT_TOLERANCE = 0.001
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,7 @@ class StreamnetUnit:
 @dataclass(frozen=True)
 class StreamnetDiagnostics:
     polygon_bearing_link_count: int
+    polygonless_dropped_reach_count: int
     root_count: int
     contracted_edge_count: int
     contracted_root_count: int
@@ -335,7 +342,7 @@ def _clamp_coordinate_domain(
     )
     if altered_vertex_count:
         LOGGER.warning(
-            "clamped coordinate-domain overshoot: layer=%s, altered_vertices=%d, native_ids=%s",
+            "diagnostic=%s_clamp.altered_vertex_count count=%d native_ids=%s",
             layer_name,
             altered_vertex_count,
             diagnostics.altered_native_ids,
@@ -858,6 +865,7 @@ def build_streamnet_model(
     )
     diagnostics = StreamnetDiagnostics(
         polygon_bearing_link_count=len(unit_tuple),
+        polygonless_dropped_reach_count=len(relation) - len(polygon_bearing_links),
         root_count=len(roots),
         contracted_edge_count=sum(
             unit.downstream_linkno != TDX_LINKNO_SENTINEL
@@ -896,7 +904,7 @@ def build_streamnet_model(
         "trusted_orientation_isolated_root_native_linknos=%s "
         "trusted_orientation_polygon_bearing_isolated_roots=%d "
         "trusted_orientation_polygon_bearing_isolated_root_native_linknos=%s "
-        "orientation_tolerance=%s",
+        "orientation_tolerance=%s polygonless_dropped_reach_count=%d",
         diagnostics.polygon_bearing_link_count,
         diagnostics.root_count,
         diagnostics.contracted_edge_count,
@@ -909,6 +917,7 @@ def build_streamnet_model(
         diagnostics.trusted_orientation_polygon_bearing_isolated_root_count,
         diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
         diagnostics.orientation_tolerance,
+        diagnostics.polygonless_dropped_reach_count,
     )
     return StreamnetModel(
         units=unit_tuple,
@@ -1008,9 +1017,7 @@ def _write_table(
             writer.write_table(table.slice(start, stop - start))
 
 
-def assert_geoparquet_valid(path: Path) -> None:
-    """Raise when a Parquet file fails GeoParquet 1.1 validation."""
-    result = validate_geoparquet(str(path), target_version="1.1")
+def _assert_geoparquet_result(path: Path, result: object) -> None:
     if result.is_valid:
         return
     failures = [check for check in result.checks if check.status.value == "failed"]
@@ -1018,6 +1025,12 @@ def assert_geoparquet_valid(path: Path) -> None:
         f"{check.name}: {check.message}" for check in failures
     )
     raise ValueError(f"GeoParquet validation failed for {path}: {details}")
+
+
+def assert_geoparquet_valid(path: Path) -> None:
+    """Raise when a Parquet file fails GeoParquet 1.1 validation."""
+    result = validate_geoparquet(str(path), target_version="1.1")
+    _assert_geoparquet_result(path, result)
 
 
 def _validate_core_model(
@@ -1269,3 +1282,259 @@ def compile_core_hfx(
             streamnet=streamnet_model.diagnostics,
         ),
     )
+
+
+def build_diagnostics_report(
+    result: CoreBuildResult,
+    *,
+    processing_basin_id: str,
+    fabric_version: str,
+    created_at: datetime,
+    dataset_root: Path,
+) -> dict[str, object]:
+    """Serialize build identity and preserved compiler diagnostics."""
+    return {
+        "build_identity": {
+            "processing_basin_id": processing_basin_id,
+            "fabric_name": FABRIC_NAME,
+            "fabric_version": fabric_version,
+            "created_at": created_at.astimezone(timezone.utc).isoformat(),
+            "adapter_version": ADAPTER_VERSION,
+            "dataset_root": str(dataset_root.resolve(strict=False)),
+        },
+        "diagnostics": asdict(result.diagnostics),
+    }
+
+
+def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
+    streamnet = diagnostics.streamnet
+    for field_name in (
+        "contracted_edge_count",
+        "contracted_root_count",
+        "contracted_link_traversal_count",
+        "polygonless_dropped_reach_count",
+    ):
+        count = getattr(streamnet, field_name)
+        if count:
+            LOGGER.warning("diagnostic=%s count=%d", field_name, count)
+    for field_name, native_ids_field in (
+        (
+            "trusted_orientation_isolated_root_count",
+            "trusted_orientation_isolated_root_native_linknos",
+        ),
+        (
+            "trusted_orientation_polygon_bearing_isolated_root_count",
+            "trusted_orientation_polygon_bearing_isolated_root_native_linknos",
+        ),
+    ):
+        count = getattr(streamnet, field_name)
+        if count:
+            LOGGER.warning(
+                "diagnostic=%s count=%d native_ids=%s",
+                field_name,
+                count,
+                getattr(streamnet, native_ids_field),
+            )
+
+
+def build_dataset(
+    basins_path: Path,
+    streamnet_path: Path,
+    output_root: Path,
+    report_path: Path,
+    *,
+    processing_basin_id: str,
+    fabric_version: str,
+    endpoint_tolerance: float = DEFAULT_ENDPOINT_TOLERANCE,
+    created_at: datetime,
+) -> CoreBuildResult:
+    """Build and atomically publish one TDX-Hydro HFX dataset and report."""
+    basins_path = basins_path.expanduser()
+    streamnet_path = streamnet_path.expanduser()
+    output_root = output_root.expanduser().resolve(strict=False)
+    report_path = report_path.expanduser().resolve(strict=False)
+
+    if report_path == output_root or report_path.is_relative_to(output_root):
+        raise ValueError("report path must be outside dataset root")
+    output_existed_empty = False
+    if output_root.exists():
+        if not output_root.is_dir():
+            raise ValueError("output dataset root exists and is not a directory")
+        if any(output_root.iterdir()):
+            raise ValueError("output dataset root exists and is not empty")
+        output_existed_empty = True
+    if report_path.exists():
+        raise ValueError("report path already exists")
+
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_root: Path | None = None
+    report_temporary: Path | None = None
+    published_dataset = False
+    published_report = False
+    removed_existing_output = False
+    try:
+        staging_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_root.name}.tmp-", dir=output_root.parent
+            )
+        )
+        staging_dataset_root = staging_root / "dataset"
+        source = load_tdx_geopackages(basins_path, streamnet_path)
+        header_number = load_header_crosswalk()[processing_basin_id]
+        model = build_streamnet_model(
+            source.basins,
+            source.streamnet,
+            header_number,
+            endpoint_tolerance=endpoint_tolerance,
+        )
+        staging_result = compile_core_hfx(
+            source,
+            model,
+            staging_dataset_root,
+            processing_basin_id=processing_basin_id,
+            fabric_version=fabric_version,
+            created_at=created_at,
+        )
+        result = CoreBuildResult(
+            catchments_path=output_root / "catchments.parquet",
+            graph_path=output_root / "graph.parquet",
+            manifest_path=output_root / "manifest.json",
+            diagnostics=staging_result.diagnostics,
+        )
+        report = build_diagnostics_report(
+            result,
+            processing_basin_id=processing_basin_id,
+            fabric_version=fabric_version,
+            created_at=created_at,
+            dataset_root=output_root,
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{report_path.name}.tmp-",
+            dir=report_path.parent,
+            delete=False,
+        ) as report_file:
+            report_temporary = Path(report_file.name)
+            report_file.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
+        _warn_nonzero_build_diagnostics(result.diagnostics)
+        if output_existed_empty:
+            output_root.rmdir()
+            removed_existing_output = True
+        staging_dataset_root.replace(output_root)
+        published_dataset = True
+        os.replace(report_temporary, report_path)
+        published_report = True
+        return result
+    except Exception:
+        if published_report:
+            report_path.unlink(missing_ok=True)
+        if published_dataset:
+            shutil.rmtree(output_root, ignore_errors=True)
+        if removed_existing_output and not output_root.exists():
+            output_root.mkdir(parents=True)
+        raise
+    finally:
+        if report_temporary is not None:
+            report_temporary.unlink(missing_ok=True)
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def validate_dataset(
+    dataset: Path,
+    *,
+    hfx_binary: str | Path = "hfx",
+) -> None:
+    """Run strict HFX validation and inspect both Parquet files."""
+    completed = subprocess.run(
+        [
+            str(hfx_binary),
+            str(dataset),
+            "--strict",
+            "--sample-pct",
+            "100",
+            "--format",
+            "text",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"HFX validation failed with return code {completed.returncode}: "
+            f"stderr={completed.stderr!r} stdout={completed.stdout!r}"
+        )
+
+    catchments_path = dataset / "catchments.parquet"
+    catchments_result = validate_geoparquet(
+        str(catchments_path), target_version="1.1"
+    )
+    _assert_geoparquet_result(catchments_path, catchments_result)
+    graph_path = dataset / "graph.parquet"
+    graph_result = validate_geoparquet(str(graph_path), target_version="1.1")
+    graph_failures = [
+        check for check in graph_result.checks if check.status.value == "failed"
+    ]
+    if graph_result.is_valid or [check.name for check in graph_failures] != [
+        "version_match"
+    ]:
+        details = "; ".join(
+            f"{check.name}: {check.message}" for check in graph_failures
+        )
+        raise ValueError(
+            f"unexpected graph GeoParquet classification for {graph_path}: {details}"
+        )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the TDX-Hydro adapter command-line parser."""
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_parser = subparsers.add_parser("build")
+    build_parser.add_argument("--basins", required=True, type=Path)
+    build_parser.add_argument("--streamnet", required=True, type=Path)
+    build_parser.add_argument("--out", required=True, type=Path)
+    build_parser.add_argument("--report", required=True, type=Path)
+    build_parser.add_argument("--processing-basin-id", required=True)
+    build_parser.add_argument("--fabric-version", required=True)
+    build_parser.add_argument(
+        "--endpoint-tolerance",
+        type=float,
+        default=DEFAULT_ENDPOINT_TOLERANCE,
+    )
+    validate_parser = subparsers.add_parser("validate")
+    validate_parser.add_argument("dataset", type=Path)
+    validate_parser.add_argument("--hfx-binary", default="hfx")
+    return parser
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch the selected adapter command."""
+    arguments = build_arg_parser().parse_args(argv)
+    if arguments.command == "build":
+        created_at = _utc_now()
+        build_dataset(
+            arguments.basins,
+            arguments.streamnet,
+            arguments.out,
+            arguments.report,
+            processing_basin_id=arguments.processing_basin_id,
+            fabric_version=arguments.fabric_version,
+            endpoint_tolerance=arguments.endpoint_tolerance,
+            created_at=created_at,
+        )
+    else:
+        validate_dataset(arguments.dataset, hfx_binary=arguments.hfx_binary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
