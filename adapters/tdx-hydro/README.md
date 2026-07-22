@@ -11,6 +11,8 @@ This adapter compiles one pristine NGA TDX-Hydro processing basin into an HFX v0
 
 Each path must name an existing `.gpkg` file containing exactly one non-empty vector layer with one active geometry column and a declared CRS. The adapter transforms a non-EPSG:4326 input to EPSG:4326 before compiling it. Topology identifiers must be integral. `basins.streamID` and `streamnet.LINKNO` must be non-negative; `streamnet.DSLINKNO` may also use the native `-1` terminal sentinel. `DSContArea` must be finite and positive.
 
+TDX-Hydro source data may encode a zero-length reach as a two-coordinate LineString whose two two-dimensional coordinate tuples are exactly identical. The adapter accepts that one otherwise-invalid geometry shape as a documented source-data convention. It preserves both source vertices and does not repair, extend, perturb, or replace the geometry. Null, empty, Z, wrong-type, and every other invalid geometry remain fatal; in particular, a LineString with three identical coordinates is not admitted by this exception.
+
 The source fabric is the pristine NGA distribution, not the modified GEOGLOWS v2 derivative. `fabric_name` is `tdx_hydro`; `--fabric-version` supplies the NGA product version recorded in the manifest. See [the pristine-NGA source decision](../../docs/decisions/2026-07-21-tdx-hydro-pristine-nga-source.md). NGA's observed download pattern is `https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg`, where `<product>` is `basins` or `streamnet`.
 
 ## Manifest facts
@@ -52,17 +54,23 @@ Every basin polygon must join to one streamnet row. Missing or duplicate identit
 
 The native same-level relation is `LINKNO -> DSLINKNO`. For each polygon-bearing link, the adapter follows `DSLINKNO` through zero or more polygon-less links until it reaches the first polygon-bearing downstream link or `-1`. The former creates one contracted same-level edge; the latter makes the unit a root. The report distinguishes `contracted_edge_count`, `contracted_root_count`, and the total `contracted_link_traversal_count`.
 
+Degenerate reaches do not change unit selection or contraction. A polygon-bearing degenerate reach still emits its drainage unit. A polygon-less degenerate reach remains a native topology pass-through and is dropped from emitted units and snap stems exactly like any other polygon-less reach. Polygon-bearing status comes only from the attribute join; there is no spatial fallback or per-basin allowlist.
+
 Tree topology is enforced, not inferred from the manifest declaration. The adapter rejects native self-links, missing downstream targets, cycles, duplicate `LINKNO` rows, and duplicate rows that imply a bifurcation. It then verifies that every emitted unit has at most one downstream edge and that the contracted emitted relation is acyclic. A violation is a fatal build error.
 
 ## Reach orientation and outlets
 
-For every native reach whose `DSLINKNO` names a successor, the adapter compares both endpoints of the reach with both endpoints of that native successor. Exactly one endpoint pair must coincide within `--endpoint-tolerance`, which defaults to `0.001` degrees. No match is a fatal non-coincidence error, and multiple matches are a fatal ambiguity. The matched endpoint of the current reach is its proven downstream endpoint. This proof is performed against the immediate native `DSLINKNO` successor, including when later graph contraction skips polygon-less links.
+For every healthy native reach whose `DSLINKNO` names a successor, the adapter compares the two endpoints of the reach with the distinct endpoint coordinates of that immediate native successor. Exactly one semantic endpoint pair must coincide within `--endpoint-tolerance`, which defaults to `0.001` degrees. No match is a fatal non-coincidence error, and multiple distinct matches are a fatal ambiguity. The matched endpoint of the healthy current reach is its proven downstream endpoint. This proof is performed against the immediate native `DSLINKNO` successor, including when later graph contraction skips polygon-less links.
 
-For a native root with predecessors, predecessor-to-root endpoint matches identify the root's upstream endpoint. The opposite root endpoint is therefore the downstream endpoint. Conflicting predecessor matches are fatal. This is the predecessor-based root-orientation proof.
+A degenerate successor has one distinct coordinate even though its preserved LineString stores that coordinate twice. A sole match between that point and one endpoint of a healthy current reach still discriminates the healthy reach's direction, so it is counted as proven by endpoint coincidence. Duplicate storage of the successor point does not create ambiguity. If both distinct endpoints of the healthy current reach match that point, or one current endpoint matches two distinct endpoints of a healthy successor, ambiguity remains fatal.
 
-**TRUST ASSUMPTION: isolated native roots have no successor and no predecessor topology, so their orientation cannot be proven by endpoint coincidence. For those reaches only, the adapter trusts TauDEM/TDX native vertex order and treats the final LineString vertex as the outlet. This is a trust assumption, never an orientation proof.** The report keeps trusted isolated roots separate from endpoint-coincidence-proven links and predecessor-orientation-proven roots, and separately identifies the trusted isolated roots that bear polygons.
+**TRUST ASSUMPTION: a TDX-Hydro degenerate reach has no directional axis, so its orientation is vacuous and is never counted as proven. Its single distinct source coordinate is treated as its downstream endpoint. A non-root degenerate reach must still coincide with exactly one distinct endpoint coordinate of its immediate native successor; non-coincidence and ambiguity remain fatal. This is a source-convention trust assumption, not spatial inference or an orientation proof.** A polygon-bearing degenerate reach uses that coordinate as its unit outlet. A degenerate root uses the same rule whether or not it has predecessors and is not counted as predecessor-orientation-proven or as a native-order trusted isolated root.
 
-Each drainage unit's `outlet_lon` and `outlet_lat` are the downstream endpoint resolved for its own native polygon-bearing reach. They are not polygon centroids, spatial joins, or the downstream endpoint of a synthetic geometry assembled across contracted links.
+For a healthy native root with predecessors, predecessor-to-root endpoint matches identify the root's upstream endpoint. The opposite root endpoint is therefore the downstream endpoint. Conflicting predecessor matches are fatal. This is the predecessor-based root-orientation proof.
+
+**TRUST ASSUMPTION: a healthy isolated native root has no successor and no predecessor topology, so its orientation cannot be proven by endpoint coincidence. For those reaches only, the adapter trusts TauDEM/TDX native vertex order and treats the final LineString vertex as the outlet. This is a trust assumption, never an orientation proof.** The report keeps trusted healthy isolated roots separate from endpoint-coincidence-proven links and predecessor-orientation-proven roots, and separately identifies the trusted isolated roots that bear polygons. Degenerate reaches are instead identified by their dedicated diagnostics.
+
+Each drainage unit's `outlet_lon` and `outlet_lat` are the downstream endpoint resolved for its own native polygon-bearing reach. They are not polygon centroids, spatial joins, repaired geometries, or the downstream endpoint of a synthetic geometry assembled across contracted links. The convention is adapter-wide and applies identically to all 62 processing basins used by planetary build #107.
 
 ## Inclusive upstream area and coordinate normalization
 
@@ -81,6 +89,8 @@ The one-cell envelope is grounded in NGA's description of TDX-Hydro as a nominal
 The adapter always writes `aux/snap_stems.parquet` and declares it as `hfx.aux.snap.v2` with `metadata.name = "stems"` and `references_levels = [0]`. Only polygon-bearing native reaches are included. Polygon-less reaches are excluded without a spatial fallback, and the snap path reuses the topology model's `polygonless_dropped_reach_count`; it does not compute a second drop definition.
 
 Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance within the unit bounds, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
+
+For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer expands a zero-width or zero-height float32 bbox by the existing metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
 
 `weight` is the same empirically normalized inclusive `DSContArea` in km2 used by `up_area_km2`, stored as float32. The manifest records this exact producer definition:
 
@@ -113,6 +123,12 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.ingestion.dscontarea.selected_relative_error`
 - `diagnostics.streamnet.polygon_bearing_link_count`
 - `diagnostics.streamnet.polygonless_dropped_reach_count`
+- `diagnostics.streamnet.degenerate_reach_count`
+- `diagnostics.streamnet.degenerate_reach_native_linknos`
+- `diagnostics.streamnet.degenerate_polygon_bearing_reach_count`
+- `diagnostics.streamnet.degenerate_polygon_bearing_reach_native_linknos`
+- `diagnostics.streamnet.degenerate_polygonless_reach_count`
+- `diagnostics.streamnet.degenerate_polygonless_reach_native_linknos`
 - `diagnostics.streamnet.root_count`
 - `diagnostics.streamnet.contracted_edge_count`
 - `diagnostics.streamnet.contracted_root_count`
@@ -125,7 +141,7 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.streamnet.trusted_orientation_polygon_bearing_isolated_root_native_linknos`
 - `diagnostics.streamnet.orientation_tolerance`
 
-The adapter emits a warning for each nonzero clamp, including the layer, altered vertex count, and native IDs. After compilation it emits separate warnings for nonzero `contracted_edge_count`, `contracted_root_count`, `contracted_link_traversal_count`, and `polygonless_dropped_reach_count`. It also warns separately for nonzero trusted isolated-root counts, including native LINKNO values, both for all isolated native roots and for the polygon-bearing subset. The empirical area result and complete streamnet summary are informational logs; validation or contract failures raise errors rather than warnings.
+The adapter emits a warning for each nonzero clamp, including the layer, altered vertex count, and native IDs. After compilation it emits separate warnings for nonzero `contracted_edge_count`, `contracted_root_count`, `contracted_link_traversal_count`, and `polygonless_dropped_reach_count`. It emits three dedicated nonzero degenerate-reach warnings, each with a count and sorted native LINKNOs: all degenerate reaches, the polygon-bearing subset, and the polygon-less subset. It also warns separately for nonzero trusted healthy isolated-root counts, including native LINKNO values, both for all healthy isolated native roots and for the polygon-bearing subset. The empirical area result and complete streamnet summary are informational logs. Validity outside the exact two-identical-vertex source convention, native-successor non-coincidence, genuine orientation ambiguity, and other contract failures raise errors rather than warnings.
 
 ## CLI usage
 

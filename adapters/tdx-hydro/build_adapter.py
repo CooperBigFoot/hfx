@@ -105,6 +105,12 @@ class StreamnetUnit:
 class StreamnetDiagnostics:
     polygon_bearing_link_count: int
     polygonless_dropped_reach_count: int
+    degenerate_reach_count: int
+    degenerate_reach_native_linknos: tuple[int, ...]
+    degenerate_polygon_bearing_reach_count: int
+    degenerate_polygon_bearing_reach_native_linknos: tuple[int, ...]
+    degenerate_polygonless_reach_count: int
+    degenerate_polygonless_reach_native_linknos: tuple[int, ...]
     root_count: int
     contracted_edge_count: int
     contracted_root_count: int
@@ -195,16 +201,38 @@ def _require_columns(
         raise ValueError(f"{table_name} is missing required columns: {missing}")
 
 
+def _is_tdx_degenerate_reach(geometry: object) -> bool:
+    if (
+        not isinstance(geometry, LineString)
+        or geometry.is_empty
+        or geometry.has_z
+    ):
+        return False
+    coordinates = list(geometry.coords)
+    if len(coordinates) != 2 or any(len(coordinate) != 2 for coordinate in coordinates):
+        return False
+    converted = tuple(
+        (float(coordinate[0]), float(coordinate[1])) for coordinate in coordinates
+    )
+    return all(math.isfinite(value) for coordinate in converted for value in coordinate) and (
+        converted[0] == converted[1]
+    )
+
+
 def _validate_layer_geometry(
     table: gpd.GeoDataFrame,
     layer_name: str,
     allowed_types: set[str],
+    *,
+    allow_tdx_degenerate_reaches: bool = False,
 ) -> None:
     expected = " or ".join(sorted(allowed_types))
     for geometry in table.geometry:
         if geometry is None or geometry.is_empty:
             raise ValueError(f"{layer_name} geometry must be non-null and non-empty")
-        if not geometry.is_valid:
+        if not geometry.is_valid and not (
+            allow_tdx_degenerate_reaches and _is_tdx_degenerate_reach(geometry)
+        ):
             raise ValueError(f"{layer_name} geometry must be valid")
         if geometry.has_z:
             raise ValueError(f"{layer_name} geometry must be two-dimensional")
@@ -461,7 +489,12 @@ def load_tdx_geopackages(
         {"LINKNO", "DSLINKNO", "DSContArea", streamnet.geometry.name},
     )
     _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(streamnet, "streamnet", {"LineString"})
+    _validate_layer_geometry(
+        streamnet,
+        "streamnet",
+        {"LineString"},
+        allow_tdx_degenerate_reaches=True,
+    )
     _normalize_topology_column(basins, "basins", "streamID")
     _normalize_topology_column(streamnet, "streamnet", "LINKNO")
     _normalize_topology_column(streamnet, "streamnet", "DSLINKNO")
@@ -481,6 +514,15 @@ def load_tdx_geopackages(
                 f"got {downstream_linkno}"
             )
     _validate_duplicate_ids(basin_linknos, stream_linknos, downstream_linknos)
+    degenerate_linknos_before_clamp = tuple(
+        sorted(
+            linkno
+            for linkno, geometry in zip(
+                stream_linknos, streamnet.geometry, strict=True
+            )
+            if _is_tdx_degenerate_reach(geometry)
+        )
+    )
     _normalize_dscontarea(streamnet)
     relation = dict(zip(stream_linknos, downstream_linknos, strict=True))
     _validate_streamnet_relation(relation)
@@ -493,7 +535,26 @@ def load_tdx_geopackages(
     basins_clamp = _clamp_coordinate_domain(basins, "basins", "streamID")
     streamnet_clamp = _clamp_coordinate_domain(streamnet, "streamnet", "LINKNO")
     _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(streamnet, "streamnet", {"LineString"})
+    _validate_layer_geometry(
+        streamnet,
+        "streamnet",
+        {"LineString"},
+        allow_tdx_degenerate_reaches=True,
+    )
+    degenerate_linknos_after_clamp = tuple(
+        sorted(
+            linkno
+            for linkno, geometry in zip(
+                stream_linknos, streamnet.geometry, strict=True
+            )
+            if _is_tdx_degenerate_reach(geometry)
+        )
+    )
+    if degenerate_linknos_before_clamp != degenerate_linknos_after_clamp:
+        raise ValueError(
+            "streamnet degenerate reach classification changed during coordinate "
+            "normalization"
+        )
     dscontarea = _infer_dscontarea_unit(basins, streamnet, relation)
     return TdxSourceData(
         basins=basins,
@@ -631,10 +692,14 @@ def _positive_finite_tolerance(endpoint_tolerance: object) -> float:
 def _streamnet_endpoints(
     stream_linknos: list[int],
     geometries: list[object],
-) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+) -> tuple[
+    dict[int, tuple[tuple[float, float], tuple[float, float]]],
+    frozenset[int],
+]:
     endpoints_by_linkno: dict[
         int, tuple[tuple[float, float], tuple[float, float]]
     ] = {}
+    degenerate_linknos: set[int] = set()
     for linkno, geometry in zip(stream_linknos, geometries, strict=True):
         if not isinstance(geometry, LineString) or geometry.is_empty:
             raise ValueError(
@@ -660,12 +725,15 @@ def _streamnet_endpoints(
         start_xy = (float(start[0]), float(start[1]))
         end_xy = (float(end[0]), float(end[1]))
         if start_xy == end_xy:
-            raise ValueError(
-                f"streamnet geometry for native LINKNO {linkno} has degenerate endpoints"
-            )
+            if not _is_tdx_degenerate_reach(geometry):
+                raise ValueError(
+                    "streamnet geometry for native LINKNO "
+                    f"{linkno} has unsupported degenerate geometry"
+                )
+            degenerate_linknos.add(linkno)
         endpoints_by_linkno[linkno] = (start_xy, end_xy)
 
-    return endpoints_by_linkno
+    return endpoints_by_linkno, frozenset(degenerate_linknos)
 
 
 @dataclass(frozen=True)
@@ -681,10 +749,12 @@ def _resolve_native_orientation(
     endpoints_by_linkno: dict[
         int, tuple[tuple[float, float], tuple[float, float]]
     ],
+    degenerate_linknos: frozenset[int],
     endpoint_tolerance: float,
 ) -> _OrientationResolution:
     downstream_endpoints: dict[int, tuple[float, float]] = {}
     matched_successor_endpoints: dict[int, list[int]] = {}
+    endpoint_coincidence_proven_links = 0
 
     for linkno, downstream_linkno in relation.items():
         if downstream_linkno == TDX_LINKNO_SENTINEL:
@@ -692,10 +762,20 @@ def _resolve_native_orientation(
 
         current_endpoints = endpoints_by_linkno[linkno]
         successor_endpoints = endpoints_by_linkno[downstream_linkno]
+        current_candidates = (
+            ((0, current_endpoints[0]),)
+            if linkno in degenerate_linknos
+            else tuple(enumerate(current_endpoints))
+        )
+        successor_candidates = (
+            ((0, successor_endpoints[0]),)
+            if downstream_linkno in degenerate_linknos
+            else tuple(enumerate(successor_endpoints))
+        )
         matches = [
             (current_index, successor_index)
-            for current_index, current_endpoint in enumerate(current_endpoints)
-            for successor_index, successor_endpoint in enumerate(successor_endpoints)
+            for current_index, current_endpoint in current_candidates
+            for successor_index, successor_endpoint in successor_candidates
             if math.dist(current_endpoint, successor_endpoint) <= endpoint_tolerance
         ]
         if not matches:
@@ -714,11 +794,17 @@ def _resolve_native_orientation(
         matched_successor_endpoints.setdefault(downstream_linkno, []).append(
             successor_index
         )
+        if linkno not in degenerate_linknos:
+            endpoint_coincidence_proven_links += 1
 
     predecessor_proven_roots = 0
     trusted_isolated_roots: list[int] = []
     for root_linkno, downstream_linkno in relation.items():
         if downstream_linkno != TDX_LINKNO_SENTINEL:
+            continue
+
+        if root_linkno in degenerate_linknos:
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][0]
             continue
 
         predecessor_matches = matched_successor_endpoints.get(root_linkno, [])
@@ -743,10 +829,7 @@ def _resolve_native_orientation(
 
     return _OrientationResolution(
         downstream_endpoints=downstream_endpoints,
-        endpoint_coincidence_proven_link_count=sum(
-            downstream_linkno != TDX_LINKNO_SENTINEL
-            for downstream_linkno in relation.values()
-        ),
+        endpoint_coincidence_proven_link_count=endpoint_coincidence_proven_links,
         predecessor_orientation_proven_root_count=predecessor_proven_roots,
         trusted_orientation_isolated_root_native_linknos=tuple(
             sorted(trusted_isolated_roots)
@@ -818,15 +901,22 @@ def build_streamnet_model(
         )
 
     _require_column(streamnet, "streamnet", "geometry")
-    endpoints_by_linkno = _streamnet_endpoints(
+    endpoints_by_linkno, degenerate_linknos = _streamnet_endpoints(
         stream_linknos, streamnet["geometry"].tolist()
     )
     orientation = _resolve_native_orientation(
-        relation, endpoints_by_linkno, tolerance
+        relation, endpoints_by_linkno, degenerate_linknos, tolerance
     )
     downstream_endpoints = orientation.downstream_endpoints
 
     polygon_bearing_links = set(basin_linknos)
+    degenerate_ids = tuple(sorted(degenerate_linknos))
+    degenerate_polygon_bearing_ids = tuple(
+        linkno for linkno in degenerate_ids if linkno in polygon_bearing_links
+    )
+    degenerate_polygonless_ids = tuple(
+        linkno for linkno in degenerate_ids if linkno not in polygon_bearing_links
+    )
     units: list[StreamnetUnit] = []
     for linkno in sorted(polygon_bearing_links):
         downstream_linkno, contracted_link_count = _resolve_downstream(
@@ -868,6 +958,14 @@ def build_streamnet_model(
     diagnostics = StreamnetDiagnostics(
         polygon_bearing_link_count=len(unit_tuple),
         polygonless_dropped_reach_count=len(relation) - len(polygon_bearing_links),
+        degenerate_reach_count=len(degenerate_ids),
+        degenerate_reach_native_linknos=degenerate_ids,
+        degenerate_polygon_bearing_reach_count=len(degenerate_polygon_bearing_ids),
+        degenerate_polygon_bearing_reach_native_linknos=(
+            degenerate_polygon_bearing_ids
+        ),
+        degenerate_polygonless_reach_count=len(degenerate_polygonless_ids),
+        degenerate_polygonless_reach_native_linknos=degenerate_polygonless_ids,
         root_count=len(roots),
         contracted_edge_count=sum(
             unit.downstream_linkno != TDX_LINKNO_SENTINEL
@@ -899,7 +997,11 @@ def build_streamnet_model(
         orientation_tolerance=tolerance,
     )
     LOGGER.info(
-        "streamnet_model polygon_bearing_links=%d roots=%d contracted_edges=%d "
+        "streamnet_model polygon_bearing_links=%d degenerate_reaches=%d "
+        "degenerate_reach_native_linknos=%s degenerate_polygon_bearing_reaches=%d "
+        "degenerate_polygon_bearing_reach_native_linknos=%s "
+        "degenerate_polygonless_reaches=%d "
+        "degenerate_polygonless_reach_native_linknos=%s roots=%d contracted_edges=%d "
         "contracted_roots=%d contracted_link_traversals=%d "
         "endpoint_coincidence_proven_links=%d predecessor_orientation_proven_roots=%d "
         "trusted_orientation_isolated_roots=%d "
@@ -908,6 +1010,12 @@ def build_streamnet_model(
         "trusted_orientation_polygon_bearing_isolated_root_native_linknos=%s "
         "orientation_tolerance=%s polygonless_dropped_reach_count=%d",
         diagnostics.polygon_bearing_link_count,
+        diagnostics.degenerate_reach_count,
+        diagnostics.degenerate_reach_native_linknos,
+        diagnostics.degenerate_polygon_bearing_reach_count,
+        diagnostics.degenerate_polygon_bearing_reach_native_linknos,
+        diagnostics.degenerate_polygonless_reach_count,
+        diagnostics.degenerate_polygonless_reach_native_linknos,
         diagnostics.root_count,
         diagnostics.contracted_edge_count,
         diagnostics.contracted_root_count,
@@ -1436,6 +1544,18 @@ def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
         if count:
             LOGGER.warning("diagnostic=%s count=%d", field_name, count)
     for field_name, native_ids_field in (
+        (
+            "degenerate_reach_count",
+            "degenerate_reach_native_linknos",
+        ),
+        (
+            "degenerate_polygon_bearing_reach_count",
+            "degenerate_polygon_bearing_reach_native_linknos",
+        ),
+        (
+            "degenerate_polygonless_reach_count",
+            "degenerate_polygonless_reach_native_linknos",
+        ),
         (
             "trusted_orientation_isolated_root_count",
             "trusted_orientation_isolated_root_native_linknos",
