@@ -79,6 +79,55 @@ def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float
     return basins, streamnet, area_100_m2, area_200_m2
 
 
+def planetary_order_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    polygon_100 = Polygon([
+        (-170.1, -80.1),
+        (-169.9, -80.1),
+        (-169.9, -79.9),
+        (-170.1, -79.9),
+        (-170.1, -80.1),
+    ])
+    polygon_200 = Polygon([
+        (-120.1, -80.1),
+        (-119.9, -80.1),
+        (-119.9, -79.9),
+        (-120.1, -79.9),
+        (-120.1, -80.1),
+    ])
+    polygon_300 = Polygon([
+        (-170.1, -20.1),
+        (-169.9, -20.1),
+        (-169.9, -19.9),
+        (-170.1, -19.9),
+        (-170.1, -20.1),
+    ])
+    polygons = [polygon_100, polygon_200, polygon_300]
+    geod = Geod(ellps="WGS84")
+    areas_km2 = [
+        abs(geod.geometry_area_perimeter(polygon)[0]) / 1_000_000
+        for polygon in polygons
+    ]
+    basins = gpd.GeoDataFrame(
+        {"streamID": [100, 200, 300]},
+        geometry=polygons,
+        crs="EPSG:4326",
+    )
+    streamnet = gpd.GeoDataFrame(
+        {
+            "LINKNO": [100, 200, 300],
+            "DSLINKNO": [-1, -1, -1],
+            "DSContArea": areas_km2,
+        },
+        geometry=[
+            LineString([(-170.05, -80.0), (-169.95, -80.0)]),
+            LineString([(-120.05, -80.0), (-119.95, -80.0)]),
+            LineString([(-170.05, -20.0), (-169.95, -20.0)]),
+        ],
+        crs="EPSG:4326",
+    )
+    return basins, streamnet
+
+
 def write_pair(
     directory: Path,
     basins: gpd.GeoDataFrame,
@@ -1372,6 +1421,80 @@ class CoreHfxCompilationTests(unittest.TestCase):
     basin_id = "7020000010"
     fabric_version = "synthetic-2026.07"
 
+    def test_compile_core_hfx_uses_dataset_global_hilbert_order(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            basins, streamnet = planetary_order_frames()
+            source = load_tdx_geopackages(
+                *write_pair(source_dir, basins, streamnet)
+            )
+            model = build_streamnet_model(
+                source.basins,
+                source.streamnet,
+                header_number=71,
+                endpoint_tolerance=0.001,
+            )
+            result = compile_core_hfx(
+                source,
+                model,
+                root / "output",
+                processing_basin_id=self.basin_id,
+                fabric_version=self.fabric_version,
+                created_at=self.created_at,
+            )
+            catchment_ids = pq.read_table(
+                result.catchments_path, columns=["id"]
+            )["id"].to_pylist()
+            snap_unit_ids = pq.read_table(
+                result.snap_path, columns=["unit_id"]
+            )["unit_id"].to_pylist()
+
+        local_catchment_distances = (
+            source.basins.geometry.centroid.hilbert_distance(
+                total_bounds=source.basins.geometry.total_bounds
+            )
+        )
+        local_stem_distances = (
+            source.streamnet.geometry.centroid.hilbert_distance(
+                total_bounds=source.basins.geometry.total_bounds
+            )
+        )
+        world_catchment_distances = (
+            source.basins.geometry.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+        world_stem_distances = (
+            source.streamnet.geometry.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+        self.assertEqual(
+            local_catchment_distances.tolist(),
+            [54876, 4294912416, 1431666952],
+        )
+        self.assertEqual(
+            local_stem_distances.tolist(),
+            [54876, 4294912416, 1431666952],
+        )
+        self.assertEqual(
+            world_catchment_distances.tolist(),
+            [7054384, 238609294, 1008396555],
+        )
+        self.assertEqual(
+            world_stem_distances.tolist(),
+            [7054384, 238609294, 1008396555],
+        )
+        self.assertEqual(
+            (catchment_ids, snap_unit_ids),
+            (
+                [710000100, 710000200, 710000300],
+                [710000100, 710000200, 710000300],
+            ),
+        )
+
     def compile_fixture(
         self,
         directory: Path,
@@ -1657,32 +1780,32 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 [tuple(bounds) for bounds in expected_bounds],
             )
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertEqual(
                 snap["weight"].to_pylist(),
-                [1.2309072017669678, 2.4618144035339355],
+                [2.4618144035339355, 1.2309072017669678],
             )
             self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
             self.assertEqual(
                 snap["bbox"].to_pylist(),
                 [
                     {
-                        "xmin": 0.0,
-                        "ymin": -9.999999747378752e-05,
-                        "xmax": 0.009999999776482582,
-                        "ymax": 9.999999747378752e-05,
-                    },
-                    {
                         "xmin": 0.009999999776482582,
                         "ymin": -9.999999747378752e-05,
                         "xmax": 0.019999999552965164,
                         "ymax": 9.999999747378752e-05,
                     },
+                    {
+                        "xmin": 0.0,
+                        "ymin": -9.999999747378752e-05,
+                        "xmax": 0.009999999776482582,
+                        "ymax": 9.999999747378752e-05,
+                    },
                 ],
             )
             expected_stems = [
-                LineString([(0.0, 0.0), (0.01, 0.0)]),
                 LineString([(0.01, 0.0), (0.02, 0.0)]),
+                LineString([(0.0, 0.0), (0.01, 0.0)]),
             ]
             self.assertEqual(
                 snap["geometry"].to_pylist(),
@@ -1694,12 +1817,12 @@ class CoreHfxCompilationTests(unittest.TestCase):
                     LineString([(0.0, 0.0), (0.01, 0.0)]),
                 ],
                 crs=CRS,
-            ).centroid.hilbert_distance(total_bounds=source_basins.geometry.total_bounds)
-            self.assertEqual(stem_distances.tolist(), [4026531839, 268435455])
+            ).centroid.hilbert_distance(total_bounds=[-180, -90, 180, 90])
+            self.assertEqual(stem_distances.tolist(), [3579139411, 3579139413])
             distances = source_basins.geometry.centroid.hilbert_distance(
-                total_bounds=source_basins.geometry.total_bounds
+                total_bounds=[-180, -90, 180, 90]
             )
-            self.assertEqual(distances.tolist(), [3489660928, 805306368])
+            self.assertEqual(distances.tolist(), [2147483655, 2147483649])
             for parquet_file, names in (
                 (catchments_file, [f"bbox.{name}" for name in BBOX_LEAF_NAMES]),
                 (graph_file, [f"bbox_{name}" for name in ("minx", "miny", "maxx", "maxy")]),
@@ -1807,7 +1930,7 @@ class CoreHfxCompilationTests(unittest.TestCase):
             [(0.01, 0.0), (0.02, 0.0)],
         )
         self.assertEqual(snap["id"].to_pylist(), [1, 2])
-        self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+        self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
         self.assertEqual(
             snap["weight"].to_pylist(),
             [1.2309072017669678, 1.2309072017669678],
@@ -1816,8 +1939,8 @@ class CoreHfxCompilationTests(unittest.TestCase):
         self.assertEqual(
             snap["geometry"].to_pylist(),
             [
-                LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
             ],
         )
         diagnostics = result.diagnostics.streamnet
@@ -2207,18 +2330,18 @@ class BuildCliTests(unittest.TestCase):
             })
             snap = pq.read_table(output / "aux/snap_stems.parquet")
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertNotIn(710000150, snap["unit_id"].to_pylist())
             self.assertEqual(
                 snap["weight"].to_pylist(),
-                [1.2309072017669678, 2.4618144035339355],
+                [2.4618144035339355, 1.2309072017669678],
             )
             self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
             self.assertEqual(
                 snap["geometry"].to_pylist(),
                 [
-                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                     LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 ],
             )
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output))
@@ -2329,7 +2452,7 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output, isolated=True))
             snap = pq.read_table(output / "aux/snap_stems.parquet")
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertEqual(
                 snap["weight"].to_pylist(),
                 [1.2309072017669678, 1.2309072017669678],
@@ -2338,8 +2461,8 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(
                 snap["geometry"].to_pylist(),
                 [
-                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                     LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 ],
             )
             messages = [record.getMessage() for record in captured.records]
