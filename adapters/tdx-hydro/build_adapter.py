@@ -115,6 +115,10 @@ class StreamnetDiagnostics:
     degenerate_polygon_bearing_reach_native_linknos: tuple[int, ...]
     degenerate_polygonless_reach_count: int
     degenerate_polygonless_reach_native_linknos: tuple[int, ...]
+    short_successor_resolved_reach_count: int
+    short_successor_resolved_reach_native_linknos: tuple[int, ...]
+    reach_side_near_degenerate_resolved_reach_count: int
+    reach_side_near_degenerate_resolved_reach_native_linknos: tuple[int, ...]
     root_count: int
     contracted_edge_count: int
     contracted_root_count: int
@@ -805,6 +809,8 @@ class _OrientationResolution:
     endpoint_coincidence_proven_link_count: int
     predecessor_orientation_proven_root_count: int
     trusted_orientation_isolated_root_native_linknos: tuple[int, ...]
+    short_successor_resolved_reach_native_linknos: tuple[int, ...]
+    reach_side_near_degenerate_resolved_reach_native_linknos: tuple[int, ...]
 
 
 def _resolve_native_orientation(
@@ -817,6 +823,9 @@ def _resolve_native_orientation(
 ) -> _OrientationResolution:
     downstream_endpoints: dict[int, tuple[float, float]] = {}
     matched_successor_endpoints: dict[int, list[int]] = {}
+    indeterminate_successor_endpoint_predecessors: dict[int, list[int]] = {}
+    short_successor_resolved_linknos: set[int] = set()
+    reach_side_near_degenerate_resolved_linknos: set[int] = set()
     endpoint_coincidence_proven_links = 0
 
     for linkno, downstream_linkno in relation.items():
@@ -846,19 +855,51 @@ def _resolve_native_orientation(
                 "orientation proof for native LINKNO "
                 f"{linkno} and downstream LINKNO {downstream_linkno} is non-coincident"
             )
-        if len(matches) > 1:
-            raise ValueError(
-                "orientation proof for native LINKNO "
-                f"{linkno} and downstream LINKNO {downstream_linkno} is ambiguous"
-            )
-
-        current_index, successor_index = matches[0]
-        downstream_endpoints[linkno] = current_endpoints[current_index]
-        matched_successor_endpoints.setdefault(downstream_linkno, []).append(
-            successor_index
+        matched_current_indexes = sorted(
+            {current_index for current_index, _ in matches}
         )
-        if linkno not in degenerate_linknos:
-            endpoint_coincidence_proven_links += 1
+        if len(matched_current_indexes) == 1:
+            current_index = matched_current_indexes[0]
+            if linkno not in degenerate_linknos:
+                endpoint_coincidence_proven_links += 1
+        else:
+            current_endpoint_separation = math.dist(
+                current_endpoints[0], current_endpoints[1]
+            )
+            near_degenerate_limit = 2.0 * endpoint_tolerance
+            if current_endpoint_separation > near_degenerate_limit:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{linkno} and downstream LINKNO {downstream_linkno} is reach-side "
+                    "ambiguous: both current endpoints coincide within tolerance but "
+                    f"endpoint separation {current_endpoint_separation} exceeds "
+                    f"near-degenerate limit {near_degenerate_limit}"
+                )
+            current_index = 1
+            reach_side_near_degenerate_resolved_linknos.add(linkno)
+
+        downstream_endpoints[linkno] = current_endpoints[current_index]
+        matched_successor_indexes = sorted(
+            {
+                successor_index
+                for matched_current_index, successor_index in matches
+                if matched_current_index == current_index
+            }
+        )
+        if len(matched_successor_indexes) == 1:
+            matched_successor_endpoints.setdefault(downstream_linkno, []).append(
+                matched_successor_indexes[0]
+            )
+        else:
+            indeterminate_successor_endpoint_predecessors.setdefault(
+                downstream_linkno, []
+            ).append(linkno)
+            if (
+                linkno not in degenerate_linknos
+                and downstream_linkno not in degenerate_linknos
+                and len(matched_current_indexes) == 1
+            ):
+                short_successor_resolved_linknos.add(linkno)
 
     predecessor_proven_roots = 0
     trusted_isolated_roots: list[int] = []
@@ -871,6 +912,37 @@ def _resolve_native_orientation(
             continue
 
         predecessor_matches = matched_successor_endpoints.get(root_linkno, [])
+        indeterminate_predecessors = (
+            indeterminate_successor_endpoint_predecessors.get(root_linkno, [])
+        )
+        upstream_endpoint_indexes = set(predecessor_matches)
+        if len(upstream_endpoint_indexes) > 1:
+            raise ValueError(
+                f"orientation proof for root LINKNO {root_linkno} has conflicting predecessor matches"
+            )
+        if len(upstream_endpoint_indexes) == 1:
+            upstream_endpoint_index = upstream_endpoint_indexes.pop()
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
+                1 - upstream_endpoint_index
+            ]
+            predecessor_proven_roots += 1
+            continue
+        if indeterminate_predecessors:
+            root_endpoint_separation = math.dist(
+                endpoints_by_linkno[root_linkno][0],
+                endpoints_by_linkno[root_linkno][1],
+            )
+            if root_endpoint_separation > 2.0 * endpoint_tolerance:
+                raise ValueError(
+                    "orientation proof for root LINKNO "
+                    f"{root_linkno} is reach-side ambiguous: predecessors "
+                    f"{tuple(sorted(indeterminate_predecessors))} match both root endpoints "
+                    f"but endpoint separation {root_endpoint_separation} exceeds "
+                    f"near-degenerate limit {2.0 * endpoint_tolerance}"
+                )
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
+            reach_side_near_degenerate_resolved_linknos.add(root_linkno)
+            continue
         if not predecessor_matches:
             # TDX/TauDEM native-vertex-order TRUST ASSUMPTION: a genuinely
             # isolated root has no topology from which orientation can be
@@ -878,17 +950,6 @@ def _resolve_native_orientation(
             downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
             trusted_isolated_roots.append(root_linkno)
             continue
-        upstream_endpoint_indexes = set(predecessor_matches)
-        if len(upstream_endpoint_indexes) > 1:
-            raise ValueError(
-                f"orientation proof for root LINKNO {root_linkno} has conflicting predecessor matches"
-            )
-
-        upstream_endpoint_index = upstream_endpoint_indexes.pop()
-        downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
-            1 - upstream_endpoint_index
-        ]
-        predecessor_proven_roots += 1
 
     return _OrientationResolution(
         downstream_endpoints=downstream_endpoints,
@@ -896,6 +957,12 @@ def _resolve_native_orientation(
         predecessor_orientation_proven_root_count=predecessor_proven_roots,
         trusted_orientation_isolated_root_native_linknos=tuple(
             sorted(trusted_isolated_roots)
+        ),
+        short_successor_resolved_reach_native_linknos=tuple(
+            sorted(short_successor_resolved_linknos)
+        ),
+        reach_side_near_degenerate_resolved_reach_native_linknos=tuple(
+            sorted(reach_side_near_degenerate_resolved_linknos)
         ),
     )
 
@@ -1018,6 +1085,12 @@ def build_streamnet_model(
     trusted_polygon_bearing_ids = tuple(
         linkno for linkno in trusted_isolated_ids if linkno in polygon_bearing_links
     )
+    short_successor_resolved_ids = (
+        orientation.short_successor_resolved_reach_native_linknos
+    )
+    reach_side_near_degenerate_resolved_ids = (
+        orientation.reach_side_near_degenerate_resolved_reach_native_linknos
+    )
     diagnostics = StreamnetDiagnostics(
         polygon_bearing_link_count=len(unit_tuple),
         polygonless_dropped_reach_count=len(relation) - len(polygon_bearing_links),
@@ -1029,6 +1102,16 @@ def build_streamnet_model(
         ),
         degenerate_polygonless_reach_count=len(degenerate_polygonless_ids),
         degenerate_polygonless_reach_native_linknos=degenerate_polygonless_ids,
+        short_successor_resolved_reach_count=len(short_successor_resolved_ids),
+        short_successor_resolved_reach_native_linknos=(
+            short_successor_resolved_ids
+        ),
+        reach_side_near_degenerate_resolved_reach_count=len(
+            reach_side_near_degenerate_resolved_ids
+        ),
+        reach_side_near_degenerate_resolved_reach_native_linknos=(
+            reach_side_near_degenerate_resolved_ids
+        ),
         root_count=len(roots),
         contracted_edge_count=sum(
             unit.downstream_linkno != TDX_LINKNO_SENTINEL
@@ -1064,7 +1147,12 @@ def build_streamnet_model(
         "degenerate_reach_native_linknos=%s degenerate_polygon_bearing_reaches=%d "
         "degenerate_polygon_bearing_reach_native_linknos=%s "
         "degenerate_polygonless_reaches=%d "
-        "degenerate_polygonless_reach_native_linknos=%s roots=%d contracted_edges=%d "
+        "degenerate_polygonless_reach_native_linknos=%s "
+        "short_successor_resolved_reaches=%d "
+        "short_successor_resolved_reach_native_linknos=%s "
+        "reach_side_near_degenerate_resolved_reaches=%d "
+        "reach_side_near_degenerate_resolved_reach_native_linknos=%s "
+        "roots=%d contracted_edges=%d "
         "contracted_roots=%d contracted_link_traversals=%d "
         "endpoint_coincidence_proven_links=%d predecessor_orientation_proven_roots=%d "
         "trusted_orientation_isolated_roots=%d "
@@ -1079,6 +1167,10 @@ def build_streamnet_model(
         diagnostics.degenerate_polygon_bearing_reach_native_linknos,
         diagnostics.degenerate_polygonless_reach_count,
         diagnostics.degenerate_polygonless_reach_native_linknos,
+        diagnostics.short_successor_resolved_reach_count,
+        diagnostics.short_successor_resolved_reach_native_linknos,
+        diagnostics.reach_side_near_degenerate_resolved_reach_count,
+        diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
         diagnostics.root_count,
         diagnostics.contracted_edge_count,
         diagnostics.contracted_root_count,
@@ -1618,6 +1710,14 @@ def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
         (
             "degenerate_polygonless_reach_count",
             "degenerate_polygonless_reach_native_linknos",
+        ),
+        (
+            "short_successor_resolved_reach_count",
+            "short_successor_resolved_reach_native_linknos",
+        ),
+        (
+            "reach_side_near_degenerate_resolved_reach_count",
+            "reach_side_near_degenerate_resolved_reach_native_linknos",
         ),
         (
             "trusted_orientation_isolated_root_count",
