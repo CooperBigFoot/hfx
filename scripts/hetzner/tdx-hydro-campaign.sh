@@ -18,6 +18,7 @@ set +x
 
 readonly HFX_TDX_INVENTORY_SOURCE=adapters/tdx-hydro/data/tdx_header_numbers.json
 readonly HFX_TDX_MAX_I64=9223372036854775807
+readonly HFX_TDX_SQLITE_MAGIC=53514c69746520666f726d6174203300
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -42,7 +43,8 @@ usage() {
     printf '%s\n' \
         'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
-        '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]'
+        '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
+        '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>'
 }
 
 usage_error() {
@@ -140,21 +142,48 @@ validate_campaign_json() {
 validate_basin_json() {
     local file=$1
     local basin_id=$2
-    "$JQ" -e --arg basin_id "$basin_id" '
-        def valid_stage:
+    "$JQ" -e --arg basin_id "$basin_id" --arg magic "$HFX_TDX_SQLITE_MAGIC" --argjson max_i64 "$HFX_TDX_MAX_I64" '
+        def valid_v1_stage:
             type == "object" and
             keys == ["attempts","failure_reason","status"] and
             (.status == "pending" or .status == "running" or .status == "succeeded" or .status == "failed") and
             (.attempts | type == "number" and . == floor and . >= 0) and
             (.failure_reason == null or (.failure_reason | type == "string"));
+        def valid_compile: valid_v1_stage;
+        def valid_evidence:
+            type == "object" and
+            keys == ["bytes","layer_name","sha256","sqlite_identity"] and
+            (.bytes | type == "number" and . == floor and . > 0 and . <= $max_i64) and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            .sqlite_identity == $magic and
+            (.layer_name | type == "string" and length > 0 and (test("[\u0000-\u001f\u007f]") | not));
+        def valid_v2_acquire:
+            type == "object" and
+            keys == ["attempts","evidence","failure_reason","status"] and
+            (.attempts | type == "number" and . == floor and . >= 0) and
+            if .status == "succeeded" then
+                .attempts > 0 and .failure_reason == null and (.evidence | valid_evidence)
+            elif .status == "failed" then
+                (.failure_reason | type == "string" and length > 0) and .evidence == null
+            elif .status == "running" then
+                .failure_reason == null and .evidence == null
+            elif .status == "pending" then
+                (.failure_reason == null or .failure_reason == "interrupted before terminal state; reset by recover") and
+                .evidence == null
+            else false end;
         type == "object" and
         keys == ["processing_basin_id","schema_version","stages"] and
-        .schema_version == 1 and .processing_basin_id == $basin_id and
+        (.schema_version == 1 or .schema_version == 2) and .processing_basin_id == $basin_id and
         (.stages | type == "object" and
-            keys == ["acquire_basins","acquire_streamnet","compile"] and
-            (.acquire_basins | valid_stage)) and
-        (.stages.acquire_streamnet | valid_stage) and
-        (.stages.compile | valid_stage)
+            keys == ["acquire_basins","acquire_streamnet","compile"]) and
+        (.stages.compile | valid_compile) and
+        if .schema_version == 1 then
+            (.stages.acquire_basins | valid_v1_stage) and
+            (.stages.acquire_streamnet | valid_v1_stage)
+        else
+            (.stages.acquire_basins | valid_v2_acquire) and
+            (.stages.acquire_streamnet | valid_v2_acquire)
+        end
     ' "$file" >/dev/null 2>&1 || hfx_die "basin state is malformed for $basin_id: $file"
 }
 
@@ -175,6 +204,17 @@ atomic_install() {
 
 lock_owned=0
 lock_path=
+takeover_owned=0
+takeover_path=
+release_takeover_guard() {
+    if ((takeover_owned == 1)) && [[ -n "$takeover_path" && -d "$takeover_path" && ! -L "$takeover_path" ]] &&
+        [[ -f "$takeover_path/owner.pid" && ! -L "$takeover_path/owner.pid" ]] &&
+        [[ $(<"$takeover_path/owner.pid") == "$$" ]]; then
+        "$RM" -r -- "$takeover_path"
+    fi
+    takeover_owned=0
+}
+
 release_lock() {
     if ((lock_owned == 1)) && [[ -n "$lock_path" && -d "$lock_path" && ! -L "$lock_path" ]] &&
         [[ -f "$lock_path/owner.pid" ]] && [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
@@ -183,33 +223,95 @@ release_lock() {
     lock_owned=0
 }
 
+pid_state() {
+    local owner=$1
+    local output_file=$campaign_dir/state/tmp/.ps.$$
+    local error_file=$campaign_dir/state/tmp/.ps-error.$$
+    local ps_status
+    local output
+    if kill -0 "$owner" 2>/dev/null; then
+        printf '%s\n' live
+        return
+    fi
+    : >"$output_file"
+    : >"$error_file"
+    if "$PS" -p "$owner" -o pid= >"$output_file" 2>"$error_file"; then
+        ps_status=0
+    else
+        ps_status=$?
+    fi
+    output=$("$TR" -d '[:space:]' <"$output_file")
+    if [[ -s "$error_file" ]]; then
+        printf '%s\n' indeterminate
+    elif [[ "$output" == "$owner" && "$ps_status" -eq 0 ]]; then
+        printf '%s\n' live
+    elif [[ -z "$output" && "$ps_status" -eq 1 ]]; then
+        printf '%s\n' dead
+    else
+        printf '%s\n' indeterminate
+    fi
+    "$RM" -- "$output_file" "$error_file"
+}
+
 acquire_campaign_lock() {
     local locks_dir=$campaign_dir/state/locks
     local owner=
     local stale=
+    local state
     lock_path=$locks_dir/campaign.lock
+    takeover_path=$locks_dir/campaign.lock.takeover
     if "$MKDIR" "$lock_path" 2>/dev/null; then
         printf '%s\n' "$$" >"$lock_path/owner.pid"
         lock_owned=1
         return
     fi
-    [[ -d "$lock_path" && ! -L "$lock_path" ]] || hfx_die "campaign lock is unsafe: $lock_path"
-    if [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]]; then
-        owner=$(<"$lock_path/owner.pid")
+    if ! "$MKDIR" "$takeover_path" 2>/dev/null; then
+        hfx_die "stale-lock takeover already in progress at $takeover_path"
     fi
-    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    printf '%s\n' "$$" >"$takeover_path/owner.pid"
+    takeover_owned=1
+    if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
+        if "$MKDIR" "$lock_path" 2>/dev/null; then
+            printf '%s\n' "$$" >"$lock_path/owner.pid"
+            lock_owned=1
+            release_takeover_guard
+            return
+        fi
+        release_takeover_guard
+        hfx_die 'campaign lock was acquired concurrently'
+    fi
+    if [[ ! -d "$lock_path" || -L "$lock_path" || ! -f "$lock_path/owner.pid" || -L "$lock_path/owner.pid" ]]; then
+        release_takeover_guard
+        hfx_die "campaign lock owner is indeterminate; preserved at $lock_path"
+    fi
+    owner=$(<"$lock_path/owner.pid")
+    if [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+        release_takeover_guard
+        hfx_die "campaign lock owner is indeterminate; preserved at $lock_path"
+    fi
+    state=$(pid_state "$owner")
+    if [[ "$state" == live ]]; then
+        release_takeover_guard
         hfx_die "campaign lock is held by live PID $owner"
+    elif [[ "$state" != dead ]]; then
+        release_takeover_guard
+        hfx_die "campaign lock owner PID $owner is indeterminate; preserved at $lock_path"
     fi
     stale=$locks_dir/.campaign.lock.stale.$$
     [[ ! -e "$stale" && ! -L "$stale" ]] || hfx_die "stale-lock destination already exists: $stale"
-    "$MV" "$lock_path" "$stale" || hfx_die 'campaign lock changed during stale-lock takeover'
+    if ! "$MV" "$lock_path" "$stale"; then
+        release_takeover_guard
+        hfx_die 'campaign lock changed during stale-lock takeover'
+    fi
     if ! "$MKDIR" "$lock_path" 2>/dev/null; then
+        release_takeover_guard
         hfx_die 'campaign lock was acquired concurrently'
     fi
     printf '%s\n' "$$" >"$lock_path/owner.pid"
     lock_owned=1
     [[ -d "$stale" && ! -L "$stale" ]] || hfx_die "renamed stale lock is unsafe: $stale"
     "$RM" -r -- "$stale"
+    release_takeover_guard
 }
 
 validate_workspace_state() {
@@ -370,11 +472,11 @@ initialize_campaign() {
         "$MKDIR" "$campaign_dir/state/basins/$basin_id"
         temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
         "$JQ" -n --arg basin_id "$basin_id" '{
-          schema_version: 1,
+          schema_version: 2,
           processing_basin_id: $basin_id,
           stages: {
-            acquire_basins: {status: "pending", attempts: 0, failure_reason: null},
-            acquire_streamnet: {status: "pending", attempts: 0, failure_reason: null},
+            acquire_basins: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
+            acquire_streamnet: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
             compile: {status: "pending", attempts: 0, failure_reason: null}
           }
         }' >"$temporary"
@@ -384,21 +486,40 @@ initialize_campaign() {
     print_status
 }
 
-recover_campaign() {
+migrate_basin_states() {
     local basin_id
     local current
     local temporary
-    acquire_campaign_lock
-    validate_workspace_state
+    while IFS= read -r basin_id; do
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        if [[ $("$JQ" -r '.schema_version' "$current") == 1 ]]; then
+            temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+            "$JQ" '
+                .schema_version = 2 |
+                .stages.acquire_basins.evidence = null |
+                .stages.acquire_streamnet.evidence = null
+            ' "$current" >"$temporary"
+            atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+        fi
+    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+}
+
+recover_running_stages() {
+    local acquisition_only=${1-false}
+    local basin_id
+    local current
+    local temporary
     while IFS= read -r basin_id; do
         current=$campaign_dir/state/basins/$basin_id/current.json
         if "$JQ" -e '[.stages[].status] | any(. == "running")' "$current" >/dev/null; then
             temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-            "$JQ" '
+            "$JQ" --argjson acquisition_only "$acquisition_only" '
                 .stages |= with_entries(
-                    if .value.status == "running" then
+                    if .value.status == "running" and
+                        (($acquisition_only | not) or .key == "acquire_basins" or .key == "acquire_streamnet") then
                         .value.status = "pending" |
-                        .value.failure_reason = "interrupted before terminal state; reset by recover"
+                        .value.failure_reason = "interrupted before terminal state; reset by recover" |
+                        if (.value | has("evidence")) then .value.evidence = null else . end
                     else .
                     end
                 )
@@ -406,6 +527,214 @@ recover_campaign() {
             atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
         fi
     done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+}
+
+recover_campaign() {
+    acquire_campaign_lock
+    validate_workspace_state
+    recover_running_stages false
+    validate_workspace_state
+    print_status
+}
+
+write_acquire_stage() {
+    local basin_id=$1
+    local stage=$2
+    local status=$3
+    local attempts=$4
+    local reason=$5
+    local evidence_json=$6
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+    "$JQ" --arg stage "$stage" --arg status "$status" --arg reason "$reason" \
+        --argjson attempts "$attempts" --argjson evidence "$evidence_json" '
+        .stages[$stage].status = $status |
+        .stages[$stage].attempts = $attempts |
+        .stages[$stage].failure_reason = (if $reason == "" then null else $reason end) |
+        .stages[$stage].evidence = $evidence
+    ' "$current" >"$temporary"
+    atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+}
+
+evidence_bytes=
+evidence_sha256=
+evidence_layer=
+verify_download() {
+    local file=$1
+    local token
+    local hash_output
+    local magic
+    local ogr_output=$2
+    local layer_count=0
+    local line
+    [[ -f "$file" && ! -L "$file" && -s "$file" ]] || return 1
+    evidence_bytes=$("$WC" -c <"$file" | "$TR" -d '[:space:]') || return 1
+    [[ "$evidence_bytes" =~ ^[0-9]+$ && "$evidence_bytes" != 0 ]] || return 1
+    if [[ ${#evidence_bytes} -gt 19 ]] ||
+        [[ ${#evidence_bytes} -eq 19 && "$evidence_bytes" > "$HFX_TDX_MAX_I64" ]]; then
+        return 1
+    fi
+    hash_output=$("$SHA256SUM" "$file") || return 1
+    token=${hash_output%%[[:space:]]*}
+    [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+    evidence_sha256=$token
+    magic=$("$OD" -An -tx1 -N16 "$file" | "$TR" -d '[:space:]') || return 1
+    [[ "$magic" == "$HFX_TDX_SQLITE_MAGIC" ]] || return 1
+    if ! "$OGRINFO" -ro -so "$file" >"$ogr_output" 2>&1; then
+        return 1
+    fi
+    evidence_layer=
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*[0-9]+:[[:space:]]+(.+)$ ]]; then
+            layer_count=$((layer_count + 1))
+            evidence_layer=${BASH_REMATCH[1]}
+            evidence_layer=${evidence_layer%% \(*}
+        fi
+    done <"$ogr_output"
+    [[ "$layer_count" -eq 1 && -n "$evidence_layer" ]] || return 1
+    [[ ! "$evidence_layer" =~ [[:cntrl:]] ]] || return 1
+}
+
+evidence_json() {
+    "$JQ" -cn --argjson bytes "$evidence_bytes" --arg sha256 "$evidence_sha256" \
+        --arg magic "$HFX_TDX_SQLITE_MAGIC" --arg layer "$evidence_layer" \
+        '{bytes:$bytes,sha256:$sha256,sqlite_identity:$magic,layer_name:$layer}'
+}
+
+fail_product() {
+    local basin_id=$1
+    local stage=$2
+    local attempts=$3
+    local reason=$4
+    write_acquire_stage "$basin_id" "$stage" failed "$attempts" "$reason" null
+}
+
+acquire_product() {
+    local basin_id=$1
+    local product=$2
+    local stage=acquire_$product
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local final=$campaign_dir/downloads/$basin_id-$product.gpkg
+    local partial=$final.partial
+    local inspect=$campaign_dir/state/tmp/.ogr.$basin_id.$product.$$
+    local persisted_status
+    local attempts
+    local expected
+    local actual
+    local url=https://earth-info.nga.mil/php/download.php?file=$basin_id-$product-gpkg
+    persisted_status=$("$JQ" -r --arg stage "$stage" '.stages[$stage].status' "$current")
+    attempts=$("$JQ" -r --arg stage "$stage" '.stages[$stage].attempts' "$current")
+
+    if [[ -e "$final" || -L "$final" ]]; then
+        if ! verify_download "$final" "$inspect"; then
+            fail_product "$basin_id" "$stage" "$attempts" 'existing final file failed integrity verification; retained for inspection'
+            "$RM" -f -- "$inspect"
+            return
+        fi
+        actual=$(evidence_json)
+        if [[ "$persisted_status" == succeeded ]]; then
+            expected=$("$JQ" -cS --arg stage "$stage" '.stages[$stage].evidence' "$current")
+            actual=$(printf '%s\n' "$actual" | "$JQ" -cS '.')
+            if [[ "$actual" != "$expected" ]]; then
+                fail_product "$basin_id" "$stage" "$attempts" 'persisted evidence does not match final file; retained for inspection'
+            fi
+        else
+            write_acquire_stage "$basin_id" "$stage" succeeded "$attempts" '' "$actual"
+        fi
+        "$RM" -f -- "$inspect"
+        return
+    fi
+
+    if [[ -e "$partial" || -L "$partial" ]]; then
+        if [[ -f "$partial" && ! -L "$partial" ]]; then
+            "$RM" -- "$partial"
+        else
+            fail_product "$basin_id" "$stage" "$attempts" 'partial path is unsafe; retained without traversal'
+            return
+        fi
+    fi
+
+    attempts=$((attempts + 1))
+    write_acquire_stage "$basin_id" "$stage" running "$attempts" '' null
+    if ! "$CURL" --fail --show-error --location --connect-timeout 30 \
+        --speed-limit 65536 --speed-time 60 --output "$partial" "$url"; then
+        [[ ! -e "$partial" && ! -L "$partial" ]] ||
+            { [[ -f "$partial" && ! -L "$partial" ]] && "$RM" -- "$partial"; }
+        fail_product "$basin_id" "$stage" "$attempts" 'complete GET failed'
+        return
+    fi
+    if ! verify_download "$partial" "$inspect"; then
+        [[ -f "$partial" && ! -L "$partial" ]] && "$RM" -- "$partial"
+        "$RM" -f -- "$inspect"
+        fail_product "$basin_id" "$stage" "$attempts" 'download failed integrity verification'
+        return
+    fi
+    "$CHMOD" 0644 "$partial" || return 1
+    "$MV" "$partial" "$final" || return 1
+    if ! verify_download "$final" "$inspect"; then
+        fail_product "$basin_id" "$stage" "$attempts" 'installed final failed integrity verification; retained for inspection'
+        "$RM" -f -- "$inspect"
+        return
+    fi
+    actual=$(evidence_json)
+    "$RM" -f -- "$inspect"
+    write_acquire_stage "$basin_id" "$stage" succeeded "$attempts" '' "$actual"
+}
+
+acquire_basin() {
+    local basin_id=$1
+    lock_owned=0
+    takeover_owned=0
+    acquire_product "$basin_id" basins
+    acquire_product "$basin_id" streamnet
+}
+
+worker_pids=()
+worker_failure=0
+wait_oldest_worker() {
+    local index
+    local last
+    if ! wait "${worker_pids[0]}"; then
+        worker_failure=1
+    fi
+    last=$((${#worker_pids[@]} - 1))
+    for ((index = 0; index < last; index++)); do
+        worker_pids[$index]=${worker_pids[$((index + 1))]}
+    done
+    unset "worker_pids[$last]"
+}
+
+interrupt_acquisition() {
+    local pid
+    for pid in ${worker_pids[@]+"${worker_pids[@]}"}; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -TERM "$pid" 2>/dev/null || :
+    done
+    while ((${#worker_pids[@]} > 0)); do
+        wait_oldest_worker
+    done
+    exit 130
+}
+
+acquire_campaign() {
+    local basin_id
+    acquire_campaign_lock
+    validate_workspace_state
+    migrate_basin_states
+    recover_running_stages true
+    validate_workspace_state
+    trap interrupt_acquisition INT TERM
+    while IFS= read -r basin_id; do
+        acquire_basin "$basin_id" &
+        worker_pids[${#worker_pids[@]}]=$!
+        if ((${#worker_pids[@]} >= max_parallel)); then
+            wait_oldest_worker
+        fi
+    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    while ((${#worker_pids[@]} > 0)); do
+        wait_oldest_worker
+    done
+    trap - INT TERM
+    ((worker_failure == 0)) || hfx_die 'an acquisition worker could not atomically record state'
     validate_workspace_state
     print_status
 }
@@ -418,7 +747,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover) ;;
+    init|status|recover|acquire) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -434,11 +763,13 @@ assembly_memory_ceiling_bytes=
 assembly_scratch_ceiling_bytes=
 assembled_artifact_bytes=
 sizing_seen=' '
+max_parallel=
+max_parallel_seen=0
 
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes)
+        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel)
             shift
             (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
             value=$1
@@ -456,6 +787,12 @@ while (($# > 0)); do
             ((workspace_seen == 0)) || usage_error 'option --workspace-root may not be repeated'
             workspace_seen=1
             workspace_root=$value
+            ;;
+        --max-parallel)
+            [[ "$subcommand" == acquire ]] || usage_error 'option --max-parallel is valid only for acquire'
+            ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
+            max_parallel_seen=1
+            max_parallel=$value
             ;;
         *)
             [[ "$subcommand" == init ]] || usage_error "sizing option $option is valid only for init"
@@ -484,10 +821,11 @@ CHMOD=$(resolve_command HFX_TDX_CHMOD chmod)
 FIND=$(resolve_command HFX_TDX_FIND find)
 WC=$(resolve_command HFX_TDX_WC wc)
 TR=$(resolve_command HFX_TDX_TR tr)
+PS=$(resolve_command HFX_TDX_PS ps)
 validate_inventory_file "$inventory_source"
 
 campaign_dir=$workspace_root/tdx-hydro-$campaign
-trap release_lock EXIT
+trap 'release_takeover_guard; release_lock' EXIT
 
 if [[ "$subcommand" == init ]]; then
     for variable_name in available_memory_bytes available_disk_bytes retained_input_bytes retained_basin_output_bytes assembly_memory_ceiling_bytes assembly_scratch_ceiling_bytes assembled_artifact_bytes; do
@@ -512,7 +850,18 @@ elif [[ "$subcommand" == status ]]; then
     acquire_campaign_lock
     validate_workspace_state
     print_status
-else
+elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
+else
+    ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
+    [[ "$max_parallel" =~ ^[0-9]+$ ]] || usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
+    ((max_parallel >= 1 && max_parallel <= 62)) ||
+        usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    CURL=$(resolve_command HFX_TDX_CURL curl)
+    SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+    OD=$(resolve_command HFX_TDX_OD od)
+    OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+    acquire_campaign
 fi
