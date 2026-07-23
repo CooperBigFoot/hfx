@@ -81,6 +81,12 @@ Exit codes: `0` = valid, `1` = invalid.
   `geo.columns.geometry.covering.bbox`.
 - Snap features are declared with `hfx.aux.snap.v2`; the previous v1 snap schema
   is no longer blessed.
+- D8 rasters are declared with `hfx.aux.d8_raster.v2`; the previous v1 schema is
+  no longer blessed and is rejected with `manifest.auxiliary_schema`. A v2
+  declaration must carry `crs`, `flow_dir_encoding`, and `flow_acc_units` as
+  manifest metadata, while dtype and nodata stay authoritative in each GeoTIFF
+  header. Rasters are no longer assumed to be WGS84: footprints are read in
+  their declared CRS and projected for the extent check.
 - `graph.parquet` is unchanged: it carries no geometry column, so it keeps its
   four flat `bbox_minx`, `bbox_miny`, `bbox_maxx`, `bbox_maxy` columns plus their
   row-group statistics and layout checks.

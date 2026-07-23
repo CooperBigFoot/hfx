@@ -31,14 +31,17 @@ The toolkit track versions the two workspace crates `hfx` and `hfx-cli`.
 The `hfx` crate is the library that other Rust code depends on.
 The `hfx-cli` crate installs a binary named `hfx`.
 The two crates move in lockstep: both read the workspace version through `version.workspace = true` in the root `Cargo.toml`.
-The current workspace version is 0.4.0.
+The current workspace version is 0.5.0.
 
 Toolkit releases follow Semantic Versioning, a scheme that signals compatibility through the version number, over the crate API and the `hfx` command-line surface.
 While the major version is 0, a minor bump signals a breaking change to either surface.
 The `v*` git tags belong to this track.
 
-crates.io currently holds the 0.3.0 toolkit crates, published under the crates' pre-rename names.
-The next curated release is 0.4.0 for both crates, tagged `v0.4.0`, and a human maintainer fires it.
+crates.io currently holds the 0.4.0 toolkit crates, published on 2026-07-06 under the current names `hfx` and `hfx-cli`.
+The next curated release is 0.5.0 for both crates, tagged `v0.5.0`, and a human maintainer fires it.
+
+The `v0.4.0` git tag points at a commit that predates the `hfx-core` → `hfx` rename, so it does not match the published 0.4.0 crates.
+Treat the crates.io artifacts as authoritative for what 0.4.0 shipped, and tag `v0.5.0` on the release-prep commit itself.
 
 ## Spec-to-toolkit mapping
 
@@ -49,7 +52,8 @@ The following table maps published and planned toolkit releases to the spec vers
 |---|---|---|
 | toolkit 0.2.0 and 0.1.26 (crates.io, pre-rename names) | legacy 0.1-era format | superseded |
 | toolkit 0.3.0 (crates.io, pre-rename names) | HFX spec 0.2.1 | released |
-| hfx 0.4.0 and hfx-cli 0.4.0 | HFX spec 0.3.0 | planned |
+| hfx 0.4.0 and hfx-cli 0.4.0 | HFX spec 0.3.0 | released |
+| hfx 0.5.0 and hfx-cli 0.5.0 | HFX spec 0.3.0 | planned |
 
 Use a toolkit release against datasets that match its spec version.
 The legacy 0.2.0 and 0.1.26 crates target the 0.1-era format, so do not use them against current datasets.
