@@ -43,6 +43,156 @@ from build_adapter import (
     main,
 )
 
+MERGE_RUN_A = [
+    (710_000_101, -170.0, -80.0, [], 1.0, 1.0),
+    (710_000_102, -80.0, -60.0, [710_000_101], 2.0, 3.0),
+    (710_000_103, 0.0, 0.0, [710_000_102], 3.0, 6.0),
+]
+MERGE_RUN_B = [
+    (720_000_201, -120.0, -80.0, [], 4.0, 4.0),
+    (720_000_202, -20.0, -40.0, [720_000_201], 5.0, 9.0),
+    (720_000_203, 0.0, 0.0, [720_000_202], 6.0, 15.0),
+    (720_000_204, -170.0, -20.0, [720_000_203], 7.0, 22.0),
+]
+
+
+def merge_fixture_polygon(x: float, y: float) -> Polygon:
+    return Polygon(
+        [
+            (x - 0.1, y - 0.1),
+            (x + 0.1, y - 0.1),
+            (x + 0.1, y + 0.1),
+            (x - 0.1, y + 0.1),
+            (x - 0.1, y - 0.1),
+        ]
+    )
+
+
+def merge_fixture_schemas() -> tuple[pa.Schema, pa.Schema]:
+    catchment_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(
+        build_adapter.build_geo_metadata(["Polygon", "MultiPolygon"])
+    )
+    graph_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field(
+                "upstream_ids",
+                pa.list_(pa.field("item", pa.int64(), nullable=True)),
+                nullable=False,
+            ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+    return catchment_schema, graph_schema
+
+
+def write_merge_fixture(
+    root: Path,
+    rows: list[tuple[int, float, float, list[int], float, float]],
+    *,
+    row_group_size: int = 2,
+    catchment_schema: pa.Schema | None = None,
+    graph_schema: pa.Schema | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    root.mkdir(parents=True)
+    expected_catchment_schema, expected_graph_schema = merge_fixture_schemas()
+    catchment_schema = catchment_schema or expected_catchment_schema
+    graph_schema = graph_schema or expected_graph_schema
+    catchment_rows: list[dict[str, object]] = []
+    graph_rows: list[dict[str, object]] = []
+    for unit_id, x, y, upstream_ids, area_km2, up_area_km2 in rows:
+        polygon = merge_fixture_polygon(x, y)
+        minx, miny, maxx, maxy = (
+            np.float32(value) for value in polygon.bounds
+        )
+        bbox = {
+            "xmin": minx,
+            "ymin": miny,
+            "xmax": maxx,
+            "ymax": maxy,
+        }
+        catchment_rows.append(
+            {
+                "id": unit_id,
+                "level": 0,
+                "parent_id": None,
+                "area_km2": np.float32(area_km2),
+                "up_area_km2": np.float32(up_area_km2),
+                "outlet_lon": x,
+                "outlet_lat": y,
+                "bbox": bbox,
+                "geometry": polygon.wkb,
+            }
+        )
+        graph_rows.append(
+            {
+                "id": unit_id,
+                "level": 0,
+                "upstream_ids": upstream_ids,
+                "bbox_minx": minx,
+                "bbox_miny": miny,
+                "bbox_maxx": maxx,
+                "bbox_maxy": maxy,
+            }
+        )
+    pq.write_table(
+        pa.Table.from_pylist(catchment_rows, schema=catchment_schema),
+        root / "catchments.parquet",
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+    pq.write_table(
+        pa.Table.from_pylist(graph_rows, schema=graph_schema),
+        root / "graph.parquet",
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+    return catchment_rows, graph_rows
+
+
+def merge_hilbert_keys(wkb_values: list[bytes]) -> list[int]:
+    geometry = gpd.GeoSeries.from_wkb(wkb_values, crs=CRS)
+    return [
+        int(value)
+        for value in geometry.centroid.hilbert_distance(
+            total_bounds=[-180, -90, 180, 90]
+        )
+    ]
+
+
+def rewrite_merge_rows(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    row_group_size: int = 2,
+) -> None:
+    schema = pq.ParquetFile(path).schema_arrow
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema),
+        path,
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+
 
 def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
     polygon_100 = Polygon([
@@ -1414,6 +1564,465 @@ class StreamnetTopologyRejectionTests(unittest.TestCase):
             build_streamnet_model(
                 basins, streamnet, header_number=71, endpoint_tolerance=0.001
             )
+
+
+class CoreMergeTests(unittest.TestCase):
+    def assert_merge_output_scan(
+        self,
+        result: build_adapter.CoreMergeResult,
+        expected_upstream_by_id: dict[int, list[int]],
+    ) -> None:
+        catchment_file = pq.ParquetFile(result.catchments_path)
+        graph_file = pq.ParquetFile(result.graph_path)
+        previous_key = None
+        row_count = 0
+        for catchment_batch, graph_batch in zip(
+            catchment_file.iter_batches(batch_size=2),
+            graph_file.iter_batches(batch_size=2),
+            strict=True,
+        ):
+            catchment_ids = catchment_batch.column("id").to_pylist()
+            graph_ids = graph_batch.column("id").to_pylist()
+            self.assertEqual(catchment_ids, graph_ids)
+            hilbert_keys = merge_hilbert_keys(
+                catchment_batch.column("geometry").to_pylist()
+            )
+            upstream_lists = graph_batch.column("upstream_ids").to_pylist()
+            for hilbert, unit_id, upstream_ids in zip(
+                hilbert_keys,
+                catchment_ids,
+                upstream_lists,
+                strict=True,
+            ):
+                current_key = hilbert, unit_id
+                if previous_key is not None:
+                    self.assertLessEqual(previous_key, current_key)
+                previous_key = current_key
+                self.assertEqual(
+                    upstream_ids, expected_upstream_by_id[unit_id]
+                )
+                row_count += 1
+        self.assertEqual(row_count, result.metrics.total_input_rows)
+
+    def test_merge_catchments_and_graph_interleaves_sorted_runs_in_lockstep(
+        self,
+    ) -> None:
+        expected_ids = [
+            710_000_101,
+            720_000_201,
+            710_000_102,
+            720_000_202,
+            710_000_103,
+            720_000_203,
+            720_000_204,
+        ]
+        expected_upstream_ids = [
+            [],
+            [],
+            [710_000_101],
+            [720_000_201],
+            [710_000_102],
+            [720_000_202],
+            [720_000_203],
+        ]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_a_catchments, run_a_graph = write_merge_fixture(
+                root / "run-a", MERGE_RUN_A
+            )
+            run_b_catchments, run_b_graph = write_merge_fixture(
+                root / "run-b", MERGE_RUN_B
+            )
+            keys_a = merge_hilbert_keys(
+                [row["geometry"] for row in run_a_catchments]
+            )
+            keys_b = merge_hilbert_keys(
+                [row["geometry"] for row in run_b_catchments]
+            )
+            self.assertEqual(keys_a, [7_054_384, 517_598_622, 715_827_882])
+            self.assertEqual(
+                keys_b,
+                [238_609_294, 622_261_220, 715_827_882, 1_008_396_555],
+            )
+            concatenated_ids = [
+                row["id"]
+                for row in run_a_catchments + run_b_catchments
+            ]
+            self.assertEqual(
+                concatenated_ids,
+                [
+                    710_000_101,
+                    710_000_102,
+                    710_000_103,
+                    720_000_201,
+                    720_000_202,
+                    720_000_203,
+                    720_000_204,
+                ],
+            )
+            self.assertNotEqual(concatenated_ids, expected_ids)
+
+            output = root / "output"
+            result = build_adapter.merge_catchments_and_graph(
+                [root / "run-a", root / "run-b"],
+                output,
+                input_batch_size=2,
+                row_group_min=3,
+                row_group_max=4,
+            )
+            catchment_file = pq.ParquetFile(result.catchments_path)
+            graph_file = pq.ParquetFile(result.graph_path)
+            actual_catchments = catchment_file.read().to_pylist()
+            actual_graph = graph_file.read().to_pylist()
+            self.assertEqual(
+                [row["id"] for row in actual_catchments], expected_ids
+            )
+            self.assertEqual([row["id"] for row in actual_graph], expected_ids)
+            self.assertEqual(
+                [row["upstream_ids"] for row in actual_graph],
+                expected_upstream_ids,
+            )
+            source_catchments = {
+                row["id"]: row
+                for row in run_a_catchments + run_b_catchments
+            }
+            source_graph = {
+                row["id"]: row for row in run_a_graph + run_b_graph
+            }
+            for catchment_row, graph_row in zip(
+                actual_catchments, actual_graph, strict=True
+            ):
+                self.assertEqual(
+                    catchment_row, source_catchments[catchment_row["id"]]
+                )
+                self.assertEqual(graph_row, source_graph[graph_row["id"]])
+            self.assertEqual(
+                [
+                    catchment_file.metadata.row_group(index).num_rows
+                    for index in range(catchment_file.num_row_groups)
+                ],
+                [4, 3],
+            )
+            self.assertEqual(
+                [
+                    graph_file.metadata.row_group(index).num_rows
+                    for index in range(graph_file.num_row_groups)
+                ],
+                [4, 3],
+            )
+
+            previous_key = None
+            scanned_ids = []
+            catchment_batches = catchment_file.iter_batches(batch_size=2)
+            graph_batches = graph_file.iter_batches(batch_size=2)
+            for catchment_batch, graph_batch in zip(
+                catchment_batches, graph_batches, strict=True
+            ):
+                catchment_ids = catchment_batch.column("id").to_pylist()
+                graph_ids = graph_batch.column("id").to_pylist()
+                self.assertEqual(graph_ids, catchment_ids)
+                keys = merge_hilbert_keys(
+                    catchment_batch.column("geometry").to_pylist()
+                )
+                for key, unit_id in zip(keys, catchment_ids, strict=True):
+                    current_key = (key, unit_id)
+                    if previous_key is not None:
+                        self.assertLessEqual(previous_key, current_key)
+                    previous_key = current_key
+                scanned_ids.extend(catchment_ids)
+            self.assertEqual(scanned_ids, expected_ids)
+            build_adapter.assert_geoparquet_valid(result.catchments_path)
+            self.assertNotIn(b"geo", graph_file.schema_arrow.metadata or {})
+
+            reverse_output = root / "reverse-output"
+            reverse_result = build_adapter.merge_catchments_and_graph(
+                [root / "run-b", root / "run-a"],
+                reverse_output,
+                input_batch_size=2,
+                row_group_min=3,
+                row_group_max=4,
+            )
+            self.assertEqual(
+                result.catchments_path.read_bytes(),
+                reverse_result.catchments_path.read_bytes(),
+            )
+            self.assertEqual(
+                result.graph_path.read_bytes(),
+                reverse_result.graph_path.read_bytes(),
+            )
+
+    def test_merge_catchments_and_graph_buffer_ceiling_is_row_count_independent(
+        self,
+    ) -> None:
+        observed_metrics = []
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for rows_per_run in (2, 25):
+                run_a = [
+                    (
+                        710_000_000 + native_id,
+                        0.0,
+                        0.0,
+                        (
+                            []
+                            if native_id == 1
+                            else [710_000_000 + native_id - 1]
+                        ),
+                        float(native_id),
+                        float(native_id),
+                    )
+                    for native_id in range(1, rows_per_run + 1)
+                ]
+                run_b = [
+                    (
+                        720_000_000 + native_id,
+                        0.0,
+                        0.0,
+                        (
+                            []
+                            if native_id == 1
+                            else [720_000_000 + native_id - 1]
+                        ),
+                        float(native_id),
+                        float(native_id),
+                    )
+                    for native_id in range(1, rows_per_run + 1)
+                ]
+                case_root = root / f"rows-{rows_per_run}"
+                _, graph_a = write_merge_fixture(case_root / "run-a", run_a)
+                _, graph_b = write_merge_fixture(case_root / "run-b", run_b)
+                expected_upstream = {
+                    row["id"]: row["upstream_ids"]
+                    for row in graph_a + graph_b
+                }
+                result = build_adapter.merge_catchments_and_graph(
+                    [case_root / "run-a", case_root / "run-b"],
+                    case_root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+                metrics = result.metrics
+                observed_metrics.append(metrics)
+                self.assertEqual(metrics.input_count, 2)
+                self.assertEqual(metrics.total_input_rows, 2 * rows_per_run)
+                self.assertEqual(metrics.emitted_rows, 2 * rows_per_run)
+                self.assertEqual(metrics.input_batch_size, 2)
+                self.assertEqual(metrics.row_group_min, 3)
+                self.assertEqual(metrics.row_group_max, 4)
+                self.assertEqual(metrics.buffer_row_pair_ceiling, 8)
+                self.assertLessEqual(metrics.peak_input_buffer_row_pairs, 4)
+                self.assertLessEqual(metrics.peak_output_buffer_row_pairs, 4)
+                self.assertLessEqual(metrics.peak_heap_entries, 2)
+                self.assertLessEqual(metrics.peak_buffered_row_pairs, 8)
+                self.assert_merge_output_scan(result, expected_upstream)
+            self.assertEqual(
+                observed_metrics[0].buffer_row_pair_ceiling,
+                observed_metrics[1].buffer_row_pair_ceiling,
+            )
+
+    def test_merge_rejects_invalid_paths_and_size_arguments(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.assertRaisesRegex(ValueError, "at least one input"):
+                build_adapter.merge_catchments_and_graph([], root / "output")
+
+            valid = root / "valid"
+            write_merge_fixture(valid, MERGE_RUN_A)
+            missing_catchments = root / "missing-catchments"
+            write_merge_fixture(missing_catchments, MERGE_RUN_A)
+            (missing_catchments / "catchments.parquet").unlink()
+            missing_graph = root / "missing-graph"
+            write_merge_fixture(missing_graph, MERGE_RUN_A)
+            (missing_graph / "graph.parquet").unlink()
+            for missing_root, filename in (
+                (missing_catchments, "catchments.parquet"),
+                (missing_graph, "graph.parquet"),
+            ):
+                with self.subTest(filename=filename):
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.merge_catchments_and_graph(
+                            [missing_root], root / f"output-{filename}"
+                        )
+                    self.assertIn(str(missing_root.resolve()), str(raised.exception))
+                    self.assertIn(filename, str(raised.exception))
+
+            with self.assertRaisesRegex(ValueError, "unique after resolution"):
+                build_adapter.merge_catchments_and_graph(
+                    [valid, valid / ".." / "valid"], root / "duplicate-output"
+                )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph([valid], valid)
+            self.assertIn(str(valid.resolve()), str(raised.exception))
+            self.assertIn("aliases output", str(raised.exception))
+
+            invalid_arguments = (
+                {"input_batch_size": 0},
+                {"input_batch_size": -1},
+                {"row_group_min": 0},
+                {"row_group_min": -1},
+                {"row_group_min": 4, "row_group_max": 3},
+                {"row_group_max": 0},
+            )
+            for arguments in invalid_arguments:
+                with self.subTest(arguments=arguments):
+                    with self.assertRaises(ValueError):
+                        build_adapter.merge_catchments_and_graph(
+                            [valid],
+                            root / f"invalid-{len(arguments)}",
+                            **arguments,
+                        )
+
+    def test_merge_rejects_row_count_and_exact_schema_mismatches(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            count_root = root / "count"
+            _, graph_rows = write_merge_fixture(count_root, MERGE_RUN_A)
+            rewrite_merge_rows(
+                count_root / "graph.parquet", graph_rows[:-1]
+            )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [count_root], root / "count-output"
+                )
+            self.assertIn(str(count_root.resolve()), str(raised.exception))
+            self.assertIn("row counts differ", str(raised.exception))
+
+            catchment_schema, graph_schema = merge_fixture_schemas()
+            wrong_catchment_schema = catchment_schema.remove_metadata()
+            wrong_catchment_roots = [
+                root / "wrong-catchment-a",
+                root / "wrong-catchment-b",
+            ]
+            for wrong_root in wrong_catchment_roots:
+                write_merge_fixture(
+                    wrong_root,
+                    MERGE_RUN_A,
+                    catchment_schema=wrong_catchment_schema,
+                )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    wrong_catchment_roots, root / "wrong-catchment-output"
+                )
+            self.assertIn(
+                str(wrong_catchment_roots[0].resolve()),
+                str(raised.exception),
+            )
+            self.assertIn("catchment schema", str(raised.exception))
+
+            wrong_graph_root = root / "wrong-graph"
+            write_merge_fixture(
+                wrong_graph_root,
+                MERGE_RUN_A,
+                graph_schema=graph_schema.with_metadata({b"invalid": b"schema"}),
+            )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [wrong_graph_root], root / "wrong-graph-output"
+                )
+            self.assertIn(str(wrong_graph_root.resolve()), str(raised.exception))
+            self.assertIn("graph schema", str(raised.exception))
+
+    def test_merge_rejects_paired_row_value_mismatches(self) -> None:
+        mutations = {
+            "id": lambda rows: rows[0].update(id=rows[0]["id"] + 1),
+            "level": lambda rows: rows[0].update(level=1),
+            "bbox": lambda rows: rows[0].update(
+                bbox_minx=np.float32(rows[0]["bbox_minx"] + 1.0)
+            ),
+        }
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for condition, mutate in mutations.items():
+                with self.subTest(condition=condition):
+                    case_root = root / condition
+                    _, graph_rows = write_merge_fixture(
+                        case_root, MERGE_RUN_A
+                    )
+                    mutate(graph_rows)
+                    rewrite_merge_rows(
+                        case_root / "graph.parquet", graph_rows
+                    )
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.merge_catchments_and_graph(
+                            [case_root], root / f"{condition}-output"
+                        )
+                    message = str(raised.exception)
+                    self.assertIn(str(case_root.resolve()), message)
+                    self.assertIn(condition, message)
+
+    def test_merge_rejects_decrease_within_input_batch_without_repair(
+        self,
+    ) -> None:
+        bad_rows = [MERGE_RUN_A[1], MERGE_RUN_A[0], MERGE_RUN_A[2]]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_root = root / "within-batch"
+            write_merge_fixture(input_root, bad_rows)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [input_root],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            message = str(raised.exception)
+            self.assertIn(str(input_root.resolve()), message)
+            self.assertIn("(517598622, 710000102)", message)
+            self.assertIn("(7054384, 710000101)", message)
+            self.assertEqual(
+                pq.read_table(input_root / "catchments.parquet")
+                .column("id")
+                .to_pylist(),
+                [710_000_102, 710_000_101, 710_000_103],
+            )
+
+    def test_merge_rejects_decrease_across_input_batch_boundary_without_repair(
+        self,
+    ) -> None:
+        bad_rows = [MERGE_RUN_A[0], MERGE_RUN_A[2], MERGE_RUN_A[1]]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_root = root / "across-batch"
+            write_merge_fixture(input_root, bad_rows)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [input_root],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            message = str(raised.exception)
+            self.assertIn(str(input_root.resolve()), message)
+            self.assertIn("(715827882, 710000103)", message)
+            self.assertIn("(517598622, 710000102)", message)
+            self.assertEqual(
+                pq.read_table(input_root / "catchments.parquet")
+                .column("id")
+                .to_pylist(),
+                [710_000_101, 710_000_103, 710_000_102],
+            )
+
+    def test_merge_rejects_identical_hilbert_and_id_across_runs(self) -> None:
+        duplicate = [(710_000_101, -170.0, -80.0, [], 9.0, 9.0)]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_a = root / "run-a"
+            run_b = root / "run-b"
+            write_merge_fixture(run_a, [MERGE_RUN_A[0]])
+            write_merge_fixture(run_b, duplicate)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [run_a, run_b],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            self.assertIn("duplicate merge key", str(raised.exception))
+            self.assertIn("(7054384, 710000101)", str(raised.exception))
 
 
 class CoreHfxCompilationTests(unittest.TestCase):
