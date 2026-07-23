@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import heapq
 import json
 import logging
@@ -88,6 +89,51 @@ class CoreMergeResult:
     catchments_path: Path
     graph_path: Path
     metrics: CoreMergeMetrics
+
+
+@dataclass(frozen=True)
+class SnapMergeMetrics:
+    input_count: int
+    total_input_rows: int
+    emitted_rows: int
+    input_batch_size: int
+    row_group_min: int
+    row_group_max: int
+    peak_retained_input_rows: int
+    peak_output_rows: int
+    peak_heap_entries: int
+    peak_buffered_rows: int
+    buffer_row_ceiling: int
+
+
+@dataclass(frozen=True)
+class AssemblyResult:
+    catchments_path: Path
+    graph_path: Path
+    snap_path: Path
+    manifest_path: Path
+    notice_path: Path
+    citation_path: Path
+    core_metrics: CoreMergeMetrics
+    snap_metrics: SnapMergeMetrics
+
+
+SNAP_AUXILIARY_DECLARATION = {
+    "schema": "hfx.aux.snap.v2",
+    "artifacts": {"snap": "aux/snap_stems.parquet"},
+    "metadata": {
+        "name": "stems",
+        "description": (
+            "Native TDX-Hydro LineString reaches for polygon-bearing level 0 "
+            "drainage units."
+        ),
+        "references_levels": [0],
+        "weight_semantics": (
+            "Drainage-area weight equals inclusive DSContArea in km2; higher "
+            "values indicate stronger drainage dominance."
+        ),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -1358,6 +1404,19 @@ def _merge_graph_schema() -> pa.Schema:
     )
 
 
+def _snap_merge_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["LineString"]))
+
+
 def _balanced_row_group_targets(
     total_rows: int,
     min_size: int,
@@ -1718,6 +1777,480 @@ def merge_catchments_and_graph(
         catchments_path=catchments_path,
         graph_path=graph_path,
         metrics=metrics,
+    )
+
+
+@dataclass
+class _SnapMergeCursor:
+    root: Path
+    batches: Iterator[pa.RecordBatch]
+    batch: pa.RecordBatch | None = None
+    hilbert_keys: tuple[int, ...] = ()
+    row_index: int = 0
+    rows_seen: int = 0
+    previous_input_key: tuple[int, int] | None = None
+    exhausted: bool = False
+
+    @property
+    def retained_rows(self) -> int:
+        return 0 if self.batch is None else self.batch.num_rows
+
+    @property
+    def current_key(self) -> tuple[int, int]:
+        if self.batch is None:
+            raise RuntimeError("exhausted snap cursor has no current key")
+        unit_id = int(self.batch.column("unit_id")[self.row_index].as_py())
+        return self.hilbert_keys[self.row_index], unit_id
+
+    def current_row(self) -> dict[str, object]:
+        if self.batch is None:
+            raise RuntimeError("exhausted snap cursor has no current row")
+        return self.batch.slice(self.row_index, 1).to_pylist()[0]
+
+    def start(self) -> None:
+        self._load_next_batch()
+
+    def advance(self) -> None:
+        if self.batch is None:
+            raise RuntimeError("cannot advance an exhausted snap cursor")
+        if self.row_index + 1 < self.batch.num_rows:
+            self.row_index += 1
+        else:
+            self._load_next_batch()
+
+    def _load_next_batch(self) -> None:
+        self.batch = None
+        self.hilbert_keys = ()
+        batch = next(self.batches, None)
+        if batch is None:
+            self.exhausted = True
+            return
+        unit_ids = batch.column("unit_id").to_pylist()
+        weights = batch.column("weight").to_pylist()
+        stem_roles = batch.column("stem_role").to_pylist()
+        bboxes = batch.column("bbox").to_pylist()
+        geometries_wkb = batch.column("geometry").to_pylist()
+        geometries = gpd.GeoSeries.from_wkb(geometries_wkb, crs=CRS)
+        hilbert_keys = tuple(
+            int(value)
+            for value in geometries.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+        previous_key = self.previous_input_key
+        for offset, (
+            hilbert,
+            unit_id,
+            weight,
+            stem_role,
+            bbox,
+            wkb,
+            geometry,
+        ) in enumerate(
+            zip(
+                hilbert_keys,
+                unit_ids,
+                weights,
+                stem_roles,
+                bboxes,
+                geometries_wkb,
+                geometries,
+                strict=True,
+            )
+        ):
+            absolute_row = self.rows_seen + offset
+            if unit_id is None:
+                raise ValueError(f"{self.root}: null snap unit_id at row {absolute_row}")
+            if (
+                weight is None
+                or not math.isfinite(float(weight))
+                or float(weight) < 0
+            ):
+                raise ValueError(f"{self.root}: invalid snap weight at row {absolute_row}")
+            if stem_role not in {
+                None,
+                "mainstem",
+                "tributary",
+                "distributary",
+                "unknown",
+            }:
+                raise ValueError(
+                    f"{self.root}: invalid snap stem_role at row {absolute_row}"
+                )
+            if wkb is None:
+                raise ValueError(f"{self.root}: null snap geometry at row {absolute_row}")
+            if geometry.is_empty or geometry.geom_type != "LineString":
+                raise ValueError(f"{self.root}: invalid snap geometry at row {absolute_row}")
+            if bbox is not None:
+                values = [float(bbox[name]) for name in BBOX_LEAF_NAMES]
+                if (
+                    not all(math.isfinite(value) for value in values)
+                    or values[0] > values[2]
+                    or values[1] > values[3]
+                ):
+                    raise ValueError(f"{self.root}: invalid snap bbox at row {absolute_row}")
+            current_key = hilbert, int(unit_id)
+            if previous_key is not None and current_key < previous_key:
+                raise ValueError(
+                    f"{self.root}: non-monotonic snap input; previous key "
+                    f"{previous_key}, current key {current_key}"
+                )
+            previous_key = current_key
+        self.batch = batch
+        self.hilbert_keys = hilbert_keys
+        self.row_index = 0
+        self.rows_seen += batch.num_rows
+        self.previous_input_key = previous_key
+
+
+def _validate_snap_references(root: Path, batch_size: int) -> None:
+    catchment_ids: set[int] = set()
+    catchment_file = pq.ParquetFile(root / "catchments.parquet")
+    try:
+        for batch in catchment_file.iter_batches(
+            batch_size=batch_size, columns=["id"]
+        ):
+            for value in batch.column("id").to_pylist():
+                unit_id = int(value)
+                if unit_id in catchment_ids:
+                    raise ValueError(f"{root}: duplicate catchment id {unit_id}")
+                catchment_ids.add(unit_id)
+    finally:
+        catchment_file.close()
+    seen: set[int] = set()
+    snap_file = pq.ParquetFile(root / "aux" / "snap_stems.parquet")
+    try:
+        for batch in snap_file.iter_batches(
+            batch_size=batch_size, columns=["unit_id"]
+        ):
+            for value in batch.column("unit_id").to_pylist():
+                unit_id = int(value)
+                if unit_id not in catchment_ids:
+                    raise ValueError(f"{root}: dangling snap unit_id {unit_id}")
+                if unit_id in seen:
+                    raise ValueError(f"{root}: duplicate snap unit_id {unit_id}")
+                seen.add(unit_id)
+    finally:
+        snap_file.close()
+    if seen != catchment_ids:
+        missing = sorted(catchment_ids - seen)
+        raise ValueError(f"{root}: snap references do not cover catchments {missing[:5]}")
+
+
+def _merge_snap_stems(
+    roots: Sequence[Path],
+    output_root: Path,
+    *,
+    input_batch_size: int,
+    row_group_min: int,
+    row_group_max: int,
+) -> tuple[Path, SnapMergeMetrics]:
+    schema = _snap_merge_schema()
+    cursors: list[_SnapMergeCursor] = []
+    total_rows = 0
+    peak_input = peak_output = peak_heap = peak_buffered = 0
+
+    def observe(output_rows: int, heap_entries: int) -> None:
+        nonlocal peak_input, peak_output, peak_heap, peak_buffered
+        input_rows = sum(cursor.retained_rows for cursor in cursors)
+        peak_input = max(peak_input, input_rows)
+        peak_output = max(peak_output, output_rows)
+        peak_heap = max(peak_heap, heap_entries)
+        peak_buffered = max(peak_buffered, input_rows + output_rows)
+
+    with ExitStack() as stack:
+        for root in roots:
+            path = root / "aux" / "snap_stems.parquet"
+            if not path.is_file():
+                raise ValueError(f"{root}: required regular aux/snap_stems.parquet is missing")
+            parquet_file = pq.ParquetFile(path)
+            stack.callback(parquet_file.close)
+            if not parquet_file.schema_arrow.equals(schema, check_metadata=True):
+                raise ValueError(f"{root}: incompatible snap schema")
+            rows = parquet_file.metadata.num_rows
+            if rows == 0:
+                raise ValueError(f"{root}: input snap file must be nonempty")
+            total_rows += rows
+            cursor = _SnapMergeCursor(
+                root=root,
+                batches=parquet_file.iter_batches(batch_size=input_batch_size),
+            )
+            cursor.start()
+            cursors.append(cursor)
+            observe(0, 0)
+
+        aux = output_root / "aux"
+        aux.mkdir(parents=True, exist_ok=True)
+        output_path = aux / "snap_stems.parquet"
+        heap: list[tuple[int, int, int, _SnapMergeCursor]] = []
+        for ordinal, cursor in enumerate(cursors):
+            hilbert, unit_id = cursor.current_key
+            heapq.heappush(heap, (hilbert, unit_id, ordinal, cursor))
+        observe(0, len(heap))
+        targets = iter(
+            _balanced_row_group_targets(total_rows, row_group_min, row_group_max)
+        )
+        target = next(targets)
+        output: list[dict[str, object]] = []
+        emitted = 0
+        previous_key: tuple[int, int] | None = None
+        with pq.ParquetWriter(
+            output_path, schema=schema, compression="snappy", write_statistics=True
+        ) as writer:
+            while heap:
+                hilbert, unit_id, ordinal, cursor = heapq.heappop(heap)
+                key = hilbert, unit_id
+                if previous_key is not None and key <= previous_key:
+                    kind = "duplicate" if key == previous_key else "non-monotonic"
+                    raise ValueError(f"{kind} snap merge key {key} from {cursor.root}")
+                row = cursor.current_row()
+                emitted += 1
+                row["id"] = emitted
+                output.append(row)
+                previous_key = key
+                cursor.advance()
+                if not cursor.exhausted:
+                    next_hilbert, next_id = cursor.current_key
+                    heapq.heappush(heap, (next_hilbert, next_id, ordinal, cursor))
+                observe(len(output), len(heap))
+                if len(output) == target:
+                    writer.write_table(pa.Table.from_pylist(output, schema=schema))
+                    output.clear()
+                    observe(0, len(heap))
+                    target = next(targets, 0)
+        if output or target != 0:
+            raise AssertionError("snap row-group targets were not exhausted")
+
+    assert_geoparquet_valid(output_path)
+    ceiling = len(roots) * input_batch_size + row_group_max
+    metrics = SnapMergeMetrics(
+        input_count=len(roots),
+        total_input_rows=total_rows,
+        emitted_rows=emitted,
+        input_batch_size=input_batch_size,
+        row_group_min=row_group_min,
+        row_group_max=row_group_max,
+        peak_retained_input_rows=peak_input,
+        peak_output_rows=peak_output,
+        peak_heap_entries=peak_heap,
+        peak_buffered_rows=peak_buffered,
+        buffer_row_ceiling=ceiling,
+    )
+    assert peak_input <= len(roots) * input_batch_size
+    assert peak_output <= row_group_max
+    assert peak_heap <= len(roots)
+    assert peak_buffered <= ceiling
+    assert emitted == total_rows
+    return output_path, metrics
+
+
+def _checked_assembly_manifests(
+    roots: Sequence[Path],
+) -> tuple[str, int, list[str], list[list[float]]]:
+    crosswalk = load_header_crosswalk()
+    fabric_version: str | None = None
+    total_units = 0
+    regions: list[str] = []
+    bboxes: list[list[float]] = []
+    identity = {
+        "format_version": FORMAT_VERSION,
+        "fabric_name": FABRIC_NAME,
+        "crs": CRS,
+        "has_up_area": HAS_UP_AREA,
+        "topology": TOPOLOGY,
+        "adapter_version": ADAPTER_VERSION,
+    }
+    for root in roots:
+        path = root / "manifest.json"
+        if not path.is_file():
+            raise ValueError(f"{root}: required regular manifest.json is missing")
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"{root}: invalid manifest.json") from error
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{root}: manifest must be one JSON object")
+        for key, expected in identity.items():
+            actual = manifest.get(key)
+            if actual != expected or (
+                isinstance(expected, bool) and actual is not expected
+            ):
+                raise ValueError(f"{root}: incompatible manifest {key}")
+        version = manifest.get("fabric_version")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"{root}: invalid fabric_version")
+        if fabric_version is None:
+            fabric_version = version
+        elif version != fabric_version:
+            raise ValueError(f"{root}: incompatible fabric_version")
+        region = manifest.get("region")
+        if not isinstance(region, str) or not region.isdigit() or region not in crosswalk:
+            raise ValueError(f"{root}: unknown manifest region")
+        if region in regions:
+            raise ValueError(f"{root}: duplicate manifest region {region}")
+        regions.append(region)
+        count = manifest.get("unit_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(f"{root}: invalid manifest unit_count")
+        counts = [
+            pq.ParquetFile(root / relative).metadata.num_rows
+            for relative in (
+                "catchments.parquet",
+                "graph.parquet",
+                "aux/snap_stems.parquet",
+            )
+        ]
+        if any(value != count for value in counts):
+            raise ValueError(f"{root}: manifest and artifact row counts differ")
+        total_units += count
+        bbox = manifest.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ValueError(f"{root}: invalid manifest bbox")
+        checked_bbox: list[float] = []
+        for value in bbox:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or float(np.float32(value)) != float(value)
+            ):
+                raise ValueError(f"{root}: invalid manifest bbox")
+            checked_bbox.append(float(np.float32(value)))
+        if (
+            checked_bbox[0] < -180
+            or checked_bbox[1] < -90
+            or checked_bbox[2] > 180
+            or checked_bbox[3] > 90
+            or checked_bbox[0] > checked_bbox[2]
+            or checked_bbox[1] > checked_bbox[3]
+        ):
+            raise ValueError(f"{root}: invalid manifest bbox")
+        bboxes.append(checked_bbox)
+        if manifest.get("auxiliary") != [SNAP_AUXILIARY_DECLARATION]:
+            raise ValueError(f"{root}: incompatible auxiliary declaration")
+    if fabric_version is None:
+        raise AssertionError("validated manifests did not provide fabric_version")
+    return fabric_version, total_units, regions, bboxes
+
+
+def _atomic_bytes(destination: Path, content: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    if destination.read_bytes() != content:
+        raise AssertionError(f"{destination}: staged bytes changed")
+
+
+def assemble_hfx(
+    input_dataset_roots: Sequence[Path],
+    output_root: Path,
+    *,
+    created_at: datetime,
+    input_batch_size: int = MERGE_INPUT_BATCH_SIZE,
+    row_group_min: int = ROW_GROUP_MIN,
+    row_group_max: int = ROW_GROUP_MAX,
+) -> AssemblyResult:
+    """Assemble checked basin datasets into one bounded-memory HFX dataset."""
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
+    if input_batch_size <= 0:
+        raise ValueError("input_batch_size must be positive")
+    if row_group_min <= 0:
+        raise ValueError("row_group_min must be positive")
+    if row_group_max < row_group_min:
+        raise ValueError("row_group_max must be at least row_group_min")
+    roots = tuple(Path(root).resolve() for root in input_dataset_roots)
+    if not roots:
+        raise ValueError("at least one input dataset root is required")
+    if len(roots) != len(set(roots)):
+        raise ValueError("input dataset roots must be unique after resolution")
+    fabric_version, unit_count, regions, bboxes = _checked_assembly_manifests(roots)
+    for root in roots:
+        _validate_snap_references(root, input_batch_size)
+
+    output_root = Path(output_root)
+    core = merge_catchments_and_graph(
+        roots,
+        output_root,
+        input_batch_size=input_batch_size,
+        row_group_min=row_group_min,
+        row_group_max=row_group_max,
+    )
+    snap_path, snap_metrics = _merge_snap_stems(
+        roots,
+        output_root,
+        input_batch_size=input_batch_size,
+        row_group_min=row_group_min,
+        row_group_max=row_group_max,
+    )
+    source_root = Path(__file__).resolve().parent
+    attribution: dict[str, bytes] = {}
+    for name in ("NOTICE", "CITATION.txt"):
+        content = (source_root / name).read_bytes()
+        text = content.decode("utf-8")
+        for phrase in ("TDX-Hydro", "National Geospatial-Intelligence Agency"):
+            if phrase not in text:
+                raise ValueError(f"{name}: missing required phrase {phrase}")
+        attribution[name] = content
+    notice_path = output_root / "NOTICE"
+    citation_path = output_root / "CITATION.txt"
+    _atomic_bytes(notice_path, attribution["NOTICE"])
+    _atomic_bytes(citation_path, attribution["CITATION.txt"])
+
+    region_set = set(regions)
+    if region_set == set(load_header_crosswalk()):
+        coverage_bbox: list[float | int] = [-180, -90, 180, 90]
+        region_name = None
+    else:
+        joined = ",".join(sorted(regions))
+        digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+        region_name = f"tdx-hydro-partial-{digest}"
+        coverage_bbox = [
+            float(np.float32(min(bbox[0] for bbox in bboxes))),
+            float(np.float32(min(bbox[1] for bbox in bboxes))),
+            float(np.float32(max(bbox[2] for bbox in bboxes))),
+            float(np.float32(max(bbox[3] for bbox in bboxes))),
+        ]
+    manifest: dict[str, object] = {
+        "adapter_version": ADAPTER_VERSION,
+        "auxiliary": [SNAP_AUXILIARY_DECLARATION],
+        "bbox": coverage_bbox,
+        "created_at": created_at.astimezone(timezone.utc).isoformat(),
+        "crs": CRS,
+        "fabric_name": FABRIC_NAME,
+        "fabric_version": fabric_version,
+        "format_version": FORMAT_VERSION,
+        "has_up_area": HAS_UP_AREA,
+        "topology": TOPOLOGY,
+        "unit_count": unit_count,
+    }
+    if region_name is not None:
+        manifest["region"] = region_name
+    manifest_path = output_root / "manifest.json"
+    _atomic_bytes(
+        manifest_path,
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return AssemblyResult(
+        catchments_path=core.catchments_path,
+        graph_path=core.graph_path,
+        snap_path=snap_path,
+        manifest_path=manifest_path,
+        notice_path=notice_path,
+        citation_path=citation_path,
+        core_metrics=core.metrics,
+        snap_metrics=snap_metrics,
     )
 
 
