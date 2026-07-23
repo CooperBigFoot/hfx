@@ -1413,7 +1413,7 @@ def _prepare_core_units(
 
     ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
     ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
-        total_bounds=ordered.geometry.total_bounds
+        total_bounds=[-180, -90, 180, 90]
     )
     ordered = ordered.sort_values(["_hilbert", "id"], kind="mergesort")
     ordered = ordered.drop(columns=["_hilbert"]).reset_index(drop=True)
@@ -1556,7 +1556,7 @@ def _prepare_snap_stems(
 
     ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
     ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
-        total_bounds=units.geometry.total_bounds
+        total_bounds=[-180, -90, 180, 90]
     )
     ordered = ordered.sort_values(["_hilbert", "unit_id"], kind="mergesort")
     return ordered.drop(columns=["_hilbert"]).reset_index(drop=True)

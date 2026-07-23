@@ -98,7 +98,7 @@ The one-cell envelope is grounded in NGA's description of TDX-Hydro as a nominal
 
 The adapter always writes `aux/snap_stems.parquet` and declares it as `hfx.aux.snap.v2` with `metadata.name = "stems"` and `references_levels = [0]`. Only polygon-bearing native reaches are included. Polygon-less reaches are excluded without a spatial fallback, and the snap path reuses the topology model's `polygonless_dropped_reach_count`; it does not compute a second drop definition.
 
-Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance within the unit bounds, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
+Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance over the fixed EPSG:4326 world domain `[-180, -90, 180, 90]`, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
 
 For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer expands a zero-width or zero-height float32 bbox by the existing metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
 
