@@ -1,8 +1,10 @@
 import json
 import math
+import os
 import subprocess
 import sys
 import unittest
+from contextlib import chdir
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -43,6 +45,10 @@ from build_adapter import (
     load_tdx_geopackages,
     main,
 )
+
+HFX_BINARY = Path(os.environ["HFX_BINARY"]).expanduser().resolve()
+if not HFX_BINARY.is_absolute() or not HFX_BINARY.is_file():
+    raise RuntimeError(f"HFX binary is not a regular absolute path: {HFX_BINARY}")
 
 ABS_SCHEMA_PATH = (
     Path(__file__).resolve().parents[2] / "schemas" / "manifest.schema.json"
@@ -219,16 +225,7 @@ def write_assembly_fixture(
     snap_rows: list[tuple[int, int, float, float, float]],
 ) -> None:
     catchments, _ = write_merge_fixture(root, rows)
-    snap_schema = pa.schema(
-        [
-            pa.field("id", pa.int64(), nullable=False),
-            pa.field("unit_id", pa.int64(), nullable=False),
-            pa.field("weight", pa.float32(), nullable=False),
-            pa.field("stem_role", pa.string(), nullable=True),
-            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
-            pa.field("geometry", pa.binary(), nullable=False),
-        ]
-    ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
+    snap_schema = assembly_snap_schema()
     authored_snap_rows = []
     for source_id, unit_id, x, y, weight in snap_rows:
         geometry = LineString(
@@ -303,6 +300,34 @@ def write_assembly_fixture(
     )
 
 
+def assembly_snap_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
+
+
+def rewrite_snap_rows(
+    input_root: Path,
+    rows: list[dict[str, object]],
+    *,
+    schema: pa.Schema | None = None,
+) -> None:
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema or assembly_snap_schema()),
+        input_root / "aux" / "snap_stems.parquet",
+        row_group_size=2,
+        compression="snappy",
+        write_statistics=True,
+    )
+
+
 def validate_assembled_manifest(path: Path) -> None:
     subprocess.run(
         [
@@ -319,6 +344,28 @@ def validate_assembled_manifest(path: Path) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def validate_with_release_hfx(dataset: Path) -> None:
+    completed = subprocess.run(
+        [
+            str(HFX_BINARY),
+            str(dataset.resolve()),
+            "--strict",
+            "--sample-pct",
+            "100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    message = f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise AssertionError(message)
+    if "0 error(s), 0 warning(s), 0 info(s)" not in completed.stdout:
+        raise AssertionError(message)
+    if "Result: VALID" not in completed.stdout:
+        raise AssertionError(message)
 
 
 def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
@@ -1814,9 +1861,6 @@ class AssemblyTests(unittest.TestCase):
                 inputs,
                 root / "assembled",
                 created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
-                input_batch_size=2,
-                row_group_min=2,
-                row_group_max=3,
             )
             manifest = json.loads(result.manifest_path.read_text())
             self.assertNotIn("region", manifest)
@@ -1832,6 +1876,7 @@ class AssemblyTests(unittest.TestCase):
             )
             self.assertEqual(result.snap_metrics.emitted_rows, 62)
             validate_assembled_manifest(result.manifest_path)
+            validate_with_release_hfx(root / "assembled")
 
     def test_rejects_dangling_duplicate_and_count_mismatches(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1928,6 +1973,26 @@ class AssemblyTests(unittest.TestCase):
             write_assembly_fixture(
                 dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
             )
+            duplicate = root / "duplicate"
+            write_assembly_fixture(
+                duplicate, "7020014250", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            output = root / "merge-failure"
+            output.mkdir()
+            with self.assertRaisesRegex(
+                ValueError, "incompatible duplicate merge key"
+            ):
+                build_adapter.assemble_hfx(
+                    [dataset, duplicate],
+                    output,
+                    created_at=datetime.now(timezone.utc),
+                    input_batch_size=1,
+                    row_group_min=1,
+                    row_group_max=1,
+                )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
             real_replace = build_adapter.os.replace
 
             def fail_citation(source: Path, destination: Path) -> None:
@@ -1936,6 +2001,7 @@ class AssemblyTests(unittest.TestCase):
                 real_replace(source, destination)
 
             output = root / "attribution-failure"
+            output.mkdir()
             with patch.object(
                 build_adapter.os, "replace", side_effect=fail_citation
             ):
@@ -1945,11 +2011,8 @@ class AssemblyTests(unittest.TestCase):
                         output,
                         created_at=datetime.now(timezone.utc),
                     )
-            self.assertFalse((output / "CITATION.txt").exists())
-            self.assertEqual(
-                sorted(path.name for path in output.iterdir()),
-                ["NOTICE", "aux", "catchments.parquet", "graph.parquet"],
-            )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
 
             def fail_manifest(source: Path, destination: Path) -> None:
                 if Path(destination).name == "manifest.json":
@@ -1957,6 +2020,7 @@ class AssemblyTests(unittest.TestCase):
                 real_replace(source, destination)
 
             output = root / "manifest-failure"
+            output.mkdir()
             with patch.object(
                 build_adapter.os, "replace", side_effect=fail_manifest
             ):
@@ -1966,17 +2030,53 @@ class AssemblyTests(unittest.TestCase):
                         output,
                         created_at=datetime.now(timezone.utc),
                     )
-            self.assertFalse((output / "manifest.json").exists())
-            self.assertEqual(
-                sorted(path.name for path in output.iterdir()),
-                [
-                    "CITATION.txt",
-                    "NOTICE",
-                    "aux",
-                    "catchments.parquet",
-                    "graph.parquet",
-                ],
-            )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def test_rejects_missing_empty_and_empty_geometry_snap_inputs(self) -> None:
+        cases = ("missing", "empty", "empty-geometry")
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for case in cases:
+                with self.subTest(case=case):
+                    input_root = root / f"input-{case}"
+                    write_assembly_fixture(
+                        input_root,
+                        "7020000010",
+                        MERGE_RUN_A,
+                        PARTIAL_SNAP_A,
+                    )
+                    snap_path = input_root / "aux" / "snap_stems.parquet"
+                    if case == "missing":
+                        snap_path.unlink()
+                        message = (
+                            f"{input_root.resolve()}: required regular "
+                            "aux/snap_stems.parquet is missing"
+                        )
+                    elif case == "empty":
+                        rewrite_snap_rows(input_root, [])
+                        message = (
+                            f"{input_root.resolve()}: input snap file must be nonempty"
+                        )
+                    else:
+                        rows = pq.read_table(snap_path).to_pylist()
+                        rows[0]["geometry"] = LineString().wkb
+                        rewrite_snap_rows(input_root, rows)
+                        message = (
+                            f"{input_root.resolve()}: invalid snap geometry at row 0"
+                        )
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.assemble_hfx(
+                            [input_root],
+                            root / f"output-{case}",
+                            created_at=datetime.now(timezone.utc),
+                        )
+                    self.assertIn(message, str(raised.exception))
+                    if case == "empty-geometry":
+                        self.assertNotIn(
+                            "Hilbert distance cannot be computed",
+                            str(raised.exception),
+                        )
 
     def test_rejects_missing_attribution_phrases(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2005,6 +2105,294 @@ class AssemblyTests(unittest.TestCase):
                             root / f"missing-{phrase.split()[0]}",
                             created_at=datetime.now(timezone.utc),
                         )
+
+
+class AssemblyCliTests(unittest.TestCase):
+    def assert_rejected(
+        self,
+        input_roots: list[Path],
+        output: Path,
+        message: str,
+    ) -> None:
+        output.mkdir()
+        arguments = ["assemble"]
+        for input_root in input_roots:
+            arguments.extend(["--input", str(input_root)])
+        arguments.extend(["--out", str(output)])
+        with self.assertRaises(ValueError) as raised:
+            main(arguments)
+        self.assertIn(message, str(raised.exception))
+        self.assertEqual(list(output.iterdir()), [])
+        BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def test_assemble_cli_publishes_and_validates_partial_dataset(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_assembly_fixture(
+                root / "first", "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            write_assembly_fixture(
+                root / "second", "7020014250", MERGE_RUN_B, PARTIAL_SNAP_B
+            )
+            with chdir(root), patch.object(
+                build_adapter,
+                "_utc_now",
+                return_value=datetime(
+                    2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc
+                ),
+            ):
+                return_code = main(
+                    [
+                        "assemble",
+                        "--input",
+                        "first",
+                        "--input",
+                        "second",
+                        "--out",
+                        "assembled",
+                    ]
+                )
+            dataset = root / "assembled"
+            self.assertEqual(return_code, 0)
+            expected_ids = [
+                710_000_101,
+                720_000_201,
+                710_000_102,
+                720_000_202,
+                710_000_103,
+                720_000_203,
+                720_000_204,
+            ]
+            catchments = pq.read_table(dataset / "catchments.parquet")
+            graph = pq.read_table(dataset / "graph.parquet")
+            snap = pq.read_table(dataset / "aux" / "snap_stems.parquet")
+            self.assertEqual(catchments["id"].to_pylist(), expected_ids)
+            self.assertEqual(graph["id"].to_pylist(), expected_ids)
+            self.assertEqual(
+                graph["upstream_ids"].to_pylist(),
+                [
+                    [],
+                    [],
+                    [710_000_101],
+                    [720_000_201],
+                    [710_000_102],
+                    [720_000_202],
+                    [720_000_203],
+                ],
+            )
+            self.assertEqual(snap["id"].to_pylist(), list(range(1, 8)))
+            self.assertEqual(snap["unit_id"].to_pylist(), expected_ids)
+            self.assertEqual(set(snap["unit_id"].to_pylist()), set(expected_ids))
+            manifest = json.loads((dataset / "manifest.json").read_text())
+            self.assertEqual(
+                manifest,
+                {
+                    "adapter_version": "0.1.0",
+                    "auxiliary": [
+                        {
+                            "schema": "hfx.aux.snap.v2",
+                            "artifacts": {"snap": "aux/snap_stems.parquet"},
+                            "metadata": {
+                                "name": "stems",
+                                "description": (
+                                    "Native TDX-Hydro LineString reaches for "
+                                    "polygon-bearing level 0 drainage units."
+                                ),
+                                "references_levels": [0],
+                                "weight_semantics": (
+                                    "Drainage-area weight equals inclusive "
+                                    "DSContArea in km2; higher values indicate "
+                                    "stronger drainage dominance."
+                                ),
+                            },
+                        }
+                    ],
+                    "bbox": [
+                        -170.10000610351562,
+                        -80.0999984741211,
+                        0.10000000149011612,
+                        0.10000000149011612,
+                    ],
+                    "created_at": "2026-07-23T12:34:56+00:00",
+                    "crs": "EPSG:4326",
+                    "fabric_name": "tdx_hydro",
+                    "fabric_version": "synthetic-2026.07",
+                    "format_version": "0.3.0",
+                    "has_up_area": True,
+                    "region": "tdx-hydro-partial-afd4ffb0b736",
+                    "topology": "tree",
+                    "unit_count": 7,
+                },
+            )
+            source_root = Path(__file__).parent
+            for name in ("NOTICE", "CITATION.txt"):
+                self.assertEqual(
+                    (dataset / name).read_bytes(),
+                    (source_root / name).read_bytes(),
+                )
+                text = (dataset / name).read_text()
+                self.assertIn("TDX-Hydro", text)
+                self.assertIn("National Geospatial-Intelligence Agency", text)
+            catchment_schema, graph_write_schema = merge_fixture_schemas()
+            graph_read_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("level", pa.int16(), nullable=False),
+                    pa.field(
+                        "upstream_ids",
+                        pa.list_(
+                            pa.field("element", pa.int64(), nullable=True)
+                        ),
+                        nullable=False,
+                    ),
+                    pa.field("bbox_minx", pa.float32(), nullable=False),
+                    pa.field("bbox_miny", pa.float32(), nullable=False),
+                    pa.field("bbox_maxx", pa.float32(), nullable=False),
+                    pa.field("bbox_maxy", pa.float32(), nullable=False),
+                ]
+            )
+            self.assertTrue(
+                catchments.schema.equals(catchment_schema, check_metadata=True)
+            )
+            self.assertTrue(
+                snap.schema.equals(assembly_snap_schema(), check_metadata=True)
+            )
+            self.assertTrue(
+                graph.schema.equals(graph_read_schema, check_metadata=True)
+            )
+            self.assertIsNone(graph.schema.metadata)
+            self.assertIsNone(graph_write_schema.metadata)
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "catchments.parquet"), target_version="1.1"
+                ).is_valid
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "aux" / "snap_stems.parquet"),
+                    target_version="1.1",
+                ).is_valid
+            )
+            validate_assembled_manifest(dataset / "manifest.json")
+            validate_with_release_hfx(dataset)
+
+    def test_assemble_cli_rejects_invalid_inputs(self) -> None:
+        cases = [
+            ("incompatible snap schema", "incompatible snap schema"),
+            ("non-monotonic snap input", "non-monotonic snap input"),
+            ("empty snap input file", "input snap file must be nonempty"),
+            ("invalid weight", "invalid snap weight at row 0"),
+            ("non-LineString geometry", "invalid snap geometry at row 0"),
+            ("empty geometry", "invalid snap geometry at row 0"),
+            ("invalid stem_role", "invalid snap stem_role at row 0"),
+            ("invalid bbox", "invalid snap bbox at row 0"),
+        ]
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (case, suffix) in enumerate(cases):
+                with self.subTest(case=case):
+                    input_root = root / f"input-{index}"
+                    write_assembly_fixture(
+                        input_root,
+                        "7020000010",
+                        MERGE_RUN_A,
+                        PARTIAL_SNAP_A,
+                    )
+                    snap_path = input_root / "aux" / "snap_stems.parquet"
+                    rows = pq.read_table(snap_path).to_pylist()
+                    schema = assembly_snap_schema()
+                    if case == "incompatible snap schema":
+                        schema = pa.schema(list(schema))
+                    elif case == "non-monotonic snap input":
+                        rows = [rows[1], rows[0], rows[2]]
+                    elif case == "empty snap input file":
+                        rows = []
+                    elif case == "invalid weight":
+                        rows[0]["weight"] = np.float32(-1.0)
+                    elif case == "non-LineString geometry":
+                        rows[0]["geometry"] = Point(0.0, 0.0).wkb
+                    elif case == "empty geometry":
+                        rows[0]["geometry"] = LineString().wkb
+                    elif case == "invalid stem_role":
+                        rows[0]["stem_role"] = "invalid"
+                    else:
+                        rows[0]["bbox"] = {
+                            "xmin": np.float32(1.0),
+                            "ymin": np.float32(0.0),
+                            "xmax": np.float32(0.0),
+                            "ymax": np.float32(1.0),
+                        }
+                    rewrite_snap_rows(input_root, rows, schema=schema)
+                    if case in {
+                        "incompatible snap schema",
+                        "empty snap input file",
+                    }:
+                        message = f"{input_root.resolve()}: {suffix}"
+                    else:
+                        message = suffix
+                    self.assert_rejected(
+                        [input_root], root / f"output-{index}", message
+                    )
+
+    def test_assemble_cli_rejects_duplicate_region_and_missing_snap(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            write_assembly_fixture(
+                first,
+                "7020000010",
+                [(710_000_101, -170.0, -80.0, [], 1.0, 1.0)],
+                [(91, 710_000_101, -170.0, -80.0, 1.0)],
+            )
+            write_assembly_fixture(
+                second,
+                "7020000010",
+                [(710_000_201, -120.0, -80.0, [], 1.0, 1.0)],
+                [(92, 710_000_201, -120.0, -80.0, 1.0)],
+            )
+            self.assert_rejected(
+                [first, second],
+                root / "duplicate-output",
+                "duplicate manifest region 7020000010",
+            )
+            missing = root / "missing-snap"
+            write_assembly_fixture(
+                missing, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            (missing / "aux" / "snap_stems.parquet").unlink()
+            self.assert_rejected(
+                [missing],
+                root / "missing-output",
+                "required regular aux/snap_stems.parquet is missing",
+            )
+
+    def test_assemble_cli_rejects_missing_output_parent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            write_assembly_fixture(
+                input_root, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            missing_parent = root / "missing"
+            output = missing_parent / "assembled"
+            with self.assertRaises(ValueError) as raised:
+                main(
+                    [
+                        "assemble",
+                        "--input",
+                        str(input_root),
+                        "--out",
+                        str(output),
+                    ]
+                )
+            self.assertIn(
+                f"{missing_parent.resolve()}: output parent must be an existing directory",
+                str(raised.exception),
+            )
+            self.assertFalse(missing_parent.exists())
+            self.assertFalse(output.exists())
+            BuildCliTests.assert_no_temporary_entries(self, root)
 
 
 class CoreMergeTests(unittest.TestCase):
