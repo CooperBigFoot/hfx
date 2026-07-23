@@ -1,0 +1,28 @@
+NOTICE
+
+This accompanying HFX dataset is an adapted compilation derived from the
+National Geospatial-Intelligence Agency (NGA) TanDEM-X Hydro (TDX-Hydro)
+vector river network and drainage basin datasets from the Office of Geomatics.
+It is not the original TDX-Hydro data.
+
+The source is the pristine NGA distribution and endpoint, not the modified
+GEOGLOWS v2 derivative. Source product page:
+https://earth-info.nga.mil/index.php?action=geosciences&dir=geosci
+
+Copyright (c) 2023 National Geospatial-Intelligence Agency (NGA).
+
+License: the TDX-Hydro source datasets are licensed under the Creative Commons
+Attribution-ShareAlike 4.0 International Public License (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+This HFX compilation adapts the source into HFX Parquet and snap artifacts.
+Attribution must be given to NGA, a link to the license must be provided,
+changes must be indicated, and adapted contributions must be distributed under
+the same license.
+
+No endorsement by NGA or the United States Government is implied. Neither the
+United States Government, NGA, nor their employees makes any warranty, express
+or implied, or assumes legal liability or responsibility for the accuracy,
+completeness, or usefulness of the source data or this compilation.
+
+See CITATION.txt for the requested source citation.

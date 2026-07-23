@@ -1,0 +1,17 @@
+Citation for the source dataset: TanDEM-X Hydro (TDX-Hydro)
+
+National Geospatial-Intelligence Agency (NGA). (2023). TanDEM-X Hydro
+(TDX-Hydro) [Data set]. Office of Geomatics.
+https://earth-info.nga.mil/index.php?action=geosciences&dir=geosci
+
+@dataset{nga_2023_tdx_hydro,
+  author       = {National Geospatial-Intelligence Agency},
+  title        = {TanDEM-X Hydro (TDX-Hydro)},
+  year         = {2023},
+  publisher    = {National Geospatial-Intelligence Agency, Office of Geomatics},
+  url          = {https://earth-info.nga.mil/index.php?action=geosciences&dir=geosci}
+}
+
+License: Creative Commons Attribution-ShareAlike 4.0 International
+(CC BY-SA 4.0)
+https://creativecommons.org/licenses/by-sa/4.0/legalcode
