@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import logging
 import math
@@ -12,10 +13,12 @@ import shutil
 import subprocess
 import tempfile
 from collections import Counter, deque
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
+from typing import Iterator, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -37,6 +40,7 @@ TOPOLOGY = "tree"
 HAS_UP_AREA = True
 ROW_GROUP_MIN = 4096
 ROW_GROUP_MAX = 8192
+MERGE_INPUT_BATCH_SIZE = 1024
 BBOX_LEAF_NAMES = ("xmin", "ymin", "xmax", "ymax")
 GLOBAL_LINKNO_STRIDE = 10_000_000
 TDX_LINKNO_SENTINEL = -1
@@ -62,6 +66,28 @@ SNAP_BBOX_EPSILON = 1e-4
 class LayerClampDiagnostics:
     altered_vertex_count: int
     altered_native_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CoreMergeMetrics:
+    input_count: int
+    total_input_rows: int
+    emitted_rows: int
+    input_batch_size: int
+    row_group_min: int
+    row_group_max: int
+    peak_input_buffer_row_pairs: int
+    peak_output_buffer_row_pairs: int
+    peak_heap_entries: int
+    peak_buffered_row_pairs: int
+    buffer_row_pair_ceiling: int
+
+
+@dataclass(frozen=True)
+class CoreMergeResult:
+    catchments_path: Path
+    graph_path: Path
+    metrics: CoreMergeMetrics
 
 
 @dataclass(frozen=True)
@@ -1296,6 +1322,403 @@ def assert_geoparquet_valid(path: Path) -> None:
     """Raise when a Parquet file fails GeoParquet 1.1 validation."""
     result = validate_geoparquet(str(path), target_version="1.1")
     _assert_geoparquet_result(path, result)
+
+
+def _merge_catchment_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox", bbox_struct_type(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
+
+
+def _merge_graph_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field(
+                "upstream_ids",
+                pa.list_(pa.field("element", pa.int64(), nullable=True)),
+                nullable=False,
+            ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+
+
+def _balanced_row_group_targets(
+    total_rows: int,
+    min_size: int,
+    max_size: int,
+) -> Iterator[int]:
+    if total_rows <= 0:
+        return
+
+    min_groups = math.ceil(total_rows / max_size)
+    group_count = max(1, total_rows // min_size)
+    while group_count >= min_groups:
+        base = total_rows // group_count
+        remainder = total_rows % group_count
+        if (
+            min_size <= base <= max_size
+            and base + (1 if remainder else 0) <= max_size
+        ):
+            for index in range(group_count):
+                yield base + (1 if index < remainder else 0)
+            return
+        group_count -= 1
+
+    yield total_rows
+
+
+@dataclass
+class _PairedMergeCursor:
+    root: Path
+    catchment_batches: Iterator[pa.RecordBatch]
+    graph_batches: Iterator[pa.RecordBatch]
+    catchment_batch: pa.RecordBatch | None = None
+    graph_batch: pa.RecordBatch | None = None
+    hilbert_keys: tuple[int, ...] = ()
+    row_index: int = 0
+    rows_seen: int = 0
+    previous_input_key: tuple[int, int] | None = None
+    exhausted: bool = False
+
+    @property
+    def retained_row_pairs(self) -> int:
+        if self.catchment_batch is None:
+            return 0
+        return self.catchment_batch.num_rows
+
+    @property
+    def current_key(self) -> tuple[int, int]:
+        if self.catchment_batch is None:
+            raise RuntimeError("exhausted merge cursor has no current key")
+        unit_id = int(self.catchment_batch.column("id")[self.row_index].as_py())
+        return self.hilbert_keys[self.row_index], unit_id
+
+    def current_rows(self) -> tuple[dict[str, object], dict[str, object]]:
+        if self.catchment_batch is None or self.graph_batch is None:
+            raise RuntimeError("exhausted merge cursor has no current row")
+        return (
+            self.catchment_batch.slice(self.row_index, 1).to_pylist()[0],
+            self.graph_batch.slice(self.row_index, 1).to_pylist()[0],
+        )
+
+    def start(self) -> None:
+        self._load_next_batch()
+
+    def advance(self) -> None:
+        if self.catchment_batch is None:
+            raise RuntimeError("cannot advance an exhausted merge cursor")
+        if self.row_index + 1 < self.catchment_batch.num_rows:
+            self.row_index += 1
+            return
+        self._load_next_batch()
+
+    def _load_next_batch(self) -> None:
+        self.catchment_batch = None
+        self.graph_batch = None
+        self.hilbert_keys = ()
+        catchment_batch = next(self.catchment_batches, None)
+        graph_batch = next(self.graph_batches, None)
+        if (catchment_batch is None) != (graph_batch is None):
+            raise ValueError(
+                f"{self.root}: catchment and graph batch iterators ended "
+                "at different positions"
+            )
+        if catchment_batch is None:
+            self.exhausted = True
+            return
+        if catchment_batch.num_rows != graph_batch.num_rows:
+            raise ValueError(
+                f"{self.root}: paired batch sizes differ "
+                f"({catchment_batch.num_rows} != {graph_batch.num_rows})"
+            )
+
+        ids = catchment_batch.column("id").to_pylist()
+        levels = catchment_batch.column("level").to_pylist()
+        graph_ids = graph_batch.column("id").to_pylist()
+        graph_levels = graph_batch.column("level").to_pylist()
+        catchment_bboxes = catchment_batch.column("bbox").to_pylist()
+        graph_bbox_columns = [
+            graph_batch.column(name).to_pylist()
+            for name in ("bbox_minx", "bbox_miny", "bbox_maxx", "bbox_maxy")
+        ]
+        geometries = gpd.GeoSeries.from_wkb(
+            catchment_batch.column("geometry").to_pylist(),
+            crs=CRS,
+        )
+        hilbert_keys = tuple(
+            int(value)
+            for value in geometries.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+
+        previous_key = self.previous_input_key
+        for offset, (hilbert, unit_id, level) in enumerate(
+            zip(hilbert_keys, ids, levels, strict=True)
+        ):
+            absolute_row = self.rows_seen + offset
+            if graph_ids[offset] != unit_id:
+                raise ValueError(
+                    f"{self.root}: catchment/graph id mismatch at row "
+                    f"{absolute_row}: {unit_id} != {graph_ids[offset]}"
+                )
+            if graph_levels[offset] != level:
+                raise ValueError(
+                    f"{self.root}: catchment/graph level mismatch at row "
+                    f"{absolute_row}: {level} != {graph_levels[offset]}"
+                )
+            bbox = catchment_bboxes[offset]
+            graph_bbox = tuple(
+                values[offset] for values in graph_bbox_columns
+            )
+            catchment_bbox = tuple(
+                bbox[name] for name in BBOX_LEAF_NAMES
+            )
+            if graph_bbox != catchment_bbox:
+                raise ValueError(
+                    f"{self.root}: catchment/graph bbox mismatch at row "
+                    f"{absolute_row}: {catchment_bbox} != {graph_bbox}"
+                )
+            current_key = hilbert, int(unit_id)
+            if previous_key is not None and current_key < previous_key:
+                raise ValueError(
+                    f"{self.root}: non-monotonic input; previous key "
+                    f"{previous_key}, current key {current_key}"
+                )
+            previous_key = current_key
+
+        self.catchment_batch = catchment_batch
+        self.graph_batch = graph_batch
+        self.hilbert_keys = hilbert_keys
+        self.row_index = 0
+        self.rows_seen += catchment_batch.num_rows
+        self.previous_input_key = previous_key
+
+
+@dataclass
+class _MergePeakTracker:
+    peak_input: int = 0
+    peak_output: int = 0
+    peak_heap: int = 0
+    peak_buffered: int = 0
+
+    def observe(
+        self,
+        cursors: Sequence[_PairedMergeCursor],
+        output_rows: int,
+        heap_entries: int,
+    ) -> None:
+        input_rows = sum(cursor.retained_row_pairs for cursor in cursors)
+        self.peak_input = max(self.peak_input, input_rows)
+        self.peak_output = max(self.peak_output, output_rows)
+        self.peak_heap = max(self.peak_heap, heap_entries)
+        self.peak_buffered = max(
+            self.peak_buffered, input_rows + output_rows
+        )
+
+
+def merge_catchments_and_graph(
+    input_dataset_roots: Sequence[Path],
+    output_root: Path,
+    *,
+    input_batch_size: int = MERGE_INPUT_BATCH_SIZE,
+    row_group_min: int = ROW_GROUP_MIN,
+    row_group_max: int = ROW_GROUP_MAX,
+) -> CoreMergeResult:
+    """Merge sorted catchment and graph runs with bounded row-pair buffers."""
+    if not input_dataset_roots:
+        raise ValueError("at least one input dataset root is required")
+    if input_batch_size <= 0:
+        raise ValueError("input_batch_size must be positive")
+    if row_group_min <= 0:
+        raise ValueError("row_group_min must be positive")
+    if row_group_max < row_group_min:
+        raise ValueError("row_group_max must be at least row_group_min")
+
+    roots = tuple(Path(root).resolve() for root in input_dataset_roots)
+    if len(roots) != len(set(roots)):
+        raise ValueError("input dataset roots must be unique after resolution")
+    resolved_output = Path(output_root).resolve()
+    for root in roots:
+        if root == resolved_output:
+            raise ValueError(f"{root}: input dataset root aliases output root")
+
+    expected_catchment_schema = _merge_catchment_schema()
+    expected_graph_schema = _merge_graph_schema()
+    total_input_rows = 0
+    cursors: list[_PairedMergeCursor] = []
+    peaks = _MergePeakTracker()
+
+    with ExitStack() as stack:
+        for root in roots:
+            catchments_path = root / "catchments.parquet"
+            graph_path = root / "graph.parquet"
+            if not catchments_path.is_file():
+                raise ValueError(
+                    f"{root}: required regular catchments.parquet is missing"
+                )
+            if not graph_path.is_file():
+                raise ValueError(
+                    f"{root}: required regular graph.parquet is missing"
+                )
+            catchment_file = pq.ParquetFile(catchments_path)
+            graph_file = pq.ParquetFile(graph_path)
+            stack.callback(catchment_file.close)
+            stack.callback(graph_file.close)
+            if not catchment_file.schema_arrow.equals(
+                expected_catchment_schema, check_metadata=True
+            ):
+                raise ValueError(f"{root}: incompatible catchment schema")
+            if not graph_file.schema_arrow.equals(
+                expected_graph_schema, check_metadata=True
+            ):
+                raise ValueError(f"{root}: incompatible graph schema")
+            catchment_rows = catchment_file.metadata.num_rows
+            graph_rows = graph_file.metadata.num_rows
+            if catchment_rows != graph_rows:
+                raise ValueError(
+                    f"{root}: catchment and graph row counts differ "
+                    f"({catchment_rows} != {graph_rows})"
+                )
+            if catchment_rows == 0:
+                raise ValueError(f"{root}: input core files must be nonempty")
+            total_input_rows += catchment_rows
+            cursor = _PairedMergeCursor(
+                root=root,
+                catchment_batches=catchment_file.iter_batches(
+                    batch_size=input_batch_size
+                ),
+                graph_batches=graph_file.iter_batches(
+                    batch_size=input_batch_size
+                ),
+            )
+            cursor.start()
+            cursors.append(cursor)
+            peaks.observe(cursors, 0, 0)
+
+        output_root = Path(output_root)
+        output_root.mkdir(parents=True, exist_ok=True)
+        catchments_path = output_root / "catchments.parquet"
+        graph_path = output_root / "graph.parquet"
+        heap: list[tuple[int, int, int, _PairedMergeCursor]] = []
+        for ordinal, cursor in enumerate(cursors):
+            hilbert, unit_id = cursor.current_key
+            heapq.heappush(heap, (hilbert, unit_id, ordinal, cursor))
+        peaks.observe(cursors, 0, len(heap))
+
+        target_sizes = iter(
+            _balanced_row_group_targets(
+                total_input_rows, row_group_min, row_group_max
+            )
+        )
+        target_size = next(target_sizes)
+        catchment_output: list[dict[str, object]] = []
+        graph_output: list[dict[str, object]] = []
+        emitted_rows = 0
+        previous_output_key: tuple[int, int] | None = None
+        with pq.ParquetWriter(
+            catchments_path,
+            schema=expected_catchment_schema,
+            compression="snappy",
+            write_statistics=True,
+        ) as catchment_writer, pq.ParquetWriter(
+            graph_path,
+            schema=expected_graph_schema,
+            compression="snappy",
+            write_statistics=True,
+        ) as graph_writer:
+            while heap:
+                hilbert, unit_id, ordinal, cursor = heapq.heappop(heap)
+                current_key = hilbert, unit_id
+                if previous_output_key is not None:
+                    if current_key == previous_output_key:
+                        raise ValueError(
+                            "incompatible duplicate merge key "
+                            f"{current_key} from {cursor.root}"
+                        )
+                    if current_key < previous_output_key:
+                        raise ValueError(
+                            "non-monotonic merged output; previous key "
+                            f"{previous_output_key}, current key {current_key}"
+                        )
+                catchment_row, graph_row = cursor.current_rows()
+                catchment_output.append(catchment_row)
+                graph_output.append(graph_row)
+                emitted_rows += 1
+                previous_output_key = current_key
+                cursor.advance()
+                if not cursor.exhausted:
+                    next_hilbert, next_unit_id = cursor.current_key
+                    heapq.heappush(
+                        heap,
+                        (next_hilbert, next_unit_id, ordinal, cursor),
+                    )
+                peaks.observe(
+                    cursors, len(catchment_output), len(heap)
+                )
+
+                if len(catchment_output) == target_size:
+                    catchment_writer.write_table(
+                        pa.Table.from_pylist(
+                            catchment_output,
+                            schema=expected_catchment_schema,
+                        )
+                    )
+                    graph_writer.write_table(
+                        pa.Table.from_pylist(
+                            graph_output,
+                            schema=expected_graph_schema,
+                        )
+                    )
+                    catchment_output.clear()
+                    graph_output.clear()
+                    peaks.observe(cursors, 0, len(heap))
+                    target_size = next(target_sizes, 0)
+
+        if catchment_output or graph_output or target_size != 0:
+            raise AssertionError("merge output row-group targets were not exhausted")
+
+    assert_geoparquet_valid(catchments_path)
+    buffer_ceiling = len(roots) * input_batch_size + row_group_max
+    metrics = CoreMergeMetrics(
+        input_count=len(roots),
+        total_input_rows=total_input_rows,
+        emitted_rows=emitted_rows,
+        input_batch_size=input_batch_size,
+        row_group_min=row_group_min,
+        row_group_max=row_group_max,
+        peak_input_buffer_row_pairs=peaks.peak_input,
+        peak_output_buffer_row_pairs=peaks.peak_output,
+        peak_heap_entries=peaks.peak_heap,
+        peak_buffered_row_pairs=peaks.peak_buffered,
+        buffer_row_pair_ceiling=buffer_ceiling,
+    )
+    assert metrics.peak_input_buffer_row_pairs <= len(roots) * input_batch_size
+    assert metrics.peak_output_buffer_row_pairs <= row_group_max
+    assert metrics.peak_heap_entries <= len(roots)
+    assert metrics.peak_buffered_row_pairs <= buffer_ceiling
+    assert metrics.emitted_rows == metrics.total_input_rows
+    return CoreMergeResult(
+        catchments_path=catchments_path,
+        graph_path=graph_path,
+        metrics=metrics,
+    )
 
 
 def _validate_core_model(
