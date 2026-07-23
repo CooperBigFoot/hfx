@@ -74,7 +74,13 @@ Each drainage unit's `outlet_lon` and `outlet_lat` are the downstream endpoint r
 
 ## Inclusive upstream area and coordinate normalization
 
-`up_area_km2` is the polygon-bearing reach's inclusive `DSContArea`, normalized to square kilometres. The adapter does not assume whether the raw field is square metres or square kilometres. It computes WGS84 geodesic area for every basin polygon, accumulates those polygon areas through the complete native `LINKNO -> DSLINKNO` tree, and compares the polygon-bearing samples against both raw-unit hypotheses. It chooses the lower-error hypothesis, rejects a numerical tie, and fails the build when the selected aggregate relative error exceeds 5 percent. The selected source unit and both candidate errors are recorded in the report.
+`up_area_km2` is the polygon-bearing reach's source-authoritative inclusive `DSContArea`, converted to square kilometres only according to the empirically selected source unit. The adapter never rescales `DSContArea` toward catchment-polygon area, substitutes a polygon-derived value, or fabricates an area attribute. Snap `weight` uses the same raw converted source value.
+
+The empirical check verifies the `DSContArea` **unit**, not equality between raster drainage area and vector catchment area. At build time the adapter computes WGS84 geodesic area for every basin polygon, accumulates those polygon areas through the complete native `LINKNO -> DSLINKNO` tree, and compares polygon-bearing samples against both raw-unit hypotheses. It rejects an exact numerical tie and also fails unless the losing candidate's aggregate absolute relative error is at least 1,000 times the winning candidate's error. After decisive unit selection, a separate 100 percent aggregate absolute relative-divergence ceiling remains as a generous gross fabric/compile sanity check; it is not the unit-discrimination threshold. The selected unit, both candidate errors, and signed aggregate, absolute aggregate, and maximum per-reach relative-divergence diagnostics are recorded in the report. Positive signed divergence means raw `DSContArea` exceeds the accumulated polygon reference.
+
+For pilot processing basin `7020000010`, TauDEM raster-derived `DSContArea` systematically exceeds the inclusive sum of geodesic vector catchment-polygon areas: signed aggregate divergence is about 12.1 percent and absolute aggregate divergence is about 12.9 percent. The effect is already present at headwaters, with about +8.3 percent signed and 10.3 percent absolute divergence, so it is intrinsic raster-versus-vector source-fabric divergence rather than an error introduced by topology accumulation. Per-reach absolute divergence in the pilot has p50 about 10.6 percent, p90 about 19.9 percent, p99 about 23.7 percent, and maximum about 42.4 percent. The m2 hypothesis nevertheless wins decisively (`0.1289` error versus `1.12e6` for km2), so the empirical unit check runs and passes while preserving raw source areas.
+
+Planetary build #107 must re-check and retain these diagnostics independently for every processing basin. Divergence magnitude is basin-specific; a basin whose aggregate divergence approaches the 100 percent sanity ceiling, or whose maximum per-reach diagnostic is unusually large, deserves source and compile scrutiny, never automatic rescaling.
 
 Both source layers follow the repository's coordinate-domain clamp discipline at the normalized EPSG:4326 load boundary. Longitude must lie in `[-180, 180]` and latitude in `[-90, 90]`. A marginal overshoot of at most one 0.4-arcsecond TDX source cell, `0.4 / 3600` degrees, is clamped to the exact domain edge before identifiers, areas, outlets, ordering, or bounds are derived. A larger overshoot is a fatal source-contract error. Every clamp reports the altered vertex count and sorted native IDs, and a nonzero clamp emits a warning.
 
@@ -121,6 +127,9 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.ingestion.dscontarea.m2_relative_error`
 - `diagnostics.ingestion.dscontarea.km2_relative_error`
 - `diagnostics.ingestion.dscontarea.selected_relative_error`
+- `diagnostics.ingestion.dscontarea.signed_aggregate_relative_divergence`
+- `diagnostics.ingestion.dscontarea.absolute_aggregate_relative_divergence`
+- `diagnostics.ingestion.dscontarea.max_absolute_relative_divergence`
 - `diagnostics.streamnet.polygon_bearing_link_count`
 - `diagnostics.streamnet.polygonless_dropped_reach_count`
 - `diagnostics.streamnet.degenerate_reach_count`
@@ -141,7 +150,7 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.streamnet.trusted_orientation_polygon_bearing_isolated_root_native_linknos`
 - `diagnostics.streamnet.orientation_tolerance`
 
-The adapter emits a warning for each nonzero clamp, including the layer, altered vertex count, and native IDs. After compilation it emits separate warnings for nonzero `contracted_edge_count`, `contracted_root_count`, `contracted_link_traversal_count`, and `polygonless_dropped_reach_count`. It emits three dedicated nonzero degenerate-reach warnings, each with a count and sorted native LINKNOs: all degenerate reaches, the polygon-bearing subset, and the polygon-less subset. It also warns separately for nonzero trusted healthy isolated-root counts, including native LINKNO values, both for all healthy isolated native roots and for the polygon-bearing subset. The empirical area result and complete streamnet summary are informational logs. Validity outside the exact two-identical-vertex source convention, native-successor non-coincidence, genuine orientation ambiguity, and other contract failures raise errors rather than warnings.
+The adapter emits a warning for each nonzero clamp, including the layer, altered vertex count, and native IDs. After compilation it emits separate warnings for nonzero `contracted_edge_count`, `contracted_root_count`, `contracted_link_traversal_count`, and `polygonless_dropped_reach_count`. It emits three dedicated nonzero degenerate-reach warnings, each with a count and sorted native LINKNOs: all degenerate reaches, the polygon-bearing subset, and the polygon-less subset. It also warns separately for nonzero trusted healthy isolated-root counts, including native LINKNO values, both for all healthy isolated native roots and for the polygon-bearing subset. The empirical area-unit decision, candidate-error ratio, visible raster-versus-vector divergence metrics, and complete streamnet summary are informational logs. Validity outside the exact two-identical-vertex source convention, native-successor non-coincidence, genuine orientation ambiguity, and other contract failures raise errors rather than warnings.
 
 ## CLI usage
 

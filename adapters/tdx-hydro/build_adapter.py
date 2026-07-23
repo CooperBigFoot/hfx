@@ -52,7 +52,8 @@ CRS = "EPSG:4326"
 # to 0.4 arc-second spacing; one source cell is therefore 0.4 / 3600 degrees.
 TDX_SOURCE_CELL_ARCSECONDS = 0.4
 COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
-DSCONTAREA_RELATIVE_TOLERANCE = 0.05
+DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO = 1_000.0
+DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING = 1.0
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
 SNAP_BBOX_EPSILON = 1e-4
 
@@ -72,6 +73,9 @@ class DSContAreaDiagnostics:
     m2_relative_error: float
     km2_relative_error: float
     selected_relative_error: float
+    signed_aggregate_relative_divergence: float
+    absolute_aggregate_relative_divergence: float
+    max_absolute_relative_divergence: float
 
 
 @dataclass(frozen=True)
@@ -439,13 +443,57 @@ def _infer_dscontarea_unit(
         )
     source_unit = "m2" if m2_relative_error < km2_relative_error else "km2"
     selected_relative_error = min(m2_relative_error, km2_relative_error)
-    if selected_relative_error > DSCONTAREA_RELATIVE_TOLERANCE:
+    losing_relative_error = max(m2_relative_error, km2_relative_error)
+    unit_decisiveness_ratio = (
+        math.inf
+        if selected_relative_error == 0.0
+        else losing_relative_error / selected_relative_error
+    )
+    if unit_decisiveness_ratio < DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO:
         raise ValueError(
-            "DSContArea empirical unit verification failed: "
+            "DSContArea unit candidates are not decisive: "
             f"m2_relative_error={m2_relative_error!r}, "
             f"km2_relative_error={km2_relative_error!r}, "
-            f"tolerance={DSCONTAREA_RELATIVE_TOLERANCE!r}"
+            f"unit_decisiveness_ratio={unit_decisiveness_ratio!r}, "
+            "minimum_ratio="
+            f"{DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO!r}"
         )
+
+    converted_samples_m2 = (
+        raw_samples
+        if source_unit == "m2"
+        else [raw * 1_000_000 for raw in raw_samples]
+    )
+    signed_aggregate_relative_divergence = math.fsum(
+        converted - expected
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    ) / expected_sum
+    absolute_aggregate_relative_divergence = math.fsum(
+        abs(converted - expected)
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    ) / expected_sum
+    max_absolute_relative_divergence = max(
+        abs(converted - expected) / expected
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    )
+    if (
+        selected_relative_error
+        > DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING
+    ):
+        raise ValueError(
+            "DSContArea fabric divergence sanity check failed: "
+            f"source_unit={source_unit!r}, "
+            f"selected_relative_error={selected_relative_error!r}, "
+            "sanity_ceiling="
+            f"{DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING!r}"
+        )
+
     streamnet["DSContArea_km2"] = (
         streamnet["DSContArea"] / 1_000_000
         if source_unit == "m2"
@@ -459,11 +507,22 @@ def _infer_dscontarea_unit(
         m2_relative_error=m2_relative_error,
         km2_relative_error=km2_relative_error,
         selected_relative_error=selected_relative_error,
+        signed_aggregate_relative_divergence=(
+            signed_aggregate_relative_divergence
+        ),
+        absolute_aggregate_relative_divergence=(
+            absolute_aggregate_relative_divergence
+        ),
+        max_absolute_relative_divergence=max_absolute_relative_divergence,
     )
     LOGGER.info(
         "dscontarea source_unit=%s checked_polygon_bearing_link_count=%d "
         "geodesic_upstream_area_sum_m2=%s dscontarea_sum_raw=%s "
-        "m2_relative_error=%s km2_relative_error=%s selected_relative_error=%s",
+        "m2_relative_error=%s km2_relative_error=%s "
+        "selected_relative_error=%s unit_decisiveness_ratio=%s "
+        "signed_aggregate_relative_divergence=%s "
+        "absolute_aggregate_relative_divergence=%s "
+        "max_absolute_relative_divergence=%s",
         diagnostics.source_unit,
         diagnostics.checked_polygon_bearing_link_count,
         diagnostics.geodesic_upstream_area_sum_m2,
@@ -471,6 +530,10 @@ def _infer_dscontarea_unit(
         diagnostics.m2_relative_error,
         diagnostics.km2_relative_error,
         diagnostics.selected_relative_error,
+        unit_decisiveness_ratio,
+        diagnostics.signed_aggregate_relative_divergence,
+        diagnostics.absolute_aggregate_relative_divergence,
+        diagnostics.max_absolute_relative_divergence,
     )
     return diagnostics
 

@@ -186,6 +186,9 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(diagnostics.m2_relative_error, expected_m2_error)
         self.assertEqual(diagnostics.km2_relative_error, 0.0)
         self.assertEqual(diagnostics.selected_relative_error, 0.0)
+        self.assertEqual(diagnostics.signed_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.absolute_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.max_absolute_relative_divergence, 0.0)
 
     def test_detects_dscontarea_in_square_metres(self) -> None:
         basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
@@ -203,6 +206,9 @@ class GeoPackageIngestionTests(unittest.TestCase):
         )
         self.assertEqual(diagnostics.m2_relative_error, 0.0)
         self.assertEqual(diagnostics.selected_relative_error, 0.0)
+        self.assertEqual(diagnostics.signed_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.absolute_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.max_absolute_relative_divergence, 0.0)
         self.assertEqual(
             source.streamnet["DSContArea_km2"].tolist(),
             [(area_100_m2 + area_200_m2) / 1_000_000, area_100_m2 / 1_000_000],
@@ -210,6 +216,52 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(
             diagnostics.geodesic_upstream_area_sum_m2,
             math.fsum([expected_200_m2, expected_100_m2]),
+        )
+
+    def test_accepts_decisive_m2_unit_with_raster_vector_divergence(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        streamnet["DSContArea"] = [
+            1.13 * (area_100_m2 + area_200_m2),
+            1.13 * area_100_m2,
+        ]
+        with TemporaryDirectory() as temp_dir:
+            source = load_tdx_geopackages(
+                *write_pair(Path(temp_dir), basins, streamnet)
+            )
+
+        diagnostics = source.diagnostics.dscontarea
+        self.assertEqual(diagnostics.source_unit, "m2")
+        self.assertEqual(diagnostics.checked_polygon_bearing_link_count, 2)
+        self.assertEqual(
+            diagnostics.geodesic_upstream_area_sum_m2,
+            3692721.6149797607,
+        )
+        self.assertEqual(diagnostics.dscontarea_sum_raw, 4172775.424927129)
+        self.assertEqual(diagnostics.m2_relative_error, 0.1299999999999998)
+        self.assertEqual(diagnostics.km2_relative_error, 1129998.9999999998)
+        self.assertEqual(diagnostics.selected_relative_error, 0.1299999999999998)
+        self.assertAlmostEqual(
+            diagnostics.signed_aggregate_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            diagnostics.absolute_aggregate_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            diagnostics.max_absolute_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertEqual(
+            source.streamnet["DSContArea"].tolist(),
+            [2781850.2832847526, 1390925.1416423763],
+        )
+        self.assertEqual(
+            source.streamnet["DSContArea_km2"].tolist(),
+            [2.7818502832847525, 1.3909251416423762],
         )
 
     def test_reprojects_declared_crs_before_normalization(self) -> None:
@@ -228,6 +280,18 @@ class GeoPackageIngestionTests(unittest.TestCase):
             self.assertTrue(actual.equals_exact(expected, 1e-9))
         self.assertEqual(source.diagnostics.dscontarea.source_unit, "km2")
         self.assertLess(source.diagnostics.dscontarea.selected_relative_error, 1e-9)
+        self.assertLess(
+            abs(source.diagnostics.dscontarea.signed_aggregate_relative_divergence),
+            1e-9,
+        )
+        self.assertLess(
+            source.diagnostics.dscontarea.absolute_aggregate_relative_divergence,
+            1e-9,
+        )
+        self.assertLess(
+            source.diagnostics.dscontarea.max_absolute_relative_divergence,
+            1e-9,
+        )
 
     def test_clamps_one_tdx_cell_envelope_and_reports_native_ids(self) -> None:
         tolerance = COORDINATE_DOMAIN_TOLERANCE_DEGREES
@@ -267,6 +331,18 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(get_coordinates(source.basins.geometry).max(axis=0)[0], 180.0)
         self.assertEqual(get_coordinates(source.streamnet.geometry).max(axis=0)[0], 180.0)
         self.assertAlmostEqual(source.diagnostics.dscontarea.selected_relative_error, 0.0)
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.signed_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.absolute_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.max_absolute_relative_divergence,
+            0.0,
+        )
 
     def test_rejects_overshoot_beyond_one_tdx_cell(self) -> None:
         tolerance = COORDINATE_DOMAIN_TOLERANCE_DEGREES
@@ -363,13 +439,33 @@ class GeoPackageIngestionTests(unittest.TestCase):
                     ):
                         load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
 
-    def test_rejects_empirical_dscontarea_scale_mismatch(self) -> None:
-        basins, streamnet, _, _ = canonical_frames()
-        streamnet["DSContArea"] *= 1000
+    def test_rejects_non_decisive_dscontarea_unit_candidates(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        tie_factor = 2.0 / 1_000_001.0
+        streamnet["DSContArea"] = [
+            tie_factor * (area_100_m2 + area_200_m2),
+            tie_factor * area_100_m2,
+        ]
         with TemporaryDirectory() as temp_dir:
             with self.assertRaisesRegex(
                 ValueError,
-                r"(?=.*DSContArea)(?=.*m2_relative_error)(?=.*km2_relative_error)(?=.*0\.05)",
+                r"(?=.*DSContArea)(?=.*unit candidates are not decisive)"
+                r"(?=.*unit_decisiveness_ratio)(?=.*minimum_ratio=1000\.0)",
+            ):
+                load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
+
+    def test_rejects_gross_dscontarea_fabric_divergence(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        streamnet["DSContArea"] = [
+            2.1 * (area_100_m2 + area_200_m2),
+            2.1 * area_100_m2,
+        ]
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError,
+                r"(?=.*DSContArea fabric divergence sanity check failed)"
+                r"(?=.*source_unit='m2')(?=.*selected_relative_error=1\.1)"
+                r"(?=.*sanity_ceiling=1\.0)",
             ):
                 load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
 
@@ -1216,6 +1312,15 @@ class CoreHfxCompilationTests(unittest.TestCase):
         self.assertEqual(ingestion.dscontarea.checked_polygon_bearing_link_count, 2)
         self.assertEqual(ingestion.dscontarea.km2_relative_error, 0.0)
         self.assertEqual(ingestion.dscontarea.selected_relative_error, 0.0)
+        self.assertEqual(
+            ingestion.dscontarea.signed_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertEqual(
+            ingestion.dscontarea.absolute_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertEqual(ingestion.dscontarea.max_absolute_relative_divergence, 0.0)
         diagnostics = first.diagnostics.streamnet
         self.assertEqual(diagnostics.polygon_bearing_link_count, 2)
         self.assertEqual(diagnostics.degenerate_reach_count, 0)
@@ -1660,6 +1765,9 @@ class BuildCliTests(unittest.TestCase):
                         "m2_relative_error": 0.999999,
                         "km2_relative_error": 0.0,
                         "selected_relative_error": 0.0,
+                        "signed_aggregate_relative_divergence": 0.0,
+                        "absolute_aggregate_relative_divergence": 0.0,
+                        "max_absolute_relative_divergence": 0.0,
                     },
                 },
                 "streamnet": streamnet,
