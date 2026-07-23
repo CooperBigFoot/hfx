@@ -21,6 +21,7 @@ readonly HFX_TDX_MAX_I64=9223372036854775807
 readonly HFX_TDX_SQLITE_MAGIC=53514c69746520666f726d6174203300
 readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/bin/python
 readonly HFX_TDX_DEFAULT_HFX=/root/hfx/target/release/hfx
+readonly HFX_TDX_MAX_LIST_PAGES=1000
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -47,7 +48,9 @@ usage() {
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
-        '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+        '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
+        '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 }
 
 usage_error() {
@@ -163,7 +166,19 @@ validate_basin_json() {
             (.status == "pending" or .status == "running" or .status == "succeeded" or .status == "failed") and
             (.attempts | type == "number" and . == floor and . >= 0) and
             (.failure_reason == null or (.failure_reason | type == "string"));
-        def valid_compile: valid_v1_stage;
+        def valid_diagnostic:
+            type == "object" and
+            keys == ["diagnostics","path"] and
+            (.diagnostics | type == "object") and
+            .path == ("reports/" + $basin_id + "-build-report.json");
+        def valid_v3_compile:
+            type == "object" and
+            keys == ["attempts","diagnostic_report","failure_reason","status"] and
+            (.status == "pending" or .status == "running" or .status == "succeeded" or .status == "failed") and
+            (.attempts | type == "number" and . == floor and . >= 0) and
+            (.failure_reason == null or (.failure_reason | type == "string")) and
+            (.diagnostic_report == null or (.diagnostic_report | valid_diagnostic)) and
+            (if .status == "pending" or .status == "running" then .diagnostic_report == null else true end);
         def valid_evidence:
             type == "object" and
             keys == ["bytes","layer_name","sha256","sqlite_identity"] and
@@ -187,14 +202,19 @@ validate_basin_json() {
             else false end;
         type == "object" and
         keys == ["processing_basin_id","schema_version","stages"] and
-        (.schema_version == 1 or .schema_version == 2) and .processing_basin_id == $basin_id and
+        (.schema_version == 1 or .schema_version == 2 or .schema_version == 3) and .processing_basin_id == $basin_id and
         (.stages | type == "object" and
             keys == ["acquire_basins","acquire_streamnet","compile"]) and
-        (.stages.compile | valid_compile) and
         if .schema_version == 1 then
+            (.stages.compile | valid_v1_stage) and
             (.stages.acquire_basins | valid_v1_stage) and
             (.stages.acquire_streamnet | valid_v1_stage)
+        elif .schema_version == 2 then
+            (.stages.compile | valid_v1_stage) and
+            (.stages.acquire_basins | valid_v2_acquire) and
+            (.stages.acquire_streamnet | valid_v2_acquire)
         else
+            (.stages.compile | valid_v3_compile) and
             (.stages.acquire_basins | valid_v2_acquire) and
             (.stages.acquire_streamnet | valid_v2_acquire)
         end
@@ -491,12 +511,12 @@ initialize_campaign() {
         "$MKDIR" "$campaign_dir/state/basins/$basin_id"
         temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
         "$JQ" -n --arg basin_id "$basin_id" '{
-          schema_version: 2,
+          schema_version: 3,
           processing_basin_id: $basin_id,
           stages: {
             acquire_basins: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
             acquire_streamnet: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
-            compile: {status: "pending", attempts: 0, failure_reason: null}
+            compile: {status: "pending", attempts: 0, failure_reason: null, diagnostic_report: null}
           }
         }' >"$temporary"
         atomic_install "$temporary" "$campaign_dir/state/basins/$basin_id/current.json" validate_basin_json "$basin_id"
@@ -511,16 +531,20 @@ migrate_basin_states() {
     local temporary
     while IFS= read -r basin_id; do
         current=$campaign_dir/state/basins/$basin_id/current.json
-        if [[ $("$JQ" -r '.schema_version' "$current") == 1 ]]; then
+        if [[ $("$JQ" -r '.schema_version' "$current") != 3 ]]; then
             temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
             "$JQ" '
-                .schema_version = 2 |
-                .stages.acquire_basins.evidence = null |
-                .stages.acquire_streamnet.evidence = null |
-                .stages.acquire_basins |=
-                    if .status == "succeeded" then .status = "pending" else . end |
-                .stages.acquire_streamnet |=
-                    if .status == "succeeded" then .status = "pending" else . end
+                .schema_version as $version |
+                .schema_version = 3 |
+                if $version == 1 then
+                    .stages.acquire_basins.evidence = null |
+                    .stages.acquire_streamnet.evidence = null |
+                    .stages.acquire_basins |=
+                        if .status == "succeeded" then .status = "pending" else . end |
+                    .stages.acquire_streamnet |=
+                        if .status == "succeeded" then .status = "pending" else . end
+                else . end |
+                .stages.compile.diagnostic_report = null
             ' "$current" >"$temporary"
             atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
         fi
@@ -542,7 +566,8 @@ recover_running_stages() {
                         (($acquisition_only | not) or .key == "acquire_basins" or .key == "acquire_streamnet") then
                         .value.status = "pending" |
                         .value.failure_reason = "interrupted before terminal state; reset by recover" |
-                        if (.value | has("evidence")) then .value.evidence = null else . end
+                        if (.value | has("evidence")) then .value.evidence = null else . end |
+                        if .key == "compile" and (.value | has("diagnostic_report")) then .value.diagnostic_report = null else . end
                     else .
                     end
                 )
@@ -584,12 +609,15 @@ write_compile_stage() {
     local status=$2
     local attempts=$3
     local reason=$4
+    local diagnostic_report=${5-null}
     local current=$campaign_dir/state/basins/$basin_id/current.json
     local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-    "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" '
+    "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" \
+        --argjson diagnostic_report "$diagnostic_report" '
         .stages.compile.status = $status |
         .stages.compile.attempts = $attempts |
-        .stages.compile.failure_reason = (if $reason == "" then null else $reason end)
+        .stages.compile.failure_reason = (if $reason == "" then null else $reason end) |
+        .stages.compile.diagnostic_report = $diagnostic_report
     ' "$current" >"$temporary"
     atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
 }
@@ -615,11 +643,13 @@ establish_compile_contract() {
     atomic_install "$temporary" "$contract" validate_compile_json
 }
 
-verify_compile_artifacts() {
+diagnostic_report_json=
+verify_compile_report() {
     local basin_id=$1
     local output=$2
     local report=$3
     local resolved_output
+    local diagnostics
     [[ -d "$output" && ! -L "$output" ]] || return 1
     [[ -f "$report" && ! -L "$report" && -s "$report" ]] || return 1
     resolved_output=$(cd -P "$output" && pwd -P) || return 1
@@ -628,8 +658,19 @@ verify_compile_artifacts() {
         .build_identity.processing_basin_id == $basin_id and
         .build_identity.fabric_name == "tdx_hydro" and
         .build_identity.fabric_version == $fabric_version and
-        .build_identity.dataset_root == $dataset_root
+        .build_identity.dataset_root == $dataset_root and
+        (.diagnostics | type == "object")
     ' "$report" >/dev/null 2>&1 || return 1
+    diagnostics=$("$JQ" -cS '.diagnostics' "$report") || return 1
+    diagnostic_report_json=$("$JQ" -cnS --arg path "reports/$basin_id-build-report.json" \
+        --argjson diagnostics "$diagnostics" '{path:$path,diagnostics:$diagnostics}') || return 1
+}
+
+verify_compile_artifacts() {
+    local basin_id=$1
+    local output=$2
+    local report=$3
+    verify_compile_report "$basin_id" "$output" "$report" || return 1
     "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"
 }
 
@@ -671,17 +712,25 @@ compile_campaign() {
         report=$campaign_dir/reports/$basin_id-build-report.json
 
         if [[ "$compile_status" == succeeded ]]; then
+            diagnostic_report_json=
             if verify_compile_artifacts "$basin_id" "$output" "$report"; then
+                if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
+                    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+                fi
                 continue
             fi
             write_compile_stage "$basin_id" failed "$attempts" \
-                'existing compile artifacts failed resume verification; retained for inspection'
+                'existing compile artifacts failed resume verification; retained for inspection' \
+                "${diagnostic_report_json:-null}"
             continue
         fi
 
         if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
+            diagnostic_report_json=
+            verify_compile_report "$basin_id" "$output" "$report" || :
             write_compile_stage "$basin_id" failed "$attempts" \
-                'compile artifact path already exists; retained for inspection'
+                'compile artifact path already exists; retained for inspection' \
+                "${diagnostic_report_json:-null}"
             continue
         fi
 
@@ -697,15 +746,451 @@ compile_campaign() {
             write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed'
             continue
         fi
-        if ! verify_compile_artifacts "$basin_id" "$output" "$report"; then
+        diagnostic_report_json=
+        if ! verify_compile_report "$basin_id" "$output" "$report"; then
             write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
             continue
         fi
-        write_compile_stage "$basin_id" succeeded "$attempts" ''
+        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
+            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
+            continue
+        fi
+        write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
     done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
 
     validate_workspace_state
     print_status
+}
+
+validate_acquisition_evidence() {
+    local candidate=$1
+    "$JQ" -e --arg campaign "$campaign" '
+      type == "object" and keys == ["basins","campaign","schema_version"] and
+      .schema_version == 1 and .campaign == $campaign and
+      (.basins | type == "array" and
+        all(type == "object" and keys == ["processing_basin_id","products"] and
+          (.processing_basin_id | test("^[0-9]{10}$")) and
+          (.products | type == "object" and keys == ["basins","streamnet"] and
+            all(.[]; type == "object" and keys == ["attempts","evidence","failure_reason","status"])))) and
+      ([.basins[].processing_basin_id] as $ids | $ids == ($ids | sort) and
+        ($ids | length) == ($ids | unique | length))
+    ' "$candidate" >/dev/null 2>&1 || hfx_die "acquisition evidence is malformed: $candidate"
+}
+
+validate_outcomes_evidence() {
+    local candidate=$1
+    "$JQ" -e --arg campaign "$campaign" '
+      type == "object" and
+      keys == ["attempted_basin_ids","campaign","excluded_basins","outcomes","schema_version"] and
+      .schema_version == 1 and .campaign == $campaign and
+      (.attempted_basin_ids | type == "array" and all(test("^[0-9]{10}$"))) and
+      (.excluded_basins | type == "array" and
+        all(type == "object" and keys == ["failure_reason","processing_basin_id"])) and
+      (.outcomes | type == "array" and
+        all(type == "object" and keys == ["attempts","failure_reason","processing_basin_id","status"])) and
+      (.attempted_basin_ids == (.attempted_basin_ids | sort | unique)) and
+      ([.excluded_basins[].processing_basin_id] == ([.excluded_basins[].processing_basin_id] | sort | unique)) and
+      ([.outcomes[].processing_basin_id] == ([.outcomes[].processing_basin_id] | sort | unique))
+    ' "$candidate" >/dev/null 2>&1 || hfx_die "outcomes evidence is malformed: $candidate"
+}
+
+validate_diagnostics_evidence() {
+    local candidate=$1
+    "$JQ" -e --arg campaign "$campaign" '
+      type == "object" and keys == ["basins","campaign","schema_version"] and
+      .schema_version == 1 and .campaign == $campaign and
+      (.basins | type == "array" and all(
+        type == "object" and
+        keys == ["diagnostics","processing_basin_id","report_path","unavailable_reason"] and
+        (.processing_basin_id | test("^[0-9]{10}$")) and
+        ((.diagnostics == null and .report_path == null and
+          (.unavailable_reason | type == "string" and length > 0)) or
+         ((.diagnostics | type == "object") and
+          (.report_path | type == "string") and .unavailable_reason == null)))) and
+      ([.basins[].processing_basin_id] == ([.basins[].processing_basin_id] | sort | unique))
+    ' "$candidate" >/dev/null 2>&1 || hfx_die "diagnostics evidence is malformed: $candidate"
+}
+
+generate_evidence() {
+    local evidence_dir=$campaign_dir/publication/evidence
+    local states=$campaign_dir/state/tmp/.evidence-states.$$
+    local basin_id
+    local current
+    local acquisition=$campaign_dir/state/tmp/.acquisition.json.$$
+    local outcomes=$campaign_dir/state/tmp/.outcomes.json.$$
+    local diagnostics=$campaign_dir/state/tmp/.diagnostics.json.$$
+
+    acquire_campaign_lock
+    validate_workspace_state
+    if [[ -e "$evidence_dir" || -L "$evidence_dir" ]]; then
+        [[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] ||
+            hfx_die "evidence path is not a safe directory: $evidence_dir"
+    else
+        "$MKDIR" "$evidence_dir" || hfx_die "could not create evidence directory: $evidence_dir"
+    fi
+    : >"$states"
+    while IFS= read -r basin_id; do
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        [[ $("$JQ" -r '.schema_version' "$current") == 3 ]] ||
+            hfx_die "legacy basin state requires compile rerun before evidence: $basin_id"
+        if "$JQ" -e '
+          (.stages.compile.status == "succeeded" and .stages.compile.diagnostic_report == null) or
+          (.stages.compile.failure_reason == "adapter validation failed" and
+            .stages.compile.diagnostic_report == null)
+        ' "$current" >/dev/null; then
+            hfx_die "diagnostic state is incomplete for $basin_id; rerun compile"
+        fi
+        "$JQ" -cS '.' "$current" >>"$states"
+    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+
+    "$JQ" -csS --arg campaign "$campaign" '
+      map(select(
+        ([.stages[].attempts] | any(. > 0)) or .stages.compile.status == "failed"
+      )) |
+      {
+        schema_version:1,
+        campaign:$campaign,
+        basins:map({
+          processing_basin_id,
+          products:{
+            basins:(.stages.acquire_basins | {status,attempts,failure_reason,evidence}),
+            streamnet:(.stages.acquire_streamnet | {status,attempts,failure_reason,evidence})
+          }
+        })
+      }
+    ' "$states" >"$acquisition"
+    "$JQ" -csS --arg campaign "$campaign" '
+      . as $all |
+      ($all | map(select([.stages[].attempts] | any(. > 0))) |
+        map(.processing_basin_id)) as $attempted |
+      ($all | map(select(
+        ([.stages[].attempts] | any(. > 0)) or .stages.compile.status == "failed"
+      ))) as $reportable |
+      {
+        schema_version:1,
+        campaign:$campaign,
+        attempted_basin_ids:$attempted,
+        excluded_basins:($all | map(select(.stages.compile.status == "failed") |
+          {processing_basin_id,failure_reason:.stages.compile.failure_reason})),
+        outcomes:($reportable | map({
+          processing_basin_id,
+          status:.stages.compile.status,
+          attempts:.stages.compile.attempts,
+          failure_reason:.stages.compile.failure_reason
+        }))
+      }
+    ' "$states" >"$outcomes"
+    "$JQ" -csS --arg campaign "$campaign" '
+      map(select(
+        ([.stages[].attempts] | any(. > 0)) or .stages.compile.status == "failed"
+      )) |
+      {
+        schema_version:1,
+        campaign:$campaign,
+        basins:map(
+          if .stages.compile.diagnostic_report != null then {
+            processing_basin_id,
+            diagnostics:.stages.compile.diagnostic_report.diagnostics,
+            report_path:.stages.compile.diagnostic_report.path,
+            unavailable_reason:null
+          } else {
+            processing_basin_id,
+            diagnostics:null,
+            report_path:null,
+            unavailable_reason:(.stages.compile.failure_reason // .stages.compile.status)
+          } end
+        )
+      }
+    ' "$states" >"$diagnostics"
+    validate_acquisition_evidence "$acquisition"
+    validate_outcomes_evidence "$outcomes"
+    validate_diagnostics_evidence "$diagnostics"
+    atomic_install "$acquisition" "$evidence_dir/acquisition.json" validate_acquisition_evidence
+    atomic_install "$outcomes" "$evidence_dir/outcomes.json" validate_outcomes_evidence
+    atomic_install "$diagnostics" "$evidence_dir/diagnostics.json" validate_diagnostics_evidence
+    "$RM" -- "$states"
+}
+
+physical_file() {
+    local path=$1
+    local parent=${path%/*}
+    local base=${path##*/}
+    local physical_parent
+    [[ "$path" == /* && "$base" != "$path" ]] || return 1
+    physical_parent=$(cd -P -- "$parent" && pwd -P) || return 1
+    printf '%s/%s\n' "$physical_parent" "$base"
+}
+
+validate_publication_json() {
+    local candidate=$1
+    "$JQ" -e --arg campaign "$campaign" '
+      .prefix as $prefix |
+      type == "object" and
+      keys == ["bucket","citation","endpoint","notice","objects","out","prefix","region","report","schema_version"] and
+      .schema_version == 1 and
+      .endpoint == "https://fsn1.your-objectstorage.com" and
+      .region == "fsn1" and
+      .bucket == "pourpoint-hfx" and
+      (.prefix | type == "string" and
+        test("^scratch/tdx-hydro-" + $campaign + "/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+      ([.out,.report,.notice,.citation] |
+        all(type == "string" and startswith("/"))) and
+      (.objects | type == "array" and length > 0 and
+        all(
+          type == "object" and keys == ["bytes","key","source"] and
+          (.bytes | type == "number" and . == floor and . > 0) and
+          (.key | type == "string" and startswith($prefix + "/")) and
+          (.source | type == "string" and startswith("/"))
+        )) and
+      ((.objects | map(.key)) as $keys |
+        $keys == ($keys | sort) and
+        ($keys | length) == ($keys | unique | length))
+    ' "$candidate" >/dev/null 2>&1 || hfx_die "publication state is malformed: $candidate"
+}
+
+validate_publication_campaign_state() {
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] ||
+        hfx_die "campaign path is not a safe directory: $campaign_dir"
+    for required_dir in publication state state/locks state/tmp; do
+        [[ -d "$campaign_dir/$required_dir" && ! -L "$campaign_dir/$required_dir" ]] ||
+            hfx_die "required campaign directory is missing or unsafe: $campaign_dir/$required_dir"
+    done
+    validate_campaign_json "$campaign_dir/state/campaign.json"
+    validate_inventory_file "$campaign_dir/state/inventory.json"
+    "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
+        hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
+}
+
+list_remote_inventory() {
+    local destination=$1
+    local page=$campaign_dir/state/tmp/.aws-page.$$
+    local entries=$campaign_dir/state/tmp/.aws-entries.$$
+    local tokens=$campaign_dir/state/tmp/.aws-tokens.$$
+    local continuation=
+    local next=
+    local truncated
+    local page_count=0
+    : >"$entries"
+    : >"$tokens"
+    while :; do
+        page_count=$((page_count + 1))
+        if [[ -z "$continuation" ]]; then
+            "$AWS" s3api list-objects-v2 --bucket pourpoint-hfx --prefix "$scratch_prefix/" \
+                --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate >"$page"
+        else
+            "$AWS" s3api list-objects-v2 --bucket pourpoint-hfx --prefix "$scratch_prefix/" \
+                --continuation-token "$continuation" \
+                --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate >"$page"
+        fi
+        "$JQ" -e '
+          type == "object" and (.IsTruncated | type == "boolean") and
+          ((.Contents // []) | type == "array" and all(
+            type == "object" and
+            (.Key | type == "string") and
+            (.Size | type == "number" and . == floor and . >= 0)
+          ))
+        ' "$page" >/dev/null 2>&1 || hfx_die 'remote listing returned malformed JSON'
+        "$JQ" -c '(.Contents // [])[] | {key:.Key,bytes:.Size}' "$page" >>"$entries"
+        truncated=$("$JQ" -r '.IsTruncated' "$page")
+        [[ "$truncated" == true ]] || break
+        ((page_count < HFX_TDX_MAX_LIST_PAGES)) ||
+            hfx_die 'remote listing exceeded 1000 pages'
+        next=$("$JQ" -r 'if (.NextContinuationToken | type) == "string" then .NextContinuationToken else "" end' "$page")
+        [[ -n "$next" && ! "$next" =~ [[:cntrl:]] ]] ||
+            hfx_die 'remote listing omitted a valid continuation token'
+        if "$GREP" -Fx -- "$next" "$tokens" >/dev/null 2>&1; then
+            hfx_die 'remote listing repeated a continuation token'
+        fi
+        printf '%s\n' "$next" >>"$tokens"
+        continuation=$next
+    done
+    "$JQ" -csS '
+      sort_by(.key) |
+      if (map(.key) | length) != (map(.key) | unique | length) then
+        error("duplicate remote key")
+      else . end
+    ' "$entries" >"$destination" 2>/dev/null ||
+        hfx_die 'remote listing contains duplicate keys'
+    "$RM" -- "$page" "$entries" "$tokens"
+}
+
+publish_campaign() {
+    local out_physical
+    local report_physical
+    local notice_physical
+    local citation_physical
+    local campaign_physical
+    local ancestor_physical
+    local campaign_marker
+    local campaign_marker_root
+    local private_path
+    local private_physical
+    local entry
+    local relative
+    local bytes
+    local inventory=$campaign_dir/state/tmp/.publication-inventory.$$
+    local objects=$campaign_dir/state/tmp/.publication-objects.$$
+    local candidate=$campaign_dir/state/tmp/.publication.json.$$
+    local contract=$campaign_dir/publication/current.json
+    local remote=$campaign_dir/state/tmp/.remote.json.$$
+    local missing=$campaign_dir/state/tmp/.missing.tsv.$$
+    local campaign_markers=$campaign_dir/state/tmp/.publication-campaign-markers.$$
+    local source
+    local key
+    local existing_canonical
+    local requested_canonical
+
+    acquire_campaign_lock
+    validate_publication_campaign_state
+    [[ "$scratch_prefix" =~ ^scratch/tdx-hydro-$campaign/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] ||
+        hfx_die 'scratch prefix must match the campaign-scoped scratch grammar'
+    for entry in "$publication_out" "$publication_report" "$publication_notice" "$publication_citation"; do
+        [[ "$entry" == /* && ! "$entry" =~ [[:cntrl:]] ]] ||
+            hfx_die "publication paths must be absolute and contain no control characters: $entry"
+    done
+    [[ -d "$publication_out" && ! -L "$publication_out" ]] ||
+        hfx_die "publication output is not a regular non-symlink directory: $publication_out"
+    [[ -f "$publication_report" && ! -L "$publication_report" && -s "$publication_report" ]] ||
+        hfx_die "publication report is not a nonempty regular non-symlink file: $publication_report"
+    [[ -f "$publication_notice" && ! -L "$publication_notice" && -s "$publication_notice" ]] ||
+        hfx_die "NOTICE is not a nonempty regular non-symlink file: $publication_notice"
+    [[ -f "$publication_citation" && ! -L "$publication_citation" && -s "$publication_citation" ]] ||
+        hfx_die "CITATION.txt is not a nonempty regular non-symlink file: $publication_citation"
+    out_physical=$(cd -P -- "$publication_out" && pwd -P) ||
+        hfx_die "could not resolve publication output: $publication_out"
+    report_physical=$(physical_file "$publication_report") ||
+        hfx_die "could not resolve publication report: $publication_report"
+    notice_physical=$(physical_file "$publication_notice") ||
+        hfx_die "could not resolve NOTICE: $publication_notice"
+    citation_physical=$(physical_file "$publication_citation") ||
+        hfx_die "could not resolve CITATION.txt: $publication_citation"
+    case $report_physical in
+        "$out_physical"|"$out_physical"/*) hfx_die 'publication report must be outside the dataset directory' ;;
+    esac
+    campaign_physical=$(cd -P -- "$campaign_dir" && pwd -P) ||
+        hfx_die "could not resolve current campaign directory: $campaign_dir"
+    if [[ -f "$out_physical/state/campaign.json" || -L "$out_physical/state/campaign.json" ]]; then
+        hfx_die 'publication output must not be a campaign directory'
+    fi
+    ancestor_physical=$out_physical
+    while [[ "$ancestor_physical" != / ]]; do
+        ancestor_physical=${ancestor_physical%/*}
+        [[ -n "$ancestor_physical" ]] || ancestor_physical=/
+        if [[ -f "$ancestor_physical/state/campaign.json" ||
+              -L "$ancestor_physical/state/campaign.json" ]]; then
+            [[ "$ancestor_physical" == "$campaign_physical" ]] ||
+                hfx_die "publication output must not be in another campaign directory: $ancestor_physical"
+            break
+        fi
+    done
+    "$FIND" "$out_physical" -mindepth 2 \
+        -name campaign.json -path '*/state/campaign.json' \
+        \( -type f -o -type l \) -print0 >"$campaign_markers" ||
+        hfx_die "could not inspect publication output for campaign directories: $out_physical"
+    while IFS= read -r -d '' campaign_marker; do
+        campaign_marker_root=${campaign_marker%/state/campaign.json}
+        [[ "$campaign_marker_root" == "$campaign_physical" ]] ||
+            hfx_die "publication output must not contain another campaign directory: $campaign_marker_root"
+    done <"$campaign_markers"
+    "$RM" -- "$campaign_markers"
+    case $campaign_physical in
+        "$out_physical"|"$out_physical"/*)
+            hfx_die 'publication output must not contain the private campaign directory'
+            ;;
+    esac
+    for private_path in basin-outputs downloads reports state publication assembly/scratch; do
+        private_physical=$(cd -P -- "$campaign_dir/$private_path" && pwd -P)
+        case $out_physical in
+            "$private_physical"|"$private_physical"/*)
+                hfx_die "publication output must not be in the private campaign subtree: $private_path"
+                ;;
+        esac
+        case $private_physical in
+            "$out_physical"|"$out_physical"/*)
+                hfx_die "publication output must not contain the private campaign subtree: $private_path"
+                ;;
+        esac
+    done
+    : >"$inventory"
+    while IFS= read -r -d '' entry; do
+        [[ ! -L "$entry" ]] || hfx_die "dataset contains a symlink: $entry"
+        if [[ -d "$entry" ]]; then
+            continue
+        fi
+        [[ -f "$entry" ]] || hfx_die "dataset contains a non-regular entry: $entry"
+        relative=${entry#"$out_physical/"}
+        [[ "$relative" != "$entry" && "$relative" != /* && ! "$relative" =~ [[:cntrl:]\\] ]] ||
+            hfx_die "dataset contains an unsafe relative path: $relative"
+        case /$relative/ in
+            */./*|*/../*|*//* ) hfx_die "dataset contains an unsafe path component: $relative" ;;
+        esac
+        case $relative in
+            NOTICE|CITATION.txt|build-report.json) hfx_die "dataset key collides with reserved root key: $relative" ;;
+        esac
+        bytes=$("$WC" -c <"$entry" | "$TR" -d '[:space:]')
+        [[ "$bytes" =~ ^[0-9]+$ && "$bytes" != 0 ]] ||
+            hfx_die "dataset files must be nonempty regular files: $entry"
+        printf '%s\t%s\t%s\n' "$scratch_prefix/$relative" "$bytes" "$entry" >>"$inventory"
+    done < <("$FIND" "$out_physical" -mindepth 1 -print0)
+    [[ -s "$inventory" ]] || hfx_die 'publication dataset contains no files'
+    printf '%s\t%s\t%s\n' "$scratch_prefix/CITATION.txt" "$("$WC" -c <"$citation_physical" | "$TR" -d '[:space:]')" "$citation_physical" >>"$inventory"
+    printf '%s\t%s\t%s\n' "$scratch_prefix/NOTICE" "$("$WC" -c <"$notice_physical" | "$TR" -d '[:space:]')" "$notice_physical" >>"$inventory"
+    printf '%s\t%s\t%s\n' "$scratch_prefix/build-report.json" "$("$WC" -c <"$report_physical" | "$TR" -d '[:space:]')" "$report_physical" >>"$inventory"
+    LC_ALL=C "$SORT" -o "$inventory" "$inventory"
+    "$JQ" -Rn '[inputs | split("\t") | {key:.[0],bytes:(.[1]|tonumber),source:.[2]}]' \
+        <"$inventory" >"$objects"
+    "$JQ" -cnS \
+        --arg out "$out_physical" --arg report "$report_physical" \
+        --arg notice "$notice_physical" --arg citation "$citation_physical" \
+        --arg prefix "$scratch_prefix" --slurpfile objects "$objects" '{
+          schema_version:1,
+          endpoint:"https://fsn1.your-objectstorage.com",
+          region:"fsn1",
+          bucket:"pourpoint-hfx",
+          prefix:$prefix,
+          out:$out,
+          report:$report,
+          notice:$notice,
+          citation:$citation,
+          objects:$objects[0]
+        }' >"$candidate"
+    validate_publication_json "$candidate"
+    if [[ -e "$contract" || -L "$contract" ]]; then
+        [[ -f "$contract" && ! -L "$contract" ]] ||
+            hfx_die "publication contract is not a regular file: $contract"
+        validate_publication_json "$contract"
+        existing_canonical=$("$JQ" -cS '.' "$contract")
+        requested_canonical=$("$JQ" -cS '.' "$candidate")
+        [[ "$existing_canonical" == "$requested_canonical" ]] ||
+            hfx_die 'publication parameters or local inventory changed; use a new campaign'
+        "$RM" -- "$candidate"
+    else
+        atomic_install "$candidate" "$contract" validate_publication_json
+    fi
+    AWS=$(resolve_command HFX_TDX_AWS aws)
+    list_remote_inventory "$remote"
+    "$JQ" -e --slurpfile expected "$contract" '
+      . as $remote |
+      ($expected[0].objects | map({key:.key,value:.bytes}) | from_entries) as $sizes |
+      all($remote[]; . as $item |
+        ($sizes | has($item.key)) and $sizes[$item.key] == $item.bytes)
+    ' "$remote" >/dev/null || hfx_die 'remote inventory contains an unexpected key or wrong size'
+    "$JQ" -r --slurpfile remote "$remote" '
+      ($remote[0] | map(.key)) as $present |
+      .objects[] as $object |
+      select(($present | index($object.key)) == null) |
+      [$object.source,$object.key] | @tsv
+    ' "$contract" >"$missing"
+    while IFS=$'\t' read -r source key; do
+        [[ -n "$source" && -n "$key" ]] || continue
+        "$AWS" s3 cp "$source" "s3://pourpoint-hfx/$key" \
+            --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors
+    done <"$missing"
+    list_remote_inventory "$remote"
+    "$JQ" -e --slurpfile remote "$remote" '
+      (.objects | map({key,bytes})) == $remote[0]
+    ' "$contract" >/dev/null || hfx_die 'final remote inventory does not exactly match publication contract'
+    "$RM" -- "$inventory" "$objects" "$remote" "$missing"
 }
 
 evidence_bytes=
@@ -903,7 +1388,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile) ;;
+    init|status|recover|acquire|compile|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -923,11 +1408,21 @@ max_parallel=
 max_parallel_seen=0
 fabric_version=
 fabric_version_seen=0
+publication_out=
+publication_out_seen=0
+publication_report=
+publication_report_seen=0
+publication_notice=
+publication_notice_seen=0
+publication_citation=
+publication_citation_seen=0
+scratch_prefix=
+scratch_prefix_seen=0
 
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version)
+        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
             shift
             (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
             value=$1
@@ -957,6 +1452,36 @@ while (($# > 0)); do
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
             fabric_version=$value
+            ;;
+        --out)
+            [[ "$subcommand" == publish ]] || usage_error 'option --out is valid only for publish'
+            ((publication_out_seen == 0)) || usage_error 'option --out may not be repeated'
+            publication_out_seen=1
+            publication_out=$value
+            ;;
+        --report)
+            [[ "$subcommand" == publish ]] || usage_error 'option --report is valid only for publish'
+            ((publication_report_seen == 0)) || usage_error 'option --report may not be repeated'
+            publication_report_seen=1
+            publication_report=$value
+            ;;
+        --notice)
+            [[ "$subcommand" == publish ]] || usage_error 'option --notice is valid only for publish'
+            ((publication_notice_seen == 0)) || usage_error 'option --notice may not be repeated'
+            publication_notice_seen=1
+            publication_notice=$value
+            ;;
+        --citation)
+            [[ "$subcommand" == publish ]] || usage_error 'option --citation is valid only for publish'
+            ((publication_citation_seen == 0)) || usage_error 'option --citation may not be repeated'
+            publication_citation_seen=1
+            publication_citation=$value
+            ;;
+        --scratch-prefix)
+            [[ "$subcommand" == publish ]] || usage_error 'option --scratch-prefix is valid only for publish'
+            ((scratch_prefix_seen == 0)) || usage_error 'option --scratch-prefix may not be repeated'
+            scratch_prefix_seen=1
+            scratch_prefix=$value
             ;;
         *)
             [[ "$subcommand" == init ]] || usage_error "sizing option $option is valid only for init"
@@ -1028,7 +1553,7 @@ elif [[ "$subcommand" == acquire ]]; then
     OD=$(resolve_command HFX_TDX_OD od)
     OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
     acquire_campaign
-else
+elif [[ "$subcommand" == compile ]]; then
     ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
     [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
         usage_error 'option --fabric-version requires a non-empty non-option value'
@@ -1039,4 +1564,17 @@ else
     ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
     HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
     compile_campaign
+elif [[ "$subcommand" == evidence ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    generate_evidence
+else
+    ((publication_out_seen == 1)) || usage_error 'option --out is required'
+    ((publication_report_seen == 1)) || usage_error 'option --report is required'
+    ((publication_notice_seen == 1)) || usage_error 'option --notice is required'
+    ((publication_citation_seen == 1)) || usage_error 'option --citation is required'
+    ((scratch_prefix_seen == 1)) || usage_error 'option --scratch-prefix is required'
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    SORT=$(resolve_command HFX_TDX_SORT sort)
+    GREP=$(resolve_command HFX_TDX_GREP grep)
+    publish_campaign
 fi

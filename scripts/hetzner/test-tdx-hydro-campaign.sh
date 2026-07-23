@@ -148,6 +148,8 @@ run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
 assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 pass 'sole help arguments succeed'
 
 argument_root=$test_tmp/workspaces/arguments
@@ -174,6 +176,14 @@ expect_failure 'control fabric version' compile --campaign compile --workspace-r
     --fabric-version $'bad\nversion'
 expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+for publication_option in --out --report --notice --citation --scratch-prefix; do
+    expect_failure "foreign $publication_option" status --campaign foreign --workspace-root "$argument_root" \
+        "$publication_option" value
+    expect_failure "repeated $publication_option" publish --campaign repeated --workspace-root "$argument_root" \
+        "$publication_option" value "$publication_option" value
+    expect_failure "missing value $publication_option" publish --campaign missing --workspace-root "$argument_root" \
+        "$publication_option"
+done
 expect_failure 'zero sizing' init --campaign zero --workspace-root "$argument_root" \
     --available-memory-bytes 0 --available-disk-bytes 4 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
@@ -273,12 +283,12 @@ diff -u "$test_tmp/expected-inventory.json" "$test_tmp/actual-inventory.json"
     die 'basin state count differs'
 jq -e -s '
     length == 62 and all(
-      .schema_version == 2 and
+      .schema_version == 3 and
       (.processing_basin_id | test("^[0-9]{10}$")) and
       .stages == {
         acquire_basins:{status:"pending",attempts:0,failure_reason:null,evidence:null},
         acquire_streamnet:{status:"pending",attempts:0,failure_reason:null,evidence:null},
-        compile:{status:"pending",attempts:0,failure_reason:null}
+        compile:{status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
       }
     )
 ' "$campaign_dir"/state/basins/*/current.json >/dev/null || die 'initial basin states differ'
@@ -318,7 +328,7 @@ pass 'memory, disk, and arithmetic preflight refuse before writes'
 
 selected_id=$(jq -r 'keys[0]' "$inventory")
 selected_state=$campaign_dir/state/basins/$selected_id/current.json
-jq '.stages.compile={status:"succeeded",attempts:3,failure_reason:null}' "$selected_state" >"$selected_state.tmp"
+jq '.stages.compile={status:"succeeded",attempts:3,failure_reason:null,diagnostic_report:null}' "$selected_state" >"$selected_state.tmp"
 mv "$selected_state.tmp" "$selected_state"
 cp "$selected_state" "$test_tmp/preserved-state.json"
 cp "$campaign_dir/state/campaign.json" "$test_tmp/preserved-campaign.json"
@@ -460,6 +470,8 @@ jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
     >"$compile_state_root/tdx-hydro-equal/state/compile.json"
 expect_failure 'malformed compile contract' status --campaign equal --workspace-root "$compile_state_root"
 
+jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnostic_report","failure_reason","status"])' "$selected_state" >/dev/null ||
+    die 'shared status fixture lost the v3 compile diagnostic member'
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
 assert_contains "$case_stdout" 'inventory_count=62'
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
@@ -668,6 +680,13 @@ case $command_name in
         esac
         [ "${out##*/}" = "$basin_id" ] || exit 85
         [ "${report##*/}" = "$basin_id-build-report.json" ] || exit 85
+        if [ "${HFX_TEST_REQUIRE_CLEARED_DIAGNOSTIC-}" = 1 ]; then
+            state=${out%/basin-outputs/*}/state/basins/$basin_id/current.json
+            "${HFX_TEST_REAL_JQ:?}" -e '
+              .stages.compile.status == "running" and
+              .stages.compile.diagnostic_report == null
+            ' "$state" >/dev/null || exit 93
+        fi
         if [ "${HFX_TEST_FAIL_BUILD_ID-}" = "$basin_id" ]; then
             exit 41
         fi
@@ -836,7 +855,7 @@ acquire_dir=$acquire_root/tdx-hydro-acquire
     die 'complete acquisition did not invoke 124 transfers'
 jq -e -s '
   length == 62 and all(
-    .schema_version == 2 and
+    .schema_version == 3 and
     .stages.acquire_basins.status == "succeeded" and
     .stages.acquire_streamnet.status == "succeeded" and
     .stages.acquire_basins.attempts == 1 and
@@ -999,7 +1018,11 @@ jq -e -s '
   length == 62 and all(
     .stages.compile.status == "succeeded" and
     .stages.compile.attempts == 1 and
-    .stages.compile.failure_reason == null
+    .stages.compile.failure_reason == null and
+    .stages.compile.diagnostic_report == {
+      path:("reports/" + .processing_basin_id + "-build-report.json"),
+      diagnostics:{}
+    }
   )
 ' "$compile_dir"/state/basins/*/current.json >/dev/null || die 'compile success states differ'
 [[ $(find "$compile_dir/basin-outputs" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') == 62 ]] ||
@@ -1092,7 +1115,8 @@ compile_failure_state=$compile_failure_dir/state/basins/$compile_failure_id/curr
 jq -e '
   .stages.compile.status == "failed" and
   .stages.compile.attempts == 1 and
-  .stages.compile.failure_reason == "adapter build failed"
+  .stages.compile.failure_reason == "adapter build failed" and
+  .stages.compile.diagnostic_report == null
 ' "$compile_failure_state" >/dev/null || die 'isolated adapter build failure state differs'
 [[ ! -e "$compile_failure_dir/basin-outputs/$compile_failure_id" ]] ||
     die 'failed adapter build left a final output'
@@ -1132,7 +1156,11 @@ compile_validation_dir=$compile_validation_root/tdx-hydro-acquire
 compile_validation_state=$compile_validation_dir/state/basins/$compile_validation_id/current.json
 jq -e '
   .stages.compile.status == "failed" and .stages.compile.attempts == 1 and
-  .stages.compile.failure_reason == "adapter validation failed"
+  .stages.compile.failure_reason == "adapter validation failed" and
+  .stages.compile.diagnostic_report == {
+    path:("reports/" + .processing_basin_id + "-build-report.json"),
+    diagnostics:{}
+  }
 ' "$compile_validation_state" >/dev/null || die 'adapter validation failure state differs'
 [[ -d "$compile_validation_dir/basin-outputs/$compile_validation_id" ]] ||
     die 'validation failure did not retain output'
@@ -1147,7 +1175,11 @@ run_runner compile --campaign acquire --workspace-root "$compile_validation_root
     --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
 jq -e '
   .stages.compile.status == "failed" and .stages.compile.attempts == 1 and
-  .stages.compile.failure_reason == "compile artifact path already exists; retained for inspection"
+  .stages.compile.failure_reason == "compile artifact path already exists; retained for inspection" and
+  .stages.compile.diagnostic_report == {
+    path:("reports/" + .processing_basin_id + "-build-report.json"),
+    diagnostics:{}
+  }
 ' "$compile_validation_state" >/dev/null || die 'retained validation failure state differs on rerun'
 if grep -F "$compile_validation_id" "$HFX_TEST_ADAPTER_LOG" >/dev/null; then
     die 'retained validation failure invoked the adapter on rerun'
@@ -1156,6 +1188,19 @@ fi
     die 'validation-failure rerun rebuilt a basin'
 [[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") == 61 ]] ||
     die 'validation-failure rerun did not validate prior successes'
+rm -r "$compile_validation_dir/basin-outputs/$compile_validation_id"
+rm "$compile_validation_dir/reports/$compile_validation_id-build-report.json"
+: >"$HFX_TEST_ADAPTER_LOG"
+HFX_TEST_REQUIRE_CLEARED_DIAGNOSTIC=1 \
+    run_runner compile --campaign acquire --workspace-root "$compile_validation_root" \
+        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+jq -e '
+  .stages.compile.status == "succeeded" and .stages.compile.attempts == 2 and
+  .stages.compile.diagnostic_report == {
+    path:("reports/" + .processing_basin_id + "-build-report.json"),
+    diagnostics:{}
+  }
+' "$compile_validation_state" >/dev/null || die 'validation failure retry did not persist fresh diagnostics'
 pass 'adapter validation failure retains artifacts and refuses overwrite'
 
 migration_root=$test_tmp/workspaces/migration
@@ -1189,14 +1234,14 @@ rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
 run_runner acquire --campaign acquire --workspace-root "$migration_root" --max-parallel 3 >"$case_stdout"
 jq -e '
-  .schema_version == 2 and
+  .schema_version == 3 and
   .stages.acquire_basins.status == "succeeded" and
   .stages.acquire_streamnet.status == "succeeded" and
   .stages.acquire_basins.attempts == 1 and
   .stages.acquire_streamnet.attempts == 1 and
   (.stages.acquire_basins.evidence != null) and
   (.stages.acquire_streamnet.evidence != null) and
-  .stages.compile == {status:"pending",attempts:0,failure_reason:null}
+  .stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
 ' "$migration_state" >/dev/null || die 'v1 acquisition state did not migrate through acquire'
 [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'v1 migration fetched verified final files'
 pass 'v1 basin state migrates through acquire without transfer'
@@ -1237,6 +1282,769 @@ fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-after"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-after"
 pass 'no cloud, network, SSH, or publication command ran'
+
+cp "$HFX_TEST_ADAPTER_LOG" "$test_tmp/adapter-before-new-paths"
+cp "$HFX_TEST_HFX_LOG" "$test_tmp/hfx-before-new-paths"
+evidence_root=$test_tmp/workspaces/evidence
+mkdir "$evidence_root"
+set -- $(init_args evidence "$evidence_root")
+run_runner "$@" >"$case_stdout"
+evidence_dir=$evidence_root/tdx-hydro-evidence
+jq -n '{
+  schema_version:3,processing_basin_id:"1020000010",
+  stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:21,sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"basins-1020000010"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:22,sha256:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"streamnet-1020000010"}},
+    compile:{status:"succeeded",attempts:1,failure_reason:null,diagnostic_report:{path:"reports/1020000010-build-report.json",diagnostics:{fixture_metric:101}}}
+  }
+}' >"$evidence_dir/state/basins/1020000010/current.json"
+jq -n '{
+  schema_version:3,processing_basin_id:"1020011530",
+  stages:{
+    acquire_basins:{status:"failed",attempts:2,failure_reason:"complete GET failed",evidence:null},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:23,sha256:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"streamnet-1020011530"}},
+    compile:{status:"failed",attempts:0,failure_reason:"acquisition prerequisites are not both succeeded",diagnostic_report:null}
+  }
+}' >"$evidence_dir/state/basins/1020011530/current.json"
+jq -n '{
+  schema_version:3,processing_basin_id:"1020018110",
+  stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:24,sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"basins-1020018110"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:25,sha256:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"streamnet-1020018110"}},
+    compile:{status:"failed",attempts:1,failure_reason:"adapter validation failed",diagnostic_report:{path:"reports/1020018110-build-report.json",diagnostics:{fixture_metric:303}}}
+  }
+}' >"$evidence_dir/state/basins/1020018110/current.json"
+jq -n '{
+  schema_version:3,processing_basin_id:"1020021940",
+  stages:{
+    acquire_basins:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+    acquire_streamnet:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+    compile:{status:"failed",attempts:0,failure_reason:"acquisition prerequisites are not both succeeded",diagnostic_report:null}
+  }
+}' >"$evidence_dir/state/basins/1020021940/current.json"
+run_runner evidence --campaign evidence --workspace-root "$evidence_root" >"$case_stdout"
+printf '%s\n' '{"basins":[{"processing_basin_id":"1020000010","products":{"basins":{"attempts":1,"evidence":{"bytes":21,"layer_name":"basins-1020000010","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sqlite_identity":"53514c69746520666f726d6174203300"},"failure_reason":null,"status":"succeeded"},"streamnet":{"attempts":1,"evidence":{"bytes":22,"layer_name":"streamnet-1020000010","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sqlite_identity":"53514c69746520666f726d6174203300"},"failure_reason":null,"status":"succeeded"}}},{"processing_basin_id":"1020011530","products":{"basins":{"attempts":2,"evidence":null,"failure_reason":"complete GET failed","status":"failed"},"streamnet":{"attempts":1,"evidence":{"bytes":23,"layer_name":"streamnet-1020011530","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sqlite_identity":"53514c69746520666f726d6174203300"},"failure_reason":null,"status":"succeeded"}}},{"processing_basin_id":"1020018110","products":{"basins":{"attempts":1,"evidence":{"bytes":24,"layer_name":"basins-1020018110","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","sqlite_identity":"53514c69746520666f726d6174203300"},"failure_reason":null,"status":"succeeded"},"streamnet":{"attempts":1,"evidence":{"bytes":25,"layer_name":"streamnet-1020018110","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","sqlite_identity":"53514c69746520666f726d6174203300"},"failure_reason":null,"status":"succeeded"}}},{"processing_basin_id":"1020021940","products":{"basins":{"attempts":0,"evidence":null,"failure_reason":null,"status":"pending"},"streamnet":{"attempts":0,"evidence":null,"failure_reason":null,"status":"pending"}}}],"campaign":"evidence","schema_version":1}' >"$test_tmp/expected-acquisition.json"
+printf '%s\n' '{"attempted_basin_ids":["1020000010","1020011530","1020018110"],"campaign":"evidence","excluded_basins":[{"failure_reason":"acquisition prerequisites are not both succeeded","processing_basin_id":"1020011530"},{"failure_reason":"adapter validation failed","processing_basin_id":"1020018110"},{"failure_reason":"acquisition prerequisites are not both succeeded","processing_basin_id":"1020021940"}],"outcomes":[{"attempts":1,"failure_reason":null,"processing_basin_id":"1020000010","status":"succeeded"},{"attempts":0,"failure_reason":"acquisition prerequisites are not both succeeded","processing_basin_id":"1020011530","status":"failed"},{"attempts":1,"failure_reason":"adapter validation failed","processing_basin_id":"1020018110","status":"failed"},{"attempts":0,"failure_reason":"acquisition prerequisites are not both succeeded","processing_basin_id":"1020021940","status":"failed"}],"schema_version":1}' >"$test_tmp/expected-outcomes.json"
+printf '%s\n' '{"basins":[{"diagnostics":{"fixture_metric":101},"processing_basin_id":"1020000010","report_path":"reports/1020000010-build-report.json","unavailable_reason":null},{"diagnostics":null,"processing_basin_id":"1020011530","report_path":null,"unavailable_reason":"acquisition prerequisites are not both succeeded"},{"diagnostics":{"fixture_metric":303},"processing_basin_id":"1020018110","report_path":"reports/1020018110-build-report.json","unavailable_reason":null},{"diagnostics":null,"processing_basin_id":"1020021940","report_path":null,"unavailable_reason":"acquisition prerequisites are not both succeeded"}],"campaign":"evidence","schema_version":1}' >"$test_tmp/expected-diagnostics.json"
+diff -u "$test_tmp/expected-acquisition.json" "$evidence_dir/publication/evidence/acquisition.json"
+diff -u "$test_tmp/expected-outcomes.json" "$evidence_dir/publication/evidence/outcomes.json"
+diff -u "$test_tmp/expected-diagnostics.json" "$evidence_dir/publication/evidence/diagnostics.json"
+cp -R "$evidence_dir/publication/evidence" "$test_tmp/evidence-first"
+run_runner evidence --campaign evidence --workspace-root "$evidence_root" >"$case_stdout"
+diff -ru "$test_tmp/evidence-first" "$evidence_dir/publication/evidence"
+[[ $(jq -r '.attempted_basin_ids[]' "$evidence_dir/publication/evidence/outcomes.json" | tr '\n' ' ') == '1020000010 1020011530 1020018110 ' ]] ||
+    die 'attempted basin ID set differs'
+[[ $(jq -r '.excluded_basins[] | [.processing_basin_id,.failure_reason] | @tsv' "$evidence_dir/publication/evidence/outcomes.json" | tr '\n' '|') == $'1020011530\tacquisition prerequisites are not both succeeded|1020018110\tadapter validation failed|1020021940\tacquisition prerequisites are not both succeeded|' ]] ||
+    die 'excluded basin set or reasons differ'
+for reportable_id in 1020000010 1020011530 1020018110 1020021940; do
+    jq -e --arg id "$reportable_id" '.basins | any(.processing_basin_id == $id)' "$evidence_dir/publication/evidence/acquisition.json" >/dev/null ||
+        die "acquisition evidence omits $reportable_id"
+    jq -e --arg id "$reportable_id" '.outcomes | any(.processing_basin_id == $id)' "$evidence_dir/publication/evidence/outcomes.json" >/dev/null ||
+        die "outcomes evidence omits $reportable_id"
+    jq -e --arg id "$reportable_id" '.basins | any(.processing_basin_id == $id)' "$evidence_dir/publication/evidence/diagnostics.json" >/dev/null ||
+        die "diagnostic evidence omits $reportable_id"
+done
+pass 'deterministic acquisition, outcome, and diagnostic evidence is complete and byte-stable'
+
+mkdir "$evidence_dir/downloads/conflict" "$evidence_dir/reports/conflict" "$evidence_dir/basin-outputs/conflict"
+printf '%s\n' download >"$evidence_dir/downloads/conflict/value"
+printf '%s\n' report >"$evidence_dir/reports/conflict/value"
+printf '%s\n' output >"$evidence_dir/basin-outputs/conflict/value"
+cp -R "$evidence_dir/publication/evidence" "$test_tmp/evidence-before-artifact-change"
+printf '%s\n' changed >"$evidence_dir/downloads/conflict/value"
+printf '%s\n' changed >"$evidence_dir/reports/conflict/value"
+printf '%s\n' changed >"$evidence_dir/basin-outputs/conflict/value"
+run_runner evidence --campaign evidence --workspace-root "$evidence_root" >"$case_stdout"
+diff -ru "$test_tmp/evidence-before-artifact-change" "$evidence_dir/publication/evidence"
+cp -R "$evidence_dir/publication/evidence" "$test_tmp/evidence-before-corruption"
+jq '.stages.compile.diagnostic_report.path="reports/wrong.json"' \
+    "$evidence_dir/state/basins/1020000010/current.json" >"$evidence_dir/state/basins/1020000010/current.json.tmp"
+mv "$evidence_dir/state/basins/1020000010/current.json.tmp" \
+    "$evidence_dir/state/basins/1020000010/current.json"
+expect_failure 'malformed persisted evidence state' evidence --campaign evidence --workspace-root "$evidence_root"
+diff -ru "$test_tmp/evidence-before-corruption" "$evidence_dir/publication/evidence"
+pass 'evidence refuses malformed persisted state and never consults files outside state'
+
+strict_bin=$test_tmp/strict-bin
+mkdir "$strict_bin"
+sed >"$strict_bin/aws" <<'STRICT_AWS'
+#!/bin/bash
+set -eu
+log=${HFX_TEST_AWS_LOG:?}
+remote=${HFX_TEST_AWS_REMOTE:?}
+control=${HFX_TEST_AWS_CONTROL:?}
+prefix=${HFX_TEST_AWS_PREFIX:?}
+fixture=${HFX_TEST_AWS_FIXTURE:?}
+mode=${HFX_TEST_AWS_MODE-normal}
+printf '%s' "$0" >>"$log"
+for arg in "$@"; do
+    printf ' %s' "$arg" >>"$log"
+done
+printf '\n' >>"$log"
+if [ "${1-}" = s3api ] && [ "${2-}" = list-objects-v2 ]; then
+    token=
+    if [ "$#" -eq 13 ]; then
+        [ "$3" = --bucket ] && [ "$4" = pourpoint-hfx ] &&
+            [ "$5" = --prefix ] && [ "$6" = "$prefix/" ] &&
+            [ "$7" = --endpoint-url ] && [ "$8" = https://fsn1.your-objectstorage.com ] &&
+            [ "$9" = --region ] && [ "${10}" = fsn1 ] &&
+            [ "${11}" = --output ] && [ "${12}" = json ] && [ "${13}" = --no-paginate ] || exit 101
+    elif [ "$#" -eq 15 ]; then
+        [ "$3" = --bucket ] && [ "$4" = pourpoint-hfx ] &&
+            [ "$5" = --prefix ] && [ "$6" = "$prefix/" ] &&
+            [ "$7" = --continuation-token ] &&
+            [ "$9" = --endpoint-url ] && [ "${10}" = https://fsn1.your-objectstorage.com ] &&
+            [ "${11}" = --region ] && [ "${12}" = fsn1 ] &&
+            [ "${13}" = --output ] && [ "${14}" = json ] && [ "${15}" = --no-paginate ] || exit 102
+        token=$8
+    else
+        exit 103
+    fi
+    count=0
+    [ ! -f "$control/list-count" ] || count=$(<"$control/list-count")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$control/list-count"
+    if [ "$mode" = paginated ]; then
+        if [ -z "$token" ]; then
+            printf '%s\n' '{"Contents":[{"Key":"scratch/tdx-hydro-publish/fixture/CITATION.txt","Size":9},{"Key":"scratch/tdx-hydro-publish/fixture/NOTICE","Size":7},{"Key":"scratch/tdx-hydro-publish/fixture/aux/snap_stems.parquet","Size":5}],"IsTruncated":true,"KeyCount":3,"NextContinuationToken":"fixture-page-2"}'
+        elif [ "$token" = fixture-page-2 ]; then
+            printf '%s\n' '{"Contents":[{"Key":"scratch/tdx-hydro-publish/fixture/build-report.json","Size":7},{"Key":"scratch/tdx-hydro-publish/fixture/catchments.parquet","Size":11},{"Key":"scratch/tdx-hydro-publish/fixture/graph.parquet","Size":6},{"Key":"scratch/tdx-hydro-publish/fixture/manifest.json","Size":3}],"IsTruncated":false,"KeyCount":4}'
+        else
+            exit 104
+        fi
+        exit 0
+    fi
+    if [ "$mode" = extra ] && [ "$count" -eq 1 ]; then
+        "${HFX_TEST_REAL_JQ:?}" -cn --arg key "$prefix/unexpected" \
+            '{Contents:[{Key:$key,Size:1}],IsTruncated:false,KeyCount:1}'
+        exit 0
+    fi
+    entries=$control/entries.$$
+    : >"$entries"
+    if [ -d "$remote/$prefix" ]; then
+        find "$remote/$prefix" -type f | LC_ALL=C sort | while IFS= read -r file; do
+            key=${file#"$remote/"}
+            bytes=$(wc -c <"$file" | tr -d '[:space:]')
+            "${HFX_TEST_REAL_JQ:?}" -cn --arg key "$key" --argjson bytes "$bytes" \
+                '{Key:$key,Size:$bytes}' >>"$entries"
+        done
+    fi
+    if [ ! -s "$entries" ]; then
+        rm "$entries"
+        printf '%s\n' '{"IsTruncated":false,"KeyCount":0}'
+        exit 0
+    fi
+    "${HFX_TEST_REAL_JQ:?}" -cs '{Contents:sort_by(.Key),IsTruncated:false,KeyCount:length}' "$entries" >"$entries.json"
+    rm "$entries"
+    if { [ "$mode" = wrong-initial ] && [ "$count" -eq 1 ]; } ||
+       { [ "$mode" = post-wrong ] && [ "$count" -eq 2 ]; }; then
+        "${HFX_TEST_REAL_JQ:?}" '.Contents[0].Size += 1' "$entries.json"
+    else
+        cat "$entries.json"
+    fi
+    rm "$entries.json"
+    exit 0
+fi
+if [ "${1-}" = s3 ] && [ "${2-}" = cp ]; then
+    [ "$#" -eq 9 ] && [ "$5" = --endpoint-url ] &&
+        [ "$6" = https://fsn1.your-objectstorage.com ] &&
+        [ "$7" = --region ] && [ "$8" = fsn1 ] &&
+        [ "$9" = --only-show-errors ] || exit 105
+    source=$3
+    uri=$4
+    key=${uri#s3://pourpoint-hfx/}
+    [ "$uri" = "s3://pourpoint-hfx/$key" ] || exit 106
+    case ${key#"$prefix/"} in
+        CITATION.txt) expected=$fixture/CITATION.txt ;;
+        NOTICE) expected=$fixture/NOTICE ;;
+        aux/snap_stems.parquet) expected=$fixture/assembled/aux/snap_stems.parquet ;;
+        build-report.json) expected=$fixture/assembled-report.json ;;
+        catchments.parquet) expected=$fixture/assembled/catchments.parquet ;;
+        graph.parquet) expected=$fixture/assembled/graph.parquet ;;
+        manifest.json) expected=$fixture/assembled/manifest.json ;;
+        *) exit 107 ;;
+    esac
+    [ "$source" = "$expected" ] || exit 108
+    if [ "${HFX_TEST_AWS_FAIL_KEY-}" = "${key#"$prefix/"}" ] && [ ! -e "$control/failed-once" ]; then
+        : >"$control/failed-once"
+        exit 109
+    fi
+    mkdir -p "${remote:?}/$(dirname "$key")"
+    cp "$source" "$remote/$key"
+    exit 0
+fi
+exit 110
+STRICT_AWS
+chmod +x "$strict_bin/aws"
+aws_log=$test_tmp/aws-strict.log
+: >"$aws_log"
+
+recording_bin=$test_tmp/recording-bin
+mkdir "$recording_bin"
+sed >"$recording_bin/aws" <<'RECORDING_AWS'
+#!/bin/bash
+set -eu
+log=${HFX_TEST_AWS_LOG:?}
+remote=${HFX_TEST_AWS_REMOTE:?}
+printf '%s' "$0" >>"$log"
+for arg in "$@"; do
+    printf ' %s' "$arg" >>"$log"
+done
+printf '\n' >>"$log"
+if [ "${1-}" = s3api ] && [ "${2-}" = list-objects-v2 ]; then
+    prefix=
+    previous=
+    for arg in "$@"; do
+        if [ "$previous" = --prefix ]; then
+            prefix=$arg
+            break
+        fi
+        previous=$arg
+    done
+    entries=$remote/entries.$$
+    : >"$entries"
+    if [ -d "$remote/objects/$prefix" ]; then
+        find "$remote/objects/$prefix" -type f | LC_ALL=C sort | while IFS= read -r file; do
+            key=${file#"$remote/objects/"}
+            bytes=$(wc -c <"$file" | tr -d '[:space:]')
+            "${HFX_TEST_REAL_JQ:?}" -cn --arg key "$key" --argjson bytes "$bytes" \
+                '{Key:$key,Size:$bytes}' >>"$entries"
+        done
+    fi
+    if [ -s "$entries" ]; then
+        "${HFX_TEST_REAL_JQ:?}" -cs \
+            '{Contents:sort_by(.Key),IsTruncated:false,KeyCount:length}' "$entries"
+    else
+        printf '%s\n' '{"IsTruncated":false,"KeyCount":0}'
+    fi
+    rm "$entries"
+    exit 0
+fi
+if [ "${1-}" = s3 ] && [ "${2-}" = cp ]; then
+    source=$3
+    key=${4#s3://pourpoint-hfx/}
+    destination=$remote/objects/$key
+    mkdir -p "${destination%/*}"
+    cp "$source" "$destination"
+    exit 0
+fi
+exit 111
+RECORDING_AWS
+chmod +x "$recording_bin/aws"
+
+publish_root=$test_tmp/workspaces/publish
+mkdir "$publish_root"
+set -- $(init_args publish "$publish_root")
+run_runner "$@" >"$case_stdout"
+publish_dir=$publish_root/tdx-hydro-publish
+publish_fixture=$test_tmp/publication-fixture
+mkdir "$publish_fixture" "$publish_fixture/assembled" "$publish_fixture/assembled/aux"
+printf '{}\n' >"$publish_fixture/assembled/manifest.json"
+printf 'catchments\n' >"$publish_fixture/assembled/catchments.parquet"
+printf 'graph\n' >"$publish_fixture/assembled/graph.parquet"
+printf 'snap\n' >"$publish_fixture/assembled/aux/snap_stems.parquet"
+printf 'report\n' >"$publish_fixture/assembled-report.json"
+printf 'notice\n' >"$publish_fixture/NOTICE"
+printf 'citation\n' >"$publish_fixture/CITATION.txt"
+publish_fixture=$(cd -P "$publish_fixture" && pwd -P)
+mkdir "$publish_dir/basin-outputs/1020000010"
+printf '%s\n' canary >"$publish_dir/basin-outputs/1020000010/never-publish"
+export HFX_TEST_AWS_LOG=$aws_log
+export HFX_TEST_AWS_FIXTURE=$publish_fixture
+export HFX_TEST_AWS_PREFIX=scratch/tdx-hydro-publish/fixture
+export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-guards
+export HFX_TEST_AWS_CONTROL=$test_tmp/aws-control-guards
+mkdir "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+
+for sibling_scope in campaign state assembly; do
+    sibling_root=$test_tmp/workspaces/sibling-$sibling_scope
+    mkdir "$sibling_root"
+    set -- $(init_args sibling-a "$sibling_root")
+    run_runner "$@" >"$case_stdout"
+    set -- $(init_args sibling-b "$sibling_root")
+    run_runner "$@" >"$case_stdout"
+    sibling_a_dir=$sibling_root/tdx-hydro-sibling-a
+    sibling_b_dir=$sibling_root/tdx-hydro-sibling-b
+    printf '%s\n' private-basin >"$sibling_a_dir/basin-outputs/private"
+    printf '%s\n' private-scratch >"$sibling_a_dir/assembly/scratch/private"
+    case $sibling_scope in
+        campaign) sibling_out=$sibling_a_dir ;;
+        state) sibling_out=$sibling_a_dir/state ;;
+        assembly) sibling_out=$sibling_a_dir/assembly ;;
+    esac
+    sibling_aws_log=$test_tmp/aws-sibling-$sibling_scope.log
+    sibling_remote=$test_tmp/aws-sibling-$sibling_scope
+    : >"$sibling_aws_log"
+    mkdir "$sibling_remote"
+    export HFX_TEST_AWS_LOG=$sibling_aws_log
+    export HFX_TEST_AWS_REMOTE=$sibling_remote
+    sibling_status=0
+    HFX_TDX_AWS=$recording_bin/aws \
+        run_runner publish --campaign sibling-b --workspace-root "$sibling_root" \
+            --out "$sibling_out" --report "$publish_fixture/assembled-report.json" \
+            --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+            --scratch-prefix "scratch/tdx-hydro-sibling-b/$sibling_scope" \
+            >"$case_stdout" 2>"$case_stderr" ||
+        sibling_status=$?
+    sibling_uploads=$(grep -c ' s3 cp ' "$sibling_aws_log" || true)
+    case $sibling_scope in
+        campaign)
+            sibling_campaign_status=$sibling_status
+            sibling_campaign_uploads=$sibling_uploads
+            sibling_campaign_contract=$sibling_b_dir/publication/current.json
+            ;;
+        state)
+            sibling_state_status=$sibling_status
+            sibling_state_uploads=$sibling_uploads
+            sibling_state_contract=$sibling_b_dir/publication/current.json
+            ;;
+        assembly)
+            sibling_assembly_status=$sibling_status
+            sibling_assembly_uploads=$sibling_uploads
+            sibling_assembly_contract=$sibling_b_dir/publication/current.json
+            ;;
+    esac
+done
+if [[ "$sibling_campaign_status" -eq 0 || "$sibling_campaign_uploads" -ne 0 ||
+      -e "$sibling_campaign_contract" ||
+      "$sibling_state_status" -eq 0 || "$sibling_state_uploads" -ne 0 ||
+      -e "$sibling_state_contract" ||
+      "$sibling_assembly_status" -eq 0 || "$sibling_assembly_uploads" -ne 0 ||
+      -e "$sibling_assembly_contract" ]]; then
+    die "sibling privacy guards observed campaign status=$sibling_campaign_status uploads=$sibling_campaign_uploads contract=$([[ -e "$sibling_campaign_contract" ]] && printf yes || printf no); state status=$sibling_state_status uploads=$sibling_state_uploads contract=$([[ -e "$sibling_state_contract" ]] && printf yes || printf no); assembly status=$sibling_assembly_status uploads=$sibling_assembly_uploads contract=$([[ -e "$sibling_assembly_contract" ]] && printf yes || printf no)"
+fi
+publishable_root=$test_tmp/workspaces/publishable-current
+mkdir "$publishable_root"
+set -- $(init_args publishable-current "$publishable_root")
+run_runner "$@" >"$case_stdout"
+publishable_dir=$publishable_root/tdx-hydro-publishable-current
+mkdir "$publishable_dir/assembly/dataset"
+printf '%s\n' assembled >"$publishable_dir/assembly/dataset/manifest.json"
+publishable_aws_log=$test_tmp/aws-publishable-current.log
+publishable_remote=$test_tmp/aws-publishable-current
+: >"$publishable_aws_log"
+mkdir "$publishable_remote"
+export HFX_TEST_AWS_LOG=$publishable_aws_log
+export HFX_TEST_AWS_REMOTE=$publishable_remote
+HFX_TDX_AWS=$recording_bin/aws \
+    run_runner publish --campaign publishable-current --workspace-root "$publishable_root" \
+        --out "$publishable_dir/assembly/dataset" \
+        --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix scratch/tdx-hydro-publishable-current/dataset \
+        >"$case_stdout" 2>"$case_stderr" ||
+    die 'current campaign assembly/dataset publication was refused'
+publishable_uploads=$(grep -c ' s3 cp ' "$publishable_aws_log" || true)
+[[ "$publishable_uploads" -eq 4 && -f "$publishable_dir/publication/current.json" ]] ||
+    die "current campaign assembly/dataset publication uploaded $publishable_uploads objects or did not pin its contract"
+pass 'publication refuses a sibling campaign directory before AWS or contract pinning'
+pass 'publication refuses sibling campaign state before AWS or contract pinning'
+pass 'publication refuses sibling campaign assembly before AWS or contract pinning'
+
+foreign_parent=$test_tmp/workspaces/foreign-roots
+foreign_a_root=$foreign_parent/wk-a
+foreign_b_root=$foreign_parent/wk-b
+mkdir -p "$foreign_a_root" "$foreign_b_root"
+set -- $(init_args foreign-old "$foreign_a_root")
+run_runner "$@" >"$case_stdout"
+set -- $(init_args foreign-new "$foreign_b_root")
+run_runner "$@" >"$case_stdout"
+foreign_old_dir=$foreign_a_root/tdx-hydro-foreign-old
+foreign_new_dir=$foreign_b_root/tdx-hydro-foreign-new
+
+nested_root=$test_tmp/workspaces/nested-root
+nested_sub_root=$nested_root/sub
+mkdir -p "$nested_sub_root"
+set -- $(init_args nested-outer "$nested_root")
+run_runner "$@" >"$case_stdout"
+set -- $(init_args nested-inner "$nested_sub_root")
+run_runner "$@" >"$case_stdout"
+nested_outer_dir=$nested_root/tdx-hydro-nested-outer
+nested_inner_dir=$nested_sub_root/tdx-hydro-nested-inner
+
+for content_guard_scope in foreign-root nested-outer nested-inner; do
+    case $content_guard_scope in
+        foreign-root)
+            content_guard_campaign=foreign-new
+            content_guard_root=$foreign_b_root
+            content_guard_out=$foreign_old_dir
+            content_guard_contract=$foreign_new_dir/publication/current.json
+            ;;
+        nested-outer)
+            content_guard_campaign=nested-inner
+            content_guard_root=$nested_sub_root
+            content_guard_out=$nested_outer_dir
+            content_guard_contract=$nested_inner_dir/publication/current.json
+            ;;
+        nested-inner)
+            content_guard_campaign=nested-outer
+            content_guard_root=$nested_root
+            content_guard_out=$nested_inner_dir
+            content_guard_contract=$nested_outer_dir/publication/current.json
+            ;;
+    esac
+    content_guard_aws_log=$test_tmp/aws-content-guard-$content_guard_scope.log
+    content_guard_remote=$test_tmp/aws-content-guard-$content_guard_scope
+    : >"$content_guard_aws_log"
+    mkdir "$content_guard_remote"
+    export HFX_TEST_AWS_LOG=$content_guard_aws_log
+    export HFX_TEST_AWS_REMOTE=$content_guard_remote
+    content_guard_status=0
+    HFX_TDX_AWS=$recording_bin/aws \
+        run_runner publish --campaign "$content_guard_campaign" \
+            --workspace-root "$content_guard_root" --out "$content_guard_out" \
+            --report "$publish_fixture/assembled-report.json" \
+            --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+            --scratch-prefix "scratch/tdx-hydro-$content_guard_campaign/$content_guard_scope" \
+            >"$case_stdout" 2>"$case_stderr" ||
+        content_guard_status=$?
+    content_guard_uploads=$(grep -c ' s3 cp ' "$content_guard_aws_log" || true)
+    case $content_guard_scope in
+        foreign-root)
+            foreign_root_status=$content_guard_status
+            foreign_root_uploads=$content_guard_uploads
+            foreign_root_contract=$content_guard_contract
+            ;;
+        nested-outer)
+            nested_outer_status=$content_guard_status
+            nested_outer_uploads=$content_guard_uploads
+            nested_outer_contract=$content_guard_contract
+            ;;
+        nested-inner)
+            nested_inner_status=$content_guard_status
+            nested_inner_uploads=$content_guard_uploads
+            nested_inner_contract=$content_guard_contract
+            ;;
+    esac
+done
+if [[ "$foreign_root_status" -eq 0 || "$foreign_root_uploads" -ne 0 ||
+      -e "$foreign_root_contract" ||
+      "$nested_outer_status" -eq 0 || "$nested_outer_uploads" -ne 0 ||
+      -e "$nested_outer_contract" ||
+      "$nested_inner_status" -eq 0 || "$nested_inner_uploads" -ne 0 ||
+      -e "$nested_inner_contract" ]]; then
+    die "content privacy guards observed foreign-root status=$foreign_root_status uploads=$foreign_root_uploads contract=$([[ -e "$foreign_root_contract" ]] && printf yes || printf no); nested-outer status=$nested_outer_status uploads=$nested_outer_uploads contract=$([[ -e "$nested_outer_contract" ]] && printf yes || printf no); nested-inner status=$nested_inner_status uploads=$nested_inner_uploads contract=$([[ -e "$nested_inner_contract" ]] && printf yes || printf no)"
+fi
+pass 'publication refuses a campaign under a foreign workspace root before AWS or contract pinning'
+pass 'publication refuses an outer campaign from a nested workspace root before AWS or contract pinning'
+pass 'publication refuses a nested campaign from an outer workspace root before AWS or contract pinning'
+
+deep_descendant_publisher_root=$test_tmp/workspaces/deep-descendant-publisher
+deep_descendant_out=$test_tmp/workspaces/deep-descendant-out
+deep_descendant_foreign_root=$deep_descendant_out/a/b/c/d/e/f
+mkdir -p "$deep_descendant_publisher_root" "$deep_descendant_foreign_root"
+set -- $(init_args deep-descendant-publisher "$deep_descendant_publisher_root")
+run_runner "$@" >"$case_stdout"
+set -- $(init_args deep-descendant-foreign "$deep_descendant_foreign_root")
+run_runner "$@" >"$case_stdout"
+deep_descendant_publisher_dir=$deep_descendant_publisher_root/tdx-hydro-deep-descendant-publisher
+deep_descendant_foreign_dir=$deep_descendant_foreign_root/tdx-hydro-deep-descendant-foreign
+mkdir "$deep_descendant_foreign_dir/basin-outputs/1020000010"
+printf '%s\n' private-catchments \
+    >"$deep_descendant_foreign_dir/basin-outputs/1020000010/catchments.parquet"
+deep_descendant_aws_log=$test_tmp/aws-deep-descendant.log
+deep_descendant_remote=$test_tmp/aws-deep-descendant
+: >"$deep_descendant_aws_log"
+mkdir "$deep_descendant_remote"
+export HFX_TEST_AWS_LOG=$deep_descendant_aws_log
+export HFX_TEST_AWS_REMOTE=$deep_descendant_remote
+deep_descendant_status=0
+HFX_TDX_AWS=$recording_bin/aws \
+    run_runner publish --campaign deep-descendant-publisher \
+        --workspace-root "$deep_descendant_publisher_root" --out "$deep_descendant_out" \
+        --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix scratch/tdx-hydro-deep-descendant-publisher/deep-descendant \
+        >"$case_stdout" 2>"$case_stderr" ||
+    deep_descendant_status=$?
+deep_descendant_uploads=$(grep -c ' s3 cp ' "$deep_descendant_aws_log" || true)
+if [[ "$deep_descendant_status" -eq 0 || -s "$deep_descendant_aws_log" ||
+      -e "$deep_descendant_publisher_dir/publication/current.json" ]]; then
+    die "deep descendant privacy guard observed status=$deep_descendant_status uploads=$deep_descendant_uploads aws_lines=$(wc -l <"$deep_descendant_aws_log" | tr -d '[:space:]') contract=$([[ -e "$deep_descendant_publisher_dir/publication/current.json" ]] && printf yes || printf no)"
+fi
+assert_contains "$case_stderr" 'publication output must not contain another campaign directory'
+pass 'publication refuses a deeply nested descendant campaign before AWS or contract pinning'
+
+for non_campaign_name in basin-outputs-extra state-backup down publication-out assembly-x; do
+    non_campaign_root=$test_tmp/workspaces/non-campaign-$non_campaign_name
+    non_campaign_campaign=accept-${non_campaign_name//-}
+    mkdir "$non_campaign_root"
+    set -- $(init_args "$non_campaign_campaign" "$non_campaign_root")
+    run_runner "$@" >"$case_stdout"
+    non_campaign_dir=$non_campaign_root/tdx-hydro-$non_campaign_campaign
+    non_campaign_out=$non_campaign_dir/$non_campaign_name
+    mkdir "$non_campaign_out"
+    printf '%s\n' publishable >"$non_campaign_out/manifest.json"
+    non_campaign_aws_log=$test_tmp/aws-non-campaign-$non_campaign_name.log
+    non_campaign_remote=$test_tmp/aws-non-campaign-$non_campaign_name
+    : >"$non_campaign_aws_log"
+    mkdir "$non_campaign_remote"
+    export HFX_TEST_AWS_LOG=$non_campaign_aws_log
+    export HFX_TEST_AWS_REMOTE=$non_campaign_remote
+    HFX_TDX_AWS=$recording_bin/aws \
+        run_runner publish --campaign "$non_campaign_campaign" \
+            --workspace-root "$non_campaign_root" --out "$non_campaign_out" \
+            --report "$publish_fixture/assembled-report.json" \
+            --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+            --scratch-prefix "scratch/tdx-hydro-$non_campaign_campaign/$non_campaign_name" \
+            >"$case_stdout" 2>"$case_stderr" ||
+        die "non-campaign directory was refused: $non_campaign_name"
+    non_campaign_uploads=$(grep -c ' s3 cp ' "$non_campaign_aws_log" || true)
+    [[ "$non_campaign_uploads" -eq 4 &&
+       -f "$non_campaign_dir/publication/current.json" ]] ||
+        die "non-campaign directory $non_campaign_name uploaded $non_campaign_uploads objects or did not pin its contract"
+done
+pass 'publication accepts campaign-local directories whose names resemble private subtrees but have no campaign marker'
+
+export HFX_TEST_AWS_LOG=$aws_log
+export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-guards
+for privacy_scope in campaign assembly workspace; do
+    privacy_campaign=privacy-$privacy_scope
+    privacy_root=$test_tmp/workspaces/$privacy_campaign
+    mkdir "$privacy_root"
+    set -- $(init_args "$privacy_campaign" "$privacy_root")
+    run_runner "$@" >"$case_stdout"
+    privacy_dir=$privacy_root/tdx-hydro-$privacy_campaign
+    printf '%s\n' private-basin >"$privacy_dir/basin-outputs/private"
+    printf '%s\n' private-scratch >"$privacy_dir/assembly/scratch/private"
+    case $privacy_scope in
+        campaign) privacy_out=$privacy_dir ;;
+        assembly) privacy_out=$privacy_dir/assembly ;;
+        workspace) privacy_out=$privacy_root ;;
+    esac
+    export HFX_TEST_AWS_PREFIX=scratch/tdx-hydro-$privacy_campaign/fixture
+    export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-$privacy_campaign
+    export HFX_TEST_AWS_CONTROL=$test_tmp/aws-control-$privacy_campaign
+    mkdir "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+    privacy_aws_before=$(wc -l <"$aws_log" | tr -d ' ')
+    privacy_status=0
+    HFX_TDX_AWS=$strict_bin/aws \
+        run_runner publish --campaign "$privacy_campaign" --workspace-root "$privacy_root" \
+            --out "$privacy_out" --report "$publish_fixture/assembled-report.json" \
+            --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+            --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout" 2>"$case_stderr" ||
+        privacy_status=$?
+    privacy_aws_after=$(wc -l <"$aws_log" | tr -d ' ')
+    privacy_aws_lines=$((privacy_aws_after - privacy_aws_before))
+    [[ "$privacy_status" -ne 0 ]] || die "$privacy_scope privacy guard unexpectedly succeeded"
+    case $privacy_scope in
+        campaign)
+            campaign_privacy_aws_lines=$privacy_aws_lines
+            campaign_privacy_contract=$privacy_dir/publication/current.json
+            ;;
+        assembly)
+            assembly_privacy_aws_lines=$privacy_aws_lines
+            assembly_privacy_contract=$privacy_dir/publication/current.json
+            ;;
+        workspace)
+            workspace_privacy_aws_lines=$privacy_aws_lines
+            workspace_privacy_contract=$privacy_dir/publication/current.json
+            ;;
+    esac
+done
+if [[ "$campaign_privacy_aws_lines" -ne 0 || -e "$campaign_privacy_contract" ||
+      "$assembly_privacy_aws_lines" -ne 0 || -e "$assembly_privacy_contract" ||
+      "$workspace_privacy_aws_lines" -ne 0 || -e "$workspace_privacy_contract" ]]; then
+    die "privacy guards observed AWS lines campaign=$campaign_privacy_aws_lines assembly=$assembly_privacy_aws_lines workspace=$workspace_privacy_aws_lines; contract pinning campaign=$([[ -e "$campaign_privacy_contract" ]] && printf yes || printf no) assembly=$([[ -e "$assembly_privacy_contract" ]] && printf yes || printf no) workspace=$([[ -e "$workspace_privacy_contract" ]] && printf yes || printf no)"
+fi
+[[ "$campaign_privacy_aws_lines" -eq 0 && ! -e "$campaign_privacy_contract" ]] ||
+    die "campaign ancestor privacy guard spent $campaign_privacy_aws_lines AWS calls or pinned its contract"
+pass 'publication refuses the campaign directory before AWS or contract pinning'
+[[ "$assembly_privacy_aws_lines" -eq 0 && ! -e "$assembly_privacy_contract" ]] ||
+    die "assembly privacy guard spent $assembly_privacy_aws_lines AWS calls or pinned its contract"
+pass 'publication refuses campaign assembly before AWS or contract pinning'
+[[ "$workspace_privacy_aws_lines" -eq 0 && ! -e "$workspace_privacy_contract" ]] ||
+    die "workspace ancestor privacy guard spent $workspace_privacy_aws_lines AWS calls or pinned its contract"
+pass 'publication refuses the workspace ancestor before AWS or contract pinning'
+
+export HFX_TEST_AWS_PREFIX=scratch/tdx-hydro-publish/fixture
+export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-guards
+export HFX_TEST_AWS_CONTROL=$test_tmp/aws-control-guards
+aws_lines_before=$(wc -l <"$aws_log" | tr -d ' ')
+expect_failure 'missing publication inputs' publish --campaign publish --workspace-root "$publish_root"
+expect_failure 'relative publication output' publish --campaign publish --workspace-root "$publish_root" \
+    --out relative --report "$publish_fixture/assembled-report.json" --notice "$publish_fixture/NOTICE" \
+    --citation "$publish_fixture/CITATION.txt" --scratch-prefix "$HFX_TEST_AWS_PREFIX"
+expect_failure 'empty notice' publish --campaign publish --workspace-root "$publish_root" \
+    --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" --notice /dev/null \
+    --citation "$publish_fixture/CITATION.txt" --scratch-prefix "$HFX_TEST_AWS_PREFIX"
+ln -s "$publish_fixture/NOTICE" "$publish_fixture/NOTICE-link"
+expect_failure 'symlink notice' publish --campaign publish --workspace-root "$publish_root" \
+    --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+    --notice "$publish_fixture/NOTICE-link" --citation "$publish_fixture/CITATION.txt" \
+    --scratch-prefix "$HFX_TEST_AWS_PREFIX"
+expect_failure 'report inside output' publish --campaign publish --workspace-root "$publish_root" \
+    --out "$publish_fixture/assembled" --report "$publish_fixture/assembled/manifest.json" --notice "$publish_fixture/NOTICE" \
+    --citation "$publish_fixture/CITATION.txt" --scratch-prefix "$HFX_TEST_AWS_PREFIX"
+expect_failure 'per-basin output publication' publish --campaign publish --workspace-root "$publish_root" \
+    --out "$publish_dir/basin-outputs/1020000010" --report "$publish_fixture/assembled-report.json" --notice "$publish_fixture/NOTICE" \
+    --citation "$publish_fixture/CITATION.txt" --scratch-prefix "$HFX_TEST_AWS_PREFIX"
+for unsafe_prefix in hfx hfx/release scratch scratch/../hfx /scratch/tdx-hydro-publish/fixture scratch/tdx-hydro-other/fixture scratch/tdx-hydro-publish//fixture; do
+    expect_failure "unsafe prefix $unsafe_prefix" publish --campaign publish --workspace-root "$publish_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" --notice "$publish_fixture/NOTICE" \
+        --citation "$publish_fixture/CITATION.txt" --scratch-prefix "$unsafe_prefix"
+done
+[[ $(wc -l <"$aws_log" | tr -d ' ') == "$aws_lines_before" ]] ||
+    die 'publication guard invoked AWS'
+pass 'publication argument, attribution, physical report-placement, per-basin-output, and scratch-prefix guards refuse before AWS'
+
+rm -r "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+mkdir "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+: >"$aws_log"
+unset HFX_TDX_AWS
+PATH=$strict_bin:$PATH HFX_TEST_AWS_MODE=normal \
+    run_runner publish --campaign publish --workspace-root "$publish_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout"
+[[ $(grep -c ' s3 cp ' "$aws_log") == 7 ]] || die 'default AWS publication upload count differs'
+[[ $(grep -c ' s3api list-objects-v2 ' "$aws_log") == 2 ]] || die 'default AWS publication listing count differs'
+{
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+    printf '%s s3 cp %s/CITATION.txt s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/CITATION.txt --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/NOTICE s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/NOTICE --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/assembled/aux/snap_stems.parquet s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/aux/snap_stems.parquet --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/assembled-report.json s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/build-report.json --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/assembled/catchments.parquet s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/catchments.parquet --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/assembled/graph.parquet s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/graph.parquet --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3 cp %s/assembled/manifest.json s3://pourpoint-hfx/scratch/tdx-hydro-publish/fixture/manifest.json --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors\n' "$strict_bin/aws" "$publish_fixture"
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+} >"$test_tmp/expected-successful-aws.log"
+diff -u "$test_tmp/expected-successful-aws.log" "$aws_log"
+out_physical=$(cd -P "$publish_fixture/assembled" && pwd -P)
+report_physical=$(cd -P "${publish_fixture%/*}" && printf '%s/%s\n' "$(pwd -P)" "${publish_fixture##*/}/assembled-report.json")
+notice_physical=$(cd -P "$publish_fixture" && printf '%s/NOTICE\n' "$(pwd -P)")
+citation_physical=$(cd -P "$publish_fixture" && printf '%s/CITATION.txt\n' "$(pwd -P)")
+jq -cnS --arg out "$out_physical" --arg report "$report_physical" --arg notice "$notice_physical" --arg citation "$citation_physical" '{
+  bucket:"pourpoint-hfx",citation:$citation,endpoint:"https://fsn1.your-objectstorage.com",notice:$notice,
+  objects:[
+    {bytes:9,key:"scratch/tdx-hydro-publish/fixture/CITATION.txt",source:$citation},
+    {bytes:7,key:"scratch/tdx-hydro-publish/fixture/NOTICE",source:$notice},
+    {bytes:5,key:"scratch/tdx-hydro-publish/fixture/aux/snap_stems.parquet",source:($out+"/aux/snap_stems.parquet")},
+    {bytes:7,key:"scratch/tdx-hydro-publish/fixture/build-report.json",source:$report},
+    {bytes:11,key:"scratch/tdx-hydro-publish/fixture/catchments.parquet",source:($out+"/catchments.parquet")},
+    {bytes:6,key:"scratch/tdx-hydro-publish/fixture/graph.parquet",source:($out+"/graph.parquet")},
+    {bytes:3,key:"scratch/tdx-hydro-publish/fixture/manifest.json",source:($out+"/manifest.json")}
+  ],out:$out,prefix:"scratch/tdx-hydro-publish/fixture",region:"fsn1",report:$report,schema_version:1
+}' >"$test_tmp/expected-publication-current.json"
+diff -u "$test_tmp/expected-publication-current.json" "$publish_dir/publication/current.json"
+jq -cS '{prefix,objects:[.objects[]|{bytes,key}]}' "$publish_dir/publication/current.json" >"$test_tmp/publication-projection.json"
+printf '%s\n' '{"objects":[{"bytes":9,"key":"scratch/tdx-hydro-publish/fixture/CITATION.txt"},{"bytes":7,"key":"scratch/tdx-hydro-publish/fixture/NOTICE"},{"bytes":5,"key":"scratch/tdx-hydro-publish/fixture/aux/snap_stems.parquet"},{"bytes":7,"key":"scratch/tdx-hydro-publish/fixture/build-report.json"},{"bytes":11,"key":"scratch/tdx-hydro-publish/fixture/catchments.parquet"},{"bytes":6,"key":"scratch/tdx-hydro-publish/fixture/graph.parquet"},{"bytes":3,"key":"scratch/tdx-hydro-publish/fixture/manifest.json"}],"prefix":"scratch/tdx-hydro-publish/fixture"}' >"$test_tmp/expected-publication-projection.json"
+diff -u "$test_tmp/expected-publication-projection.json" "$test_tmp/publication-projection.json"
+: >"$aws_log"
+rm -f "$HFX_TEST_AWS_CONTROL/list-count"
+PATH=$strict_bin:$PATH HFX_TEST_AWS_MODE=paginated \
+    run_runner publish --campaign publish --workspace-root "$publish_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout"
+[[ $(wc -l <"$aws_log" | tr -d ' ') == 4 ]] || die 'paginated publication vector count differs'
+[[ $(grep -c -- '--continuation-token fixture-page-2' "$aws_log") == 2 ]] ||
+    die 'paginated publication continuation vectors differ'
+[[ $(grep -c ' s3 cp ' "$aws_log" || :) == 0 ]] || die 'paginated rerun uploaded an object'
+{
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --continuation-token fixture-page-2 --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+    printf '%s s3api list-objects-v2 --bucket pourpoint-hfx --prefix scratch/tdx-hydro-publish/fixture/ --continuation-token fixture-page-2 --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --output json --no-paginate\n' "$strict_bin/aws"
+} >"$test_tmp/expected-paginated-aws.log"
+diff -u "$test_tmp/expected-paginated-aws.log" "$aws_log"
+pass 'the shipped aws default branch publishes the exact seven-object opaque fixture and verifies it with two exact listings'
+
+resume_root=$test_tmp/workspaces/resume
+mkdir "$resume_root"
+set -- $(init_args resume "$resume_root")
+run_runner "$@" >"$case_stdout"
+resume_dir=$resume_root/tdx-hydro-resume
+export HFX_TEST_AWS_PREFIX=scratch/tdx-hydro-resume/fixture
+export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-resume
+export HFX_TEST_AWS_CONTROL=$test_tmp/aws-control-resume
+mkdir "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+: >"$aws_log"
+resume_status=0
+HFX_TDX_AWS=$strict_bin/aws HFX_TEST_AWS_FAIL_KEY=NOTICE \
+    run_runner publish --campaign resume --workspace-root "$resume_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout" 2>"$case_stderr" || resume_status=$?
+[[ "$resume_status" -ne 0 ]] || die 'one-time publication failure unexpectedly succeeded'
+rm -f "$HFX_TEST_AWS_CONTROL/list-count"
+HFX_TDX_AWS=$strict_bin/aws \
+    run_runner publish --campaign resume --workspace-root "$resume_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout"
+[[ $(grep -c 'resume/fixture/CITATION.txt' "$aws_log") == 1 ]] ||
+    die 'resume re-uploaded the completed first object'
+[[ $(grep -c ' s3 cp .*resume/fixture/NOTICE ' "$aws_log") == 2 ]] ||
+    die 'resume did not retry the one-time failed NOTICE upload exactly once'
+for suffix in aux/snap_stems.parquet build-report.json catchments.parquet graph.parquet manifest.json; do
+    [[ $(grep -c " s3 cp .*resume/fixture/$suffix " "$aws_log") == 1 ]] ||
+        die "resume upload count differs for $suffix"
+done
+: >"$aws_log"
+rm -f "$HFX_TEST_AWS_CONTROL/list-count"
+HFX_TDX_AWS=$strict_bin/aws \
+    run_runner publish --campaign resume --workspace-root "$resume_root" \
+        --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+        --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+        --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout"
+[[ $(grep -c ' s3api list-objects-v2 ' "$aws_log") == 2 ]] || die 'converged resume listing count differs'
+[[ $(grep -c ' s3 cp ' "$aws_log" || :) == 0 ]] || die 'converged resume uploaded an object'
+pass 'the HFX_TDX_AWS override resumes after failure and converges without duplicate uploads'
+
+for guard_mode in extra wrong-initial post-wrong; do
+    case $guard_mode in
+        extra) guard_campaign=pubextra ;;
+        wrong-initial) guard_campaign=pubwrong ;;
+        post-wrong) guard_campaign=pubpost ;;
+    esac
+    guard_root=$test_tmp/workspaces/$guard_campaign
+    mkdir "$guard_root"
+    set -- $(init_args "$guard_campaign" "$guard_root")
+    run_runner "$@" >"$case_stdout"
+    export HFX_TEST_AWS_PREFIX=scratch/tdx-hydro-$guard_campaign/fixture
+    export HFX_TEST_AWS_REMOTE=$test_tmp/aws-remote-$guard_campaign
+    export HFX_TEST_AWS_CONTROL=$test_tmp/aws-control-$guard_campaign
+    mkdir "$HFX_TEST_AWS_REMOTE" "$HFX_TEST_AWS_CONTROL"
+    if [[ "$guard_mode" == wrong-initial ]]; then
+        mkdir -p "$HFX_TEST_AWS_REMOTE/$HFX_TEST_AWS_PREFIX"
+        cp "$publish_fixture/CITATION.txt" "$HFX_TEST_AWS_REMOTE/$HFX_TEST_AWS_PREFIX/CITATION.txt"
+    fi
+    : >"$aws_log"
+    if HFX_TDX_AWS=$strict_bin/aws HFX_TEST_AWS_MODE=$guard_mode \
+        run_runner publish --campaign "$guard_campaign" --workspace-root "$guard_root" \
+            --out "$publish_fixture/assembled" --report "$publish_fixture/assembled-report.json" \
+            --notice "$publish_fixture/NOTICE" --citation "$publish_fixture/CITATION.txt" \
+            --scratch-prefix "$HFX_TEST_AWS_PREFIX" >"$case_stdout" 2>"$case_stderr"; then
+        die "$guard_mode remote inventory unexpectedly succeeded"
+    fi
+    if [[ "$guard_mode" != post-wrong ]]; then
+        [[ $(grep -c ' s3 cp ' "$aws_log" || :) == 0 ]] ||
+            die "$guard_mode refusal uploaded an object"
+    fi
+done
+pass 'initial extra or wrong-size inventory and post-upload size mismatch are rejected'
+
+diff -u "$test_tmp/adapter-before-new-paths" "$HFX_TEST_ADAPTER_LOG"
+diff -u "$test_tmp/hfx-before-new-paths" "$HFX_TEST_HFX_LOG"
+if grep -En '(^|[^[:alnum:]_])assemble_hfx([^[:alnum:]_]|$)' "$runner" ||
+   grep -En '^[[:space:]]*(function[[:space:]]+)?(assemble|assembly)[[:space:]]*(\(\))?[[:space:]]*\{' "$runner" ||
+   grep -En '^[[:space:]]*(assemble|assembly)(\|[^)]*)?\)[[:space:]]' "$runner"; then
+    die 'runner defines or dispatches an assembly entrypoint'
+fi
+if grep -F 'never-publish' "$aws_log" >/dev/null; then
+    die 'publication exposed the per-basin canary'
+fi
+pass 'publication never invokes or defines assembly and never consults adapter or HFX'
+
+for poison in hcloud curl aws ssh; do
+    [[ ! -e "$test_tmp/invocations/$poison.log" ]] || die "poison command was invoked: $poison"
+done
+[[ -s "$aws_log" ]] || die 'deliberate strict fake AWS log is empty'
+git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-final"
+diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-final"
+pass 'poison commands remain uninvoked and repository status preserves only the allowed PR body'
 
 printf '1..%d\n' "$passed"
 printf 'test-tdx-hydro-campaign: all %d cases passed\n' "$passed"
