@@ -193,11 +193,43 @@ The validation subcommand invokes the selected binary as `hfx <dataset> --strict
 
 ## Campaign notes
 
-Milestone 4 will record the pilot campaign for processing basin `7020000010` here after the real NGA inputs are acquired and compiled. Do not claim campaign results before that run. The campaign record should capture:
+The processing basin `7020000010` pilot ran on 2026-07-22 from VM
+checkout `433040a606c467351a0e6eb018c6c28ad4ee5a98`.
 
-- NGA input identities and observed product version
-- build command and external report path
-- report summary, including contraction, dropped-reach, clamp, area-unit, and orientation results
-- strict validation result
-- scratch object-storage destination outside the consumer-facing `hfx/` prefix
-- campaign VM teardown evidence
+| Product | Bytes | SHA-256 | Layer |
+|---|---:|---|---|
+| basins | 5907767296 | `6d75b56428227824749a497b279a5d0891fd67d4c6a82df1b746f620add6da1a` | `basins` |
+| streamnet | 1676398592 | `ae3e5c881cad7c4e3b85a594b4e59889e698f5262e18466a1748c13af6948ca9` | `TDX_streamnet_7020000010_01` |
+
+The source identity was `fabric_version = "NGA-TDX-Hydro-20230126"`.
+No explicit label or Last-Modified header was available; the latest
+`gpkg_contents.last_change` value was streamnet's
+2023-01-26T21:57:00.865Z (basins: 2022-06-30T20:53:53.843Z), yielding the
+20230126 suffix.
+
+The build ran once with external report
+`/mnt/hfx/work/tdx-hydro-7020000010-build-report.json`. The empirical area
+check selected `m2`, relative error
+0.1289, over 331263 links.
+Orientation recorded 322344 coincidence-proven links,
+1702 predecessor-proven roots, and
+1767 trusted isolated roots.
+
+Report counts:
+
+- contracted edges: `246`
+- contracted roots: `0`
+- contracted traversals: `246`
+- polygon-less dropped reaches: `123`
+- basins clamp vertices: `0`
+- streamnet clamp vertices: `0`
+- trusted polygon-bearing isolated roots: `1767`
+
+Release strict 100-percent validation and the adapter HFX/GeoParquet wrapper
+both passed. Seven dataset/report/attribution objects were verified at
+`s3://pourpoint-hfx/scratch/tdx-hydro-pilot/2026-07-23T092027Z/`, outside
+`hfx/`. Default teardown removed both exact campaign
+resources; independent listings confirmed zero footprint.
+
+Full record:
+[`scripts/hetzner/CAMPAIGN-tdx-hydro-7020000010.md`](../../scripts/hetzner/CAMPAIGN-tdx-hydro-7020000010.md).

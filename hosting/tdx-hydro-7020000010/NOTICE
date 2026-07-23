@@ -1,0 +1,34 @@
+NOTICE
+
+This object set is an HFX compilation of the National Geospatial-Intelligence
+Agency (NGA) TanDEM-X Hydro (TDX-Hydro) vector river network and drainage basin
+datasets for processing basin 7020000010.
+
+Source data: TDX-Hydro, National Geospatial-Intelligence Agency, Office of
+Geomatics. Source product page:
+https://earth-info.nga.mil/index.php?action=geosciences&dir=geosci
+
+Source version: NGA-TDX-Hydro-20230126
+Source accessed: 2026-07-22
+
+Copyright (c) 2023 National Geospatial-Intelligence Agency (NGA).
+
+License: the TDX-Hydro source datasets are licensed under the Creative Commons
+Attribution-ShareAlike 4.0 International Public License (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+This HFX compilation adapts the source by selecting processing basin
+7020000010, joining reach catchments to stream links, assigning Global LINKNO
+identifiers, contracting graph edges through polygon-less links, deriving HFX
+outlet and upstream-area fields, and encoding HFX Parquet and snap artifacts.
+This adapted object set is distributed under CC BY-SA 4.0. Attribution must be
+given to NGA, a link to the license must be provided, changes must be
+indicated, and adapted contributions must be distributed under the same
+license.
+
+No endorsement by NGA or the United States Government is implied. Neither the
+United States Government, NGA, nor their employees makes any warranty, express
+or implied, or assumes legal liability or responsibility for the accuracy,
+completeness, or usefulness of the source data or this compilation.
+
+See CITATION.txt for the requested source citation.
