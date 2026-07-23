@@ -44,6 +44,10 @@ TOPOLOGY = "tree"
 HAS_UP_AREA = True
 
 FLOW_DIR_ENCODING = "esri"
+# MERIT Hydro accumulation rasters count upstream cells, not area. Verified
+# against the source: accum11.tif is int32 with a maximum of 369,003,928, which
+# is impossible as km2 (Earth's land area is ~149 million km2).
+FLOW_ACC_UNITS = "cells"
 FLOW_DIR_NODATA_OUT = 255
 FLOW_ACC_NODATA_OUT = -1.0
 MERIT_FLOWDIR_UNDEFINED_AS_UINT8 = 247
@@ -693,12 +697,19 @@ def stage_9_write_manifest(ctx: BuildContext) -> None:
     region = ",".join(f"pfaf-{pfaf:02d}" for pfaf in pfaf_codes)
     d8_entries = [
         {
-            "schema": "hfx.aux.d8_raster.v1",
+            "schema": "hfx.aux.d8_raster.v2",
             "artifacts": {
                 "flow_dir": f"aux/d8/pfaf_{pfaf:02d}/flow_dir.tif",
                 "flow_acc": f"aux/d8/pfaf_{pfaf:02d}/flow_acc.tif",
             },
-            "metadata": {"flow_dir_encoding": FLOW_DIR_ENCODING, "name": f"pfaf-{pfaf:02d}"},
+            # v2 forbids additional metadata properties, so the v1 "name" field
+            # is dropped. hfx-cli falls back to the flow_dir parent directory,
+            # labelling these entries pfaf_<NN> instead of pfaf-<NN>.
+            "metadata": {
+                "crs": CRS,
+                "flow_dir_encoding": FLOW_DIR_ENCODING,
+                "flow_acc_units": FLOW_ACC_UNITS,
+            },
         }
         for pfaf in pfaf_codes
     ]
@@ -760,7 +771,7 @@ included basins listed above.
 
 ## D8 Raster Layout
 
-60 hfx.aux.d8_raster.v1 auxiliary entries, one per included
+60 hfx.aux.d8_raster.v2 auxiliary entries, one per included
 Pfaf basin, with COGs at aux/d8/pfaf_<NN>/flow_dir.tif and
 aux/d8/pfaf_<NN>/flow_acc.tif. Each raster preserves native
 MERIT Hydro grid geometry (cell-centered on 3-arcsec
@@ -796,7 +807,7 @@ This partial-fabric dataset covers MERIT-Basins Pfaf-L2 basin(s) {region}. The m
 
 ## D8 Raster Bounds
 
-The D8 rasters preserve native MERIT Hydro grid geometry during transcode. HFX d8_raster.v1 requires EPSG:4326 COGs with declared dtype, nodata, tiling, and matching CRS; it does not impose a strict longitude/latitude domain clamp on GeoTIFF bounds.
+The D8 rasters preserve native MERIT Hydro grid geometry during transcode. HFX d8_raster.v2 declares `crs`, `flow_dir_encoding`, and `flow_acc_units` in the manifest and takes dtype and nodata from the GeoTIFF headers; it does not impose a strict longitude/latitude domain clamp on GeoTIFF bounds.
 
 The canonical D8 artifact paths are under `aux/d8/pfaf_<NN>/`.
 """
@@ -804,12 +815,12 @@ The canonical D8 artifact paths are under `aux/d8/pfaf_<NN>/`.
 
 
 def read_d8_spec_note() -> str:
-    """Confirm d8_raster.v1 has no strict raster-bound domain constraint."""
-    spec_path = Path(__file__).parents[2] / "spec" / "aux" / "d8_raster" / "v1.md"
+    """Confirm d8_raster.v2 has no strict raster-bound domain constraint."""
+    spec_path = Path(__file__).parents[2] / "spec" / "aux" / "d8_raster" / "v2.md"
     text = spec_path.read_text(encoding="utf-8")
     if "[-180" in text or "domain" in text.lower():
-        raise AdapterError("d8_raster.v1 mentions an unexpected strict domain constraint; escalate before raster transcode")
-    return "spec/aux/d8_raster/v1.md requires EPSG:4326 COGs and CRS consistency; it does not impose strict GeoTIFF bounds clamping."
+        raise AdapterError("d8_raster.v2 mentions an unexpected strict domain constraint; escalate before raster transcode")
+    return "spec/aux/d8_raster/v2.md requires the declared CRS on both rasters and CRS consistency; it does not impose strict GeoTIFF bounds clamping."
 
 
 def validate_dataset(dataset: Path, report_dir: Path) -> None:

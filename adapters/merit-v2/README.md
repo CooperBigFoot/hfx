@@ -20,7 +20,7 @@ This adapter doubles as the **worked example** for authoring new adapters — fo
 | CRS | EPSG:4326 |
 | `has_up_area` | true |
 
-D8 rasters are transcoded to Cloud-Optimized GeoTIFFs at `aux/d8/pfaf_<NN>/flow_dir.tif` and `aux/d8/pfaf_<NN>/flow_acc.tif`, declared as `hfx.aux.d8_raster.v1` auxiliary entries with `flow_dir_encoding = "esri"`. Reach centerlines ship as one `hfx.aux.snap.v2` index (`stems`) at `aux/snap_stems.parquet`.
+D8 rasters are transcoded to Cloud-Optimized GeoTIFFs at `aux/d8/pfaf_<NN>/flow_dir.tif` and `aux/d8/pfaf_<NN>/flow_acc.tif`, declared as `hfx.aux.d8_raster.v2` auxiliary entries with `crs = "EPSG:4326"`, `flow_dir_encoding = "esri"`, and `flow_acc_units = "cells"`. Reach centerlines ship as one `hfx.aux.snap.v2` index (`stems`) at `aux/snap_stems.parquet`.
 
 ## Inputs (public sources)
 
