@@ -147,6 +147,7 @@ passed=0
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
 assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
 pass 'sole help arguments succeed'
 
 argument_root=$test_tmp/workspaces/arguments
@@ -162,6 +163,17 @@ mkdir "$test_tmp/workspaces/symlink-target"
 ln -s "$test_tmp/workspaces/symlink-target" "$test_tmp/workspaces/symlink-root"
 expect_failure 'symlink workspace root' status --campaign symlink --workspace-root "$test_tmp/workspaces/symlink-root"
 expect_failure 'sizing on status' status --campaign sizing --workspace-root "$argument_root" --available-memory-bytes 1
+expect_failure 'missing fabric version' compile --campaign compile --workspace-root "$argument_root"
+expect_failure 'empty fabric version' compile --campaign compile --workspace-root "$argument_root" \
+    --fabric-version ''
+expect_failure 'repeated fabric version' compile --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version --fabric-version version
+expect_failure 'option-shaped fabric version' compile --campaign compile --workspace-root "$argument_root" \
+    --fabric-version --campaign
+expect_failure 'control fabric version' compile --campaign compile --workspace-root "$argument_root" \
+    --fabric-version $'bad\nversion'
+expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
 expect_failure 'zero sizing' init --campaign zero --workspace-root "$argument_root" \
     --available-memory-bytes 0 --available-disk-bytes 4 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
@@ -201,9 +213,18 @@ for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
         -e "$forbidden_nameref" -e "$forbidden_lock" "$script" >"$case_stdout"; then
         die "forbidden Bash-4 construct found in $script"
     fi
+    if grep -En '"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"' "$script" |
+        grep -Ev '\[@\]\+\"\$\{' >"$case_stdout"; then
+        die "unsafe bare array expansion found in $script"
+    fi
 done
 assert_contains "$runner" 'https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg'
 assert_contains "$runner" 'The exact product set is {basins,streamnet}'
+assert_contains "$runner" 'readonly HFX_TDX_DEFAULT_HFX=/root/hfx/target/release/hfx'
+assert_contains "$runner" 'readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/bin/python'
+assert_contains "$runner" 'ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")'
+assert_contains "$runner" 'ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}'
+assert_contains "$runner" 'HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")'
 pass 'static Bash 3.2 compatibility checks pass'
 
 valid_root=$test_tmp/workspaces/valid
@@ -214,6 +235,20 @@ campaign_dir=$valid_root/tdx-hydro-equal
 for relative in downloads basin-outputs reports assembly assembly/scratch publication state state/basins state/locks state/tmp; do
     [[ -d "$campaign_dir/$relative" && ! -L "$campaign_dir/$relative" ]] || die "missing layout directory $relative"
 done
+if env -u HFX_TDX_ADAPTER -u HFX_TDX_ADAPTER_PYTHON -u HFX_TDX_ADAPTER_SCRIPT -u HFX_TDX_HFX \
+    "$selected_bash" "$runner" compile --campaign equal --workspace-root "$valid_root" \
+        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout" 2>"$case_stderr"; then
+    die 'compile with frozen defaults unexpectedly succeeded'
+fi
+assert_contains "$case_stderr" "required command '/opt/hfx-geo/bin/python' is not available"
+if env -u HFX_TDX_ADAPTER -u HFX_TDX_ADAPTER_SCRIPT -u HFX_TDX_HFX \
+    HFX_TDX_ADAPTER_PYTHON="$selected_bash" \
+    "$selected_bash" "$runner" compile --campaign equal --workspace-root "$valid_root" \
+        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout" 2>"$case_stderr"; then
+    die 'compile without the frozen HFX binary unexpectedly succeeded'
+fi
+assert_contains "$case_stderr" "required command '/root/hfx/target/release/hfx' is not available"
+pass 'compile resolves both frozen command defaults behaviorally'
 jq -e '
     keys == ["campaign","inventory","retention","schema_version","sizing"] and
     .schema_version == 1 and .campaign == "equal" and
@@ -420,6 +455,11 @@ jq '.sizing.available_memory_bytes=1' \
 mv "$sizing_root/campaign.tmp" "$sizing_root/tdx-hydro-equal/state/campaign.json"
 expect_failure 'malformed sizing' status --campaign equal --workspace-root "$sizing_root"
 
+compile_state_root=$(copy_workspace bad-compile-state)
+jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
+    >"$compile_state_root/tdx-hydro-equal/state/compile.json"
+expect_failure 'malformed compile contract' status --campaign equal --workspace-root "$compile_state_root"
+
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
 assert_contains "$case_stdout" 'inventory_count=62'
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
@@ -514,9 +554,13 @@ if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
     printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/worker.$PPID"
     if mkdir "$HFX_TEST_TRANSFER_STATE/signal-owner" 2>/dev/null; then
         marker_count=0
+        rendezvous_deadline=0
+        rendezvous_limit=${HFX_TEST_RENDEZVOUS_LIMIT-1000}
         while [ "$marker_count" -lt 3 ]; do
             marker_count=$(find "$HFX_TEST_TRANSFER_STATE" -name 'curl.*' -type f | wc -l | tr -d ' ')
             sleep 0.01
+            rendezvous_deadline=$((rendezvous_deadline + 1))
+            [ "$rendezvous_deadline" -lt "$rendezvous_limit" ] || exit 95
         done
         campaign_dir=${output%/downloads/*}
         runner_pid=$(cat "$campaign_dir/state/locks/campaign.lock/owner.pid")
@@ -595,13 +639,138 @@ if [ "${HFX_TEST_INTERRUPT_EMPTY-}" = 1 ] &&
 fi
 exec "${HFX_TEST_REAL_JQ:?}" "$@"
 FAKE_JQ
-chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq"
+sed >"$test_tmp/fake-adapter" <<'FAKE_ADAPTER'
+#!/bin/bash
+set -eu
+log=${HFX_TEST_ADAPTER_LOG:?}
+command_name=${1-}
+case $command_name in
+    build)
+        [ "$#" -eq 13 ] || exit 81
+        [ "$2" = --basins ] || exit 82
+        basins=$3
+        [ "$4" = --streamnet ] || exit 82
+        streamnet=$5
+        [ "$6" = --out ] || exit 82
+        out=$7
+        [ "$8" = --report ] || exit 82
+        report=$9
+        [ "${10}" = --processing-basin-id ] || exit 82
+        basin_id=${11}
+        [ "${12}" = --fabric-version ] || exit 82
+        fabric_version=${13}
+        printf 'build\t--basins\t%s\t--streamnet\t%s\t--out\t%s\t--report\t%s\t--processing-basin-id\t%s\t--fabric-version\t%s\n' \
+            "$basins" "$streamnet" "$out" "$report" "$basin_id" "$fabric_version" >>"$log"
+        [ -f "$basins" ] && [ ! -L "$basins" ] || exit 83
+        [ -f "$streamnet" ] && [ ! -L "$streamnet" ] || exit 83
+        case $report in
+            "$out"|"$out"/*) exit 84 ;;
+        esac
+        [ "${out##*/}" = "$basin_id" ] || exit 85
+        [ "${report##*/}" = "$basin_id-build-report.json" ] || exit 85
+        if [ "${HFX_TEST_FAIL_BUILD_ID-}" = "$basin_id" ]; then
+            exit 41
+        fi
+        mkdir -p "$out/aux"
+        printf '%s\n' fixture >"$out/catchments.parquet"
+        printf '%s\n' fixture >"$out/graph.parquet"
+        printf '%s\n' fixture >"$out/manifest.json"
+        printf '%s\n' fixture >"$out/aux/snap_stems.parquet"
+        dataset_root=$(cd -P "$out" && pwd -P)
+        "${HFX_TEST_REAL_JQ:?}" -n \
+            --arg basin_id "$basin_id" \
+            --arg fabric_version "$fabric_version" \
+            --arg dataset_root "$dataset_root" \
+            '{
+              build_identity:{
+                processing_basin_id:$basin_id,
+                fabric_name:"tdx_hydro",
+                fabric_version:$fabric_version,
+                created_at:"2026-07-23T00:00:00Z",
+                adapter_version:"0.1.0",
+                dataset_root:$dataset_root
+              },
+              diagnostics:{}
+            }' >"$report"
+        ;;
+    validate)
+        [ "$#" -eq 4 ] || exit 86
+        dataset=$2
+        [ "$3" = --hfx-binary ] || exit 87
+        hfx_binary=$4
+        printf 'validate\t%s\t--hfx-binary\t%s\n' "$dataset" "$hfx_binary" >>"$log"
+        [ -d "$dataset" ] && [ ! -L "$dataset" ] || exit 88
+        if [ "${HFX_TEST_FAIL_VALIDATE_ID-}" = "${dataset##*/}" ]; then
+            exit 42
+        fi
+        "$hfx_binary" "$dataset" --strict --sample-pct 100 --format text
+        ;;
+    assemble|assembly)
+        exit 89
+        ;;
+    *)
+        exit 90
+        ;;
+esac
+FAKE_ADAPTER
+sed >"$test_tmp/fake-adapter-python" <<'FAKE_ADAPTER_PYTHON'
+#!/bin/bash
+set -eu
+[ "$#" -ge 1 ] || exit 91
+[ "$1" = "${HFX_TEST_ADAPTER_SCRIPT:?}" ] || exit 92
+shift
+exec "${HFX_TEST_ADAPTER_STUB:?}" "$@"
+FAKE_ADAPTER_PYTHON
+sed >"$test_tmp/fake-hfx" <<'FAKE_HFX'
+#!/bin/bash
+set -eu
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HFX_LOG:?}"
+[ "$#" -eq 6 ] || exit 71
+[ "$1" != validate ] || exit 72
+[ "$2" = --strict ] || exit 73
+[ "$3" = --sample-pct ] || exit 73
+[ "$4" = 100 ] || exit 73
+[ "$5" = --format ] || exit 73
+[ "$6" = text ] || exit 73
+case "$*" in
+    *assemble*|*assembly*) exit 74 ;;
+esac
+exit 0
+FAKE_HFX
+chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
+    "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx"
 export HFX_TDX_CURL=$test_tmp/fake-curl
 export HFX_TDX_SHA256SUM=$test_tmp/fake-sha256sum
 export HFX_TDX_OGRINFO=$test_tmp/fake-ogrinfo
+unset HFX_TDX_ADAPTER HFX_TDX_ADAPTER_SCRIPT
+export HFX_TDX_ADAPTER_PYTHON=$test_tmp/fake-adapter-python
+export HFX_TDX_HFX=$test_tmp/fake-hfx
 export HFX_TEST_TRANSFER_STATE=$test_tmp/transfer-state
 export HFX_TEST_GPKG_TEMPLATE=$test_tmp/geopackage-template
 export HFX_TEST_REAL_JQ=$real_jq
+export HFX_TEST_ADAPTER_LOG=$test_tmp/invocations/adapter.log
+export HFX_TEST_ADAPTER_SCRIPT=$repo_root/adapters/tdx-hydro/build_adapter.py
+export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
+export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
+
+rendezvous_status=0
+HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
+    "$test_tmp/fake-curl" \
+        --fail \
+        --show-error \
+        --location \
+        --connect-timeout 30 \
+        --speed-limit 65536 \
+        --speed-time 60 \
+        --output "$test_tmp/lone-basins.gpkg.partial" \
+        'https://earth-info.nga.mil/php/download.php?file=1020000010-basins-gpkg' \
+        >"$case_stdout" 2>"$case_stderr" || rendezvous_status=$?
+[[ "$rendezvous_status" -eq 95 ]] ||
+    die "single-marker drain rendezvous exited $rendezvous_status instead of 95"
+[[ $(find "$test_tmp/transfer-state" -name 'curl.*' -type f | wc -l | tr -d ' ') == 1 ]] ||
+    die 'single-marker drain rendezvous did not create exactly one curl marker'
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
 
 empty_interrupt_root=$test_tmp/workspaces/interrupt-empty
 mkdir "$empty_interrupt_root"
@@ -810,9 +979,261 @@ jq -e '.stages.acquire_basins.status == "failed" and .stages.acquire_basins.atte
 [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'unsafe partial triggered a fetch'
 pass 'verified finals are adopted and partial paths follow safe all-or-nothing retry rules'
 
+compile_physical_parent=$test_tmp/workspaces/compile-physical-parent
+compile_link_parent=$test_tmp/workspaces/compile-link-parent
+mkdir "$compile_physical_parent"
+ln -s "$compile_physical_parent" "$compile_link_parent"
+compile_root=$compile_link_parent/workspace
+mkdir "$compile_root"
+cp -R "$acquire_dir" "$compile_root/tdx-hydro-acquire"
+compile_dir=$compile_root/tdx-hydro-acquire
+[ ! -L "$compile_root" ] || die "compile workspace final component is a symlink"
+compile_root_physical=$(cd -P "$compile_root" && pwd -P)
+[[ "$compile_root" != "$compile_root_physical" ]] ||
+    die "compile workspace did not exercise a symlinked parent"
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+run_runner compile --campaign acquire --workspace-root "$compile_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+jq -e -s '
+  length == 62 and all(
+    .stages.compile.status == "succeeded" and
+    .stages.compile.attempts == 1 and
+    .stages.compile.failure_reason == null
+  )
+' "$compile_dir"/state/basins/*/current.json >/dev/null || die 'compile success states differ'
+[[ $(find "$compile_dir/basin-outputs" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') == 62 ]] ||
+    die 'compile did not create 62 basin output directories'
+[[ $(find "$compile_dir/reports" -mindepth 1 -maxdepth 1 -type f -name '*-build-report.json' | wc -l | tr -d ' ') == 62 ]] ||
+    die 'compile did not create 62 sibling reports'
+while IFS= read -r compiled_id; do
+    compiled_output=$compile_dir/basin-outputs/$compiled_id
+    compiled_report=$compile_dir/reports/$compiled_id-build-report.json
+    case $compiled_report in
+        "$compiled_output"|"$compiled_output"/*) die "report is inside output for $compiled_id" ;;
+    esac
+    resolved_compiled_output=$(cd -P "$compiled_output" && pwd -P)
+    [[ "$resolved_compiled_output" != "$compiled_output" ]] ||
+        die "compile output did not preserve the symlink-parent distinction for $compiled_id"
+    jq -e --arg id "$compiled_id" --arg root "$resolved_compiled_output" \
+        '.build_identity.processing_basin_id == $id and
+         .build_identity.fabric_name == "tdx_hydro" and
+         .build_identity.fabric_version == "NGA-TDX-Hydro-20230126" and
+         .build_identity.dataset_root == $root' "$compiled_report" >/dev/null ||
+        die "compile report identity differs for $compiled_id"
+done < <(jq -r 'keys[]' "$inventory")
+jq -e '
+  type == "object" and keys == ["fabric_version","schema_version"] and
+  .schema_version == 1 and .fabric_version == "NGA-TDX-Hydro-20230126"
+' "$compile_dir/state/compile.json" >/dev/null || die 'compile contract differs'
+: >"$test_tmp/expected-adapter.log"
+: >"$test_tmp/expected-hfx.log"
+while IFS= read -r expected_id; do
+    printf 'build\t--basins\t%s\t--streamnet\t%s\t--out\t%s\t--report\t%s\t--processing-basin-id\t%s\t--fabric-version\t%s\n' \
+        "$compile_dir/downloads/$expected_id-basins.gpkg" \
+        "$compile_dir/downloads/$expected_id-streamnet.gpkg" \
+        "$compile_dir/basin-outputs/$expected_id" \
+        "$compile_dir/reports/$expected_id-build-report.json" \
+        "$expected_id" \
+        'NGA-TDX-Hydro-20230126' >>"$test_tmp/expected-adapter.log"
+    printf 'validate\t%s\t--hfx-binary\t%s\n' \
+        "$compile_dir/basin-outputs/$expected_id" \
+        "$test_tmp/fake-hfx" >>"$test_tmp/expected-adapter.log"
+    printf '%s\t--strict\t--sample-pct\t100\t--format\ttext\n' \
+        "$compile_dir/basin-outputs/$expected_id" >>"$test_tmp/expected-hfx.log"
+done < <(jq -r 'keys[]' "$inventory")
+diff -u "$test_tmp/expected-adapter.log" "$HFX_TEST_ADAPTER_LOG"
+diff -u "$test_tmp/expected-hfx.log" "$HFX_TEST_HFX_LOG"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') == 124 ]] || die 'adapter log line count differs'
+[[ $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') == 62 ]] || die 'HFX log line count differs'
+if grep -E '(^|[[:space:]])validate([[:space:]]|$)' "$HFX_TEST_HFX_LOG" >/dev/null; then
+    die 'HFX was invoked with a validate command token'
+fi
+if grep -E 'assemble|assembly' "$HFX_TEST_ADAPTER_LOG" "$HFX_TEST_HFX_LOG" >/dev/null; then
+    die 'compile invoked assembly'
+fi
+pass 'complete compile command report and validation contract lands every basin'
+
+cp -R "$compile_dir/basin-outputs" "$test_tmp/compile-outputs-before"
+cp -R "$compile_dir/reports" "$test_tmp/compile-reports-before"
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+run_runner compile --campaign acquire --workspace-root "$compile_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") == 62 ]] ||
+    die 'compile resume did not validate all 62 basins'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) == 0 ]] ||
+    die 'compile resume rebuilt a verified success'
+[[ $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') == 62 ]] ||
+    die 'compile resume did not directly validate all 62 datasets'
+jq -e -s 'all(.stages.compile.attempts == 1)' \
+    "$compile_dir"/state/basins/*/current.json >/dev/null || die 'compile resume changed attempts'
+diff -ru "$test_tmp/compile-outputs-before" "$compile_dir/basin-outputs"
+diff -ru "$test_tmp/compile-reports-before" "$compile_dir/reports"
+: >"$HFX_TEST_ADAPTER_LOG"
+expect_failure 'changed fabric version' compile --campaign acquire --workspace-root "$compile_root" \
+    --fabric-version changed-version
+assert_contains "$case_stderr" 'fabric version changed; use a new campaign ID'
+[[ ! -s "$HFX_TEST_ADAPTER_LOG" ]] || die 'fabric-version mismatch invoked the adapter'
+pass 'verified compile success resumes and fabric version is immutable'
+
+compile_failure_root=$test_tmp/workspaces/compile-failure
+mkdir "$compile_failure_root"
+cp -R "$acquire_dir" "$compile_failure_root/tdx-hydro-acquire"
+compile_failure_id=$(jq -r 'keys[0]' "$inventory")
+last_inventory_id=$(jq -r 'keys | last' "$inventory")
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+HFX_TEST_FAIL_BUILD_ID=$compile_failure_id \
+    run_runner compile --campaign acquire --workspace-root "$compile_failure_root" \
+        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+compile_failure_dir=$compile_failure_root/tdx-hydro-acquire
+compile_failure_state=$compile_failure_dir/state/basins/$compile_failure_id/current.json
+jq -e '
+  .stages.compile.status == "failed" and
+  .stages.compile.attempts == 1 and
+  .stages.compile.failure_reason == "adapter build failed"
+' "$compile_failure_state" >/dev/null || die 'isolated adapter build failure state differs'
+[[ ! -e "$compile_failure_dir/basin-outputs/$compile_failure_id" ]] ||
+    die 'failed adapter build left a final output'
+[[ ! -e "$compile_failure_dir/reports/$compile_failure_id-build-report.json" ]] ||
+    die 'failed adapter build left a final report'
+jq -e -s --arg id "$compile_failure_id" '
+  all(if .processing_basin_id == $id then true else
+    .stages.compile.status == "succeeded" and .stages.compile.attempts == 1 end)
+' "$compile_failure_dir"/state/basins/*/current.json >/dev/null || die 'build failure aborted a later basin'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") == 62 ]] || die 'build failure did not attempt all basins'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") == 61 ]] || die 'build failure validation count differs'
+grep -F "$last_inventory_id" "$HFX_TEST_ADAPTER_LOG" >/dev/null || die 'build failure did not reach the last basin'
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+run_runner compile --campaign acquire --workspace-root "$compile_failure_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+jq -e '.stages.compile.status == "succeeded" and .stages.compile.attempts == 2' \
+    "$compile_failure_state" >/dev/null || die 'failed build did not converge on retry'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") == 1 ]] || die 'build retry rebuilt prior successes'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") == 62 ]] || die 'build retry did not validate every basin'
+jq -e -s --arg id "$compile_failure_id" '
+  all(if .processing_basin_id == $id then .stages.compile.attempts == 2
+      else .stages.compile.attempts == 1 end)
+' "$compile_failure_dir"/state/basins/*/current.json >/dev/null || die 'build retry changed prior attempts'
+pass 'adapter build failure is isolated and retries only clean failed work'
+
+compile_validation_root=$test_tmp/workspaces/compile-validation
+mkdir "$compile_validation_root"
+cp -R "$acquire_dir" "$compile_validation_root/tdx-hydro-acquire"
+compile_validation_id=$(jq -r 'keys[0]' "$inventory")
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+HFX_TEST_FAIL_VALIDATE_ID=$compile_validation_id \
+    run_runner compile --campaign acquire --workspace-root "$compile_validation_root" \
+        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+compile_validation_dir=$compile_validation_root/tdx-hydro-acquire
+compile_validation_state=$compile_validation_dir/state/basins/$compile_validation_id/current.json
+jq -e '
+  .stages.compile.status == "failed" and .stages.compile.attempts == 1 and
+  .stages.compile.failure_reason == "adapter validation failed"
+' "$compile_validation_state" >/dev/null || die 'adapter validation failure state differs'
+[[ -d "$compile_validation_dir/basin-outputs/$compile_validation_id" ]] ||
+    die 'validation failure did not retain output'
+[[ -f "$compile_validation_dir/reports/$compile_validation_id-build-report.json" ]] ||
+    die 'validation failure did not retain report'
+jq -e -s --arg id "$compile_validation_id" '
+  all(if .processing_basin_id == $id then true else .stages.compile.status == "succeeded" end)
+' "$compile_validation_dir"/state/basins/*/current.json >/dev/null || die 'validation failure aborted a later basin'
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+run_runner compile --campaign acquire --workspace-root "$compile_validation_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+jq -e '
+  .stages.compile.status == "failed" and .stages.compile.attempts == 1 and
+  .stages.compile.failure_reason == "compile artifact path already exists; retained for inspection"
+' "$compile_validation_state" >/dev/null || die 'retained validation failure state differs on rerun'
+if grep -F "$compile_validation_id" "$HFX_TEST_ADAPTER_LOG" >/dev/null; then
+    die 'retained validation failure invoked the adapter on rerun'
+fi
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) == 0 ]] ||
+    die 'validation-failure rerun rebuilt a basin'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") == 61 ]] ||
+    die 'validation-failure rerun did not validate prior successes'
+pass 'adapter validation failure retains artifacts and refuses overwrite'
+
+migration_root=$test_tmp/workspaces/migration
+mkdir "$migration_root"
+cp -R "$acquire_dir" "$migration_root/tdx-hydro-acquire"
+migration_id=$(jq -r 'keys[0]' "$inventory")
+migration_state=$migration_root/tdx-hydro-acquire/state/basins/$migration_id/current.json
+jq -n --arg id "$migration_id" '{
+  schema_version: 1,
+  processing_basin_id: $id,
+  stages: {
+    acquire_basins: {
+      status: "succeeded",
+      attempts: 1,
+      failure_reason: null
+    },
+    acquire_streamnet: {
+      status: "succeeded",
+      attempts: 1,
+      failure_reason: null
+    },
+    compile: {
+      status: "pending",
+      attempts: 0,
+      failure_reason: null
+    }
+  }
+}' >"$migration_state.tmp"
+mv "$migration_state.tmp" "$migration_state"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign acquire --workspace-root "$migration_root" --max-parallel 3 >"$case_stdout"
+jq -e '
+  .schema_version == 2 and
+  .stages.acquire_basins.status == "succeeded" and
+  .stages.acquire_streamnet.status == "succeeded" and
+  .stages.acquire_basins.attempts == 1 and
+  .stages.acquire_streamnet.attempts == 1 and
+  (.stages.acquire_basins.evidence != null) and
+  (.stages.acquire_streamnet.evidence != null) and
+  .stages.compile == {status:"pending",attempts:0,failure_reason:null}
+' "$migration_state" >/dev/null || die 'v1 acquisition state did not migrate through acquire'
+[[ ! -e "$test_tmp/transfer-state/events" ]] || die 'v1 migration fetched verified final files'
+pass 'v1 basin state migrates through acquire without transfer'
+
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+: >"$test_tmp/transfer-state/events"
+post_drain_root=$test_tmp/workspaces/post-drain
+mkdir "$post_drain_root"
+cp -R "$acquire_dir" "$post_drain_root/tdx-hydro-acquire"
+post_drain_status=0
+HFX_TDX_TEST_SIGNAL_AFTER_EMPTY_DRAIN=1 \
+    run_runner acquire --campaign acquire --workspace-root "$post_drain_root" --max-parallel 3 \
+    >"$case_stdout" 2>"$case_stderr" || post_drain_status=$?
+[[ "$post_drain_status" -eq 130 ]] ||
+    die "post-drain empty-worker TERM exited $post_drain_status instead of 130"
+[[ ! -d "$post_drain_root/tdx-hydro-acquire/state/locks/campaign.lock" ]] ||
+    die 'post-drain empty-worker TERM left the campaign lock behind'
+[[ ! -s "$test_tmp/transfer-state/events" ]] ||
+    die 'post-drain empty-worker TERM triggered a transfer'
+for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/curl.*; do
+    [[ -f "$pid_file" ]] || continue
+    interrupted_pid=$(<"$pid_file")
+    ! kill -0 "$interrupted_pid" 2>/dev/null ||
+        die "post-drain acquisition worker survived: $interrupted_pid"
+done
+pass 'TERM after the final worker drain exits 130 and releases the lock'
+
 for poison in hcloud curl aws ssh; do
     [[ ! -e "$test_tmp/invocations/$poison.log" ]] || die "poison command was invoked: $poison"
 done
+if grep -Ev '^(build|validate)[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >"$case_stdout"; then
+    die 'adapter log contains an unknown command'
+fi
+if grep -E 'assemble|assembly' "$HFX_TEST_ADAPTER_LOG" "$HFX_TEST_HFX_LOG" >/dev/null; then
+    die 'local compile tools invoked assembly'
+fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-after"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-after"
 pass 'no cloud, network, SSH, or publication command ran'

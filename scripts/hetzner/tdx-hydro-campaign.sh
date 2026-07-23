@@ -19,6 +19,8 @@ set +x
 readonly HFX_TDX_INVENTORY_SOURCE=adapters/tdx-hydro/data/tdx_header_numbers.json
 readonly HFX_TDX_MAX_I64=9223372036854775807
 readonly HFX_TDX_SQLITE_MAGIC=53514c69746520666f726d6174203300
+readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/bin/python
+readonly HFX_TDX_DEFAULT_HFX=/root/hfx/target/release/hfx
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -44,7 +46,8 @@ usage() {
         'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
-        '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>'
+        '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
+        '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
 }
 
 usage_error() {
@@ -137,6 +140,17 @@ validate_campaign_json() {
             .available_memory_bytes >= .required_memory_bytes and
             .available_disk_bytes >= .required_disk_bytes)
     ' "$file" >/dev/null 2>&1 || hfx_die "campaign state is malformed: $file"
+}
+
+validate_compile_json() {
+    local file=$1
+    "$JQ" -e '
+        type == "object" and
+        keys == ["fabric_version","schema_version"] and
+        .schema_version == 1 and
+        (.fabric_version | type == "string" and length > 0 and
+            (test("[\u0000-\u001f\u007f]") | not))
+    ' "$file" >/dev/null 2>&1 || hfx_die "compile state is malformed: $file"
 }
 
 validate_basin_json() {
@@ -327,6 +341,11 @@ validate_workspace_state() {
             hfx_die "required campaign directory is missing or unsafe: $campaign_dir/$required_dir"
     done
     validate_campaign_json "$campaign_dir/state/campaign.json"
+    if [[ -e "$campaign_dir/state/compile.json" || -L "$campaign_dir/state/compile.json" ]]; then
+        [[ -f "$campaign_dir/state/compile.json" && ! -L "$campaign_dir/state/compile.json" ]] ||
+            hfx_die "compile state is not a regular file: $campaign_dir/state/compile.json"
+        validate_compile_json "$campaign_dir/state/compile.json"
+    fi
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
         hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
@@ -497,7 +516,11 @@ migrate_basin_states() {
             "$JQ" '
                 .schema_version = 2 |
                 .stages.acquire_basins.evidence = null |
-                .stages.acquire_streamnet.evidence = null
+                .stages.acquire_streamnet.evidence = null |
+                .stages.acquire_basins |=
+                    if .status == "succeeded" then .status = "pending" else . end |
+                .stages.acquire_streamnet |=
+                    if .status == "succeeded" then .status = "pending" else . end
             ' "$current" >"$temporary"
             atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
         fi
@@ -554,6 +577,135 @@ write_acquire_stage() {
         .stages[$stage].evidence = $evidence
     ' "$current" >"$temporary"
     atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+}
+
+write_compile_stage() {
+    local basin_id=$1
+    local status=$2
+    local attempts=$3
+    local reason=$4
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+    "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" '
+        .stages.compile.status = $status |
+        .stages.compile.attempts = $attempts |
+        .stages.compile.failure_reason = (if $reason == "" then null else $reason end)
+    ' "$current" >"$temporary"
+    atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+}
+
+establish_compile_contract() {
+    local contract=$campaign_dir/state/compile.json
+    local temporary
+    local persisted_fabric_version
+    if [[ -e "$contract" || -L "$contract" ]]; then
+        [[ -f "$contract" && ! -L "$contract" ]] ||
+            hfx_die "compile state is not a regular file: $contract"
+        validate_compile_json "$contract"
+        persisted_fabric_version=$("$JQ" -r '.fabric_version' "$contract")
+        [[ "$persisted_fabric_version" == "$fabric_version" ]] ||
+            hfx_die 'fabric version changed; use a new campaign ID'
+        return
+    fi
+    temporary=$campaign_dir/state/.compile.json.tmp.$$
+    "$JQ" -n --arg fabric_version "$fabric_version" '{
+      schema_version: 1,
+      fabric_version: $fabric_version
+    }' >"$temporary"
+    atomic_install "$temporary" "$contract" validate_compile_json
+}
+
+verify_compile_artifacts() {
+    local basin_id=$1
+    local output=$2
+    local report=$3
+    local resolved_output
+    [[ -d "$output" && ! -L "$output" ]] || return 1
+    [[ -f "$report" && ! -L "$report" && -s "$report" ]] || return 1
+    resolved_output=$(cd -P "$output" && pwd -P) || return 1
+    "$JQ" -e --arg basin_id "$basin_id" --arg fabric_version "$fabric_version" \
+        --arg dataset_root "$resolved_output" '
+        .build_identity.processing_basin_id == $basin_id and
+        .build_identity.fabric_name == "tdx_hydro" and
+        .build_identity.fabric_version == $fabric_version and
+        .build_identity.dataset_root == $dataset_root
+    ' "$report" >/dev/null 2>&1 || return 1
+    "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"
+}
+
+compile_campaign() {
+    local basin_id
+    local current
+    local acquire_basins_status
+    local acquire_streamnet_status
+    local compile_status
+    local attempts
+    local basins
+    local streamnet
+    local output
+    local report
+
+    acquire_campaign_lock
+    validate_workspace_state
+    establish_compile_contract
+    migrate_basin_states
+    recover_running_stages false
+    validate_workspace_state
+
+    while IFS= read -r basin_id; do
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        acquire_basins_status=$("$JQ" -r '.stages.acquire_basins.status' "$current")
+        acquire_streamnet_status=$("$JQ" -r '.stages.acquire_streamnet.status' "$current")
+        compile_status=$("$JQ" -r '.stages.compile.status' "$current")
+        attempts=$("$JQ" -r '.stages.compile.attempts' "$current")
+
+        if [[ "$acquire_basins_status" != succeeded || "$acquire_streamnet_status" != succeeded ]]; then
+            write_compile_stage "$basin_id" failed "$attempts" \
+                'acquisition prerequisites are not both succeeded'
+            continue
+        fi
+
+        basins=$campaign_dir/downloads/$basin_id-basins.gpkg
+        streamnet=$campaign_dir/downloads/$basin_id-streamnet.gpkg
+        output=$campaign_dir/basin-outputs/$basin_id
+        report=$campaign_dir/reports/$basin_id-build-report.json
+
+        if [[ "$compile_status" == succeeded ]]; then
+            if verify_compile_artifacts "$basin_id" "$output" "$report"; then
+                continue
+            fi
+            write_compile_stage "$basin_id" failed "$attempts" \
+                'existing compile artifacts failed resume verification; retained for inspection'
+            continue
+        fi
+
+        if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
+            write_compile_stage "$basin_id" failed "$attempts" \
+                'compile artifact path already exists; retained for inspection'
+            continue
+        fi
+
+        attempts=$((attempts + 1))
+        write_compile_stage "$basin_id" running "$attempts" ''
+        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
+            --basins "$basins" \
+            --streamnet "$streamnet" \
+            --out "$output" \
+            --report "$report" \
+            --processing-basin-id "$basin_id" \
+            --fabric-version "$fabric_version"; then
+            write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed'
+            continue
+        fi
+        if ! verify_compile_artifacts "$basin_id" "$output" "$report"; then
+            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
+            continue
+        fi
+        write_compile_stage "$basin_id" succeeded "$attempts" ''
+    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+
+    validate_workspace_state
+    print_status
 }
 
 evidence_bytes=
@@ -702,6 +854,10 @@ wait_oldest_worker() {
         worker_pids[$index]=${worker_pids[$((index + 1))]}
     done
     unset "worker_pids[$last]"
+    if ((${#worker_pids[@]} == 0)) && [[ ${HFX_TDX_TEST_SIGNAL_AFTER_EMPTY_DRAIN-} == 1 ]]; then
+        HFX_TDX_TEST_SIGNAL_AFTER_EMPTY_DRAIN=0
+        kill -TERM "$$"
+    fi
 }
 
 interrupt_acquisition() {
@@ -747,7 +903,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire) ;;
+    init|status|recover|acquire|compile) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -765,11 +921,13 @@ assembled_artifact_bytes=
 sizing_seen=' '
 max_parallel=
 max_parallel_seen=0
+fabric_version=
+fabric_version_seen=0
 
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel)
+        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version)
             shift
             (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
             value=$1
@@ -793,6 +951,12 @@ while (($# > 0)); do
             ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
             max_parallel_seen=1
             max_parallel=$value
+            ;;
+        --fabric-version)
+            [[ "$subcommand" == compile ]] || usage_error 'option --fabric-version is valid only for compile'
+            ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
+            fabric_version_seen=1
+            fabric_version=$value
             ;;
         *)
             [[ "$subcommand" == init ]] || usage_error "sizing option $option is valid only for init"
@@ -853,7 +1017,7 @@ elif [[ "$subcommand" == status ]]; then
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
-else
+elif [[ "$subcommand" == acquire ]]; then
     ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
     [[ "$max_parallel" =~ ^[0-9]+$ ]] || usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     ((max_parallel >= 1 && max_parallel <= 62)) ||
@@ -864,4 +1028,15 @@ else
     OD=$(resolve_command HFX_TDX_OD od)
     OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
     acquire_campaign
+else
+    ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
+    [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
+        usage_error 'option --fabric-version requires a non-empty non-option value'
+    [[ ! "$fabric_version" =~ [[:cntrl:]] ]] ||
+        usage_error 'option --fabric-version must not contain ASCII control characters'
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
+    ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
+    HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
+    compile_campaign
 fi
