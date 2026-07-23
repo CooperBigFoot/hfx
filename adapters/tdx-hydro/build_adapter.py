@@ -1831,6 +1831,18 @@ class _SnapMergeCursor:
         bboxes = batch.column("bbox").to_pylist()
         geometries_wkb = batch.column("geometry").to_pylist()
         geometries = gpd.GeoSeries.from_wkb(geometries_wkb, crs=CRS)
+        for offset, (wkb, geometry) in enumerate(
+            zip(geometries_wkb, geometries, strict=True)
+        ):
+            absolute_row = self.rows_seen + offset
+            if wkb is None:
+                raise ValueError(
+                    f"{self.root}: null snap geometry at row {absolute_row}"
+                )
+            if geometry.is_empty or geometry.geom_type != "LineString":
+                raise ValueError(
+                    f"{self.root}: invalid snap geometry at row {absolute_row}"
+                )
         hilbert_keys = tuple(
             int(value)
             for value in geometries.centroid.hilbert_distance(
@@ -1844,8 +1856,6 @@ class _SnapMergeCursor:
             weight,
             stem_role,
             bbox,
-            wkb,
-            geometry,
         ) in enumerate(
             zip(
                 hilbert_keys,
@@ -1853,8 +1863,6 @@ class _SnapMergeCursor:
                 weights,
                 stem_roles,
                 bboxes,
-                geometries_wkb,
-                geometries,
                 strict=True,
             )
         ):
@@ -1877,10 +1885,6 @@ class _SnapMergeCursor:
                 raise ValueError(
                     f"{self.root}: invalid snap stem_role at row {absolute_row}"
                 )
-            if wkb is None:
-                raise ValueError(f"{self.root}: null snap geometry at row {absolute_row}")
-            if geometry.is_empty or geometry.geom_type != "LineString":
-                raise ValueError(f"{self.root}: invalid snap geometry at row {absolute_row}")
             if bbox is not None:
                 values = [float(bbox[name]) for name in BBOX_LEAF_NAMES]
                 if (
@@ -2061,6 +2065,14 @@ def _checked_assembly_manifests(
         "adapter_version": ADAPTER_VERSION,
     }
     for root in roots:
+        required_paths = {
+            "catchments.parquet": root / "catchments.parquet",
+            "graph.parquet": root / "graph.parquet",
+            "aux/snap_stems.parquet": root / "aux" / "snap_stems.parquet",
+        }
+        for relative, required_path in required_paths.items():
+            if not required_path.is_file():
+                raise ValueError(f"{root}: required regular {relative} is missing")
         path = root / "manifest.json"
         if not path.is_file():
             raise ValueError(f"{root}: required regular manifest.json is missing")
@@ -2092,13 +2104,19 @@ def _checked_assembly_manifests(
         count = manifest.get("unit_count")
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             raise ValueError(f"{root}: invalid manifest unit_count")
+        snap_file = pq.ParquetFile(required_paths["aux/snap_stems.parquet"])
+        try:
+            if not snap_file.schema_arrow.equals(
+                _snap_merge_schema(), check_metadata=True
+            ):
+                raise ValueError(f"{root}: incompatible snap schema")
+            if snap_file.metadata.num_rows == 0:
+                raise ValueError(f"{root}: input snap file must be nonempty")
+        finally:
+            snap_file.close()
         counts = [
-            pq.ParquetFile(root / relative).metadata.num_rows
-            for relative in (
-                "catchments.parquet",
-                "graph.parquet",
-                "aux/snap_stems.parquet",
-            )
+            pq.ParquetFile(required_path).metadata.num_rows
+            for required_path in required_paths.values()
         ]
         if any(value != count for value in counts):
             raise ValueError(f"{root}: manifest and artifact row counts differ")
@@ -2152,34 +2170,20 @@ def _atomic_bytes(destination: Path, content: bytes) -> None:
         raise AssertionError(f"{destination}: staged bytes changed")
 
 
-def assemble_hfx(
-    input_dataset_roots: Sequence[Path],
+def _assemble_hfx_into(
+    roots: Sequence[Path],
     output_root: Path,
     *,
     created_at: datetime,
-    input_batch_size: int = MERGE_INPUT_BATCH_SIZE,
-    row_group_min: int = ROW_GROUP_MIN,
-    row_group_max: int = ROW_GROUP_MAX,
+    input_batch_size: int,
+    row_group_min: int,
+    row_group_max: int,
+    fabric_version: str,
+    unit_count: int,
+    regions: Sequence[str],
+    bboxes: Sequence[Sequence[float]],
 ) -> AssemblyResult:
-    """Assemble checked basin datasets into one bounded-memory HFX dataset."""
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise ValueError("created_at must be timezone-aware")
-    if input_batch_size <= 0:
-        raise ValueError("input_batch_size must be positive")
-    if row_group_min <= 0:
-        raise ValueError("row_group_min must be positive")
-    if row_group_max < row_group_min:
-        raise ValueError("row_group_max must be at least row_group_min")
-    roots = tuple(Path(root).resolve() for root in input_dataset_roots)
-    if not roots:
-        raise ValueError("at least one input dataset root is required")
-    if len(roots) != len(set(roots)):
-        raise ValueError("input dataset roots must be unique after resolution")
-    fabric_version, unit_count, regions, bboxes = _checked_assembly_manifests(roots)
-    for root in roots:
-        _validate_snap_references(root, input_batch_size)
-
-    output_root = Path(output_root)
+    """Write a fully checked assembly into an already-created staging root."""
     core = merge_catchments_and_graph(
         roots,
         output_root,
@@ -2252,6 +2256,97 @@ def assemble_hfx(
         core_metrics=core.metrics,
         snap_metrics=snap_metrics,
     )
+
+
+def assemble_hfx(
+    input_dataset_roots: Sequence[Path],
+    output_root: Path,
+    *,
+    created_at: datetime,
+    input_batch_size: int = MERGE_INPUT_BATCH_SIZE,
+    row_group_min: int = ROW_GROUP_MIN,
+    row_group_max: int = ROW_GROUP_MAX,
+) -> AssemblyResult:
+    """Assemble and atomically publish checked basin datasets."""
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
+    if input_batch_size <= 0:
+        raise ValueError("input_batch_size must be positive")
+    if row_group_min <= 0:
+        raise ValueError("row_group_min must be positive")
+    if row_group_max < row_group_min:
+        raise ValueError("row_group_max must be at least row_group_min")
+    roots = tuple(Path(root).expanduser().resolve() for root in input_dataset_roots)
+    if not roots:
+        raise ValueError("at least one input dataset root is required")
+    if len(roots) != len(set(roots)):
+        raise ValueError("input dataset roots must be unique after resolution")
+    output_root = Path(output_root).expanduser().resolve(strict=False)
+    if output_root in roots:
+        raise ValueError("output dataset root must not alias an input dataset root")
+
+    output_existed_empty = False
+    if output_root.exists():
+        if not output_root.is_dir():
+            raise ValueError("output dataset root exists and is not a directory")
+        if any(output_root.iterdir()):
+            raise ValueError("output dataset root exists and is not empty")
+        output_existed_empty = True
+    if not output_root.parent.is_dir():
+        raise ValueError(
+            f"{output_root.parent}: output parent must be an existing directory"
+        )
+
+    fabric_version, unit_count, regions, bboxes = _checked_assembly_manifests(roots)
+    for root in roots:
+        _validate_snap_references(root, input_batch_size)
+
+    staging_root: Path | None = None
+    published = False
+    removed_existing_output = False
+    try:
+        staging_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_root.name}.tmp-", dir=output_root.parent
+            )
+        )
+        staging_dataset_root = staging_root / "dataset"
+        staging_result = _assemble_hfx_into(
+            roots,
+            staging_dataset_root,
+            created_at=created_at,
+            input_batch_size=input_batch_size,
+            row_group_min=row_group_min,
+            row_group_max=row_group_max,
+            fabric_version=fabric_version,
+            unit_count=unit_count,
+            regions=regions,
+            bboxes=bboxes,
+        )
+        if output_existed_empty:
+            output_root.rmdir()
+            removed_existing_output = True
+        staging_dataset_root.replace(output_root)
+        published = True
+        return AssemblyResult(
+            catchments_path=output_root / "catchments.parquet",
+            graph_path=output_root / "graph.parquet",
+            snap_path=output_root / "aux" / "snap_stems.parquet",
+            manifest_path=output_root / "manifest.json",
+            notice_path=output_root / "NOTICE",
+            citation_path=output_root / "CITATION.txt",
+            core_metrics=staging_result.core_metrics,
+            snap_metrics=staging_result.snap_metrics,
+        )
+    except Exception:
+        if published:
+            shutil.rmtree(output_root, ignore_errors=True)
+        if removed_existing_output and not output_root.exists():
+            output_root.mkdir()
+        raise
+    finally:
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _validate_core_model(
@@ -2870,6 +2965,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("dataset", type=Path)
     validate_parser.add_argument("--hfx-binary", default="hfx")
+    assemble_parser = subparsers.add_parser("assemble")
+    assemble_parser.add_argument(
+        "--input",
+        dest="inputs",
+        action="append",
+        required=True,
+        type=Path,
+    )
+    assemble_parser.add_argument("--out", required=True, type=Path)
     return parser
 
 
@@ -2891,6 +2995,12 @@ def main(argv: list[str] | None = None) -> int:
             fabric_version=arguments.fabric_version,
             endpoint_tolerance=arguments.endpoint_tolerance,
             created_at=created_at,
+        )
+    elif arguments.command == "assemble":
+        assemble_hfx(
+            arguments.inputs,
+            arguments.out,
+            created_at=_utc_now(),
         )
     else:
         validate_dataset(arguments.dataset, hfx_binary=arguments.hfx_binary)
