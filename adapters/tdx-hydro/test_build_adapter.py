@@ -117,6 +117,30 @@ def build_cli_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
 
 
 class GeoPackageIngestionTests(unittest.TestCase):
+    def test_accepts_exact_two_identical_vertex_streamnet_linestring(self) -> None:
+        basins, streamnet, _, _ = canonical_frames()
+        streamnet.loc[streamnet["LINKNO"] == 200, "geometry"] = LineString(
+            [(0.01, 0.00), (0.01, 0.00)]
+        )
+        with TemporaryDirectory() as temp_dir:
+            paths = write_pair(Path(temp_dir), basins, streamnet)
+            source = load_tdx_geopackages(*paths)
+
+        self.assertEqual(source.streamnet["LINKNO"].tolist(), [200, 100])
+        self.assertEqual(
+            list(
+                source.streamnet.loc[
+                    source.streamnet["LINKNO"] == 200, "geometry"
+                ].iloc[0].coords
+            ),
+            [(0.01, 0.0), (0.01, 0.0)],
+        )
+        self.assertFalse(
+            source.streamnet.loc[
+                source.streamnet["LINKNO"] == 200, "geometry"
+            ].iloc[0].is_valid
+        )
+
     def test_loads_and_normalizes_real_geopackages(self) -> None:
         basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
         with TemporaryDirectory() as temp_dir:
@@ -162,6 +186,9 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(diagnostics.m2_relative_error, expected_m2_error)
         self.assertEqual(diagnostics.km2_relative_error, 0.0)
         self.assertEqual(diagnostics.selected_relative_error, 0.0)
+        self.assertEqual(diagnostics.signed_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.absolute_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.max_absolute_relative_divergence, 0.0)
 
     def test_detects_dscontarea_in_square_metres(self) -> None:
         basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
@@ -179,6 +206,9 @@ class GeoPackageIngestionTests(unittest.TestCase):
         )
         self.assertEqual(diagnostics.m2_relative_error, 0.0)
         self.assertEqual(diagnostics.selected_relative_error, 0.0)
+        self.assertEqual(diagnostics.signed_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.absolute_aggregate_relative_divergence, 0.0)
+        self.assertEqual(diagnostics.max_absolute_relative_divergence, 0.0)
         self.assertEqual(
             source.streamnet["DSContArea_km2"].tolist(),
             [(area_100_m2 + area_200_m2) / 1_000_000, area_100_m2 / 1_000_000],
@@ -186,6 +216,52 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(
             diagnostics.geodesic_upstream_area_sum_m2,
             math.fsum([expected_200_m2, expected_100_m2]),
+        )
+
+    def test_accepts_decisive_m2_unit_with_raster_vector_divergence(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        streamnet["DSContArea"] = [
+            1.13 * (area_100_m2 + area_200_m2),
+            1.13 * area_100_m2,
+        ]
+        with TemporaryDirectory() as temp_dir:
+            source = load_tdx_geopackages(
+                *write_pair(Path(temp_dir), basins, streamnet)
+            )
+
+        diagnostics = source.diagnostics.dscontarea
+        self.assertEqual(diagnostics.source_unit, "m2")
+        self.assertEqual(diagnostics.checked_polygon_bearing_link_count, 2)
+        self.assertEqual(
+            diagnostics.geodesic_upstream_area_sum_m2,
+            3692721.6149797607,
+        )
+        self.assertEqual(diagnostics.dscontarea_sum_raw, 4172775.424927129)
+        self.assertEqual(diagnostics.m2_relative_error, 0.1299999999999998)
+        self.assertEqual(diagnostics.km2_relative_error, 1129998.9999999998)
+        self.assertEqual(diagnostics.selected_relative_error, 0.1299999999999998)
+        self.assertAlmostEqual(
+            diagnostics.signed_aggregate_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            diagnostics.absolute_aggregate_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            diagnostics.max_absolute_relative_divergence,
+            0.1299999999999998,
+            places=12,
+        )
+        self.assertEqual(
+            source.streamnet["DSContArea"].tolist(),
+            [2781850.2832847526, 1390925.1416423763],
+        )
+        self.assertEqual(
+            source.streamnet["DSContArea_km2"].tolist(),
+            [2.7818502832847525, 1.3909251416423762],
         )
 
     def test_reprojects_declared_crs_before_normalization(self) -> None:
@@ -204,6 +280,18 @@ class GeoPackageIngestionTests(unittest.TestCase):
             self.assertTrue(actual.equals_exact(expected, 1e-9))
         self.assertEqual(source.diagnostics.dscontarea.source_unit, "km2")
         self.assertLess(source.diagnostics.dscontarea.selected_relative_error, 1e-9)
+        self.assertLess(
+            abs(source.diagnostics.dscontarea.signed_aggregate_relative_divergence),
+            1e-9,
+        )
+        self.assertLess(
+            source.diagnostics.dscontarea.absolute_aggregate_relative_divergence,
+            1e-9,
+        )
+        self.assertLess(
+            source.diagnostics.dscontarea.max_absolute_relative_divergence,
+            1e-9,
+        )
 
     def test_clamps_one_tdx_cell_envelope_and_reports_native_ids(self) -> None:
         tolerance = COORDINATE_DOMAIN_TOLERANCE_DEGREES
@@ -243,6 +331,18 @@ class GeoPackageIngestionTests(unittest.TestCase):
         self.assertEqual(get_coordinates(source.basins.geometry).max(axis=0)[0], 180.0)
         self.assertEqual(get_coordinates(source.streamnet.geometry).max(axis=0)[0], 180.0)
         self.assertAlmostEqual(source.diagnostics.dscontarea.selected_relative_error, 0.0)
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.signed_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.absolute_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            source.diagnostics.dscontarea.max_absolute_relative_divergence,
+            0.0,
+        )
 
     def test_rejects_overshoot_beyond_one_tdx_cell(self) -> None:
         tolerance = COORDINATE_DOMAIN_TOLERANCE_DEGREES
@@ -292,6 +392,22 @@ class GeoPackageIngestionTests(unittest.TestCase):
         geometry_cases = (
             ("basins", Point(0.0, 0.0), "Polygon"),
             ("streamnet", MultiLineString([[(0.0, 0.0), (0.01, 0.0)]]), "LineString"),
+            (
+                "streamnet",
+                LineString([(0.00, 0.00), (0.00, 0.00), (0.00, 0.00)]),
+                "valid",
+            ),
+            (
+                "basins",
+                Polygon([
+                    (0.00, 0.00),
+                    (0.01, 0.01),
+                    (0.01, 0.00),
+                    (0.00, 0.01),
+                    (0.00, 0.00),
+                ]),
+                "valid",
+            ),
             ("basins", None, "geometry"), ("streamnet", None, "geometry"),
             ("basins", Polygon(), "geometry"), ("streamnet", LineString(), "geometry"),
         )
@@ -323,13 +439,33 @@ class GeoPackageIngestionTests(unittest.TestCase):
                     ):
                         load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
 
-    def test_rejects_empirical_dscontarea_scale_mismatch(self) -> None:
-        basins, streamnet, _, _ = canonical_frames()
-        streamnet["DSContArea"] *= 1000
+    def test_rejects_non_decisive_dscontarea_unit_candidates(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        tie_factor = 2.0 / 1_000_001.0
+        streamnet["DSContArea"] = [
+            tie_factor * (area_100_m2 + area_200_m2),
+            tie_factor * area_100_m2,
+        ]
         with TemporaryDirectory() as temp_dir:
             with self.assertRaisesRegex(
                 ValueError,
-                r"(?=.*DSContArea)(?=.*m2_relative_error)(?=.*km2_relative_error)(?=.*0\.05)",
+                r"(?=.*DSContArea)(?=.*unit candidates are not decisive)"
+                r"(?=.*unit_decisiveness_ratio)(?=.*minimum_ratio=1000\.0)",
+            ):
+                load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
+
+    def test_rejects_gross_dscontarea_fabric_divergence(self) -> None:
+        basins, streamnet, area_100_m2, area_200_m2 = canonical_frames()
+        streamnet["DSContArea"] = [
+            2.1 * (area_100_m2 + area_200_m2),
+            2.1 * area_100_m2,
+        ]
+        with TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError,
+                r"(?=.*DSContArea fabric divergence sanity check failed)"
+                r"(?=.*source_unit='m2')(?=.*selected_relative_error=1\.1)"
+                r"(?=.*sanity_ceiling=1\.0)",
             ):
                 load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
 
@@ -375,6 +511,204 @@ class GlobalLinknoTests(unittest.TestCase):
 
 
 class StreamnetModelTests(unittest.TestCase):
+    def test_uses_single_coordinate_as_degenerate_polygon_bearing_root_outlet(
+        self,
+    ) -> None:
+        basins = pd.DataFrame({"streamID": [100]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [100],
+                "DSLINKNO": [-1],
+                "geometry": [LineString([(4.0, 5.0), (4.0, 5.0)])],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+
+        self.assertEqual(
+            model.units,
+            (StreamnetUnit(100, 710_000_100, 0, None, -1, -1, 0, 4.0, 5.0),),
+        )
+        self.assertEqual(model.edges, ())
+        self.assertEqual(model.roots, (710_000_100,))
+        self.assertEqual(
+            model.diagnostics,
+            StreamnetDiagnostics(
+                polygon_bearing_link_count=1,
+                polygonless_dropped_reach_count=0,
+                degenerate_reach_count=1,
+                degenerate_reach_native_linknos=(100,),
+                degenerate_polygon_bearing_reach_count=1,
+                degenerate_polygon_bearing_reach_native_linknos=(100,),
+                degenerate_polygonless_reach_count=0,
+                degenerate_polygonless_reach_native_linknos=(),
+                short_successor_resolved_reach_count=0,
+                short_successor_resolved_reach_native_linknos=(),
+                reach_side_near_degenerate_resolved_reach_count=0,
+                reach_side_near_degenerate_resolved_reach_native_linknos=(),
+                root_count=1,
+                contracted_edge_count=0,
+                contracted_root_count=0,
+                contracted_link_traversal_count=0,
+                endpoint_coincidence_proven_link_count=0,
+                predecessor_orientation_proven_root_count=0,
+                trusted_orientation_isolated_root_count=0,
+                trusted_orientation_isolated_root_native_linknos=(),
+                trusted_orientation_polygon_bearing_isolated_root_count=0,
+                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                orientation_tolerance=0.001,
+            ),
+        )
+
+    def test_proves_healthy_reach_by_coincidence_with_degenerate_successor(
+        self,
+    ) -> None:
+        basins = pd.DataFrame({"streamID": [100, 200]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [100, 200],
+                "DSLINKNO": [200, -1],
+                "geometry": [
+                    LineString([(0.0, 0.0), (1.0, 0.0)]),
+                    LineString([(1.0, 0.0), (1.0, 0.0)]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+
+        self.assertEqual(
+            [(unit.linkno, unit.outlet_lon, unit.outlet_lat) for unit in model.units],
+            [(100, 1.0, 0.0), (200, 1.0, 0.0)],
+        )
+        self.assertEqual(model.edges, ((710_000_100, 710_000_200),))
+        self.assertEqual(model.roots, (710_000_200,))
+        self.assertEqual(
+            model.diagnostics,
+            StreamnetDiagnostics(
+                polygon_bearing_link_count=2,
+                polygonless_dropped_reach_count=0,
+                degenerate_reach_count=1,
+                degenerate_reach_native_linknos=(200,),
+                degenerate_polygon_bearing_reach_count=1,
+                degenerate_polygon_bearing_reach_native_linknos=(200,),
+                degenerate_polygonless_reach_count=0,
+                degenerate_polygonless_reach_native_linknos=(),
+                short_successor_resolved_reach_count=0,
+                short_successor_resolved_reach_native_linknos=(),
+                reach_side_near_degenerate_resolved_reach_count=0,
+                reach_side_near_degenerate_resolved_reach_native_linknos=(),
+                root_count=1,
+                contracted_edge_count=0,
+                contracted_root_count=0,
+                contracted_link_traversal_count=0,
+                endpoint_coincidence_proven_link_count=1,
+                predecessor_orientation_proven_root_count=0,
+                trusted_orientation_isolated_root_count=0,
+                trusted_orientation_isolated_root_native_linknos=(),
+                trusted_orientation_polygon_bearing_isolated_root_count=0,
+                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                orientation_tolerance=0.001,
+            ),
+        )
+
+    def test_contracts_through_polygonless_degenerate_chain(self) -> None:
+        point = (-120.729444444445, 42.8208888888891)
+        basins = pd.DataFrame({"streamID": [244107, 240000]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [244107, 242123, 240000],
+                "DSLINKNO": [-1, 244107, 242123],
+                "geometry": [
+                    LineString([point, point]),
+                    LineString([point, point]),
+                    LineString([(-120.731444444445, 42.8208888888891), point]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+
+        self.assertEqual(
+            model.units,
+            (
+                StreamnetUnit(
+                    240000,
+                    710_240_000,
+                    0,
+                    None,
+                    244107,
+                    710_244_107,
+                    1,
+                    -120.729444444445,
+                    42.8208888888891,
+                ),
+                StreamnetUnit(
+                    244107,
+                    710_244_107,
+                    0,
+                    None,
+                    -1,
+                    -1,
+                    0,
+                    -120.729444444445,
+                    42.8208888888891,
+                ),
+            ),
+        )
+        self.assertEqual(model.edges, ((710_240_000, 710_244_107),))
+        self.assertEqual(model.roots, (710_244_107,))
+        self.assertEqual(model.diagnostics.polygon_bearing_link_count, 2)
+        self.assertEqual(model.diagnostics.polygonless_dropped_reach_count, 1)
+        self.assertEqual(model.diagnostics.root_count, 1)
+        self.assertEqual(model.diagnostics.contracted_edge_count, 1)
+        self.assertEqual(model.diagnostics.contracted_root_count, 0)
+        self.assertEqual(model.diagnostics.contracted_link_traversal_count, 1)
+        self.assertEqual(model.diagnostics.degenerate_reach_count, 2)
+        self.assertEqual(
+            model.diagnostics.degenerate_reach_native_linknos, (242123, 244107)
+        )
+        self.assertEqual(model.diagnostics.degenerate_polygon_bearing_reach_count, 1)
+        self.assertEqual(
+            model.diagnostics.degenerate_polygon_bearing_reach_native_linknos,
+            (244107,),
+        )
+        self.assertEqual(model.diagnostics.degenerate_polygonless_reach_count, 1)
+        self.assertEqual(
+            model.diagnostics.degenerate_polygonless_reach_native_linknos, (242123,)
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
+        )
+        self.assertEqual(model.diagnostics.endpoint_coincidence_proven_link_count, 1)
+        self.assertEqual(model.diagnostics.predecessor_orientation_proven_root_count, 0)
+        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 0)
+        self.assertEqual(
+            model.diagnostics.trusted_orientation_isolated_root_native_linknos, ()
+        )
+        self.assertEqual(
+            model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count,
+            0,
+        )
+        self.assertEqual(
+            model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            (),
+        )
+        self.assertEqual(model.diagnostics.orientation_tolerance, 0.001)
+
     def test_builds_deterministic_contracted_model(self) -> None:
         basins = pd.DataFrame(
             {
@@ -422,6 +756,16 @@ class StreamnetModelTests(unittest.TestCase):
             StreamnetDiagnostics(
                 polygon_bearing_link_count=3,
                 polygonless_dropped_reach_count=4,
+                degenerate_reach_count=0,
+                degenerate_reach_native_linknos=(),
+                degenerate_polygon_bearing_reach_count=0,
+                degenerate_polygon_bearing_reach_native_linknos=(),
+                degenerate_polygonless_reach_count=0,
+                degenerate_polygonless_reach_native_linknos=(),
+                short_successor_resolved_reach_count=0,
+                short_successor_resolved_reach_native_linknos=(),
+                reach_side_near_degenerate_resolved_reach_count=0,
+                reach_side_near_degenerate_resolved_reach_native_linknos=(),
                 root_count=2,
                 contracted_edge_count=1,
                 contracted_root_count=1,
@@ -437,7 +781,16 @@ class StreamnetModelTests(unittest.TestCase):
         )
         self.assertEqual(model.diagnostics.polygonless_dropped_reach_count, 4)
         self.assertIn(
-            "streamnet_model polygon_bearing_links=3 roots=2 contracted_edges=1 "
+            "streamnet_model polygon_bearing_links=3 degenerate_reaches=0 "
+            "degenerate_reach_native_linknos=() degenerate_polygon_bearing_reaches=0 "
+            "degenerate_polygon_bearing_reach_native_linknos=() "
+            "degenerate_polygonless_reaches=0 "
+            "degenerate_polygonless_reach_native_linknos=() "
+            "short_successor_resolved_reaches=0 "
+            "short_successor_resolved_reach_native_linknos=() "
+            "reach_side_near_degenerate_resolved_reaches=0 "
+            "reach_side_near_degenerate_resolved_reach_native_linknos=() "
+            "roots=2 contracted_edges=1 "
             "contracted_roots=1 contracted_link_traversals=3 "
             "endpoint_coincidence_proven_links=5 predecessor_orientation_proven_roots=2 "
             "trusted_orientation_isolated_roots=0 "
@@ -473,9 +826,127 @@ class StreamnetModelTests(unittest.TestCase):
         )
         self.assertEqual(model.diagnostics.endpoint_coincidence_proven_link_count, 1)
         self.assertEqual(model.diagnostics.predecessor_orientation_proven_root_count, 1)
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
+        )
         self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 0)
         self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 0)
         self.assertEqual(model.diagnostics.orientation_tolerance, 0.001)
+
+    def test_proves_reach_when_one_current_endpoint_matches_both_short_successor_endpoints(
+        self,
+    ) -> None:
+        basins = pd.DataFrame({"streamID": [100, 200, 300]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [100, 200, 300],
+                "DSLINKNO": [200, 300, -1],
+                "geometry": [
+                    LineString([(0.0, 0.0), (1.0, 0.0)]),
+                    LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+                    LineString([(1.0008, 0.0), (2.0, 0.0)]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+
+        self.assertEqual(
+            [(unit.linkno, unit.outlet_lon, unit.outlet_lat) for unit in model.units],
+            [
+                (100, 1.0, 0.0),
+                (200, 1.0008, 0.0),
+                (300, 2.0, 0.0),
+            ],
+        )
+        self.assertEqual(
+            model.diagnostics,
+            StreamnetDiagnostics(
+                polygon_bearing_link_count=3,
+                polygonless_dropped_reach_count=0,
+                degenerate_reach_count=0,
+                degenerate_reach_native_linknos=(),
+                degenerate_polygon_bearing_reach_count=0,
+                degenerate_polygon_bearing_reach_native_linknos=(),
+                degenerate_polygonless_reach_count=0,
+                degenerate_polygonless_reach_native_linknos=(),
+                short_successor_resolved_reach_count=1,
+                short_successor_resolved_reach_native_linknos=(100,),
+                reach_side_near_degenerate_resolved_reach_count=0,
+                reach_side_near_degenerate_resolved_reach_native_linknos=(),
+                root_count=1,
+                contracted_edge_count=0,
+                contracted_root_count=0,
+                contracted_link_traversal_count=0,
+                endpoint_coincidence_proven_link_count=2,
+                predecessor_orientation_proven_root_count=1,
+                trusted_orientation_isolated_root_count=0,
+                trusted_orientation_isolated_root_native_linknos=(),
+                trusted_orientation_polygon_bearing_isolated_root_count=0,
+                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                orientation_tolerance=0.001,
+            ),
+        )
+
+    def test_uses_native_order_for_reach_side_near_degenerate_reach(self) -> None:
+        basins = pd.DataFrame({"streamID": [100, 200]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [100, 200],
+                "DSLINKNO": [200, -1],
+                "geometry": [
+                    LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+                    LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+
+        self.assertEqual(
+            [(unit.linkno, unit.outlet_lon, unit.outlet_lat) for unit in model.units],
+            [(100, 1.0008, 0.0), (200, 0.9992, 0.0)],
+        )
+        self.assertEqual(
+            model.diagnostics,
+            StreamnetDiagnostics(
+                polygon_bearing_link_count=2,
+                polygonless_dropped_reach_count=0,
+                degenerate_reach_count=0,
+                degenerate_reach_native_linknos=(),
+                degenerate_polygon_bearing_reach_count=0,
+                degenerate_polygon_bearing_reach_native_linknos=(),
+                degenerate_polygonless_reach_count=0,
+                degenerate_polygonless_reach_native_linknos=(),
+                short_successor_resolved_reach_count=0,
+                short_successor_resolved_reach_native_linknos=(),
+                reach_side_near_degenerate_resolved_reach_count=1,
+                reach_side_near_degenerate_resolved_reach_native_linknos=(100,),
+                root_count=1,
+                contracted_edge_count=0,
+                contracted_root_count=0,
+                contracted_link_traversal_count=0,
+                endpoint_coincidence_proven_link_count=0,
+                predecessor_orientation_proven_root_count=1,
+                trusted_orientation_isolated_root_count=0,
+                trusted_orientation_isolated_root_native_linknos=(),
+                trusted_orientation_polygon_bearing_isolated_root_count=0,
+                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                orientation_tolerance=0.001,
+            ),
+        )
 
 
 class StreamnetOrientationRejectionTests(unittest.TestCase):
@@ -513,27 +984,28 @@ class StreamnetOrientationRejectionTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            ValueError, r"(?=.*orientation)(?=.*100)(?=.*200)(?=.*ambiguous)"
+            ValueError,
+            r"(?=.*orientation)(?=.*100)(?=.*200)(?=.*reach-side)(?=.*ambiguous)",
         ):
             build_streamnet_model(
                 basins, streamnet, header_number=71, endpoint_tolerance=0.001
             )
 
-    def test_rejects_one_endpoint_matching_both_successor_endpoints(self) -> None:
+    def test_rejects_degenerate_reach_noncoincident_with_successor(self) -> None:
         basins = pd.DataFrame({"streamID": [100, 200]})
         streamnet = pd.DataFrame(
             {
                 "LINKNO": [100, 200],
                 "DSLINKNO": [200, -1],
                 "geometry": [
-                    LineString([(0.0, 0.0), (1.0, 0.0)]),
-                    LineString([(1.0004, 0.0), (1.0008, 0.0)]),
+                    LineString([(1.0, 0.0), (1.0, 0.0)]),
+                    LineString([(2.0, 0.0), (3.0, 0.0)]),
                 ],
             }
         )
 
         with self.assertRaisesRegex(
-            ValueError, r"(?=.*orientation)(?=.*100)(?=.*200)(?=.*ambiguous)"
+            ValueError, r"(?=.*orientation)(?=.*100)(?=.*200)(?=.*non-coincident)"
         ):
             build_streamnet_model(
                 basins, streamnet, header_number=71, endpoint_tolerance=0.001
@@ -555,6 +1027,19 @@ class StreamnetOrientationRejectionTests(unittest.TestCase):
         self.assertEqual((model.units[0].outlet_lon, model.units[0].outlet_lat), (1.0, 0.0))
         self.assertEqual(model.diagnostics.endpoint_coincidence_proven_link_count, 0)
         self.assertEqual(model.diagnostics.predecessor_orientation_proven_root_count, 0)
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
+        )
         self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 1)
         self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_native_linknos, (100,))
         self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 1)
@@ -570,6 +1055,19 @@ class StreamnetOrientationRejectionTests(unittest.TestCase):
         )
         model = build_streamnet_model(
             basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
         )
         self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 2)
         self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_native_linknos, (100, 900))
@@ -967,8 +1465,36 @@ class CoreHfxCompilationTests(unittest.TestCase):
         self.assertEqual(ingestion.dscontarea.checked_polygon_bearing_link_count, 2)
         self.assertEqual(ingestion.dscontarea.km2_relative_error, 0.0)
         self.assertEqual(ingestion.dscontarea.selected_relative_error, 0.0)
+        self.assertEqual(
+            ingestion.dscontarea.signed_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertEqual(
+            ingestion.dscontarea.absolute_aggregate_relative_divergence,
+            0.0,
+        )
+        self.assertEqual(ingestion.dscontarea.max_absolute_relative_divergence, 0.0)
         diagnostics = first.diagnostics.streamnet
         self.assertEqual(diagnostics.polygon_bearing_link_count, 2)
+        self.assertEqual(diagnostics.degenerate_reach_count, 0)
+        self.assertEqual(diagnostics.degenerate_reach_native_linknos, ())
+        self.assertEqual(diagnostics.degenerate_polygon_bearing_reach_count, 0)
+        self.assertEqual(
+            diagnostics.degenerate_polygon_bearing_reach_native_linknos, ()
+        )
+        self.assertEqual(diagnostics.degenerate_polygonless_reach_count, 0)
+        self.assertEqual(diagnostics.degenerate_polygonless_reach_native_linknos, ())
+        self.assertEqual(diagnostics.short_successor_resolved_reach_count, 0)
+        self.assertEqual(
+            diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
+        )
         self.assertEqual(diagnostics.root_count, 1)
         self.assertEqual(diagnostics.contracted_edge_count, 0)
         self.assertEqual(diagnostics.contracted_root_count, 0)
@@ -1297,6 +1823,17 @@ class CoreHfxCompilationTests(unittest.TestCase):
         diagnostics = result.diagnostics.streamnet
         self.assertEqual(diagnostics.endpoint_coincidence_proven_link_count, 0)
         self.assertEqual(diagnostics.predecessor_orientation_proven_root_count, 0)
+        self.assertEqual(diagnostics.short_successor_resolved_reach_count, 0)
+        self.assertEqual(
+            diagnostics.short_successor_resolved_reach_native_linknos, ()
+        )
+        self.assertEqual(
+            diagnostics.reach_side_near_degenerate_resolved_reach_count, 0
+        )
+        self.assertEqual(
+            diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (),
+        )
         self.assertEqual(diagnostics.trusted_orientation_isolated_root_count, 2)
         self.assertEqual(
             diagnostics.trusted_orientation_isolated_root_native_linknos, (100, 200)
@@ -1364,6 +1901,16 @@ class BuildCliTests(unittest.TestCase):
         streamnet = {
             "polygon_bearing_link_count": 2,
             "polygonless_dropped_reach_count": 0 if isolated else 1,
+            "degenerate_reach_count": 0,
+            "degenerate_reach_native_linknos": [],
+            "degenerate_polygon_bearing_reach_count": 0,
+            "degenerate_polygon_bearing_reach_native_linknos": [],
+            "degenerate_polygonless_reach_count": 0,
+            "degenerate_polygonless_reach_native_linknos": [],
+            "short_successor_resolved_reach_count": 0,
+            "short_successor_resolved_reach_native_linknos": [],
+            "reach_side_near_degenerate_resolved_reach_count": 0,
+            "reach_side_near_degenerate_resolved_reach_native_linknos": [],
             "root_count": 2 if isolated else 1,
             "contracted_edge_count": 0 if isolated else 1,
             "contracted_root_count": 0,
@@ -1397,6 +1944,9 @@ class BuildCliTests(unittest.TestCase):
                         "m2_relative_error": 0.999999,
                         "km2_relative_error": 0.0,
                         "selected_relative_error": 0.0,
+                        "signed_aggregate_relative_divergence": 0.0,
+                        "absolute_aggregate_relative_divergence": 0.0,
+                        "max_absolute_relative_divergence": 0.0,
                     },
                 },
                 "streamnet": streamnet,
@@ -1407,6 +1957,203 @@ class BuildCliTests(unittest.TestCase):
         for parent in parents:
             self.assertFalse(
                 any(".tmp-" in entry.name for entry in parent.iterdir()), parent
+            )
+
+    def test_build_cli_reports_degenerate_reaches(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            basins, streamnet, _, _ = canonical_frames()
+            streamnet.loc[streamnet["LINKNO"] == 200, "geometry"] = LineString(
+                [(0.01, 0.00), (0.01, 0.00)]
+            )
+            basins_path, streamnet_path = write_pair(source_dir, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with patch("build_adapter._utc_now", return_value=self.created_at):
+                with self.assertLogs("tdx-hydro", level="WARNING") as captured:
+                    status = main(
+                        self.build_args(
+                            basins_path, streamnet_path, output, report
+                        )
+                    )
+
+            self.assertEqual(status, 0)
+            report_data = json.loads(report.read_text())
+            diagnostics = report_data["diagnostics"]["streamnet"]
+            self.assertEqual(
+                diagnostics,
+                {
+                    "polygon_bearing_link_count": 2,
+                    "polygonless_dropped_reach_count": 0,
+                    "degenerate_reach_count": 1,
+                    "degenerate_reach_native_linknos": [200],
+                    "degenerate_polygon_bearing_reach_count": 1,
+                    "degenerate_polygon_bearing_reach_native_linknos": [200],
+                    "degenerate_polygonless_reach_count": 0,
+                    "degenerate_polygonless_reach_native_linknos": [],
+                    "short_successor_resolved_reach_count": 0,
+                    "short_successor_resolved_reach_native_linknos": [],
+                    "reach_side_near_degenerate_resolved_reach_count": 0,
+                    "reach_side_near_degenerate_resolved_reach_native_linknos": [],
+                    "root_count": 1,
+                    "contracted_edge_count": 0,
+                    "contracted_root_count": 0,
+                    "contracted_link_traversal_count": 0,
+                    "endpoint_coincidence_proven_link_count": 1,
+                    "predecessor_orientation_proven_root_count": 0,
+                    "trusted_orientation_isolated_root_count": 0,
+                    "trusted_orientation_isolated_root_native_linknos": [],
+                    "trusted_orientation_polygon_bearing_isolated_root_count": 0,
+                    "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                    "orientation_tolerance": 0.001,
+                },
+            )
+            snap = pq.read_table(output / "aux/snap_stems.parquet")
+            row_index = snap["unit_id"].to_pylist().index(710000200)
+            self.assertEqual(
+                snap["geometry"][row_index].as_py(),
+                LineString([(0.01, 0.00), (0.01, 0.00)]).wkb,
+            )
+            self.assertEqual(
+                snap["bbox"][row_index].as_py(),
+                {
+                    "xmin": 0.00989999994635582,
+                    "ymin": -9.999999747378752e-05,
+                    "xmax": 0.010099999606609344,
+                    "ymax": 9.999999747378752e-05,
+                },
+            )
+            messages = [record.getMessage() for record in captured.records]
+            self.assertEqual(
+                sum(
+                    "diagnostic=degenerate_reach_count count=1 native_ids=(200,)"
+                    in message
+                    for message in messages
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    "diagnostic=degenerate_polygon_bearing_reach_count count=1 "
+                    "native_ids=(200,)" in message
+                    for message in messages
+                ),
+                1,
+            )
+            self.assertFalse(
+                any(
+                    "diagnostic=degenerate_polygonless_reach_count" in message
+                    for message in messages
+                )
+            )
+            self.assertFalse(
+                any(
+                    "diagnostic=short_successor_resolved_reach_count" in message
+                    for message in messages
+                )
+            )
+            self.assertFalse(
+                any(
+                    "diagnostic=reach_side_near_degenerate_resolved_reach_count"
+                    in message
+                    for message in messages
+                )
+            )
+
+    def test_build_cli_reports_short_successor_and_near_degenerate_root_resolution(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            basins, streamnet, _, _ = canonical_frames()
+            streamnet.loc[streamnet["LINKNO"] == 100, "geometry"] = LineString(
+                [(0.0, 0.0), (0.01, 0.0)]
+            )
+            streamnet.loc[streamnet["LINKNO"] == 200, "geometry"] = LineString(
+                [(0.0092, 0.0), (0.0108, 0.0)]
+            )
+            basins_path, streamnet_path = write_pair(source_dir, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with patch("build_adapter._utc_now", return_value=self.created_at):
+                with self.assertLogs("tdx-hydro", level="WARNING") as captured:
+                    status = main(
+                        self.build_args(
+                            basins_path, streamnet_path, output, report
+                        )
+                    )
+
+            self.assertEqual(status, 0)
+            report_data = json.loads(report.read_text())
+            self.assertEqual(
+                report_data["diagnostics"]["streamnet"],
+                {
+                    "polygon_bearing_link_count": 2,
+                    "polygonless_dropped_reach_count": 0,
+                    "degenerate_reach_count": 0,
+                    "degenerate_reach_native_linknos": [],
+                    "degenerate_polygon_bearing_reach_count": 0,
+                    "degenerate_polygon_bearing_reach_native_linknos": [],
+                    "degenerate_polygonless_reach_count": 0,
+                    "degenerate_polygonless_reach_native_linknos": [],
+                    "short_successor_resolved_reach_count": 1,
+                    "short_successor_resolved_reach_native_linknos": [100],
+                    "reach_side_near_degenerate_resolved_reach_count": 1,
+                    "reach_side_near_degenerate_resolved_reach_native_linknos": [200],
+                    "root_count": 1,
+                    "contracted_edge_count": 0,
+                    "contracted_root_count": 0,
+                    "contracted_link_traversal_count": 0,
+                    "endpoint_coincidence_proven_link_count": 1,
+                    "predecessor_orientation_proven_root_count": 0,
+                    "trusted_orientation_isolated_root_count": 0,
+                    "trusted_orientation_isolated_root_native_linknos": [],
+                    "trusted_orientation_polygon_bearing_isolated_root_count": 0,
+                    "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                    "orientation_tolerance": 0.001,
+                },
+            )
+            catchments = pq.read_table(output / "catchments.parquet")
+            outlets = {
+                linkno: (lon, lat)
+                for linkno, lon, lat in zip(
+                    catchments["id"].to_pylist(),
+                    catchments["outlet_lon"].to_pylist(),
+                    catchments["outlet_lat"].to_pylist(),
+                    strict=True,
+                )
+            }
+            self.assertEqual(outlets[710000100], (0.01, 0.0))
+            self.assertEqual(outlets[710000200], (0.0108, 0.0))
+            messages = [record.getMessage() for record in captured.records]
+            self.assertEqual(
+                sum(
+                    "diagnostic=short_successor_resolved_reach_count count=1 "
+                    "native_ids=(100,)" in message
+                    for message in messages
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    "diagnostic=reach_side_near_degenerate_resolved_reach_count "
+                    "count=1 native_ids=(200,)" in message
+                    for message in messages
+                ),
+                1,
+            )
+            self.assertFalse(
+                any("diagnostic=degenerate_reach_count" in message for message in messages)
+            )
+            self.assertFalse(
+                any(
+                    "diagnostic=trusted_orientation_isolated_root_count" in message
+                    for message in messages
+                )
             )
 
     def test_build_cli_writes_dataset_and_exact_external_report(self) -> None:
@@ -1488,6 +2235,19 @@ class BuildCliTests(unittest.TestCase):
                 1,
             )
             self.assertFalse(any("contracted_root_count" in message for message in messages))
+            self.assertFalse(any("degenerate_" in message for message in messages))
+            self.assertFalse(
+                any(
+                    "short_successor_resolved_reach_count" in message
+                    for message in messages
+                )
+            )
+            self.assertFalse(
+                any(
+                    "reach_side_near_degenerate_resolved_reach_count" in message
+                    for message in messages
+                )
+            )
             self.assertFalse(any("trusted_orientation" in message for message in messages))
             self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
 
@@ -1585,6 +2345,18 @@ class BuildCliTests(unittest.TestCase):
             messages = [record.getMessage() for record in captured.records]
             self.assertTrue(any("diagnostic=trusted_orientation_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
             self.assertTrue(any("diagnostic=trusted_orientation_polygon_bearing_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
+            self.assertFalse(
+                any(
+                    "short_successor_resolved_reach_count" in message
+                    for message in messages
+                )
+            )
+            self.assertFalse(
+                any(
+                    "reach_side_near_degenerate_resolved_reach_count" in message
+                    for message in messages
+                )
+            )
             self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
 
     def test_validate_cli_runs_explicit_binary_and_all_dataset_layer_checks(self) -> None:

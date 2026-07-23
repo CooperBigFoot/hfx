@@ -52,7 +52,8 @@ CRS = "EPSG:4326"
 # to 0.4 arc-second spacing; one source cell is therefore 0.4 / 3600 degrees.
 TDX_SOURCE_CELL_ARCSECONDS = 0.4
 COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
-DSCONTAREA_RELATIVE_TOLERANCE = 0.05
+DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO = 1_000.0
+DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING = 1.0
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
 SNAP_BBOX_EPSILON = 1e-4
 
@@ -72,6 +73,9 @@ class DSContAreaDiagnostics:
     m2_relative_error: float
     km2_relative_error: float
     selected_relative_error: float
+    signed_aggregate_relative_divergence: float
+    absolute_aggregate_relative_divergence: float
+    max_absolute_relative_divergence: float
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,16 @@ class StreamnetUnit:
 class StreamnetDiagnostics:
     polygon_bearing_link_count: int
     polygonless_dropped_reach_count: int
+    degenerate_reach_count: int
+    degenerate_reach_native_linknos: tuple[int, ...]
+    degenerate_polygon_bearing_reach_count: int
+    degenerate_polygon_bearing_reach_native_linknos: tuple[int, ...]
+    degenerate_polygonless_reach_count: int
+    degenerate_polygonless_reach_native_linknos: tuple[int, ...]
+    short_successor_resolved_reach_count: int
+    short_successor_resolved_reach_native_linknos: tuple[int, ...]
+    reach_side_near_degenerate_resolved_reach_count: int
+    reach_side_near_degenerate_resolved_reach_native_linknos: tuple[int, ...]
     root_count: int
     contracted_edge_count: int
     contracted_root_count: int
@@ -195,16 +209,38 @@ def _require_columns(
         raise ValueError(f"{table_name} is missing required columns: {missing}")
 
 
+def _is_tdx_degenerate_reach(geometry: object) -> bool:
+    if (
+        not isinstance(geometry, LineString)
+        or geometry.is_empty
+        or geometry.has_z
+    ):
+        return False
+    coordinates = list(geometry.coords)
+    if len(coordinates) != 2 or any(len(coordinate) != 2 for coordinate in coordinates):
+        return False
+    converted = tuple(
+        (float(coordinate[0]), float(coordinate[1])) for coordinate in coordinates
+    )
+    return all(math.isfinite(value) for coordinate in converted for value in coordinate) and (
+        converted[0] == converted[1]
+    )
+
+
 def _validate_layer_geometry(
     table: gpd.GeoDataFrame,
     layer_name: str,
     allowed_types: set[str],
+    *,
+    allow_tdx_degenerate_reaches: bool = False,
 ) -> None:
     expected = " or ".join(sorted(allowed_types))
     for geometry in table.geometry:
         if geometry is None or geometry.is_empty:
             raise ValueError(f"{layer_name} geometry must be non-null and non-empty")
-        if not geometry.is_valid:
+        if not geometry.is_valid and not (
+            allow_tdx_degenerate_reaches and _is_tdx_degenerate_reach(geometry)
+        ):
             raise ValueError(f"{layer_name} geometry must be valid")
         if geometry.has_z:
             raise ValueError(f"{layer_name} geometry must be two-dimensional")
@@ -411,13 +447,57 @@ def _infer_dscontarea_unit(
         )
     source_unit = "m2" if m2_relative_error < km2_relative_error else "km2"
     selected_relative_error = min(m2_relative_error, km2_relative_error)
-    if selected_relative_error > DSCONTAREA_RELATIVE_TOLERANCE:
+    losing_relative_error = max(m2_relative_error, km2_relative_error)
+    unit_decisiveness_ratio = (
+        math.inf
+        if selected_relative_error == 0.0
+        else losing_relative_error / selected_relative_error
+    )
+    if unit_decisiveness_ratio < DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO:
         raise ValueError(
-            "DSContArea empirical unit verification failed: "
+            "DSContArea unit candidates are not decisive: "
             f"m2_relative_error={m2_relative_error!r}, "
             f"km2_relative_error={km2_relative_error!r}, "
-            f"tolerance={DSCONTAREA_RELATIVE_TOLERANCE!r}"
+            f"unit_decisiveness_ratio={unit_decisiveness_ratio!r}, "
+            "minimum_ratio="
+            f"{DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO!r}"
         )
+
+    converted_samples_m2 = (
+        raw_samples
+        if source_unit == "m2"
+        else [raw * 1_000_000 for raw in raw_samples]
+    )
+    signed_aggregate_relative_divergence = math.fsum(
+        converted - expected
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    ) / expected_sum
+    absolute_aggregate_relative_divergence = math.fsum(
+        abs(converted - expected)
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    ) / expected_sum
+    max_absolute_relative_divergence = max(
+        abs(converted - expected) / expected
+        for converted, expected in zip(
+            converted_samples_m2, expected_samples, strict=True
+        )
+    )
+    if (
+        selected_relative_error
+        > DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING
+    ):
+        raise ValueError(
+            "DSContArea fabric divergence sanity check failed: "
+            f"source_unit={source_unit!r}, "
+            f"selected_relative_error={selected_relative_error!r}, "
+            "sanity_ceiling="
+            f"{DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING!r}"
+        )
+
     streamnet["DSContArea_km2"] = (
         streamnet["DSContArea"] / 1_000_000
         if source_unit == "m2"
@@ -431,11 +511,22 @@ def _infer_dscontarea_unit(
         m2_relative_error=m2_relative_error,
         km2_relative_error=km2_relative_error,
         selected_relative_error=selected_relative_error,
+        signed_aggregate_relative_divergence=(
+            signed_aggregate_relative_divergence
+        ),
+        absolute_aggregate_relative_divergence=(
+            absolute_aggregate_relative_divergence
+        ),
+        max_absolute_relative_divergence=max_absolute_relative_divergence,
     )
     LOGGER.info(
         "dscontarea source_unit=%s checked_polygon_bearing_link_count=%d "
         "geodesic_upstream_area_sum_m2=%s dscontarea_sum_raw=%s "
-        "m2_relative_error=%s km2_relative_error=%s selected_relative_error=%s",
+        "m2_relative_error=%s km2_relative_error=%s "
+        "selected_relative_error=%s unit_decisiveness_ratio=%s "
+        "signed_aggregate_relative_divergence=%s "
+        "absolute_aggregate_relative_divergence=%s "
+        "max_absolute_relative_divergence=%s",
         diagnostics.source_unit,
         diagnostics.checked_polygon_bearing_link_count,
         diagnostics.geodesic_upstream_area_sum_m2,
@@ -443,6 +534,10 @@ def _infer_dscontarea_unit(
         diagnostics.m2_relative_error,
         diagnostics.km2_relative_error,
         diagnostics.selected_relative_error,
+        unit_decisiveness_ratio,
+        diagnostics.signed_aggregate_relative_divergence,
+        diagnostics.absolute_aggregate_relative_divergence,
+        diagnostics.max_absolute_relative_divergence,
     )
     return diagnostics
 
@@ -461,7 +556,12 @@ def load_tdx_geopackages(
         {"LINKNO", "DSLINKNO", "DSContArea", streamnet.geometry.name},
     )
     _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(streamnet, "streamnet", {"LineString"})
+    _validate_layer_geometry(
+        streamnet,
+        "streamnet",
+        {"LineString"},
+        allow_tdx_degenerate_reaches=True,
+    )
     _normalize_topology_column(basins, "basins", "streamID")
     _normalize_topology_column(streamnet, "streamnet", "LINKNO")
     _normalize_topology_column(streamnet, "streamnet", "DSLINKNO")
@@ -481,6 +581,15 @@ def load_tdx_geopackages(
                 f"got {downstream_linkno}"
             )
     _validate_duplicate_ids(basin_linknos, stream_linknos, downstream_linknos)
+    degenerate_linknos_before_clamp = tuple(
+        sorted(
+            linkno
+            for linkno, geometry in zip(
+                stream_linknos, streamnet.geometry, strict=True
+            )
+            if _is_tdx_degenerate_reach(geometry)
+        )
+    )
     _normalize_dscontarea(streamnet)
     relation = dict(zip(stream_linknos, downstream_linknos, strict=True))
     _validate_streamnet_relation(relation)
@@ -493,7 +602,26 @@ def load_tdx_geopackages(
     basins_clamp = _clamp_coordinate_domain(basins, "basins", "streamID")
     streamnet_clamp = _clamp_coordinate_domain(streamnet, "streamnet", "LINKNO")
     _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(streamnet, "streamnet", {"LineString"})
+    _validate_layer_geometry(
+        streamnet,
+        "streamnet",
+        {"LineString"},
+        allow_tdx_degenerate_reaches=True,
+    )
+    degenerate_linknos_after_clamp = tuple(
+        sorted(
+            linkno
+            for linkno, geometry in zip(
+                stream_linknos, streamnet.geometry, strict=True
+            )
+            if _is_tdx_degenerate_reach(geometry)
+        )
+    )
+    if degenerate_linknos_before_clamp != degenerate_linknos_after_clamp:
+        raise ValueError(
+            "streamnet degenerate reach classification changed during coordinate "
+            "normalization"
+        )
     dscontarea = _infer_dscontarea_unit(basins, streamnet, relation)
     return TdxSourceData(
         basins=basins,
@@ -631,10 +759,14 @@ def _positive_finite_tolerance(endpoint_tolerance: object) -> float:
 def _streamnet_endpoints(
     stream_linknos: list[int],
     geometries: list[object],
-) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+) -> tuple[
+    dict[int, tuple[tuple[float, float], tuple[float, float]]],
+    frozenset[int],
+]:
     endpoints_by_linkno: dict[
         int, tuple[tuple[float, float], tuple[float, float]]
     ] = {}
+    degenerate_linknos: set[int] = set()
     for linkno, geometry in zip(stream_linknos, geometries, strict=True):
         if not isinstance(geometry, LineString) or geometry.is_empty:
             raise ValueError(
@@ -660,12 +792,15 @@ def _streamnet_endpoints(
         start_xy = (float(start[0]), float(start[1]))
         end_xy = (float(end[0]), float(end[1]))
         if start_xy == end_xy:
-            raise ValueError(
-                f"streamnet geometry for native LINKNO {linkno} has degenerate endpoints"
-            )
+            if not _is_tdx_degenerate_reach(geometry):
+                raise ValueError(
+                    "streamnet geometry for native LINKNO "
+                    f"{linkno} has unsupported degenerate geometry"
+                )
+            degenerate_linknos.add(linkno)
         endpoints_by_linkno[linkno] = (start_xy, end_xy)
 
-    return endpoints_by_linkno
+    return endpoints_by_linkno, frozenset(degenerate_linknos)
 
 
 @dataclass(frozen=True)
@@ -674,6 +809,8 @@ class _OrientationResolution:
     endpoint_coincidence_proven_link_count: int
     predecessor_orientation_proven_root_count: int
     trusted_orientation_isolated_root_native_linknos: tuple[int, ...]
+    short_successor_resolved_reach_native_linknos: tuple[int, ...]
+    reach_side_near_degenerate_resolved_reach_native_linknos: tuple[int, ...]
 
 
 def _resolve_native_orientation(
@@ -681,10 +818,15 @@ def _resolve_native_orientation(
     endpoints_by_linkno: dict[
         int, tuple[tuple[float, float], tuple[float, float]]
     ],
+    degenerate_linknos: frozenset[int],
     endpoint_tolerance: float,
 ) -> _OrientationResolution:
     downstream_endpoints: dict[int, tuple[float, float]] = {}
     matched_successor_endpoints: dict[int, list[int]] = {}
+    indeterminate_successor_endpoint_predecessors: dict[int, list[int]] = {}
+    short_successor_resolved_linknos: set[int] = set()
+    reach_side_near_degenerate_resolved_linknos: set[int] = set()
+    endpoint_coincidence_proven_links = 0
 
     for linkno, downstream_linkno in relation.items():
         if downstream_linkno == TDX_LINKNO_SENTINEL:
@@ -692,10 +834,20 @@ def _resolve_native_orientation(
 
         current_endpoints = endpoints_by_linkno[linkno]
         successor_endpoints = endpoints_by_linkno[downstream_linkno]
+        current_candidates = (
+            ((0, current_endpoints[0]),)
+            if linkno in degenerate_linknos
+            else tuple(enumerate(current_endpoints))
+        )
+        successor_candidates = (
+            ((0, successor_endpoints[0]),)
+            if downstream_linkno in degenerate_linknos
+            else tuple(enumerate(successor_endpoints))
+        )
         matches = [
             (current_index, successor_index)
-            for current_index, current_endpoint in enumerate(current_endpoints)
-            for successor_index, successor_endpoint in enumerate(successor_endpoints)
+            for current_index, current_endpoint in current_candidates
+            for successor_index, successor_endpoint in successor_candidates
             if math.dist(current_endpoint, successor_endpoint) <= endpoint_tolerance
         ]
         if not matches:
@@ -703,17 +855,51 @@ def _resolve_native_orientation(
                 "orientation proof for native LINKNO "
                 f"{linkno} and downstream LINKNO {downstream_linkno} is non-coincident"
             )
-        if len(matches) > 1:
-            raise ValueError(
-                "orientation proof for native LINKNO "
-                f"{linkno} and downstream LINKNO {downstream_linkno} is ambiguous"
-            )
-
-        current_index, successor_index = matches[0]
-        downstream_endpoints[linkno] = current_endpoints[current_index]
-        matched_successor_endpoints.setdefault(downstream_linkno, []).append(
-            successor_index
+        matched_current_indexes = sorted(
+            {current_index for current_index, _ in matches}
         )
+        if len(matched_current_indexes) == 1:
+            current_index = matched_current_indexes[0]
+            if linkno not in degenerate_linknos:
+                endpoint_coincidence_proven_links += 1
+        else:
+            current_endpoint_separation = math.dist(
+                current_endpoints[0], current_endpoints[1]
+            )
+            near_degenerate_limit = 2.0 * endpoint_tolerance
+            if current_endpoint_separation > near_degenerate_limit:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{linkno} and downstream LINKNO {downstream_linkno} is reach-side "
+                    "ambiguous: both current endpoints coincide within tolerance but "
+                    f"endpoint separation {current_endpoint_separation} exceeds "
+                    f"near-degenerate limit {near_degenerate_limit}"
+                )
+            current_index = 1
+            reach_side_near_degenerate_resolved_linknos.add(linkno)
+
+        downstream_endpoints[linkno] = current_endpoints[current_index]
+        matched_successor_indexes = sorted(
+            {
+                successor_index
+                for matched_current_index, successor_index in matches
+                if matched_current_index == current_index
+            }
+        )
+        if len(matched_successor_indexes) == 1:
+            matched_successor_endpoints.setdefault(downstream_linkno, []).append(
+                matched_successor_indexes[0]
+            )
+        else:
+            indeterminate_successor_endpoint_predecessors.setdefault(
+                downstream_linkno, []
+            ).append(linkno)
+            if (
+                linkno not in degenerate_linknos
+                and downstream_linkno not in degenerate_linknos
+                and len(matched_current_indexes) == 1
+            ):
+                short_successor_resolved_linknos.add(linkno)
 
     predecessor_proven_roots = 0
     trusted_isolated_roots: list[int] = []
@@ -721,7 +907,42 @@ def _resolve_native_orientation(
         if downstream_linkno != TDX_LINKNO_SENTINEL:
             continue
 
+        if root_linkno in degenerate_linknos:
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][0]
+            continue
+
         predecessor_matches = matched_successor_endpoints.get(root_linkno, [])
+        indeterminate_predecessors = (
+            indeterminate_successor_endpoint_predecessors.get(root_linkno, [])
+        )
+        upstream_endpoint_indexes = set(predecessor_matches)
+        if len(upstream_endpoint_indexes) > 1:
+            raise ValueError(
+                f"orientation proof for root LINKNO {root_linkno} has conflicting predecessor matches"
+            )
+        if len(upstream_endpoint_indexes) == 1:
+            upstream_endpoint_index = upstream_endpoint_indexes.pop()
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
+                1 - upstream_endpoint_index
+            ]
+            predecessor_proven_roots += 1
+            continue
+        if indeterminate_predecessors:
+            root_endpoint_separation = math.dist(
+                endpoints_by_linkno[root_linkno][0],
+                endpoints_by_linkno[root_linkno][1],
+            )
+            if root_endpoint_separation > 2.0 * endpoint_tolerance:
+                raise ValueError(
+                    "orientation proof for root LINKNO "
+                    f"{root_linkno} is reach-side ambiguous: predecessors "
+                    f"{tuple(sorted(indeterminate_predecessors))} match both root endpoints "
+                    f"but endpoint separation {root_endpoint_separation} exceeds "
+                    f"near-degenerate limit {2.0 * endpoint_tolerance}"
+                )
+            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
+            reach_side_near_degenerate_resolved_linknos.add(root_linkno)
+            continue
         if not predecessor_matches:
             # TDX/TauDEM native-vertex-order TRUST ASSUMPTION: a genuinely
             # isolated root has no topology from which orientation can be
@@ -729,27 +950,19 @@ def _resolve_native_orientation(
             downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
             trusted_isolated_roots.append(root_linkno)
             continue
-        upstream_endpoint_indexes = set(predecessor_matches)
-        if len(upstream_endpoint_indexes) > 1:
-            raise ValueError(
-                f"orientation proof for root LINKNO {root_linkno} has conflicting predecessor matches"
-            )
-
-        upstream_endpoint_index = upstream_endpoint_indexes.pop()
-        downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
-            1 - upstream_endpoint_index
-        ]
-        predecessor_proven_roots += 1
 
     return _OrientationResolution(
         downstream_endpoints=downstream_endpoints,
-        endpoint_coincidence_proven_link_count=sum(
-            downstream_linkno != TDX_LINKNO_SENTINEL
-            for downstream_linkno in relation.values()
-        ),
+        endpoint_coincidence_proven_link_count=endpoint_coincidence_proven_links,
         predecessor_orientation_proven_root_count=predecessor_proven_roots,
         trusted_orientation_isolated_root_native_linknos=tuple(
             sorted(trusted_isolated_roots)
+        ),
+        short_successor_resolved_reach_native_linknos=tuple(
+            sorted(short_successor_resolved_linknos)
+        ),
+        reach_side_near_degenerate_resolved_reach_native_linknos=tuple(
+            sorted(reach_side_near_degenerate_resolved_linknos)
         ),
     )
 
@@ -818,15 +1031,22 @@ def build_streamnet_model(
         )
 
     _require_column(streamnet, "streamnet", "geometry")
-    endpoints_by_linkno = _streamnet_endpoints(
+    endpoints_by_linkno, degenerate_linknos = _streamnet_endpoints(
         stream_linknos, streamnet["geometry"].tolist()
     )
     orientation = _resolve_native_orientation(
-        relation, endpoints_by_linkno, tolerance
+        relation, endpoints_by_linkno, degenerate_linknos, tolerance
     )
     downstream_endpoints = orientation.downstream_endpoints
 
     polygon_bearing_links = set(basin_linknos)
+    degenerate_ids = tuple(sorted(degenerate_linknos))
+    degenerate_polygon_bearing_ids = tuple(
+        linkno for linkno in degenerate_ids if linkno in polygon_bearing_links
+    )
+    degenerate_polygonless_ids = tuple(
+        linkno for linkno in degenerate_ids if linkno not in polygon_bearing_links
+    )
     units: list[StreamnetUnit] = []
     for linkno in sorted(polygon_bearing_links):
         downstream_linkno, contracted_link_count = _resolve_downstream(
@@ -865,9 +1085,33 @@ def build_streamnet_model(
     trusted_polygon_bearing_ids = tuple(
         linkno for linkno in trusted_isolated_ids if linkno in polygon_bearing_links
     )
+    short_successor_resolved_ids = (
+        orientation.short_successor_resolved_reach_native_linknos
+    )
+    reach_side_near_degenerate_resolved_ids = (
+        orientation.reach_side_near_degenerate_resolved_reach_native_linknos
+    )
     diagnostics = StreamnetDiagnostics(
         polygon_bearing_link_count=len(unit_tuple),
         polygonless_dropped_reach_count=len(relation) - len(polygon_bearing_links),
+        degenerate_reach_count=len(degenerate_ids),
+        degenerate_reach_native_linknos=degenerate_ids,
+        degenerate_polygon_bearing_reach_count=len(degenerate_polygon_bearing_ids),
+        degenerate_polygon_bearing_reach_native_linknos=(
+            degenerate_polygon_bearing_ids
+        ),
+        degenerate_polygonless_reach_count=len(degenerate_polygonless_ids),
+        degenerate_polygonless_reach_native_linknos=degenerate_polygonless_ids,
+        short_successor_resolved_reach_count=len(short_successor_resolved_ids),
+        short_successor_resolved_reach_native_linknos=(
+            short_successor_resolved_ids
+        ),
+        reach_side_near_degenerate_resolved_reach_count=len(
+            reach_side_near_degenerate_resolved_ids
+        ),
+        reach_side_near_degenerate_resolved_reach_native_linknos=(
+            reach_side_near_degenerate_resolved_ids
+        ),
         root_count=len(roots),
         contracted_edge_count=sum(
             unit.downstream_linkno != TDX_LINKNO_SENTINEL
@@ -899,7 +1143,16 @@ def build_streamnet_model(
         orientation_tolerance=tolerance,
     )
     LOGGER.info(
-        "streamnet_model polygon_bearing_links=%d roots=%d contracted_edges=%d "
+        "streamnet_model polygon_bearing_links=%d degenerate_reaches=%d "
+        "degenerate_reach_native_linknos=%s degenerate_polygon_bearing_reaches=%d "
+        "degenerate_polygon_bearing_reach_native_linknos=%s "
+        "degenerate_polygonless_reaches=%d "
+        "degenerate_polygonless_reach_native_linknos=%s "
+        "short_successor_resolved_reaches=%d "
+        "short_successor_resolved_reach_native_linknos=%s "
+        "reach_side_near_degenerate_resolved_reaches=%d "
+        "reach_side_near_degenerate_resolved_reach_native_linknos=%s "
+        "roots=%d contracted_edges=%d "
         "contracted_roots=%d contracted_link_traversals=%d "
         "endpoint_coincidence_proven_links=%d predecessor_orientation_proven_roots=%d "
         "trusted_orientation_isolated_roots=%d "
@@ -908,6 +1161,16 @@ def build_streamnet_model(
         "trusted_orientation_polygon_bearing_isolated_root_native_linknos=%s "
         "orientation_tolerance=%s polygonless_dropped_reach_count=%d",
         diagnostics.polygon_bearing_link_count,
+        diagnostics.degenerate_reach_count,
+        diagnostics.degenerate_reach_native_linknos,
+        diagnostics.degenerate_polygon_bearing_reach_count,
+        diagnostics.degenerate_polygon_bearing_reach_native_linknos,
+        diagnostics.degenerate_polygonless_reach_count,
+        diagnostics.degenerate_polygonless_reach_native_linknos,
+        diagnostics.short_successor_resolved_reach_count,
+        diagnostics.short_successor_resolved_reach_native_linknos,
+        diagnostics.reach_side_near_degenerate_resolved_reach_count,
+        diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
         diagnostics.root_count,
         diagnostics.contracted_edge_count,
         diagnostics.contracted_root_count,
@@ -1436,6 +1699,26 @@ def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
         if count:
             LOGGER.warning("diagnostic=%s count=%d", field_name, count)
     for field_name, native_ids_field in (
+        (
+            "degenerate_reach_count",
+            "degenerate_reach_native_linknos",
+        ),
+        (
+            "degenerate_polygon_bearing_reach_count",
+            "degenerate_polygon_bearing_reach_native_linknos",
+        ),
+        (
+            "degenerate_polygonless_reach_count",
+            "degenerate_polygonless_reach_native_linknos",
+        ),
+        (
+            "short_successor_resolved_reach_count",
+            "short_successor_resolved_reach_native_linknos",
+        ),
+        (
+            "reach_side_near_degenerate_resolved_reach_count",
+            "reach_side_near_degenerate_resolved_reach_native_linknos",
+        ),
         (
             "trusted_orientation_isolated_root_count",
             "trusted_orientation_isolated_root_native_linknos",
