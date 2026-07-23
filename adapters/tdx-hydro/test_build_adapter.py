@@ -1,5 +1,6 @@
 import json
 import math
+import subprocess
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -43,6 +44,12 @@ from build_adapter import (
     main,
 )
 
+ABS_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[2] / "schemas" / "manifest.schema.json"
+).resolve()
+if not ABS_SCHEMA_PATH.is_absolute() or not ABS_SCHEMA_PATH.is_file():
+    raise RuntimeError(f"manifest schema is not a regular absolute path: {ABS_SCHEMA_PATH}")
+
 MERGE_RUN_A = [
     (710_000_101, -170.0, -80.0, [], 1.0, 1.0),
     (710_000_102, -80.0, -60.0, [710_000_101], 2.0, 3.0),
@@ -53,6 +60,17 @@ MERGE_RUN_B = [
     (720_000_202, -20.0, -40.0, [720_000_201], 5.0, 9.0),
     (720_000_203, 0.0, 0.0, [720_000_202], 6.0, 15.0),
     (720_000_204, -170.0, -20.0, [720_000_203], 7.0, 22.0),
+]
+PARTIAL_SNAP_A = [
+    (91, 710_000_101, -170.0, -80.0, 1.0),
+    (7, 710_000_102, -80.0, -60.0, 3.0),
+    (400, 710_000_103, 0.0, 0.0, 6.0),
+]
+PARTIAL_SNAP_B = [
+    (800, 720_000_201, -120.0, -80.0, 4.0),
+    (3, 720_000_202, -20.0, -40.0, 9.0),
+    (200, 720_000_203, 0.0, 0.0, 15.0),
+    (1, 720_000_204, -170.0, -20.0, 22.0),
 ]
 
 
@@ -191,6 +209,115 @@ def rewrite_merge_rows(
         row_group_size=row_group_size,
         compression="snappy",
         write_statistics=True,
+    )
+
+
+def write_assembly_fixture(
+    root: Path,
+    region: str,
+    rows: list[tuple[int, float, float, list[int], float, float]],
+    snap_rows: list[tuple[int, int, float, float, float]],
+) -> None:
+    catchments, _ = write_merge_fixture(root, rows)
+    snap_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
+    authored_snap_rows = []
+    for source_id, unit_id, x, y, weight in snap_rows:
+        geometry = LineString(
+            [(x - 0.1, y - 0.1), (x + 0.1, y + 0.1)]
+        )
+        minx, miny, maxx, maxy = (
+            np.float32(value) for value in geometry.bounds
+        )
+        authored_snap_rows.append(
+            {
+                "id": source_id,
+                "unit_id": unit_id,
+                "weight": np.float32(weight),
+                "stem_role": None,
+                "bbox": {
+                    "xmin": minx,
+                    "ymin": miny,
+                    "xmax": maxx,
+                    "ymax": maxy,
+                },
+                "geometry": geometry.wkb,
+            }
+        )
+    aux = root / "aux"
+    aux.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(authored_snap_rows, schema=snap_schema),
+        aux / "snap_stems.parquet",
+        row_group_size=2,
+        compression="snappy",
+        write_statistics=True,
+    )
+    bounds = [row["bbox"] for row in catchments]
+    manifest = {
+        "adapter_version": "0.1.0",
+        "auxiliary": [
+            {
+                "schema": "hfx.aux.snap.v2",
+                "artifacts": {"snap": "aux/snap_stems.parquet"},
+                "metadata": {
+                    "name": "stems",
+                    "description": (
+                        "Native TDX-Hydro LineString reaches for polygon-bearing "
+                        "level 0 drainage units."
+                    ),
+                    "references_levels": [0],
+                    "weight_semantics": (
+                        "Drainage-area weight equals inclusive DSContArea in km2; "
+                        "higher values indicate stronger drainage dominance."
+                    ),
+                },
+            }
+        ],
+        "bbox": [
+            float(np.float32(min(value["xmin"] for value in bounds))),
+            float(np.float32(min(value["ymin"] for value in bounds))),
+            float(np.float32(max(value["xmax"] for value in bounds))),
+            float(np.float32(max(value["ymax"] for value in bounds))),
+        ],
+        "created_at": "2026-07-21T12:34:56+00:00",
+        "crs": "EPSG:4326",
+        "fabric_name": "tdx_hydro",
+        "fabric_version": "synthetic-2026.07",
+        "format_version": "0.3.0",
+        "has_up_area": True,
+        "region": region,
+        "topology": "tree",
+        "unit_count": len(rows),
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def validate_assembled_manifest(path: Path) -> None:
+    subprocess.run(
+        [
+            "uv",
+            "run",
+            "--with",
+            "check-jsonschema",
+            "check-jsonschema",
+            "--schemafile",
+            str(ABS_SCHEMA_PATH),
+            str(path.resolve()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -1564,6 +1691,320 @@ class StreamnetTopologyRejectionTests(unittest.TestCase):
             build_streamnet_model(
                 basins, streamnet, header_number=71, endpoint_tolerance=0.001
             )
+
+
+class AssemblyTests(unittest.TestCase):
+    def test_partial_coverage_assembly(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            write_assembly_fixture(
+                first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            write_assembly_fixture(
+                second, "7020014250", MERGE_RUN_B, PARTIAL_SNAP_B
+            )
+
+            result = build_adapter.assemble_hfx(
+                [first, second],
+                root / "assembled",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                input_batch_size=2,
+                row_group_min=2,
+                row_group_max=3,
+            )
+            manifest = json.loads(result.manifest_path.read_text())
+            self.assertEqual(manifest["region"], "tdx-hydro-partial-afd4ffb0b736")
+            self.assertEqual(
+                manifest["bbox"],
+                [
+                    -170.10000610351562,
+                    -80.0999984741211,
+                    0.10000000149011612,
+                    0.10000000149011612,
+                ],
+            )
+            self.assertEqual(manifest["unit_count"], 7)
+            self.assertEqual(
+                manifest["created_at"], "2026-07-23T12:34:56+00:00"
+            )
+            catchment_ids = pq.read_table(
+                result.catchments_path, columns=["id"]
+            )["id"].to_pylist()
+            graph = pq.read_table(result.graph_path).to_pydict()
+            self.assertEqual(catchment_ids, graph["id"])
+            self.assertEqual(
+                graph["upstream_ids"],
+                [
+                    [],
+                    [],
+                    [710_000_101],
+                    [720_000_201],
+                    [710_000_102],
+                    [720_000_202],
+                    [720_000_203],
+                ],
+            )
+            snap = pq.read_table(result.snap_path).to_pydict()
+            self.assertEqual(snap["id"], list(range(1, 8)))
+            self.assertEqual(
+                snap["unit_id"],
+                [
+                    710_000_101,
+                    720_000_201,
+                    710_000_102,
+                    720_000_202,
+                    710_000_103,
+                    720_000_203,
+                    720_000_204,
+                ],
+            )
+            self.assertEqual(set(snap["unit_id"]), set(catchment_ids))
+            self.assertTrue(result.notice_path.read_bytes() == (Path(__file__).parent / "NOTICE").read_bytes())
+            self.assertTrue(result.citation_path.read_bytes() == (Path(__file__).parent / "CITATION.txt").read_bytes())
+            for path in (result.notice_path, result.citation_path):
+                text = path.read_text()
+                self.assertIn("TDX-Hydro", text)
+                self.assertIn("National Geospatial-Intelligence Agency", text)
+            self.assertTrue(
+                pq.ParquetFile(result.snap_path).schema_arrow.equals(
+                    build_adapter._snap_merge_schema(), check_metadata=True
+                )
+            )
+            self.assertTrue(validate_geoparquet(str(result.snap_path), target_version="1.1").is_valid)
+            validate_assembled_manifest(result.manifest_path)
+            reversed_result = build_adapter.assemble_hfx(
+                [second, first],
+                root / "reversed",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                input_batch_size=2,
+                row_group_min=2,
+                row_group_max=3,
+            )
+            validate_assembled_manifest(reversed_result.manifest_path)
+            for name in (
+                "catchments.parquet",
+                "graph.parquet",
+                "aux/snap_stems.parquet",
+                "manifest.json",
+            ):
+                self.assertEqual(
+                    (root / "assembled" / name).read_bytes(),
+                    (root / "reversed" / name).read_bytes(),
+                )
+
+    def test_complete_coverage_assembly(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = []
+            for index, (region, header) in enumerate(
+                sorted(load_header_crosswalk().items()), start=1
+            ):
+                dataset = root / region
+                unit_id = header * 10_000_000 + 1
+                write_assembly_fixture(
+                    dataset,
+                    region,
+                    [(unit_id, 0.0, 0.0, [], 1.0, 1.0)],
+                    [(9_000 + index, unit_id, 0.0, 0.0, 1.0)],
+                )
+                inputs.append(dataset)
+            result = build_adapter.assemble_hfx(
+                inputs,
+                root / "assembled",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                input_batch_size=2,
+                row_group_min=2,
+                row_group_max=3,
+            )
+            manifest = json.loads(result.manifest_path.read_text())
+            self.assertNotIn("region", manifest)
+            self.assertEqual(manifest["bbox"], [-180, -90, 180, 90])
+            self.assertEqual(manifest["unit_count"], 62)
+            self.assertEqual(
+                pq.read_table(result.snap_path, columns=["id"])["id"].to_pylist(),
+                list(range(1, 63)),
+            )
+            self.assertLessEqual(
+                result.snap_metrics.peak_buffered_rows,
+                result.snap_metrics.buffer_row_ceiling,
+            )
+            self.assertEqual(result.snap_metrics.emitted_rows, 62)
+            validate_assembled_manifest(result.manifest_path)
+
+    def test_rejects_dangling_duplicate_and_count_mismatches(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            snap_path = dataset / "aux" / "snap_stems.parquet"
+            table = pq.read_table(snap_path)
+            rows = table.to_pylist()
+            rows[0]["unit_id"] = 999
+            pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), snap_path)
+            with self.assertRaisesRegex(ValueError, "dangling snap unit_id"):
+                build_adapter.assemble_hfx(
+                    [dataset], root / "out", created_at=datetime.now(timezone.utc)
+                )
+
+            write_assembly_fixture(
+                root / "duplicate", "7020014250", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            duplicate_path = root / "duplicate" / "aux" / "snap_stems.parquet"
+            duplicate_table = pq.read_table(duplicate_path)
+            duplicate_rows = duplicate_table.to_pylist()
+            duplicate_rows[1]["unit_id"] = duplicate_rows[0]["unit_id"]
+            pq.write_table(
+                pa.Table.from_pylist(duplicate_rows, schema=duplicate_table.schema),
+                duplicate_path,
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate snap unit_id"):
+                build_adapter.assemble_hfx(
+                    [root / "duplicate"],
+                    root / "out2",
+                    created_at=datetime.now(timezone.utc),
+                )
+
+            count_root = root / "count"
+            write_assembly_fixture(
+                count_root, "7020021430", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            manifest_path = count_root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["unit_count"] = 2
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "row counts differ"):
+                build_adapter.assemble_hfx(
+                    [count_root],
+                    root / "out3",
+                    created_at=datetime.now(timezone.utc),
+                )
+
+    def test_rejects_manifest_identity_regions_bbox_and_naive_complete(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            write_assembly_fixture(
+                first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            manifest_path = first / "manifest.json"
+            original = json.loads(manifest_path.read_text())
+            mutations = [
+                ("fabric_name", "other", "fabric_name"),
+                ("fabric_version", "", "fabric_version"),
+                ("region", "999", "region"),
+                ("bbox", [float("inf"), 0.0, 1.0, 1.0], "bbox"),
+                ("auxiliary", [], "auxiliary"),
+            ]
+            for key, value, message in mutations:
+                manifest = dict(original)
+                manifest[key] = value
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, message):
+                    build_adapter.assemble_hfx(
+                        [first],
+                        root / f"out-{key}",
+                        created_at=datetime.now(timezone.utc),
+                    )
+            manifest_path.write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError, "unique"):
+                build_adapter.assemble_hfx(
+                    [first, first],
+                    root / "duplicate-root",
+                    created_at=datetime.now(timezone.utc),
+                )
+            with self.assertRaisesRegex(ValueError, "timezone-aware"):
+                build_adapter.assemble_hfx(
+                    [first], root / "naive", created_at=datetime.now()
+                )
+
+    def test_attribution_and_manifest_publication_are_atomic(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            real_replace = build_adapter.os.replace
+
+            def fail_citation(source: Path, destination: Path) -> None:
+                if Path(destination).name == "CITATION.txt":
+                    raise OSError("injected citation replacement failure")
+                real_replace(source, destination)
+
+            output = root / "attribution-failure"
+            with patch.object(
+                build_adapter.os, "replace", side_effect=fail_citation
+            ):
+                with self.assertRaisesRegex(OSError, "injected citation"):
+                    build_adapter.assemble_hfx(
+                        [dataset],
+                        output,
+                        created_at=datetime.now(timezone.utc),
+                    )
+            self.assertFalse((output / "CITATION.txt").exists())
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                ["NOTICE", "aux", "catchments.parquet", "graph.parquet"],
+            )
+
+            def fail_manifest(source: Path, destination: Path) -> None:
+                if Path(destination).name == "manifest.json":
+                    raise OSError("injected manifest replacement failure")
+                real_replace(source, destination)
+
+            output = root / "manifest-failure"
+            with patch.object(
+                build_adapter.os, "replace", side_effect=fail_manifest
+            ):
+                with self.assertRaisesRegex(OSError, "injected manifest"):
+                    build_adapter.assemble_hfx(
+                        [dataset],
+                        output,
+                        created_at=datetime.now(timezone.utc),
+                    )
+            self.assertFalse((output / "manifest.json").exists())
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                [
+                    "CITATION.txt",
+                    "NOTICE",
+                    "aux",
+                    "catchments.parquet",
+                    "graph.parquet",
+                ],
+            )
+
+    def test_rejects_missing_attribution_phrases(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            original_read_bytes = Path.read_bytes
+            notice = (Path(__file__).resolve().parent / "NOTICE").resolve()
+
+            for phrase in (
+                "TDX-Hydro",
+                "National Geospatial-Intelligence Agency",
+            ):
+                def altered_read_bytes(path: Path, removed: str = phrase) -> bytes:
+                    content = original_read_bytes(path)
+                    if path.resolve() == notice:
+                        return content.replace(removed.encode(), b"removed")
+                    return content
+
+                with patch.object(Path, "read_bytes", altered_read_bytes):
+                    with self.assertRaisesRegex(ValueError, "missing required phrase"):
+                        build_adapter.assemble_hfx(
+                            [dataset],
+                            root / f"missing-{phrase.split()[0]}",
+                            created_at=datetime.now(timezone.utc),
+                        )
 
 
 class CoreMergeTests(unittest.TestCase):
