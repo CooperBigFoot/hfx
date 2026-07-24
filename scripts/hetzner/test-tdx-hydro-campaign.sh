@@ -92,6 +92,21 @@ init_args() {
         --assembled-artifact-bytes 8
 }
 
+subset_init_args() {
+    printf '%s\n' \
+        init --campaign "$1" --workspace-root "$2" \
+        --basin 7020000010 \
+        --basin 1020000010 \
+        --basin 9020000010 \
+        --available-memory-bytes 11 \
+        --available-disk-bytes 26 \
+        --retained-input-bytes 5 \
+        --retained-basin-output-bytes 6 \
+        --assembly-memory-ceiling-bytes 11 \
+        --assembly-scratch-ceiling-bytes 7 \
+        --assembled-artifact-bytes 8
+}
+
 copy_workspace() {
     local name=$1
     local destination=$test_tmp/workspaces/$name
@@ -248,7 +263,7 @@ skipped=0
 
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
-assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init'
+assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
@@ -281,6 +296,12 @@ expect_failure 'foreign fabric version' status --campaign compile --workspace-ro
     --fabric-version version
 expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+for foreign_basin_command in status recover acquire compile assemble evidence publish; do
+    expect_failure "basin on $foreign_basin_command" "$foreign_basin_command" \
+        --campaign foreign --workspace-root "$argument_root" --basin 1020000010
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init' ]] ||
+        die "foreign --basin diagnostic differs for $foreign_basin_command"
+done
 for publication_option in --out --report --notice --citation --scratch-prefix; do
     expect_failure "foreign $publication_option" status --campaign foreign --workspace-root "$argument_root" \
         "$publication_option" value
@@ -344,6 +365,50 @@ assert_contains "$runner" 'ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/ad
 assert_contains "$runner" 'HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")'
 pass 'static Bash 3.2 compatibility checks pass'
 
+subset_root=$test_tmp/workspaces/subset
+mkdir "$subset_root"
+set -- $(subset_init_args subset "$subset_root")
+run_runner "$@" >"$case_stdout"
+subset_campaign_dir=$subset_root/tdx-hydro-subset
+jq -e '
+  keys == ["basin_ids","schema_version"] and
+  .schema_version == 1 and
+  .basin_ids == ["1020000010","7020000010","9020000010"]
+' "$subset_campaign_dir/state/selection.json" >/dev/null ||
+    die 'subset selection was not frozen in sorted canonical form'
+[[ $(jq 'length' "$subset_campaign_dir/state/inventory.json") -eq 62 ]] ||
+    die 'subset init changed the authoritative inventory'
+cp -R "$subset_campaign_dir/state" "$test_tmp/subset-state-before"
+set -- $(init_args subset "$subset_root")
+run_runner "$@" --basin 9020000010 --basin 7020000010 --basin 1020000010 >"$case_stdout"
+diff -ru "$test_tmp/subset-state-before" "$subset_campaign_dir/state"
+for changed_selection in \
+    '--basin 7020000010 --basin 1020000010' \
+    '--basin 7020000010 --basin 1020000010 --basin 9020000010 --basin 1020011530'
+do
+    set -- $(init_args subset "$subset_root")
+    eval "set -- \"\$@\" $changed_selection"
+    expect_failure 'changed basin selection' "$@"
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: basin selection changed; use a new campaign ID' ]] ||
+        die 'changed basin selection diagnostic differs'
+    diff -ru "$test_tmp/subset-state-before" "$subset_campaign_dir/state"
+done
+set -- $(init_args duplicate-subset "$subset_root")
+expect_failure 'duplicate basin selection' "$@" --basin 7020000010 --basin 7020000010
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: basin ID '7020000010' was selected more than once" ]] ||
+    die 'duplicate basin diagnostic differs'
+[[ ! -e "$subset_root/tdx-hydro-duplicate-subset" ]] ||
+    die 'duplicate basin request left an accepted campaign'
+set -- $(init_args unknown-subset "$subset_root")
+expect_failure 'unknown basin selection' "$@" --basin 9999999999
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: unknown basin ID '9999999999'; expected a key in state/inventory.json" ]] ||
+    die 'unknown basin diagnostic differs'
+[[ ! -e "$subset_root/tdx-hydro-unknown-subset" ]] ||
+    die 'unknown basin request left an accepted campaign'
+pass 'selection parsing, freezing, and convergence'
+
 valid_root=$test_tmp/workspaces/valid
 mkdir "$valid_root"
 set -- $(init_args equal "$valid_root")
@@ -384,6 +449,8 @@ jq -e '
 jq -S '.' "$inventory" >"$test_tmp/expected-inventory.json"
 jq -S '.' "$campaign_dir/state/inventory.json" >"$test_tmp/actual-inventory.json"
 diff -u "$test_tmp/expected-inventory.json" "$test_tmp/actual-inventory.json"
+[[ ! -e "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]] ||
+    die 'full-inventory init unexpectedly created selection state'
 [[ $(find "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') == 62 ]] ||
     die 'basin directory count differs'
 [[ $(find "$campaign_dir/state/basins" -name current.json -type f | wc -l | tr -d ' ') == 62 ]] ||
@@ -591,6 +658,18 @@ jq '.input_basin_ids=["7020000010","1020000010"]' \
     "$assembly_state_root/tdx-hydro-equal/state/assembly.json" >"$assembly_state_root/assembly.tmp"
 mv "$assembly_state_root/assembly.tmp" "$assembly_state_root/tdx-hydro-equal/state/assembly.json"
 expect_failure 'malformed assembly contract' status --campaign equal --workspace-root "$assembly_state_root"
+
+selection_state_root=$(copy_workspace bad-selection-state)
+jq -n '{schema_version:1,basin_ids:[]}' \
+    >"$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'empty selection contract' status --campaign equal --workspace-root "$selection_state_root"
+selection_state_root=$(copy_workspace unsorted-selection-state)
+jq -n '{schema_version:1,basin_ids:["7020000010","1020000010"]}' \
+    >"$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'unsorted selection contract' status --campaign equal --workspace-root "$selection_state_root"
+selection_state_root=$(copy_workspace symlink-selection-state)
+ln -s inventory.json "$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'symlink selection contract' status --campaign equal --workspace-root "$selection_state_root"
 
 jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnostic_report","failure_reason","status"])' "$selected_state" >/dev/null ||
     die 'shared status fixture lost the v3 compile diagnostic member'
@@ -939,6 +1018,172 @@ export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
 export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
 export HFX_TEST_DIFF=$(command -v diff)
 
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign subset --workspace-root "$subset_root" --max-parallel 62 >"$case_stdout"
+grep '^start ' "$test_tmp/transfer-state/events" | sed 's/^start //' | sort >"$test_tmp/subset-starts"
+printf '%s\n' \
+    1020000010-basins 1020000010-streamnet \
+    7020000010-basins 7020000010-streamnet \
+    9020000010-basins 9020000010-streamnet >"$test_tmp/expected-subset-starts"
+diff -u "$test_tmp/expected-subset-starts" "$test_tmp/subset-starts"
+[[ $(find "$subset_campaign_dir/downloads" -name '*.gpkg' -type f | wc -l | tr -d ' ') -eq 6 ]] ||
+    die 'subset acquisition did not install exactly six files'
+jq -e -s '
+  map(select(.processing_basin_id as $id |
+    ["1020000010","7020000010","9020000010"] | index($id) | not)) |
+  length == 59 and all(
+    .stages.acquire_basins.status == "pending" and
+    .stages.acquire_basins.attempts == 0 and
+    .stages.acquire_streamnet.status == "pending" and
+    .stages.acquire_streamnet.attempts == 0)
+' "$subset_campaign_dir"/state/basins/*/current.json >/dev/null ||
+    die 'subset acquisition modified an unselected basin'
+assert_contains "$case_stdout" 'acquire_basins_succeeded=3'
+assert_contains "$case_stdout" 'acquire_streamnet_succeeded=3'
+pass 'three-basin acquisition schedules only the frozen selection'
+
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner compile --campaign subset --workspace-root "$subset_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+grep '^build' "$HFX_TEST_ADAPTER_LOG" | cut -f11 | sort >"$test_tmp/subset-build-ids"
+printf '%s\n' 1020000010 7020000010 9020000010 >"$test_tmp/expected-subset-build-ids"
+diff -u "$test_tmp/expected-subset-build-ids" "$test_tmp/subset-build-ids"
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 3 ]] ||
+    die 'subset compile did not issue exactly three builds'
+jq '.stages.compile={
+  status:"failed",attempts:1,failure_reason:"adapter validation failed",
+  diagnostic_report:{path:"reports/7020000010-build-report.json",diagnostics:{fixture_metric:702}}
+}' "$subset_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/subset-failed"
+mv "$test_tmp/subset-failed" "$subset_campaign_dir/state/basins/7020000010/current.json"
+mark_compile_succeeded "$subset_campaign_dir" 1020011530
+HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/subset-assembly-argv
+export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
+printf '%s\n' \
+    assemble \
+    --input "$subset_campaign_dir/basin-outputs/1020000010" \
+    --input "$subset_campaign_dir/basin-outputs/9020000010" \
+    --out "$subset_campaign_dir/assembly/dataset" >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+run_runner assemble --campaign subset --workspace-root "$subset_root" >"$case_stdout"
+jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+    "$subset_campaign_dir/state/assembly.json" >/dev/null ||
+    die 'subset assembly state admitted a failed or unselected basin'
+jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+    "$subset_campaign_dir/reports/assembly.json" >/dev/null ||
+    die 'subset assembly report admitted a failed or unselected basin'
+pass 'compile and assemble remain scoped to the frozen selection'
+
+mkdir "$test_tmp/subset-lifecycle-before"
+cp "$subset_campaign_dir/state/selection.json" "$test_tmp/subset-lifecycle-before/selection.json"
+cp "$subset_campaign_dir/state/assembly.json" "$test_tmp/subset-lifecycle-before/assembly.json"
+cp "$subset_campaign_dir/state/compile.json" "$test_tmp/subset-lifecycle-before/compile.json"
+cp "$subset_campaign_dir/reports/assembly.json" "$test_tmp/subset-lifecycle-before/assembly-report.json"
+for preserved_id in 1020000010 7020000010 9020000010 1020011530; do
+    cp "$subset_campaign_dir/state/basins/$preserved_id/current.json" \
+        "$test_tmp/subset-lifecycle-before/$preserved_id.json"
+done
+subset_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+subset_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+subset_transfer_lines=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
+set -- $(init_args subset "$subset_root")
+expect_failure 'mid-lifecycle basin selection drift' "$@" \
+    --basin 1020000010 --basin 9020000010
+[[ $(tail -1 "$case_stderr") == 'hfx: error: basin selection changed; use a new campaign ID' ]] ||
+    die 'mid-lifecycle basin selection diagnostic differs'
+diff -u "$test_tmp/subset-lifecycle-before/assembly-report.json" \
+    "$subset_campaign_dir/reports/assembly.json"
+for preserved_id in 1020000010 7020000010 9020000010 1020011530; do
+    diff -u "$test_tmp/subset-lifecycle-before/$preserved_id.json" \
+        "$subset_campaign_dir/state/basins/$preserved_id/current.json"
+done
+diff -u "$test_tmp/subset-lifecycle-before/selection.json" "$subset_campaign_dir/state/selection.json"
+diff -u "$test_tmp/subset-lifecycle-before/compile.json" "$subset_campaign_dir/state/compile.json"
+diff -u "$test_tmp/subset-lifecycle-before/assembly.json" "$subset_campaign_dir/state/assembly.json"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$subset_adapter_lines" &&
+    $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$subset_hfx_lines" &&
+    $(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ') -eq "$subset_transfer_lines" ]] ||
+    die 'mid-lifecycle selection refusal invoked a service fake'
+pass 'mid-lifecycle basin selection drift refuses without side effects'
+
+subset_evidence_root=$test_tmp/workspaces/subset-evidence
+mkdir "$subset_evidence_root"
+set -- $(init_args subset-evidence "$subset_evidence_root")
+run_runner "$@" --basin 7020000010 --basin 1020000010 >"$case_stdout"
+subset_evidence_dir=$subset_evidence_root/tdx-hydro-subset-evidence
+assert_contains "$case_stdout" 'inventory_count=62'
+assert_contains "$case_stdout" 'selected_basin_count=2'
+assert_contains "$case_stdout" 'unselected_basin_count=60'
+assert_contains "$case_stdout" 'compile_pending=2'
+jq -n --arg id 1020000010 '{
+  schema_version:3,processing_basin_id:$id,stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:21,sha256:("a"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"basins-1020000010"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:22,sha256:("b"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"streamnet-1020000010"}},
+    compile:{status:"succeeded",attempts:1,failure_reason:null,diagnostic_report:{
+      path:"reports/1020000010-build-report.json",diagnostics:{fixture_metric:101}}}
+  }}' >"$subset_evidence_dir/state/basins/1020000010/current.json"
+jq -n --arg id 7020000010 '{
+  schema_version:3,processing_basin_id:$id,stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:23,sha256:("c"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"basins-7020000010"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:24,sha256:("d"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"streamnet-7020000010"}},
+    compile:{status:"failed",attempts:1,failure_reason:"adapter validation failed",diagnostic_report:{
+      path:"reports/7020000010-build-report.json",diagnostics:{fixture_metric:702}}}
+  }}' >"$subset_evidence_dir/state/basins/7020000010/current.json"
+cp "$subset_evidence_dir/state/basins/9020000010/current.json" "$test_tmp/unselected-before-evidence"
+run_runner status --campaign subset-evidence --workspace-root "$subset_evidence_root" >"$case_stdout"
+assert_contains "$case_stdout" 'acquire_basins_succeeded=2'
+assert_contains "$case_stdout" 'acquire_streamnet_succeeded=2'
+assert_contains "$case_stdout" 'compile_succeeded=1'
+assert_contains "$case_stdout" 'compile_failed=1'
+run_runner evidence --campaign subset-evidence --workspace-root "$subset_evidence_root"
+diff -u "$test_tmp/unselected-before-evidence" \
+    "$subset_evidence_dir/state/basins/9020000010/current.json"
+for evidence_name in acquisition outcomes diagnostics; do
+    evidence_file=$subset_evidence_dir/publication/evidence/$evidence_name.json
+    jq -e '
+      .schema_version == 2 and
+      .selected_basin_ids == ["1020000010","7020000010"]
+    ' "$evidence_file" >/dev/null || die "$evidence_name subset classes differ"
+    jq -e --slurpfile inventory "$subset_evidence_dir/state/inventory.json" '
+      .unselected_basin_ids == (($inventory[0] | keys) - ["1020000010","7020000010"]) and
+      (.unselected_basin_ids | index("9020000010")) != null
+    ' "$evidence_file" >/dev/null || die "$evidence_name unselected class differs"
+done
+jq -e '
+  [.basins[].processing_basin_id] == ["1020000010","7020000010"]
+' "$subset_evidence_dir/publication/evidence/acquisition.json" >/dev/null ||
+    die 'subset acquisition evidence omitted a selected basin'
+jq -e '
+  {schema_version,campaign,selected_basin_ids,attempted_basin_ids,excluded_basins,outcomes} == {
+    schema_version:2,
+    campaign:"subset-evidence",
+    selected_basin_ids:["1020000010","7020000010"],
+    attempted_basin_ids:["1020000010","7020000010"],
+    excluded_basins:[{processing_basin_id:"7020000010",
+      failure_reason:"adapter validation failed"}],
+    outcomes:[
+      {processing_basin_id:"1020000010",status:"succeeded",attempts:1,failure_reason:null},
+      {processing_basin_id:"7020000010",status:"failed",attempts:1,
+        failure_reason:"adapter validation failed"}
+    ]
+  }
+' "$subset_evidence_dir/publication/evidence/outcomes.json" >/dev/null ||
+    die 'subset outcome projection differs'
+jq -e '
+  [.basins[].processing_basin_id] == ["1020000010","7020000010"]
+' "$subset_evidence_dir/publication/evidence/diagnostics.json" >/dev/null ||
+    die 'subset diagnostics evidence omitted a selected basin'
+pass 'subset status and evidence preserve selected, attempted, excluded, and unselected classes'
+
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
 rendezvous_status=0
 HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
     "$test_tmp/fake-curl" \
