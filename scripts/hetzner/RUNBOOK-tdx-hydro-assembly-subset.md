@@ -55,8 +55,9 @@ resource names, immutable ref, server type, or volume size differs.
 ## 2. Contention preflight
 
 This preflight is read-only. It lists every returned server and volume by exact
-name, proves both exact campaign names absent, and records the unrelated
-`grit-d8-m3` volume. The lifecycle prefixes the campaign ID with
+name, proves both exact campaign names absent, and proves the unrelated
+`grit-d8-m3` volume absent. That volume was deleted after its data was archived,
+as user-confirmed on 2026-07-24. The lifecycle prefixes the campaign ID with
 `hfx-build-` and suffixes the volume name with `-data`
 (`scripts/hetzner/README.md:13-17`).
 
@@ -78,19 +79,16 @@ jq -r '.[] | [.id, .name] | @tsv' \
 jq -e --arg name "$VOLUME_NAME" \
   '[.[] | select(.name == $name)] == []' \
   "$LOCAL_EVIDENCE_DIR/preflight-volumes.json"
-jq -e '[.[] | select(.name == "grit-d8-m3")] | length == 1' \
+jq -e '[.[] | select(.name == "grit-d8-m3")] == []' \
   "$LOCAL_EVIDENCE_DIR/preflight-volumes.json"
-jq -S '[.[] | select(.name == "grit-d8-m3")]' \
-  "$LOCAL_EVIDENCE_DIR/preflight-volumes.json" \
-  > "$LOCAL_EVIDENCE_DIR/grit-d8-m3-before.json"
-cat "$LOCAL_EVIDENCE_DIR/grit-d8-m3-before.json"
 ```
 
 Abort on a context mismatch, command failure, malformed response, any existing
-exact campaign server or volume, or an absent or ambiguous `grit-d8-m3`
-listing. Do not use pattern or label discovery for cleanup. Never detach,
-resize, delete, or otherwise mutate `grit-d8-m3`. The only mutable cloud
-targets in this runbook are `$SERVER_NAME` and `$VOLUME_NAME`.
+exact campaign server or volume, or an unexpectedly existing `grit-d8-m3`
+volume. Do not use pattern or label discovery for cleanup. This runbook never
+creates, mutates, or references `grit-d8-m3` beyond this read-only absence
+check. The only mutable cloud targets in this runbook are `$SERVER_NAME` and
+`$VOLUME_NAME`.
 
 Also inspect the complete listings for another live build campaign. The
 dedicated-core quota allows only one campaign at a time. If another campaign
@@ -601,8 +599,7 @@ detaches, deletes, waits for absence, and verifies zero footprint
 (`scripts/hetzner/teardown.sh:247-341`).
 
 Independently list exact names after teardown, list all returned names, prove
-the campaign resources absent, and prove `grit-d8-m3` remains present and
-unchanged:
+the campaign resources absent:
 
 ```bash
 hcloud --context pourpoint server list -o json \
@@ -620,17 +617,9 @@ jq -r '.[] | [.id, .name] | @tsv' \
 jq -e --arg name "$VOLUME_NAME" \
   '[.[] | select(.name == $name)] == []' \
   "$LOCAL_EVIDENCE_DIR/final-volumes.json"
-jq -e '[.[] | select(.name == "grit-d8-m3")] | length == 1' \
-  "$LOCAL_EVIDENCE_DIR/final-volumes.json"
-jq -S '[.[] | select(.name == "grit-d8-m3")]' \
-  "$LOCAL_EVIDENCE_DIR/final-volumes.json" \
-  > "$LOCAL_EVIDENCE_DIR/grit-d8-m3-after.json"
-cmp "$LOCAL_EVIDENCE_DIR/grit-d8-m3-before.json" \
-  "$LOCAL_EVIDENCE_DIR/grit-d8-m3-after.json"
 ```
 
-Both exact campaign filters must yield empty arrays. The final complete volume
-listing must still include `grit-d8-m3`.
+Both exact campaign filters must yield empty arrays.
 
 ## 10. Failure classifications and budget kill-switch
 
