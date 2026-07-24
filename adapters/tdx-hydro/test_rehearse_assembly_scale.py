@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -340,6 +341,414 @@ class RehearseAssemblyScaleTests(unittest.TestCase):
             )
         self.assertNotEqual(result, 0)
         self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class SyntheticAssemblyRehearsalTests(unittest.TestCase):
+    script = Path(rehearse_assembly_scale.__file__).resolve()
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temporary = TemporaryDirectory()
+        cls.scratch = Path(cls.temporary.name) / "scratch"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(cls.script),
+                "rehearse",
+                "--scratch-root",
+                str(cls.scratch),
+                "--basin-count",
+                "3",
+                "--total-units",
+                "12291",
+                "--distribution",
+                "even",
+                "--seed",
+                "20260723",
+                "--generator-batch-size",
+                "512",
+                "--verify-batch-size",
+                "512",
+                "--sample-interval-ms",
+                "5",
+                "--rss-ceiling-bytes",
+                "32212254720",
+                "--scratch-ceiling-bytes",
+                "68719476736",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+        cls.report = json.loads(result.stdout)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @staticmethod
+    def file_hashes(root: Path) -> dict[str, str]:
+        return {
+            str(path.relative_to(root)): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    def run_generate(self, output: Path, seed: int) -> dict[str, object]:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.script),
+                "generate",
+                "--out",
+                str(output),
+                "--basin-count",
+                "3",
+                "--total-units",
+                "51",
+                "--distribution",
+                "seeded-skew",
+                "--seed",
+                str(seed),
+                "--generator-batch-size",
+                "7",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)
+
+    def test_generation_is_byte_deterministic_and_seeded(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            changed = root / "changed"
+            first_report = self.run_generate(first, 73421)
+            second_report = self.run_generate(second, 73421)
+            changed_report = self.run_generate(changed, 73422)
+            self.assertEqual(
+                first_report["basin_unit_counts"], [15, 14, 22]
+            )
+            self.assertEqual(first_report, second_report)
+            self.assertEqual(
+                changed_report["basin_unit_counts"], [20, 12, 19]
+            )
+            first_hashes = self.file_hashes(first / "inputs")
+            second_hashes = self.file_hashes(second / "inputs")
+            changed_hashes = self.file_hashes(changed / "inputs")
+            self.assertEqual(first_hashes, second_hashes)
+            self.assertEqual(set(first_hashes), set(changed_hashes))
+            self.assertTrue(
+                any(
+                    first_hashes[path] != changed_hashes[path]
+                    for path in first_hashes
+                )
+            )
+
+    def test_scaled_end_to_end_uses_real_assemble_and_verifier(self) -> None:
+        regions = ["1020000010", "1020011530", "1020018110"]
+        self.assertEqual(self.report["status"], "passed")
+        assembly = self.report["assembly"]
+        expected_argv = [
+            sys.executable,
+            str(self.script.with_name("build_adapter.py").resolve()),
+            "assemble",
+        ]
+        for region in regions:
+            expected_argv.extend(
+                [
+                    "--input",
+                    str((self.scratch / "inputs" / region).resolve()),
+                ]
+            )
+        expected_argv.extend(
+            ["--out", str((self.scratch / "assembled").resolve())]
+        )
+        self.assertEqual(assembly["argv"], expected_argv)
+        self.assertEqual(len(assembly["argv"]), 11)
+        self.assertEqual(assembly["returncode"], 0)
+        catchment_schema, _, graph_read_schema, snap_schema = (
+            rehearse_assembly_scale._schemas()
+        )
+        for region in regions:
+            basin = self.scratch / "inputs" / region
+            manifest = json.loads((basin / "manifest.json").read_text())
+            self.assertEqual(manifest["unit_count"], 4097)
+            self.assertEqual(manifest["region"], region)
+            for relative, schema in (
+                ("catchments.parquet", catchment_schema),
+                ("graph.parquet", graph_read_schema),
+                ("aux/snap_stems.parquet", snap_schema),
+            ):
+                parquet = pq.ParquetFile(basin / relative)
+                self.assertEqual(parquet.metadata.num_rows, 4097)
+                self.assertTrue(
+                    parquet.schema_arrow.equals(
+                        schema, check_metadata=True
+                    )
+                )
+        assembled = self.scratch / "assembled"
+        self.assertTrue((assembled / "manifest.json").is_file())
+        verifier = subprocess.run(
+            [
+                sys.executable,
+                str(self.script),
+                "verify",
+                str(assembled),
+                "--batch-size",
+                "512",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(verifier.returncode, 0)
+        self.assertEqual(verifier.stderr, "")
+
+    def test_interleaving_proof_covers_batches_and_row_groups(self) -> None:
+        metrics = self.report["interleaving"]
+        self.assertEqual(metrics["input_batches_per_basin"], [5, 5, 5])
+        for key in (
+            "catchment_input_row_groups_per_basin",
+            "graph_input_row_groups_per_basin",
+            "snap_input_row_groups_per_basin",
+        ):
+            self.assertEqual(metrics[key], [9, 9, 9])
+        self.assertEqual(metrics["output_catchment_row_groups"], 3)
+        self.assertEqual(metrics["output_graph_row_groups"], 3)
+        self.assertEqual(metrics["output_snap_row_groups"], 3)
+        self.assertEqual(metrics["basin_origin_transitions"], 12290)
+        self.assertEqual(
+            metrics["post_first_input_batch_origin_transitions"], 9218
+        )
+        self.assertEqual(
+            metrics["catchment_row_groups_with_multiple_basins"], 3
+        )
+        self.assertEqual(
+            metrics["snap_row_groups_with_multiple_basins"], 3
+        )
+        self.assertTrue(metrics["passed"])
+
+        assembled = self.scratch / "assembled"
+        catchments = pq.ParquetFile(assembled / "catchments.parquet")
+        graph = pq.ParquetFile(assembled / "graph.parquet")
+        snaps = pq.ParquetFile(
+            assembled / "aux" / "snap_stems.parquet"
+        )
+        known_headers = {11, 12, 13}
+        basin_groups = {header: 0 for header in known_headers}
+        snap_groups = {header: 0 for header in known_headers}
+        for index in range(catchments.num_row_groups):
+            catchment_ids = catchments.read_row_group(
+                index, columns=["id"]
+            ).column("id").to_pylist()
+            graph_ids = graph.read_row_group(
+                index, columns=["id"]
+            ).column("id").to_pylist()
+            self.assertEqual(catchment_ids, graph_ids)
+            headers = {
+                int(identifier) // 10_000_000
+                for identifier in catchment_ids
+            }
+            self.assertGreaterEqual(len(headers), 2)
+            for header in headers:
+                basin_groups[header] += 1
+        for index in range(snaps.num_row_groups):
+            unit_ids = snaps.read_row_group(
+                index, columns=["unit_id"]
+            ).column("unit_id").to_pylist()
+            headers = {
+                int(identifier) // 10_000_000 for identifier in unit_ids
+            }
+            self.assertGreaterEqual(len(headers), 2)
+            for header in headers:
+                snap_groups[header] += 1
+        self.assertTrue(all(groups > 1 for groups in basin_groups.values()))
+        self.assertTrue(all(groups > 1 for groups in snap_groups.values()))
+
+    def test_measurement_report_is_complete_and_bounded(self) -> None:
+        self.assertEqual(
+            set(self.report),
+            {
+                "schema_version",
+                "status",
+                "configuration",
+                "generation",
+                "assembly",
+                "interleaving",
+                "verification",
+            },
+        )
+        configuration = self.report["configuration"]
+        self.assertEqual(
+            set(configuration),
+            {
+                "seed",
+                "basin_count",
+                "total_units",
+                "distribution",
+                "generator_batch_size",
+                "verify_batch_size",
+                "sample_interval_ms",
+                "assemble_input_batch_size",
+                "assemble_row_group_min",
+                "assemble_row_group_max",
+                "rss_ceiling_bytes",
+                "scratch_ceiling_bytes",
+            },
+        )
+        generation = self.report["generation"]
+        self.assertEqual(
+            set(generation),
+            {
+                "regions",
+                "basin_unit_counts",
+                "basin_snap_counts",
+                "peak_authored_rows_bound",
+            },
+        )
+        self.assertEqual(sum(generation["basin_unit_counts"]), 12291)
+        self.assertEqual(
+            generation["basin_snap_counts"],
+            generation["basin_unit_counts"],
+        )
+        self.assertEqual(generation["peak_authored_rows_bound"], 1536)
+        assembly = self.report["assembly"]
+        self.assertEqual(
+            set(assembly),
+            {
+                "argv",
+                "returncode",
+                "wall_time_seconds",
+                "process_tree_peak_rss_bytes",
+                "referential_proof_peak_rss_bytes",
+                "scratch_tree_peak_bytes",
+                "final_scratch_tree_bytes",
+            },
+        )
+        for key in (
+            "wall_time_seconds",
+            "process_tree_peak_rss_bytes",
+            "referential_proof_peak_rss_bytes",
+            "scratch_tree_peak_bytes",
+            "final_scratch_tree_bytes",
+        ):
+            self.assertIsInstance(assembly[key], (int, float))
+            self.assertNotIsInstance(assembly[key], bool)
+            self.assertGreater(assembly[key], 0)
+        self.assertGreaterEqual(
+            assembly["process_tree_peak_rss_bytes"],
+            assembly["referential_proof_peak_rss_bytes"],
+        )
+        self.assertGreaterEqual(
+            assembly["scratch_tree_peak_bytes"],
+            assembly["final_scratch_tree_bytes"],
+        )
+        self.assertLessEqual(
+            assembly["process_tree_peak_rss_bytes"],
+            configuration["rss_ceiling_bytes"],
+        )
+        self.assertLessEqual(
+            assembly["scratch_tree_peak_bytes"],
+            configuration["scratch_ceiling_bytes"],
+        )
+        interleaving = self.report["interleaving"]
+        self.assertLessEqual(
+            interleaving["basin_origin_transitions"], 12290
+        )
+        self.assertLessEqual(
+            interleaving["post_first_input_batch_origin_transitions"],
+            12291 - 3 * 1024 - 1,
+        )
+        self.assertLessEqual(
+            interleaving["catchment_row_groups_with_multiple_basins"],
+            interleaving["output_catchment_row_groups"],
+        )
+        self.assertLessEqual(
+            interleaving["snap_row_groups_with_multiple_basins"],
+            interleaving["output_snap_row_groups"],
+        )
+        self.assertEqual(
+            self.report["verification"],
+            {"batch_size": 512, "passed": True},
+        )
+
+    def test_exact_rss_ceiling_failure(self) -> None:
+        with TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self.script),
+                    "rehearse",
+                    "--scratch-root",
+                    str(Path(temporary) / "rss"),
+                    "--basin-count",
+                    "2",
+                    "--total-units",
+                    "8194",
+                    "--generator-batch-size",
+                    "512",
+                    "--sample-interval-ms",
+                    "5",
+                    "--rss-ceiling-bytes",
+                    "1",
+                    "--scratch-ceiling-bytes",
+                    "68719476736",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "rehearsal failed: process-tree peak RSS exceeded ceiling\n",
+        )
+
+    def test_exact_generation_scratch_ceiling_failure(self) -> None:
+        with TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self.script),
+                    "rehearse",
+                    "--scratch-root",
+                    str(Path(temporary) / "scratch"),
+                    "--basin-count",
+                    "2",
+                    "--total-units",
+                    "8194",
+                    "--generator-batch-size",
+                    "512",
+                    "--sample-interval-ms",
+                    "5",
+                    "--rss-ceiling-bytes",
+                    "32212254720",
+                    "--scratch-ceiling-bytes",
+                    "1",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "rehearsal failed: scratch-tree peak usage exceeded ceiling\n",
+        )
 
 
 if __name__ == "__main__":
