@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 
+bash_version_at_least_3_2() {
+    hfx_test_bash_version=$1
+    [ -n "$hfx_test_bash_version" ] || return 1
+    hfx_test_bash_major=${hfx_test_bash_version%%.*}
+    hfx_test_bash_remainder=${hfx_test_bash_version#*.}
+    hfx_test_bash_minor=${hfx_test_bash_remainder%%.*}
+    case $hfx_test_bash_major in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case $hfx_test_bash_minor in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$hfx_test_bash_major" -gt 3 ] ||
+        { [ "$hfx_test_bash_major" -eq 3 ] && [ "$hfx_test_bash_minor" -ge 2 ]; }
+}
+
 if [ -z "${BASH_VERSION-}" ]; then
     printf '%s\n' 'test-tdx-hydro-campaign: error: Bash >=3.2 is required; observed non-Bash interpreter' >&2
     exit 1
 fi
-bash_major=${BASH_VERSION%%.*}
-bash_remainder=${BASH_VERSION#*.}
-bash_minor=${bash_remainder%%.*}
-if [ "$bash_major" -lt 3 ] || { [ "$bash_major" -eq 3 ] && [ "$bash_minor" -lt 2 ]; }; then
+if ! bash_version_at_least_3_2 "$BASH_VERSION"; then
     printf 'test-tdx-hydro-campaign: error: Bash >=3.2 is required; observed %s\n' "$BASH_VERSION" >&2
     exit 1
 fi
@@ -26,6 +39,13 @@ pass() {
     printf 'ok %d - %s\n' "$passed" "$1"
 }
 
+skip() {
+    passed=$((passed + 1))
+    skipped=$((skipped + 1))
+    printf 'ok %d - %s # SKIP %s\n' "$passed" "$1" "$2"
+    printf 'test-tdx-hydro-campaign: SKIP: %s\n' "$2" >&2
+}
+
 expect_failure() {
     local label=$1
     shift
@@ -39,6 +59,21 @@ assert_contains() {
     local file=$1
     local text=$2
     grep -F -- "$text" "$file" >/dev/null || die "expected '$text' in $file"
+}
+
+assert_zero_ere() {
+    local label=$1
+    local pattern=$2
+    local file=$3
+    local grep_option=${4-}
+    local match_count
+    if [[ -n "$grep_option" ]]; then
+        grep "$grep_option" -En -- "$pattern" "$file" >"$case_stdout" || :
+    else
+        grep -En -- "$pattern" "$file" >"$case_stdout" || :
+    fi
+    match_count=$(wc -l <"$case_stdout" | tr -d ' ')
+    [[ "$match_count" -eq 0 ]] || die "$label matched $match_count times"
 }
 
 run_runner() {
@@ -82,10 +117,7 @@ else
     printf '%s\n' 'test-tdx-hydro-campaign: warning: /bin/bash is unavailable; the Bash 3.2 floor is not being exercised' >&2
 fi
 selected_version=$("$selected_bash" -c 'printf "%s\n" "$BASH_VERSION"')
-selected_major=${selected_version%%.*}
-selected_remainder=${selected_version#*.}
-selected_minor=${selected_remainder%%.*}
-if [[ "$selected_major" -lt 3 ]] || { [[ "$selected_major" -eq 3 ]] && [[ "$selected_minor" -lt 2 ]]; }; then
+if ! bash_version_at_least_3_2 "$selected_version"; then
     die "selected Bash is older than 3.2: $selected_version"
 fi
 printf 'test-tdx-hydro-campaign: selected interpreter %s (%s)\n' "$selected_bash" "$selected_version"
@@ -117,7 +149,7 @@ mkdir "$test_tmp/fake-bin" "$test_tmp/invocations" "$test_tmp/workspaces"
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-before"
 case_stdout=$test_tmp/stdout
 case_stderr=$test_tmp/stderr
-for poison in hcloud curl aws ssh; do
+for poison in curl aws ssh; do
     sed -e "s/@NAME@/$poison/g" >"$test_tmp/fake-bin/$poison" <<'POISON'
 #!/bin/sh
 printf '%s\n' "$*" >>"${HFX_TEST_INVOCATIONS:?}/@NAME@.log"
@@ -125,6 +157,18 @@ exit 97
 POISON
     chmod +x "$test_tmp/fake-bin/$poison"
 done
+sed >"$test_tmp/fake-bin/hcloud" <<'POISON_HCLOUD'
+#!/bin/sh
+for argument do
+    if [ "$argument" = delete ]; then
+        printf '%s\n' "$*" >>"${HFX_TEST_INVOCATIONS:?}/hcloud-delete.log"
+        exit 96
+    fi
+done
+printf '%s\n' "$*" >>"${HFX_TEST_INVOCATIONS:?}/hcloud.log"
+exit 97
+POISON_HCLOUD
+chmod +x "$test_tmp/fake-bin/hcloud"
 sed >"$test_tmp/fake-ps" <<'FAKE_PS'
 #!/bin/sh
 if [ "${HFX_TEST_PS_MODE-}" = live ]; then
@@ -143,6 +187,7 @@ export HFX_TEST_INVOCATIONS=$test_tmp/invocations
 PATH=$test_tmp/fake-bin:$PATH
 export PATH
 passed=0
+skipped=0
 
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
@@ -2038,13 +2083,101 @@ if grep -F 'never-publish' "$aws_log" >/dev/null; then
 fi
 pass 'publication never invokes or defines assembly and never consults adapter or HFX'
 
+for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
+    bash_version_at_least_3_2 "$accepted_version" ||
+        die "Bash floor predicate rejected $accepted_version"
+done
+for rejected_version in 3.1.99 2.05 '' x.2 3.x; do
+    if bash_version_at_least_3_2 "$rejected_version"; then
+        die "Bash floor predicate accepted $rejected_version"
+    fi
+done
+if [[ -x /bin/bash ]]; then
+    [[ "$selected_bash" == /bin/bash ]] || die 'the exercised interpreter is not /bin/bash'
+fi
+bash_version_at_least_3_2 "$selected_version" ||
+    die "recorded selected Bash does not satisfy the floor: $selected_version"
+sed -n '3,13p' "$runner" >"$test_tmp/runner-bash-floor"
+assert_contains "$test_tmp/runner-bash-floor" 'Bash >=3.2 is required; observed non-Bash interpreter'
+assert_contains "$test_tmp/runner-bash-floor" 'Bash >=3.2 is required; observed %s'
+assert_contains "$test_tmp/runner-bash-floor" '[ "$bash_major" -lt 3 ]'
+assert_contains "$test_tmp/runner-bash-floor" '[ "$bash_minor" -lt 2 ]'
+pass 'the harness records its exercised Bash and rejects the insufficient-version fixtures'
+
+logical_runner=$test_tmp/runner-logical-lines
+sed ':join
+/\\$/ {
+    N
+    s/\\\n/ /
+    b join
+}' "$runner" >"$logical_runner"
+assert_zero_ere 'teardown script token' '(^|[[:space:]/"'\''])teardown[.]sh([[:space:];|"'\'']|$)' "$logical_runner"
+assert_zero_ere 'hcloud token' 'hcloud' "$logical_runner" -i
+assert_zero_ere 'standalone delete verb' '(^|[^[:alnum:]_])delete([^[:alnum:]_]|$)' "$logical_runner"
+assert_zero_ere 'word-bounded ssh token' '(^|[^[:alnum:]_])ssh([^[:alnum:]_]|$)' "$logical_runner"
+assert_zero_ere 'label selector' '(^|[[:space:]])(--selector|--label-selector)(=|[[:space:]"'\'']|$)' "$logical_runner"
+grep -Fn -- 'grit-d8-m3' "$logical_runner" >"$case_stdout" || :
+[[ $(wc -l <"$case_stdout" | tr -d ' ') -eq 0 ]] ||
+    die "protected retained volume matched $(wc -l <"$case_stdout" | tr -d ' ') times"
+assert_zero_ere 'absolute real service client' '/(usr/)?(local/)?bin/(ssh|hcloud|curl|aws)([[:space:]"'\'']|$)' "$logical_runner"
+[[ $(grep -Fc -- 'list-objects-v2' "$runner") -eq 2 ]] ||
+    die 'legitimate list-objects-v2 occurrence count differs'
+[[ $(grep -Fc -- 'list_remote_inventory' "$runner") -eq 3 ]] ||
+    die 'legitimate list_remote_inventory occurrence count differs'
+[[ $(grep -Ec -- '[[:space:]]-name[[:space:]]+campaign[.]json' "$runner") -eq 1 ]] ||
+    die 'legitimate local campaign marker find count differs'
+pass 'the campaign runner has no teardown, destructive hcloud, resource sweep, or protected-volume reference'
+
+hcloud_probe_invocations=$test_tmp/hcloud-probe-invocations
+mkdir "$hcloud_probe_invocations"
+hcloud_server_delete_status=0
+HFX_TEST_INVOCATIONS=$hcloud_probe_invocations hcloud server delete 123 \
+    >"$case_stdout" 2>"$case_stderr" || hcloud_server_delete_status=$?
+hcloud_volume_delete_status=0
+HFX_TEST_INVOCATIONS=$hcloud_probe_invocations hcloud volume delete 456 \
+    >"$case_stdout" 2>"$case_stderr" || hcloud_volume_delete_status=$?
+hcloud_list_status=0
+HFX_TEST_INVOCATIONS=$hcloud_probe_invocations hcloud server list \
+    >"$case_stdout" 2>"$case_stderr" || hcloud_list_status=$?
+[[ "$hcloud_server_delete_status" -eq 96 ]] ||
+    die "hcloud server delete poison exited $hcloud_server_delete_status instead of 96"
+[[ "$hcloud_volume_delete_status" -eq 96 ]] ||
+    die "hcloud volume delete poison exited $hcloud_volume_delete_status instead of 96"
+[[ "$hcloud_list_status" -eq 97 ]] ||
+    die "hcloud server list poison exited $hcloud_list_status instead of 97"
+printf '%s\n' 'server delete 123' 'volume delete 456' >"$test_tmp/expected-hcloud-delete.log"
+printf '%s\n' 'server list' >"$test_tmp/expected-hcloud.log"
+diff -u "$test_tmp/expected-hcloud-delete.log" "$hcloud_probe_invocations/hcloud-delete.log"
+diff -u "$test_tmp/expected-hcloud.log" "$hcloud_probe_invocations/hcloud.log"
+for poison in hcloud curl aws ssh; do
+    poison_path=$(command -v "$poison")
+    [[ "$poison_path" == "$test_tmp/fake-bin/$poison" ]] ||
+        die "$poison does not resolve to the intended PATH poison"
+done
+pass 'PATH poisons trap every hcloud delete verb and shadow all real service clients'
+
+shellcheck_path=$(command -v shellcheck || true)
+if [[ -n "$shellcheck_path" ]]; then
+    "$shellcheck_path" -S warning -e SC2046 \
+        "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"
+    pass 'shellcheck reports no warning-or-higher findings in the harness'
+else
+    skip 'shellcheck checks' 'shellcheck is unavailable'
+fi
+
 for poison in hcloud curl aws ssh; do
     [[ ! -e "$test_tmp/invocations/$poison.log" ]] || die "poison command was invoked: $poison"
 done
+[[ ! -e "$test_tmp/invocations/hcloud-delete.log" ]] ||
+    die 'poison command was invoked: hcloud delete'
 [[ -s "$aws_log" ]] || die 'deliberate strict fake AWS log is empty'
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-final"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-final"
 pass 'poison commands remain uninvoked and repository status preserves only the allowed PR body'
 
 printf '1..%d\n' "$passed"
-printf 'test-tdx-hydro-campaign: all %d cases passed\n' "$passed"
+if [[ "$skipped" -eq 0 ]]; then
+    printf 'test-tdx-hydro-campaign: all %d cases passed\n' "$passed"
+else
+    printf 'test-tdx-hydro-campaign: all %d cases completed (%d skipped)\n' "$passed" "$skipped"
+fi
