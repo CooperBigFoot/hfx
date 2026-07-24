@@ -100,6 +100,63 @@ copy_workspace() {
     printf '%s\n' "$destination"
 }
 
+mark_compile_succeeded() {
+    local campaign_dir=$1
+    local basin_id=$2
+    local state=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$state.tmp
+    jq '.stages.compile={status:"succeeded",attempts:1,failure_reason:null,diagnostic_report:null}' \
+        "$state" >"$temporary"
+    mv "$temporary" "$state"
+    mkdir -p "$campaign_dir/basin-outputs/$basin_id"
+}
+
+write_expected_assembly_argv() {
+    local campaign_dir=$1
+    HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/expected-assembly-argv
+    export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
+    printf '%s\n' \
+        assemble \
+        --input "$campaign_dir/basin-outputs/1020000010" \
+        --input "$campaign_dir/basin-outputs/7020000010" \
+        --out "$campaign_dir/assembly/dataset" \
+        >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+}
+
+write_assembly_state_fixture() {
+    local campaign_dir=$1
+    local status=$2
+    local attempts=$3
+    local reason=$4
+    jq -n --arg status "$status" --argjson attempts "$attempts" --arg reason "$reason" '{
+      schema_version:1,
+      status:$status,
+      attempts:$attempts,
+      failure_reason:(if $reason == "" then null else $reason end),
+      input_basin_ids:["1020000010","7020000010"],
+      output_path:"assembly/dataset",
+      report_path:"reports/assembly.json"
+    }' >"$campaign_dir/state/assembly.json"
+}
+
+create_assembly_dataset_fixture() {
+    local output=$1
+    mkdir -p "$output/aux"
+    printf '%s\n' fixture >"$output/catchments.parquet"
+    printf '%s\n' fixture >"$output/graph.parquet"
+    printf '%s\n' fixture >"$output/manifest.json"
+    printf '%s\n' fixture >"$output/aux/snap_stems.parquet"
+}
+
+new_assembly_workspace() {
+    local name=$1
+    local destination=$test_tmp/workspaces/$name
+    mkdir "$destination"
+    set -- $(init_args equal "$destination")
+    run_runner "$@" >"$case_stdout"
+    printf '%s\n' "$destination"
+}
+
 SCRIPT_DIR=$(cd -P -- "${BASH_SOURCE[0]%/*}" && pwd)
 repo_root=$(cd -P -- "$SCRIPT_DIR/../.." && pwd)
 runner=$SCRIPT_DIR/tdx-hydro-campaign.sh
@@ -193,6 +250,7 @@ run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
 assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 pass 'sole help arguments succeed'
@@ -221,8 +279,12 @@ expect_failure 'control fabric version' compile --campaign compile --workspace-r
     --fabric-version $'bad\nversion'
 expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
 for publication_option in --out --report --notice --citation --scratch-prefix; do
     expect_failure "foreign $publication_option" status --campaign foreign --workspace-root "$argument_root" \
+        "$publication_option" value
+    expect_failure "$publication_option on assemble" assemble --campaign foreign --workspace-root "$argument_root" \
         "$publication_option" value
     expect_failure "repeated $publication_option" publish --campaign repeated --workspace-root "$argument_root" \
         "$publication_option" value "$publication_option" value
@@ -337,6 +399,15 @@ jq -e -s '
       }
     )
 ' "$campaign_dir"/state/basins/*/current.json >/dev/null || die 'initial basin states differ'
+jq -e '. == {
+  schema_version:1,
+  status:"pending",
+  attempts:0,
+  failure_reason:null,
+  input_basin_ids:[],
+  output_path:"assembly/dataset",
+  report_path:"reports/assembly.json"
+}' "$campaign_dir/state/assembly.json" >/dev/null || die 'initial assembly state differs'
 if grep -F '7020000010' "$runner" >/dev/null; then
     die 'runner contains a transcribed processing-basin ID'
 fi
@@ -515,6 +586,12 @@ jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
     >"$compile_state_root/tdx-hydro-equal/state/compile.json"
 expect_failure 'malformed compile contract' status --campaign equal --workspace-root "$compile_state_root"
 
+assembly_state_root=$(copy_workspace bad-assembly-state)
+jq '.input_basin_ids=["7020000010","1020000010"]' \
+    "$assembly_state_root/tdx-hydro-equal/state/assembly.json" >"$assembly_state_root/assembly.tmp"
+mv "$assembly_state_root/assembly.tmp" "$assembly_state_root/tdx-hydro-equal/state/assembly.json"
+expect_failure 'malformed assembly contract' status --campaign equal --workspace-root "$assembly_state_root"
+
 jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnostic_report","failure_reason","status"])' "$selected_state" >/dev/null ||
     die 'shared status fixture lost the v3 compile diagnostic member'
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
@@ -522,6 +599,10 @@ assert_contains "$case_stdout" 'inventory_count=62'
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=1'
 assert_contains "$case_stdout" 'compile_succeeded=1'
+assert_contains "$case_stdout" 'assemble_pending=1'
+assert_contains "$case_stdout" 'assemble_running=0'
+assert_contains "$case_stdout" 'assemble_succeeded=0'
+assert_contains "$case_stdout" 'assemble_failed=0'
 pass 'status rejects all malformed state and reports deterministic counts'
 
 run_runner --help >"$case_stdout"
@@ -764,12 +845,43 @@ case $command_name in
         hfx_binary=$4
         printf 'validate\t%s\t--hfx-binary\t%s\n' "$dataset" "$hfx_binary" >>"$log"
         [ -d "$dataset" ] && [ ! -L "$dataset" ] || exit 88
-        if [ "${HFX_TEST_FAIL_VALIDATE_ID-}" = "${dataset##*/}" ]; then
+        if [ "${HFX_TEST_FAIL_VALIDATE_ID-}" = "${dataset##*/}" ] ||
+            { [ "${dataset##*/}" = dataset ] && [ "${HFX_TEST_FAIL_ASSEMBLY_VALIDATE-}" = 1 ]; }; then
             exit 42
         fi
-        "$hfx_binary" "$dataset" --strict --sample-pct 100 --format text
+        hfx_status=0
+        "$hfx_binary" "$dataset" --strict --sample-pct 100 --format text || hfx_status=$?
+        printf '%s\t%s\n' "$dataset" "$hfx_status" >>"${HFX_TEST_HFX_STATUS_LOG:?}"
+        exit "$hfx_status"
         ;;
-    assemble|assembly)
+    assemble)
+        assemble_arguments=("$@")
+        shift
+        input_count=0
+        while [ "$#" -gt 2 ]; do
+            [ "$1" = --input ] || exit 89
+            [ -d "$2" ] && [ ! -L "$2" ] || exit 89
+            input_count=$((input_count + 1))
+            shift 2
+        done
+        [ "$input_count" -gt 0 ] || exit 89
+        [ "$#" -eq 2 ] && [ "$1" = --out ] || exit 89
+        out=$2
+        printf '%s' "${assemble_arguments[0]}" >>"$log"
+        for argument in "${assemble_arguments[@]:1}"; do
+            printf '\t%s' "$argument" >>"$log"
+        done
+        printf '\n' >>"$log"
+        if [ "${HFX_TEST_FAIL_ASSEMBLY-}" = 1 ]; then
+            exit 43
+        fi
+        mkdir -p "$out/aux"
+        printf '%s\n' fixture >"$out/catchments.parquet"
+        printf '%s\n' fixture >"$out/graph.parquet"
+        printf '%s\n' fixture >"$out/manifest.json"
+        printf '%s\n' fixture >"$out/aux/snap_stems.parquet"
+        ;;
+    assembly)
         exit 89
         ;;
     *)
@@ -783,11 +895,22 @@ set -eu
 [ "$#" -ge 1 ] || exit 91
 [ "$1" = "${HFX_TEST_ADAPTER_SCRIPT:?}" ] || exit 92
 shift
+if [ "${1-}" = assemble ]; then
+    actual=${HFX_TEST_EXPECTED_ASSEMBLY_ARGV:?}.actual
+    : >"$actual"
+    for argument do
+        printf '%s\n' "$argument" >>"$actual"
+    done
+    "${HFX_TEST_DIFF:?}" -u "${HFX_TEST_EXPECTED_ASSEMBLY_ARGV:?}" "$actual" || exit 94
+fi
 exec "${HFX_TEST_ADAPTER_STUB:?}" "$@"
 FAKE_ADAPTER_PYTHON
 sed >"$test_tmp/fake-hfx" <<'FAKE_HFX'
 #!/bin/bash
 set -eu
+case ${1-} in
+    assemble|assembly) exit 74 ;;
+esac
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HFX_LOG:?}"
 [ "$#" -eq 6 ] || exit 71
 [ "$1" != validate ] || exit 72
@@ -796,9 +919,6 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 [ "$4" = 100 ] || exit 73
 [ "$5" = --format ] || exit 73
 [ "$6" = text ] || exit 73
-case "$*" in
-    *assemble*|*assembly*) exit 74 ;;
-esac
 exit 0
 FAKE_HFX
 chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
@@ -816,6 +936,8 @@ export HFX_TEST_ADAPTER_LOG=$test_tmp/invocations/adapter.log
 export HFX_TEST_ADAPTER_SCRIPT=$repo_root/adapters/tdx-hydro/build_adapter.py
 export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
 export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
+export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
+export HFX_TEST_DIFF=$(command -v diff)
 
 rendezvous_status=0
 HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
@@ -1327,6 +1449,216 @@ fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-after"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-after"
 pass 'no cloud, network, SSH, or publication command ran'
+
+assembly_hfx_start=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+assembly_success_root=$(new_assembly_workspace assembly-success)
+assembly_success_dir=$assembly_success_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_success_dir" 7020000010
+mark_compile_succeeded "$assembly_success_dir" 1020000010
+write_expected_assembly_argv "$assembly_success_dir"
+run_runner assemble --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout" 2>"$case_stderr"
+jq -e '
+  .schema_version == 1 and .status == "succeeded" and .attempts == 1 and
+  .failure_reason == null and .input_basin_ids == ["1020000010","7020000010"] and
+  .output_path == "assembly/dataset" and .report_path == "reports/assembly.json"
+' "$assembly_success_dir/state/assembly.json" >/dev/null
+jq -e --arg campaign equal '
+  . == {
+    schema_version:1,
+    campaign:$campaign,
+    input_basin_ids:["1020000010","7020000010"],
+    input_dataset_paths:["basin-outputs/1020000010","basin-outputs/7020000010"],
+    output_path:"assembly/dataset"
+  }
+' "$assembly_success_dir/reports/assembly.json" >/dev/null
+[[ -d "$assembly_success_dir/assembly/dataset" ]] ||
+    die 'assembly success did not publish the dataset'
+[[ ! -e "$assembly_success_dir/assembly/dataset/assembly.json" ]] ||
+    die 'runner-owned assembly report was placed beneath the dataset'
+pass 'assembly succeeds with exact sorted repeated-input argv and external report'
+
+for rejected_verb in assemble assembly; do
+    literal_status=0
+    "$test_tmp/fake-hfx" "$rejected_verb" --strict --sample-pct 100 --format text \
+        >"$case_stdout" 2>"$case_stderr" || literal_status=$?
+    [[ "$literal_status" -eq 74 ]] ||
+        die "fake-hfx literal $rejected_verb verb exited $literal_status instead of 74"
+done
+
+assembly_empty_root=$(new_assembly_workspace assembly-empty)
+assembly_empty_dir=$assembly_empty_root/tdx-hydro-equal
+cp "$assembly_empty_dir/state/assembly.json" "$test_tmp/assembly-empty-state-before"
+empty_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+empty_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'assembly without compiled basins' assemble --campaign equal --workspace-root "$assembly_empty_root"
+assert_contains "$case_stderr" 'hfx: error: assembly requires at least one basin with compile status succeeded'
+diff -u "$test_tmp/assembly-empty-state-before" "$assembly_empty_dir/state/assembly.json"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$empty_adapter_lines" ]] ||
+    die 'empty assembly invoked the adapter'
+[[ $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$empty_hfx_lines" ]] ||
+    die 'empty assembly invoked HFX'
+[[ ! -e "$assembly_empty_dir/assembly/dataset" &&
+   ! -e "$assembly_empty_dir/reports/assembly.json" ]] ||
+    die 'empty assembly created an artifact'
+[[ $(find "$assembly_empty_dir/assembly" -mindepth 1 -maxdepth 1 ! -name scratch | wc -l | tr -d ' ') -eq 0 ]] ||
+    die 'empty assembly created a staging entry'
+pass 'assembly refuses an empty compiled-basin selection without mutation'
+
+assembly_adopt_root=$(new_assembly_workspace assembly-adopt)
+assembly_adopt_dir=$assembly_adopt_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_adopt_dir" 7020000010
+mark_compile_succeeded "$assembly_adopt_dir" 1020000010
+write_assembly_state_fixture "$assembly_adopt_dir" running 1 ''
+create_assembly_dataset_fixture "$assembly_adopt_dir/assembly/dataset"
+run_runner recover --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+adopt_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+adopt_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$adopt_assemble_before" ]] ||
+    die 'attributable adoption invoked assemble'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((adopt_validate_before + 1)) ]] ||
+    die 'attributable adoption did not validate exactly once'
+jq -e '.status == "succeeded" and .attempts == 1' "$assembly_adopt_dir/state/assembly.json" >/dev/null
+[[ -f "$assembly_adopt_dir/reports/assembly.json" ]] ||
+    die 'attributable adoption did not regenerate the report'
+pass 'recover adopts a verified destination with attributable interrupted provenance'
+
+assembly_refuse_root=$(new_assembly_workspace assembly-refuse)
+assembly_refuse_dir=$assembly_refuse_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_refuse_dir" 7020000010
+mark_compile_succeeded "$assembly_refuse_dir" 1020000010
+mkdir "$assembly_refuse_dir/assembly/dataset"
+printf '%s\n' preserve >"$assembly_refuse_dir/assembly/dataset/canary"
+refuse_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+refuse_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'unverified assembly destination' assemble --campaign equal --workspace-root "$assembly_refuse_root"
+assert_contains "$case_stderr" 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+[[ $(<"$assembly_refuse_dir/assembly/dataset/canary") == preserve ]] ||
+    die 'unverified destination was modified'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$refuse_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$refuse_hfx_lines" ]] ||
+    die 'unverified destination refusal invoked validation'
+[[ ! -e "$assembly_refuse_dir/reports/assembly.json" ]] ||
+    die 'unverified destination refusal created a report'
+jq -e '.attempts == 0' "$assembly_refuse_dir/state/assembly.json" >/dev/null
+pass 'assembly preserves and refuses an unverified existing destination'
+
+assembly_retry_root=$(new_assembly_workspace assembly-retry)
+assembly_retry_dir=$assembly_retry_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_retry_dir" 7020000010
+mark_compile_succeeded "$assembly_retry_dir" 1020000010
+write_expected_assembly_argv "$assembly_retry_dir"
+cp -R "$assembly_retry_dir/state/basins" "$test_tmp/retry-basins-before"
+HFX_TEST_FAIL_ASSEMBLY=1 expect_failure 'injected assembly failure' \
+    assemble --campaign equal --workspace-root "$assembly_retry_root"
+jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "adapter assembly failed"' \
+    "$assembly_retry_dir/state/assembly.json" >/dev/null
+[[ ! -e "$assembly_retry_dir/assembly/dataset" &&
+   ! -e "$assembly_retry_dir/reports/assembly.json" ]] ||
+    die 'adapter assembly failure left a dataset or report'
+diff -ru "$test_tmp/retry-basins-before" "$assembly_retry_dir/state/basins"
+retry_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_retry_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((retry_assemble_before + 1)) ]] ||
+    die 'assembly retry did not issue exactly one fresh assemble vector'
+jq -e '.status == "succeeded" and .attempts == 2' "$assembly_retry_dir/state/assembly.json" >/dev/null
+pass 'adapter assembly failure is isolated and a clean retry converges'
+
+assembly_stage_root=$(new_assembly_workspace assembly-stage)
+assembly_stage_dir=$assembly_stage_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_stage_dir" 7020000010
+mark_compile_succeeded "$assembly_stage_dir" 1020000010
+write_assembly_state_fixture "$assembly_stage_dir" running 1 ''
+mkdir "$assembly_stage_dir/assembly/.dataset.tmp-interrupted"
+printf '%s\n' keep >"$assembly_stage_dir/assembly/unrelated"
+run_runner recover --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
+write_expected_assembly_argv "$assembly_stage_dir"
+run_runner assemble --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
+[[ ! -e "$assembly_stage_dir/assembly/.dataset.tmp-interrupted" ]] ||
+    die 'attributable interrupted staging was not removed'
+[[ $(<"$assembly_stage_dir/assembly/unrelated") == keep ]] ||
+    die 'unrelated assembly entry changed'
+jq -e '.status == "succeeded" and .attempts == 2' "$assembly_stage_dir/state/assembly.json" >/dev/null
+pass 'recover removes only attributable adapter staging before retry'
+
+cp "$assembly_success_dir/reports/assembly.json" "$test_tmp/assembly-success-report-before"
+success_attempts_before=$(jq -r '.attempts' "$assembly_success_dir/state/assembly.json")
+success_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+success_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$success_assemble_before" ]] ||
+    die 'succeeded assembly resume invoked assemble'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((success_validate_before + 1)) ]] ||
+    die 'succeeded assembly resume did not validate exactly once'
+[[ $(jq -r '.attempts' "$assembly_success_dir/state/assembly.json") -eq "$success_attempts_before" ]] ||
+    die 'succeeded assembly resume incremented attempts'
+diff -u "$test_tmp/assembly-success-report-before" "$assembly_success_dir/reports/assembly.json"
+run_runner status --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+assert_contains "$case_stdout" 'assemble_pending=0'
+assert_contains "$case_stdout" 'assemble_running=0'
+assert_contains "$case_stdout" 'assemble_succeeded=1'
+assert_contains "$case_stdout" 'assemble_failed=0'
+assembly_changed_root=$test_tmp/workspaces/assembly-changed
+mkdir "$assembly_changed_root"
+cp -R "$assembly_success_dir" "$assembly_changed_root/tdx-hydro-equal"
+assembly_changed_dir=$assembly_changed_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_changed_dir" 1020011530
+changed_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+changed_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'changed succeeded assembly input set' \
+    assemble --campaign equal --workspace-root "$assembly_changed_root"
+assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
+jq -e '
+  .status == "failed" and .attempts == 1 and
+  .failure_reason == "existing succeeded assembly failed resume verification; retained for inspection" and
+  .input_basin_ids == ["1020000010","7020000010"]
+' "$assembly_changed_dir/state/assembly.json" >/dev/null
+[[ -d "$assembly_changed_dir/assembly/dataset" &&
+   -f "$assembly_changed_dir/reports/assembly.json" ]] ||
+    die 'changed succeeded input set did not preserve assembly artifacts'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$changed_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$changed_hfx_lines" ]] ||
+    die 'changed succeeded input set invoked adapter or HFX'
+pass 'succeeded assembly resumes by verification without report or attempt mutation'
+
+assembly_invalid_root=$(new_assembly_workspace assembly-invalid)
+assembly_invalid_dir=$assembly_invalid_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_invalid_dir" 7020000010
+mark_compile_succeeded "$assembly_invalid_dir" 1020000010
+write_expected_assembly_argv "$assembly_invalid_dir"
+cp -R "$assembly_invalid_dir/state/basins" "$test_tmp/invalid-basins-before"
+HFX_TEST_FAIL_ASSEMBLY_VALIDATE=1 expect_failure 'post-assembly validation failure' \
+    assemble --campaign equal --workspace-root "$assembly_invalid_root"
+assert_contains "$case_stderr" 'assembled dataset validation failed; retained for inspection'
+jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "assembled dataset validation failed; retained for inspection"' \
+    "$assembly_invalid_dir/state/assembly.json" >/dev/null
+[[ -d "$assembly_invalid_dir/assembly/dataset" &&
+   ! -e "$assembly_invalid_dir/reports/assembly.json" ]] ||
+    die 'post-validation failure did not retain only the dataset'
+diff -ru "$test_tmp/invalid-basins-before" "$assembly_invalid_dir/state/basins"
+invalid_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+invalid_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'post-validation artifact rerun' assemble --campaign equal --workspace-root "$assembly_invalid_root"
+assert_contains "$case_stderr" 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$invalid_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$invalid_hfx_lines" ]] ||
+    die 'post-validation artifact rerun invoked adapter or HFX'
+pass 'post-assembly validation failure retains evidence and refuses rerun'
+
+assembly_hfx_end=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+tail -n $((assembly_hfx_end - assembly_hfx_start)) "$HFX_TEST_HFX_LOG" >"$test_tmp/assembly-hfx-delta"
+if grep -Ev $'/assembly/dataset\t--strict\t--sample-pct\t100\t--format\ttext$' \
+    "$test_tmp/assembly-hfx-delta" >"$case_stdout"; then
+    die 'assembly HFX delta contains a non-validation vector'
+fi
+[[ $(wc -l <"$test_tmp/assembly-hfx-delta" | tr -d ' ') -eq 5 ]] ||
+    die 'assembly cases produced an unexpected HFX validation count'
+if grep -Ev '^(build|validate|assemble)[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >"$case_stdout"; then
+    die 'adapter log contains an unknown command after assembly cases'
+fi
+if grep -E '^assembly[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >/dev/null; then
+    die 'adapter log contains the rejected assembly misspelling'
+fi
 
 cp "$HFX_TEST_ADAPTER_LOG" "$test_tmp/adapter-before-new-paths"
 cp "$HFX_TEST_HFX_LOG" "$test_tmp/hfx-before-new-paths"
@@ -2073,15 +2405,10 @@ pass 'initial extra or wrong-size inventory and post-upload size mismatch are re
 
 diff -u "$test_tmp/adapter-before-new-paths" "$HFX_TEST_ADAPTER_LOG"
 diff -u "$test_tmp/hfx-before-new-paths" "$HFX_TEST_HFX_LOG"
-if grep -En '(^|[^[:alnum:]_])assemble_hfx([^[:alnum:]_]|$)' "$runner" ||
-   grep -En '^[[:space:]]*(function[[:space:]]+)?(assemble|assembly)[[:space:]]*(\(\))?[[:space:]]*\{' "$runner" ||
-   grep -En '^[[:space:]]*(assemble|assembly)(\|[^)]*)?\)[[:space:]]' "$runner"; then
-    die 'runner defines or dispatches an assembly entrypoint'
-fi
 if grep -F 'never-publish' "$aws_log" >/dev/null; then
     die 'publication exposed the per-basin canary'
 fi
-pass 'publication never invokes or defines assembly and never consults adapter or HFX'
+pass 'publication never invokes assembly and never consults adapter or HFX'
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||
