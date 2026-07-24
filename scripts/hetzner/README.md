@@ -258,6 +258,166 @@ commands, missing root privileges, unsafe or unloadable credentials, missing
 or empty required AWS variables, download or atomic-install verification
 failures, and S3 upload failure.
 
+### `tdx-hydro-campaign.sh`
+
+The TDX-Hydro campaign runner manages one 62-basin workspace. It requires Bash
+`>=3.2`. When the harness can execute `/bin/bash`, it deliberately selects that
+interpreter and reports its version so a newer Bash earlier on `PATH` cannot
+hide a portability failure. An older Bash exits with
+`hfx: error: Bash >=3.2 is required; observed <version>`; a non-Bash
+interpreter exits with
+`hfx: error: Bash >=3.2 is required; observed non-Bash interpreter`.
+
+The accepted command forms are:
+
+```text
+tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>
+tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>
+tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>
+tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
+```
+
+`--workspace-root` defaults to `/mnt/hfx/work`, giving campaign directory
+`/mnt/hfx/work/tdx-hydro-<campaign>`. All seven `init` byte values are required,
+positive base-10 integers within the signed 64-bit range. The feasibility
+checks are:
+
+```text
+required_memory_bytes = assembly_memory_ceiling_bytes
+required_disk_bytes = retained_input_bytes
+                    + retained_basin_output_bytes
+                    + assembly_scratch_ceiling_bytes
+                    + assembled_artifact_bytes
+available_memory_bytes >= required_memory_bytes
+available_disk_bytes >= required_disk_bytes
+```
+
+Insufficient capacity is reported as
+`hfx: error: insufficient memory: available <available> bytes; required <required> bytes`
+or
+`hfx: error: insufficient disk: available <available> bytes; required <required> bytes`.
+Re-running `init` for an existing campaign requires the same normalized sizing
+values and the same 62-basin inventory. Changed parameters require a new
+campaign ID.
+
+The persisted policy is `retain-all-through-publication`. Acquired final
+GeoPackages, per-basin outputs, and external diagnostic reports remain on the
+campaign volume. Acquisition retains an invalid final for inspection and
+removes only its ordinary incomplete `.partial` file before a complete-file
+retry. A resumed acquisition re-verifies each retained final's byte count,
+SHA-256, SQLite identity, layer name, and persisted evidence. A resumed compile
+re-validates each succeeded dataset and external report. Existing failed or
+conflicting compile artifacts are retained for inspection.
+
+The runner phases are:
+
+1. `init` creates the fixed campaign layout and records sizing, inventory, and
+   retention policy.
+2. `acquire --max-parallel <1-62>` performs bounded parallel work across
+   basins. Each product transfer remains a complete GET.
+3. `compile --fabric-version <value>` invokes one isolated adapter build per
+   basin after both products succeed. It retains
+   `basin-outputs/<basin>` and `reports/<basin>-build-report.json`.
+4. `evidence` writes deterministic
+   `publication/evidence/acquisition.json`,
+   `publication/evidence/outcomes.json`, and
+   `publication/evidence/diagnostics.json`.
+5. After assembly by a separate repository entrypoint, `publish` accepts the
+   assembled dataset directory as opaque input. The runner inventories
+   nonempty regular files and uploads the exact persisted inventory; it does
+   not invoke assembly or validate dataset semantics.
+
+`status` validates state and prints sizing plus deterministic per-stage counts.
+`recover` changes interrupted `running` stages back to `pending`; `acquire` and
+`compile` also perform the applicable recovery before work. Operational
+recovery always re-runs the same campaign with the same sizing, inventory,
+parallelism, fabric version, paths, attribution inputs, and scratch prefix.
+Do not sweep resources, enumerate by name pattern or label selector, or perform
+opportunistic cleanup. Inspect and retry only the exact campaign resources and
+retained paths named by the diagnostic.
+
+On the VM, compile defaults to Python `/opt/hfx-geo/bin/python`, adapter script
+`/root/hfx/adapters/tdx-hydro/build_adapter.py`, and validator
+`/root/hfx/target/release/hfx`. The corresponding explicit overrides are
+`HFX_TDX_ADAPTER_PYTHON`, `HFX_TDX_ADAPTER_SCRIPT`, and `HFX_TDX_HFX`.
+Bootstrap fetches `origin/main` and resets the whole tracked `/root/hfx`
+checkout to it. Future repository files merged to `origin/main` are therefore
+staged on the VM by bootstrap without maintaining an explicit adapter file
+list.
+
+Use `launch.sh` to keep each long phase in a detached session. These are
+templates only; replace every angle-bracketed value with the approved campaign
+parameters. They document usage and do not authorize provisioning:
+
+```bash
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-init -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh init \
+  --campaign <campaign> \
+  --available-memory-bytes <available-memory-bytes> \
+  --available-disk-bytes <available-disk-bytes> \
+  --retained-input-bytes <retained-input-bytes> \
+  --retained-basin-output-bytes <retained-basin-output-bytes> \
+  --assembly-memory-ceiling-bytes <assembly-memory-ceiling-bytes> \
+  --assembly-scratch-ceiling-bytes <assembly-scratch-ceiling-bytes> \
+  --assembled-artifact-bytes <assembled-artifact-bytes>
+
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-acquire -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh acquire \
+  --campaign <campaign> --max-parallel <parallelism>
+
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-compile -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh compile \
+  --campaign <campaign> --fabric-version <fabric-version>
+
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-evidence -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh evidence \
+  --campaign <campaign>
+
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-publish -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh publish \
+  --campaign <campaign> \
+  --out <absolute-assembled-dataset-dir> \
+  --report <absolute-external-build-report> \
+  --notice <absolute-notice-path> \
+  --citation <absolute-citation-path> \
+  --scratch-prefix scratch/tdx-hydro-<campaign>/<artifact>
+```
+
+Publication requires a nonempty external report, NOTICE, and CITATION file.
+`--report` must resolve outside `--out`. The scratch prefix must match
+`scratch/tdx-hydro-<campaign>/<artifact>`, so publication remains outside the
+delivery prefix `hfx/`. A directory is a campaign directory when it contains
+`state/campaign.json`. The content-based privacy guard refuses `--out` when it
+is a campaign directory, is inside another campaign directory, or contains
+another campaign directory at any descendant depth.
+
+Before default teardown, copy the campaign record, the three deterministic
+evidence documents, required reports, and relevant logs off the VM. The
+committed campaign record must capture the successful teardown line exactly:
+
+```text
+hfx: campaign <campaign> has zero Hetzner footprint: server hfx-build-<campaign> absent; volume hfx-build-<campaign>-data absent
+```
+
+`teardown.sh` emits this line today after its exact-name absence checks. The
+record must also include independent server and volume listings filtered by
+exact name, with both result arrays empty:
+
+```bash
+hcloud --context pourpoint server list -o json |
+  jq --arg name 'hfx-build-<campaign>' '[.[] | select(.name == $name)]'
+hcloud --context pourpoint volume list -o json |
+  jq --arg name 'hfx-build-<campaign>-data' '[.[] | select(.name == $name)]'
+```
+
+The expected output from each independent listing is `[]`. These listings are
+evidence checks, not cleanup discovery. The unrelated `grit-d8-m3` volume is
+intentionally retained and is an operator invariant: never inspect it as a
+campaign target, detach it, resize it, delete it, or include it in cleanup.
+
 ### `teardown.sh`
 
 ```text
