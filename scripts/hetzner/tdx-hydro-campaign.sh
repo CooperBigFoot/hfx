@@ -44,7 +44,7 @@ hfx_log() {
 
 usage() {
     printf '%s\n' \
-        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
+        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
@@ -115,6 +115,28 @@ validate_inventory_file() {
             (.value | type == "string" and test("^[0-9]+$") and length > 0)
         ))
     ' "$file" >/dev/null 2>&1 || hfx_die "authoritative inventory is invalid: $file"
+}
+
+validate_selection_file() {
+    local file=$1
+    local inventory_file=${2-$campaign_dir/state/inventory.json}
+    "$JQ" -e --slurpfile inventory "$inventory_file" '
+        type == "object" and
+        keys == ["basin_ids","schema_version"] and
+        .schema_version == 1 and
+        (.basin_ids | type == "array" and length > 0 and
+            . == (sort | unique) and
+            all(.[]; type == "string" and test("^[0-9]{10}$") and
+                $inventory[0][.] != null))
+    ' "$file" >/dev/null 2>&1 || hfx_die "basin selection state is malformed: $file"
+}
+
+effective_basin_ids() {
+    if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -r '.basin_ids[]' "$campaign_dir/state/selection.json"
+    else
+        "$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json"
+    fi
 }
 
 validate_campaign_json() {
@@ -432,6 +454,11 @@ validate_workspace_state() {
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
         hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
+    if [[ -e "$campaign_dir/state/selection.json" || -L "$campaign_dir/state/selection.json" ]]; then
+        [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]] ||
+            hfx_die "basin selection state is not a regular file: $campaign_dir/state/selection.json"
+        validate_selection_file "$campaign_dir/state/selection.json"
+    fi
     expected_count=$("$JQ" -r 'length' "$campaign_dir/state/inventory.json")
     actual_dirs=$("$FIND" "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d | "$WC" -l | "$TR" -d ' ')
     [[ "$actual_dirs" == "$expected_count" ]] || hfx_die "expected $expected_count basin directories; found $actual_dirs"
@@ -471,15 +498,26 @@ print_sizing() {
 print_status() {
     local stage
     local status
+    local basin_id
+    local selected_count
+    local state_files=()
     printf 'campaign=%s\n' "$campaign"
     printf 'inventory_count=62\n'
+    while IFS= read -r basin_id; do
+        state_files[${#state_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
+    done < <(effective_basin_ids)
+    selected_count=${#state_files[@]}
+    if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
+        printf 'selected_basin_count=%s\n' "$selected_count"
+        printf 'unselected_basin_count=%s\n' "$((62 - selected_count))"
+    fi
     print_sizing
     for stage in acquire_basins acquire_streamnet compile; do
         for status in pending running succeeded failed; do
             printf '%s_%s=' "$stage" "$status"
             "$JQ" -s --arg stage "$stage" --arg status "$status" \
                 '[.[].stages[$stage].status | select(. == $status)] | length' \
-                "$campaign_dir"/state/basins/*/current.json
+                ${state_files[@]+"${state_files[@]}"}
         done
     done
     if [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]]; then
@@ -523,6 +561,9 @@ initialize_campaign() {
     local temporary
     local existing_canonical
     local requested_canonical
+    local requested_basin_id
+    local seen_basin_ids=' '
+    local selection_temporary=$campaign_dir/state/.selection.json.tmp.$$
 
     if [[ -e "$campaign_dir" || -L "$campaign_dir" ]]; then
         [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] ||
@@ -544,6 +585,31 @@ initialize_campaign() {
     temporary=$campaign_dir/state/.inventory.json.tmp.$$
     "$JQ" -S '.' "$inventory_source" >"$temporary"
     validate_inventory_file "$temporary"
+    if ((${#basin_ids[@]} > 0)); then
+        for requested_basin_id in ${basin_ids[@]+"${basin_ids[@]}"}; do
+            case $seen_basin_ids in
+                *" $requested_basin_id "*)
+                    "$RM" -- "$temporary"
+                    if ((created == 1)); then
+                        "$RM" -r -- "$campaign_dir"
+                    fi
+                    usage_error "basin ID '$requested_basin_id' was selected more than once"
+                    ;;
+            esac
+            seen_basin_ids="$seen_basin_ids$requested_basin_id "
+            if ! "$JQ" -e --arg id "$requested_basin_id" 'has($id)' "$temporary" >/dev/null; then
+                "$RM" -- "$temporary"
+                if ((created == 1)); then
+                    "$RM" -r -- "$campaign_dir"
+                fi
+                usage_error "unknown basin ID '$requested_basin_id'; expected a key in state/inventory.json"
+            fi
+        done
+        "$JQ" -n '
+          {schema_version:1,basin_ids:($ARGS.positional | sort)}
+        ' --args ${basin_ids[@]+"${basin_ids[@]}"} >"$selection_temporary"
+        validate_selection_file "$selection_temporary" "$temporary"
+    fi
 
     temporary=$campaign_dir/state/.campaign.json.tmp.$$
     "$JQ" -n \
@@ -584,24 +650,51 @@ initialize_campaign() {
 
     if ((created == 0)); then
         validate_workspace_state
+        if [[ -f "$campaign_dir/state/selection.json" ]]; then
+            if ((${#basin_ids[@]} == 0)); then
+                "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$"
+                hfx_die 'basin selection changed; use a new campaign ID'
+            fi
+            existing_canonical=$("$JQ" -cS '.' "$campaign_dir/state/selection.json")
+            requested_canonical=$("$JQ" -cS '.' "$selection_temporary")
+            if [[ "$existing_canonical" != "$requested_canonical" ]]; then
+                "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$" "$selection_temporary"
+                hfx_die 'basin selection changed; use a new campaign ID'
+            fi
+        elif ((${#basin_ids[@]} > 0)); then
+            "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$" "$selection_temporary"
+            hfx_die 'basin selection changed; use a new campaign ID'
+        fi
         existing_canonical=$("$JQ" -cS '.' "$campaign_dir/state/campaign.json")
         requested_canonical=$("$JQ" -cS '.' "$temporary")
         if [[ "$existing_canonical" != "$requested_canonical" ]]; then
             "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$"
+            if [[ -e "$selection_temporary" ]]; then
+                "$RM" -- "$selection_temporary"
+            fi
             hfx_die 'campaign parameters changed; use a new campaign ID'
         fi
         existing_canonical=$("$JQ" -cS '.' "$campaign_dir/state/inventory.json")
         requested_canonical=$("$JQ" -cS '.' "$campaign_dir/state/.inventory.json.tmp.$$")
         if [[ "$existing_canonical" != "$requested_canonical" ]]; then
             "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$"
+            if [[ -e "$selection_temporary" ]]; then
+                "$RM" -- "$selection_temporary"
+            fi
             hfx_die 'campaign inventory changed; use a new campaign ID'
         fi
         "$RM" -- "$temporary" "$campaign_dir/state/.inventory.json.tmp.$$"
+        if [[ -e "$selection_temporary" ]]; then
+            "$RM" -- "$selection_temporary"
+        fi
         print_status
         return
     fi
 
     atomic_install "$campaign_dir/state/.inventory.json.tmp.$$" "$campaign_dir/state/inventory.json" validate_inventory_file
+    if ((${#basin_ids[@]} > 0)); then
+        atomic_install "$selection_temporary" "$campaign_dir/state/selection.json" validate_selection_file
+    fi
     atomic_install "$temporary" "$campaign_dir/state/campaign.json" validate_campaign_json
     materialize_assembly_state
     while IFS= read -r basin_id; do
@@ -645,7 +738,7 @@ migrate_basin_states() {
             ' "$current" >"$temporary"
             atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
         fi
-    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    done < <(effective_basin_ids)
 }
 
 recover_running_stages() {
@@ -671,7 +764,7 @@ recover_running_stages() {
             ' "$current" >"$temporary"
             atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
         fi
-    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    done < <(effective_basin_ids)
 }
 
 recover_campaign() {
@@ -727,17 +820,18 @@ assembly_inputs_json=
 assembly_args=()
 select_assembly_inputs() {
     local basin_id
+    local current
     local selected_file=$campaign_dir/state/tmp/assembly-inputs.$$.txt
     : >"$selected_file"
     assembly_args=()
     while IFS= read -r basin_id; do
-        assembly_args[${#assembly_args[@]}]=--input
-        assembly_args[${#assembly_args[@]}]=$campaign_dir/basin-outputs/$basin_id
-        printf '%s\n' "$basin_id" >>"$selected_file"
-    done < <("$JQ" -r '
-      select(.stages.compile.status == "succeeded") |
-      .processing_basin_id
-    ' "$campaign_dir"/state/basins/*/current.json | LC_ALL=C "$SORT")
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        if [[ $("$JQ" -r '.stages.compile.status' "$current") == succeeded ]]; then
+            assembly_args[${#assembly_args[@]}]=--input
+            assembly_args[${#assembly_args[@]}]=$campaign_dir/basin-outputs/$basin_id
+            printf '%s\n' "$basin_id" >>"$selected_file"
+        fi
+    done < <(effective_basin_ids)
     if ((${#assembly_args[@]} == 0)); then
         "$RM" -- "$selected_file"
         hfx_die 'assembly requires at least one basin with compile status succeeded'
@@ -1035,7 +1129,7 @@ compile_campaign() {
             continue
         fi
         write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
-    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    done < <(effective_basin_ids)
 
     validate_workspace_state
     print_status
@@ -1043,6 +1137,25 @@ compile_campaign() {
 
 validate_acquisition_evidence() {
     local candidate=$1
+    if [[ -f "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -e --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          type == "object" and
+          keys == ["basins","campaign","schema_version","selected_basin_ids","unselected_basin_ids"] and
+          .schema_version == 2 and .campaign == $campaign and
+          .selected_basin_ids == $selected and .unselected_basin_ids == $unselected and
+          (($selected + $unselected) | sort) == ($inventory[0] | keys) and
+          ([.basins[].processing_basin_id] == $selected) and
+          (.basins | all(type == "object" and keys == ["processing_basin_id","products"] and
+            (.products | type == "object" and keys == ["basins","streamnet"] and
+              all(.[]; type == "object" and keys == ["attempts","evidence","failure_reason","status"]))))
+        ' "$candidate" >/dev/null 2>&1 ||
+            hfx_die "acquisition evidence is malformed: $candidate"
+        return
+    fi
     "$JQ" -e --arg campaign "$campaign" '
       type == "object" and keys == ["basins","campaign","schema_version"] and
       .schema_version == 1 and .campaign == $campaign and
@@ -1058,6 +1171,43 @@ validate_acquisition_evidence() {
 
 validate_outcomes_evidence() {
     local candidate=$1
+    if [[ -f "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -e --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          . as $document |
+          type == "object" and
+          keys == ["attempted_basin_ids","campaign","excluded_basins","outcomes","schema_version","selected_basin_ids","unselected_basin_ids"] and
+          .schema_version == 2 and .campaign == $campaign and
+          .selected_basin_ids == $selected and .unselected_basin_ids == $unselected and
+          (($selected + $unselected) | sort) == ($inventory[0] | keys) and
+          .attempted_basin_ids == (.attempted_basin_ids | sort | unique) and
+          (.attempted_basin_ids - $selected | length) == 0 and
+          (.excluded_basins | type == "array" and all(
+            type == "object" and keys == ["failure_reason","processing_basin_id"] and
+            (.failure_reason | type == "string" and length > 0))) and
+          ([.excluded_basins[].processing_basin_id] ==
+            ([.excluded_basins[].processing_basin_id] | sort | unique)) and
+          (([.excluded_basins[].processing_basin_id] - $selected) | length) == 0 and
+          (.outcomes | type == "array" and all(
+            type == "object" and
+            keys == ["attempts","failure_reason","processing_basin_id","status"] and
+            (.status == "pending" or .status == "running" or
+              .status == "succeeded" or .status == "failed") and
+            (.attempts | type == "number" and . == floor and . >= 0) and
+            (.failure_reason == null or (.failure_reason | type == "string")))) and
+          ([.outcomes[].processing_basin_id] == $selected) and
+          all(.excluded_basins[];
+            . as $excluded | any($document.outcomes[];
+              .processing_basin_id == $excluded.processing_basin_id and
+              .status == "failed" and
+              .failure_reason == $excluded.failure_reason))
+        ' "$candidate" >/dev/null 2>&1 ||
+            hfx_die "outcomes evidence is malformed: $candidate"
+        return
+    fi
     "$JQ" -e --arg campaign "$campaign" '
       type == "object" and
       keys == ["attempted_basin_ids","campaign","excluded_basins","outcomes","schema_version"] and
@@ -1075,6 +1225,28 @@ validate_outcomes_evidence() {
 
 validate_diagnostics_evidence() {
     local candidate=$1
+    if [[ -f "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -e --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          type == "object" and
+          keys == ["basins","campaign","schema_version","selected_basin_ids","unselected_basin_ids"] and
+          .schema_version == 2 and .campaign == $campaign and
+          .selected_basin_ids == $selected and .unselected_basin_ids == $unselected and
+          (($selected + $unselected) | sort) == ($inventory[0] | keys) and
+          ([.basins[].processing_basin_id] == $selected) and
+          (.basins | all(type == "object" and
+            keys == ["diagnostics","processing_basin_id","report_path","unavailable_reason"] and
+            ((.diagnostics == null and .report_path == null and
+              (.unavailable_reason | type == "string" and length > 0)) or
+             ((.diagnostics | type == "object") and
+              (.report_path | type == "string") and .unavailable_reason == null))))
+        ' "$candidate" >/dev/null 2>&1 ||
+            hfx_die "diagnostics evidence is malformed: $candidate"
+        return
+    fi
     "$JQ" -e --arg campaign "$campaign" '
       type == "object" and keys == ["basins","campaign","schema_version"] and
       .schema_version == 1 and .campaign == $campaign and
@@ -1120,8 +1292,76 @@ generate_evidence() {
             hfx_die "diagnostic state is incomplete for $basin_id; rerun compile"
         fi
         "$JQ" -cS '.' "$current" >>"$states"
-    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    done < <(effective_basin_ids)
 
+    if [[ -f "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -csS --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          {
+            schema_version:2,
+            campaign:$campaign,
+            selected_basin_ids:$selected,
+            unselected_basin_ids:$unselected,
+            basins:map({
+              processing_basin_id,
+              products:{
+                basins:(.stages.acquire_basins | {status,attempts,failure_reason,evidence}),
+                streamnet:(.stages.acquire_streamnet | {status,attempts,failure_reason,evidence})
+              }
+            })
+          }
+        ' "$states" >"$acquisition"
+        "$JQ" -csS --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          {
+            schema_version:2,
+            campaign:$campaign,
+            selected_basin_ids:$selected,
+            unselected_basin_ids:$unselected,
+            attempted_basin_ids:(map(select([.stages[].attempts] | any(. > 0))) |
+              map(.processing_basin_id)),
+            excluded_basins:(map(select(.stages.compile.status == "failed") |
+              {processing_basin_id,failure_reason:.stages.compile.failure_reason})),
+            outcomes:map({
+              processing_basin_id,
+              status:.stages.compile.status,
+              attempts:.stages.compile.attempts,
+              failure_reason:.stages.compile.failure_reason
+            })
+          }
+        ' "$states" >"$outcomes"
+        "$JQ" -csS --arg campaign "$campaign" \
+            --slurpfile inventory "$campaign_dir/state/inventory.json" \
+            --slurpfile selection "$campaign_dir/state/selection.json" '
+          ($selection[0].basin_ids) as $selected |
+          (($inventory[0] | keys) - $selected) as $unselected |
+          {
+            schema_version:2,
+            campaign:$campaign,
+            selected_basin_ids:$selected,
+            unselected_basin_ids:$unselected,
+            basins:map(
+              if .stages.compile.diagnostic_report != null then {
+                processing_basin_id,
+                diagnostics:.stages.compile.diagnostic_report.diagnostics,
+                report_path:.stages.compile.diagnostic_report.path,
+                unavailable_reason:null
+              } else {
+                processing_basin_id,
+                diagnostics:null,
+                report_path:null,
+                unavailable_reason:(.stages.compile.failure_reason // .stages.compile.status)
+              } end
+            )
+          }
+        ' "$states" >"$diagnostics"
+    else
     "$JQ" -csS --arg campaign "$campaign" '
       map(select(
         ([.stages[].attempts] | any(. > 0)) or .stages.compile.status == "failed"
@@ -1181,6 +1421,7 @@ generate_evidence() {
         )
       }
     ' "$states" >"$diagnostics"
+    fi
     validate_acquisition_evidence "$acquisition"
     validate_outcomes_evidence "$outcomes"
     validate_diagnostics_evidence "$diagnostics"
@@ -1238,6 +1479,11 @@ validate_publication_campaign_state() {
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
         hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
+    if [[ -e "$campaign_dir/state/selection.json" || -L "$campaign_dir/state/selection.json" ]]; then
+        [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]] ||
+            hfx_die "basin selection state is not a regular file: $campaign_dir/state/selection.json"
+        validate_selection_file "$campaign_dir/state/selection.json"
+    fi
 }
 
 list_remote_inventory() {
@@ -1649,7 +1895,7 @@ acquire_campaign() {
         if ((${#worker_pids[@]} >= max_parallel)); then
             wait_oldest_worker
         fi
-    done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
+    done < <(effective_basin_ids)
     while ((${#worker_pids[@]} > 0)); do
         wait_oldest_worker
     done
@@ -1697,11 +1943,12 @@ publication_citation=
 publication_citation_seen=0
 scratch_prefix=
 scratch_prefix_seen=0
+basin_ids=()
 
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
+        --campaign|--workspace-root|--basin|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
             shift
             (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
             value=$1
@@ -1719,6 +1966,10 @@ while (($# > 0)); do
             ((workspace_seen == 0)) || usage_error 'option --workspace-root may not be repeated'
             workspace_seen=1
             workspace_root=$value
+            ;;
+        --basin)
+            [[ "$subcommand" == init ]] || usage_error 'option --basin is valid only for init'
+            basin_ids[${#basin_ids[@]}]=$value
             ;;
         --max-parallel)
             [[ "$subcommand" == acquire ]] || usage_error 'option --max-parallel is valid only for acquire'
