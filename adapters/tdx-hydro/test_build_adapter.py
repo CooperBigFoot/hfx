@@ -1,7 +1,10 @@
 import json
 import math
+import os
+import subprocess
 import sys
 import unittest
+from contextlib import chdir
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -43,6 +46,327 @@ from build_adapter import (
     main,
 )
 
+HFX_BINARY = Path(os.environ["HFX_BINARY"]).expanduser().resolve()
+if not HFX_BINARY.is_absolute() or not HFX_BINARY.is_file():
+    raise RuntimeError(f"HFX binary is not a regular absolute path: {HFX_BINARY}")
+
+ABS_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[2] / "schemas" / "manifest.schema.json"
+).resolve()
+if not ABS_SCHEMA_PATH.is_absolute() or not ABS_SCHEMA_PATH.is_file():
+    raise RuntimeError(f"manifest schema is not a regular absolute path: {ABS_SCHEMA_PATH}")
+
+MERGE_RUN_A = [
+    (710_000_101, -170.0, -80.0, [], 1.0, 1.0),
+    (710_000_102, -80.0, -60.0, [710_000_101], 2.0, 3.0),
+    (710_000_103, 0.0, 0.0, [710_000_102], 3.0, 6.0),
+]
+MERGE_RUN_B = [
+    (720_000_201, -120.0, -80.0, [], 4.0, 4.0),
+    (720_000_202, -20.0, -40.0, [720_000_201], 5.0, 9.0),
+    (720_000_203, 0.0, 0.0, [720_000_202], 6.0, 15.0),
+    (720_000_204, -170.0, -20.0, [720_000_203], 7.0, 22.0),
+]
+PARTIAL_SNAP_A = [
+    (91, 710_000_101, -170.0, -80.0, 1.0),
+    (7, 710_000_102, -80.0, -60.0, 3.0),
+    (400, 710_000_103, 0.0, 0.0, 6.0),
+]
+PARTIAL_SNAP_B = [
+    (800, 720_000_201, -120.0, -80.0, 4.0),
+    (3, 720_000_202, -20.0, -40.0, 9.0),
+    (200, 720_000_203, 0.0, 0.0, 15.0),
+    (1, 720_000_204, -170.0, -20.0, 22.0),
+]
+
+
+def merge_fixture_polygon(x: float, y: float) -> Polygon:
+    return Polygon(
+        [
+            (x - 0.1, y - 0.1),
+            (x + 0.1, y - 0.1),
+            (x + 0.1, y + 0.1),
+            (x - 0.1, y + 0.1),
+            (x - 0.1, y - 0.1),
+        ]
+    )
+
+
+def merge_fixture_schemas() -> tuple[pa.Schema, pa.Schema]:
+    catchment_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field("parent_id", pa.int64(), nullable=True),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("up_area_km2", pa.float32(), nullable=True),
+            pa.field("outlet_lon", pa.float64(), nullable=False),
+            pa.field("outlet_lat", pa.float64(), nullable=False),
+            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(
+        build_adapter.build_geo_metadata(["Polygon", "MultiPolygon"])
+    )
+    graph_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field(
+                "upstream_ids",
+                pa.list_(pa.field("item", pa.int64(), nullable=True)),
+                nullable=False,
+            ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+    return catchment_schema, graph_schema
+
+
+def write_merge_fixture(
+    root: Path,
+    rows: list[tuple[int, float, float, list[int], float, float]],
+    *,
+    row_group_size: int = 2,
+    catchment_schema: pa.Schema | None = None,
+    graph_schema: pa.Schema | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    root.mkdir(parents=True)
+    expected_catchment_schema, expected_graph_schema = merge_fixture_schemas()
+    catchment_schema = catchment_schema or expected_catchment_schema
+    graph_schema = graph_schema or expected_graph_schema
+    catchment_rows: list[dict[str, object]] = []
+    graph_rows: list[dict[str, object]] = []
+    for unit_id, x, y, upstream_ids, area_km2, up_area_km2 in rows:
+        polygon = merge_fixture_polygon(x, y)
+        minx, miny, maxx, maxy = (
+            np.float32(value) for value in polygon.bounds
+        )
+        bbox = {
+            "xmin": minx,
+            "ymin": miny,
+            "xmax": maxx,
+            "ymax": maxy,
+        }
+        catchment_rows.append(
+            {
+                "id": unit_id,
+                "level": 0,
+                "parent_id": None,
+                "area_km2": np.float32(area_km2),
+                "up_area_km2": np.float32(up_area_km2),
+                "outlet_lon": x,
+                "outlet_lat": y,
+                "bbox": bbox,
+                "geometry": polygon.wkb,
+            }
+        )
+        graph_rows.append(
+            {
+                "id": unit_id,
+                "level": 0,
+                "upstream_ids": upstream_ids,
+                "bbox_minx": minx,
+                "bbox_miny": miny,
+                "bbox_maxx": maxx,
+                "bbox_maxy": maxy,
+            }
+        )
+    pq.write_table(
+        pa.Table.from_pylist(catchment_rows, schema=catchment_schema),
+        root / "catchments.parquet",
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+    pq.write_table(
+        pa.Table.from_pylist(graph_rows, schema=graph_schema),
+        root / "graph.parquet",
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+    return catchment_rows, graph_rows
+
+
+def merge_hilbert_keys(wkb_values: list[bytes]) -> list[int]:
+    geometry = gpd.GeoSeries.from_wkb(wkb_values, crs=CRS)
+    return [
+        int(value)
+        for value in geometry.centroid.hilbert_distance(
+            total_bounds=[-180, -90, 180, 90]
+        )
+    ]
+
+
+def rewrite_merge_rows(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    row_group_size: int = 2,
+) -> None:
+    schema = pq.ParquetFile(path).schema_arrow
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema),
+        path,
+        row_group_size=row_group_size,
+        compression="snappy",
+        write_statistics=True,
+    )
+
+
+def write_assembly_fixture(
+    root: Path,
+    region: str,
+    rows: list[tuple[int, float, float, list[int], float, float]],
+    snap_rows: list[tuple[int, int, float, float, float]],
+) -> None:
+    catchments, _ = write_merge_fixture(root, rows)
+    snap_schema = assembly_snap_schema()
+    authored_snap_rows = []
+    for source_id, unit_id, x, y, weight in snap_rows:
+        geometry = LineString(
+            [(x - 0.1, y - 0.1), (x + 0.1, y + 0.1)]
+        )
+        minx, miny, maxx, maxy = (
+            np.float32(value) for value in geometry.bounds
+        )
+        authored_snap_rows.append(
+            {
+                "id": source_id,
+                "unit_id": unit_id,
+                "weight": np.float32(weight),
+                "stem_role": None,
+                "bbox": {
+                    "xmin": minx,
+                    "ymin": miny,
+                    "xmax": maxx,
+                    "ymax": maxy,
+                },
+                "geometry": geometry.wkb,
+            }
+        )
+    aux = root / "aux"
+    aux.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(authored_snap_rows, schema=snap_schema),
+        aux / "snap_stems.parquet",
+        row_group_size=2,
+        compression="snappy",
+        write_statistics=True,
+    )
+    bounds = [row["bbox"] for row in catchments]
+    manifest = {
+        "adapter_version": "0.1.0",
+        "auxiliary": [
+            {
+                "schema": "hfx.aux.snap.v2",
+                "artifacts": {"snap": "aux/snap_stems.parquet"},
+                "metadata": {
+                    "name": "stems",
+                    "description": (
+                        "Native TDX-Hydro LineString reaches for polygon-bearing "
+                        "level 0 drainage units."
+                    ),
+                    "references_levels": [0],
+                    "weight_semantics": (
+                        "Drainage-area weight equals inclusive DSContArea in km2; "
+                        "higher values indicate stronger drainage dominance."
+                    ),
+                },
+            }
+        ],
+        "bbox": [
+            float(np.float32(min(value["xmin"] for value in bounds))),
+            float(np.float32(min(value["ymin"] for value in bounds))),
+            float(np.float32(max(value["xmax"] for value in bounds))),
+            float(np.float32(max(value["ymax"] for value in bounds))),
+        ],
+        "created_at": "2026-07-21T12:34:56+00:00",
+        "crs": "EPSG:4326",
+        "fabric_name": "tdx_hydro",
+        "fabric_version": "synthetic-2026.07",
+        "format_version": "0.3.0",
+        "has_up_area": True,
+        "region": region,
+        "topology": "tree",
+        "unit_count": len(rows),
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def assembly_snap_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("unit_id", pa.int64(), nullable=False),
+            pa.field("weight", pa.float32(), nullable=False),
+            pa.field("stem_role", pa.string(), nullable=True),
+            pa.field("bbox", build_adapter.bbox_struct_type(), nullable=True),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    ).with_metadata(build_adapter.build_geo_metadata(["LineString"]))
+
+
+def rewrite_snap_rows(
+    input_root: Path,
+    rows: list[dict[str, object]],
+    *,
+    schema: pa.Schema | None = None,
+) -> None:
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema or assembly_snap_schema()),
+        input_root / "aux" / "snap_stems.parquet",
+        row_group_size=2,
+        compression="snappy",
+        write_statistics=True,
+    )
+
+
+def validate_assembled_manifest(path: Path) -> None:
+    subprocess.run(
+        [
+            "uv",
+            "run",
+            "--with",
+            "check-jsonschema",
+            "check-jsonschema",
+            "--schemafile",
+            str(ABS_SCHEMA_PATH),
+            str(path.resolve()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def validate_with_release_hfx(dataset: Path) -> None:
+    completed = subprocess.run(
+        [
+            str(HFX_BINARY),
+            str(dataset.resolve()),
+            "--strict",
+            "--sample-pct",
+            "100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    message = f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise AssertionError(message)
+    if "0 error(s), 0 warning(s), 0 info(s)" not in completed.stdout:
+        raise AssertionError(message)
+    if "Result: VALID" not in completed.stdout:
+        raise AssertionError(message)
+
 
 def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
     polygon_100 = Polygon([
@@ -77,6 +401,55 @@ def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float
         crs="EPSG:4326",
     )
     return basins, streamnet, area_100_m2, area_200_m2
+
+
+def planetary_order_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    polygon_100 = Polygon([
+        (-170.1, -80.1),
+        (-169.9, -80.1),
+        (-169.9, -79.9),
+        (-170.1, -79.9),
+        (-170.1, -80.1),
+    ])
+    polygon_200 = Polygon([
+        (-120.1, -80.1),
+        (-119.9, -80.1),
+        (-119.9, -79.9),
+        (-120.1, -79.9),
+        (-120.1, -80.1),
+    ])
+    polygon_300 = Polygon([
+        (-170.1, -20.1),
+        (-169.9, -20.1),
+        (-169.9, -19.9),
+        (-170.1, -19.9),
+        (-170.1, -20.1),
+    ])
+    polygons = [polygon_100, polygon_200, polygon_300]
+    geod = Geod(ellps="WGS84")
+    areas_km2 = [
+        abs(geod.geometry_area_perimeter(polygon)[0]) / 1_000_000
+        for polygon in polygons
+    ]
+    basins = gpd.GeoDataFrame(
+        {"streamID": [100, 200, 300]},
+        geometry=polygons,
+        crs="EPSG:4326",
+    )
+    streamnet = gpd.GeoDataFrame(
+        {
+            "LINKNO": [100, 200, 300],
+            "DSLINKNO": [-1, -1, -1],
+            "DSContArea": areas_km2,
+        },
+        geometry=[
+            LineString([(-170.05, -80.0), (-169.95, -80.0)]),
+            LineString([(-120.05, -80.0), (-119.95, -80.0)]),
+            LineString([(-170.05, -20.0), (-169.95, -20.0)]),
+        ],
+        crs="EPSG:4326",
+    )
+    return basins, streamnet
 
 
 def write_pair(
@@ -1367,10 +1740,1198 @@ class StreamnetTopologyRejectionTests(unittest.TestCase):
             )
 
 
+class AssemblyTests(unittest.TestCase):
+    def test_partial_coverage_assembly(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            write_assembly_fixture(
+                first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            write_assembly_fixture(
+                second, "7020014250", MERGE_RUN_B, PARTIAL_SNAP_B
+            )
+
+            result = build_adapter.assemble_hfx(
+                [first, second],
+                root / "assembled",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                input_batch_size=2,
+                row_group_min=2,
+                row_group_max=3,
+            )
+            manifest = json.loads(result.manifest_path.read_text())
+            self.assertEqual(manifest["region"], "tdx-hydro-partial-afd4ffb0b736")
+            self.assertEqual(
+                manifest["bbox"],
+                [
+                    -170.10000610351562,
+                    -80.0999984741211,
+                    0.10000000149011612,
+                    0.10000000149011612,
+                ],
+            )
+            self.assertEqual(manifest["unit_count"], 7)
+            self.assertEqual(
+                manifest["created_at"], "2026-07-23T12:34:56+00:00"
+            )
+            catchment_ids = pq.read_table(
+                result.catchments_path, columns=["id"]
+            )["id"].to_pylist()
+            graph = pq.read_table(result.graph_path).to_pydict()
+            self.assertEqual(catchment_ids, graph["id"])
+            self.assertEqual(
+                graph["upstream_ids"],
+                [
+                    [],
+                    [],
+                    [710_000_101],
+                    [720_000_201],
+                    [710_000_102],
+                    [720_000_202],
+                    [720_000_203],
+                ],
+            )
+            snap = pq.read_table(result.snap_path).to_pydict()
+            self.assertEqual(snap["id"], list(range(1, 8)))
+            self.assertEqual(
+                snap["unit_id"],
+                [
+                    710_000_101,
+                    720_000_201,
+                    710_000_102,
+                    720_000_202,
+                    710_000_103,
+                    720_000_203,
+                    720_000_204,
+                ],
+            )
+            self.assertEqual(set(snap["unit_id"]), set(catchment_ids))
+            self.assertTrue(result.notice_path.read_bytes() == (Path(__file__).parent / "NOTICE").read_bytes())
+            self.assertTrue(result.citation_path.read_bytes() == (Path(__file__).parent / "CITATION.txt").read_bytes())
+            for path in (result.notice_path, result.citation_path):
+                text = path.read_text()
+                self.assertIn("TDX-Hydro", text)
+                self.assertIn("National Geospatial-Intelligence Agency", text)
+            self.assertTrue(
+                pq.ParquetFile(result.snap_path).schema_arrow.equals(
+                    build_adapter._snap_merge_schema(), check_metadata=True
+                )
+            )
+            self.assertTrue(validate_geoparquet(str(result.snap_path), target_version="1.1").is_valid)
+            validate_assembled_manifest(result.manifest_path)
+            reversed_result = build_adapter.assemble_hfx(
+                [second, first],
+                root / "reversed",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                input_batch_size=2,
+                row_group_min=2,
+                row_group_max=3,
+            )
+            validate_assembled_manifest(reversed_result.manifest_path)
+            for name in (
+                "catchments.parquet",
+                "graph.parquet",
+                "aux/snap_stems.parquet",
+                "manifest.json",
+            ):
+                self.assertEqual(
+                    (root / "assembled" / name).read_bytes(),
+                    (root / "reversed" / name).read_bytes(),
+                )
+
+    def test_complete_coverage_assembly(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = []
+            for index, (region, header) in enumerate(
+                sorted(load_header_crosswalk().items()), start=1
+            ):
+                dataset = root / region
+                unit_id = header * 10_000_000 + 1
+                write_assembly_fixture(
+                    dataset,
+                    region,
+                    [(unit_id, 0.0, 0.0, [], 1.0, 1.0)],
+                    [(9_000 + index, unit_id, 0.0, 0.0, 1.0)],
+                )
+                inputs.append(dataset)
+            result = build_adapter.assemble_hfx(
+                inputs,
+                root / "assembled",
+                created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+            )
+            manifest = json.loads(result.manifest_path.read_text())
+            self.assertNotIn("region", manifest)
+            self.assertEqual(manifest["bbox"], [-180, -90, 180, 90])
+            self.assertEqual(manifest["unit_count"], 62)
+            self.assertEqual(
+                pq.read_table(result.snap_path, columns=["id"])["id"].to_pylist(),
+                list(range(1, 63)),
+            )
+            self.assertLessEqual(
+                result.snap_metrics.peak_buffered_rows,
+                result.snap_metrics.buffer_row_ceiling,
+            )
+            self.assertEqual(result.snap_metrics.emitted_rows, 62)
+            validate_assembled_manifest(result.manifest_path)
+            validate_with_release_hfx(root / "assembled")
+
+    def test_rejects_dangling_duplicate_and_count_mismatches(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            snap_path = dataset / "aux" / "snap_stems.parquet"
+            table = pq.read_table(snap_path)
+            rows = table.to_pylist()
+            rows[0]["unit_id"] = 999
+            pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), snap_path)
+            with self.assertRaisesRegex(ValueError, "dangling snap unit_id"):
+                build_adapter.assemble_hfx(
+                    [dataset], root / "out", created_at=datetime.now(timezone.utc)
+                )
+
+            write_assembly_fixture(
+                root / "duplicate", "7020014250", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            duplicate_path = root / "duplicate" / "aux" / "snap_stems.parquet"
+            duplicate_table = pq.read_table(duplicate_path)
+            duplicate_rows = duplicate_table.to_pylist()
+            duplicate_rows[1]["unit_id"] = duplicate_rows[0]["unit_id"]
+            pq.write_table(
+                pa.Table.from_pylist(duplicate_rows, schema=duplicate_table.schema),
+                duplicate_path,
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate snap unit_id"):
+                build_adapter.assemble_hfx(
+                    [root / "duplicate"],
+                    root / "out2",
+                    created_at=datetime.now(timezone.utc),
+                )
+
+            count_root = root / "count"
+            write_assembly_fixture(
+                count_root, "7020021430", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            manifest_path = count_root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["unit_count"] = 2
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "row counts differ"):
+                build_adapter.assemble_hfx(
+                    [count_root],
+                    root / "out3",
+                    created_at=datetime.now(timezone.utc),
+                )
+
+    def test_rejects_manifest_identity_regions_bbox_and_naive_complete(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            write_assembly_fixture(
+                first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            manifest_path = first / "manifest.json"
+            original = json.loads(manifest_path.read_text())
+            mutations = [
+                ("fabric_name", "other", "fabric_name"),
+                ("fabric_version", "", "fabric_version"),
+                ("region", "999", "region"),
+                ("bbox", [float("inf"), 0.0, 1.0, 1.0], "bbox"),
+                ("auxiliary", [], "auxiliary"),
+            ]
+            for key, value, message in mutations:
+                manifest = dict(original)
+                manifest[key] = value
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, message):
+                    build_adapter.assemble_hfx(
+                        [first],
+                        root / f"out-{key}",
+                        created_at=datetime.now(timezone.utc),
+                    )
+            manifest_path.write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError, "unique"):
+                build_adapter.assemble_hfx(
+                    [first, first],
+                    root / "duplicate-root",
+                    created_at=datetime.now(timezone.utc),
+                )
+            with self.assertRaisesRegex(ValueError, "timezone-aware"):
+                build_adapter.assemble_hfx(
+                    [first], root / "naive", created_at=datetime.now()
+                )
+
+    def test_attribution_and_manifest_publication_are_atomic(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            duplicate = root / "duplicate"
+            write_assembly_fixture(
+                duplicate, "7020014250", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            output = root / "merge-failure"
+            output.mkdir()
+            with self.assertRaisesRegex(
+                ValueError, "incompatible duplicate merge key"
+            ):
+                build_adapter.assemble_hfx(
+                    [dataset, duplicate],
+                    output,
+                    created_at=datetime.now(timezone.utc),
+                    input_batch_size=1,
+                    row_group_min=1,
+                    row_group_max=1,
+                )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+            real_replace = build_adapter.os.replace
+
+            def fail_citation(source: Path, destination: Path) -> None:
+                if Path(destination).name == "CITATION.txt":
+                    raise OSError("injected citation replacement failure")
+                real_replace(source, destination)
+
+            output = root / "attribution-failure"
+            output.mkdir()
+            with patch.object(
+                build_adapter.os, "replace", side_effect=fail_citation
+            ):
+                with self.assertRaisesRegex(OSError, "injected citation"):
+                    build_adapter.assemble_hfx(
+                        [dataset],
+                        output,
+                        created_at=datetime.now(timezone.utc),
+                    )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+            def fail_manifest(source: Path, destination: Path) -> None:
+                if Path(destination).name == "manifest.json":
+                    raise OSError("injected manifest replacement failure")
+                real_replace(source, destination)
+
+            output = root / "manifest-failure"
+            output.mkdir()
+            with patch.object(
+                build_adapter.os, "replace", side_effect=fail_manifest
+            ):
+                with self.assertRaisesRegex(OSError, "injected manifest"):
+                    build_adapter.assemble_hfx(
+                        [dataset],
+                        output,
+                        created_at=datetime.now(timezone.utc),
+                    )
+            self.assertEqual(list(output.iterdir()), [])
+            BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def test_rejects_missing_empty_and_empty_geometry_snap_inputs(self) -> None:
+        cases = ("missing", "empty", "empty-geometry")
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for case in cases:
+                with self.subTest(case=case):
+                    input_root = root / f"input-{case}"
+                    write_assembly_fixture(
+                        input_root,
+                        "7020000010",
+                        MERGE_RUN_A,
+                        PARTIAL_SNAP_A,
+                    )
+                    snap_path = input_root / "aux" / "snap_stems.parquet"
+                    if case == "missing":
+                        snap_path.unlink()
+                        message = (
+                            f"{input_root.resolve()}: required regular "
+                            "aux/snap_stems.parquet is missing"
+                        )
+                    elif case == "empty":
+                        rewrite_snap_rows(input_root, [])
+                        message = (
+                            f"{input_root.resolve()}: input snap file must be nonempty"
+                        )
+                    else:
+                        rows = pq.read_table(snap_path).to_pylist()
+                        rows[0]["geometry"] = LineString().wkb
+                        rewrite_snap_rows(input_root, rows)
+                        message = (
+                            f"{input_root.resolve()}: invalid snap geometry at row 0"
+                        )
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.assemble_hfx(
+                            [input_root],
+                            root / f"output-{case}",
+                            created_at=datetime.now(timezone.utc),
+                        )
+                    self.assertIn(message, str(raised.exception))
+                    if case == "empty-geometry":
+                        self.assertNotIn(
+                            "Hilbert distance cannot be computed",
+                            str(raised.exception),
+                        )
+
+    def test_rejects_missing_attribution_phrases(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            write_assembly_fixture(
+                dataset, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            original_read_bytes = Path.read_bytes
+            notice = (Path(__file__).resolve().parent / "NOTICE").resolve()
+
+            for phrase in (
+                "TDX-Hydro",
+                "National Geospatial-Intelligence Agency",
+            ):
+                def altered_read_bytes(path: Path, removed: str = phrase) -> bytes:
+                    content = original_read_bytes(path)
+                    if path.resolve() == notice:
+                        return content.replace(removed.encode(), b"removed")
+                    return content
+
+                with patch.object(Path, "read_bytes", altered_read_bytes):
+                    with self.assertRaisesRegex(ValueError, "missing required phrase"):
+                        build_adapter.assemble_hfx(
+                            [dataset],
+                            root / f"missing-{phrase.split()[0]}",
+                            created_at=datetime.now(timezone.utc),
+                        )
+
+
+class AssemblyCliTests(unittest.TestCase):
+    def assert_rejected(
+        self,
+        input_roots: list[Path],
+        output: Path,
+        message: str,
+    ) -> None:
+        output.mkdir()
+        arguments = ["assemble"]
+        for input_root in input_roots:
+            arguments.extend(["--input", str(input_root)])
+        arguments.extend(["--out", str(output)])
+        with self.assertRaises(ValueError) as raised:
+            main(arguments)
+        self.assertIn(message, str(raised.exception))
+        self.assertEqual(list(output.iterdir()), [])
+        BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def test_assemble_cli_publishes_and_validates_partial_dataset(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_assembly_fixture(
+                root / "first", "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            write_assembly_fixture(
+                root / "second", "7020014250", MERGE_RUN_B, PARTIAL_SNAP_B
+            )
+            with chdir(root), patch.object(
+                build_adapter,
+                "_utc_now",
+                return_value=datetime(
+                    2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc
+                ),
+            ):
+                return_code = main(
+                    [
+                        "assemble",
+                        "--input",
+                        "first",
+                        "--input",
+                        "second",
+                        "--out",
+                        "assembled",
+                    ]
+                )
+            dataset = root / "assembled"
+            self.assertEqual(return_code, 0)
+            expected_ids = [
+                710_000_101,
+                720_000_201,
+                710_000_102,
+                720_000_202,
+                710_000_103,
+                720_000_203,
+                720_000_204,
+            ]
+            catchments = pq.read_table(dataset / "catchments.parquet")
+            graph = pq.read_table(dataset / "graph.parquet")
+            snap = pq.read_table(dataset / "aux" / "snap_stems.parquet")
+            self.assertEqual(catchments["id"].to_pylist(), expected_ids)
+            self.assertEqual(graph["id"].to_pylist(), expected_ids)
+            self.assertEqual(
+                graph["upstream_ids"].to_pylist(),
+                [
+                    [],
+                    [],
+                    [710_000_101],
+                    [720_000_201],
+                    [710_000_102],
+                    [720_000_202],
+                    [720_000_203],
+                ],
+            )
+            self.assertEqual(snap["id"].to_pylist(), list(range(1, 8)))
+            self.assertEqual(snap["unit_id"].to_pylist(), expected_ids)
+            self.assertEqual(set(snap["unit_id"].to_pylist()), set(expected_ids))
+            manifest = json.loads((dataset / "manifest.json").read_text())
+            self.assertEqual(
+                manifest,
+                {
+                    "adapter_version": "0.1.0",
+                    "auxiliary": [
+                        {
+                            "schema": "hfx.aux.snap.v2",
+                            "artifacts": {"snap": "aux/snap_stems.parquet"},
+                            "metadata": {
+                                "name": "stems",
+                                "description": (
+                                    "Native TDX-Hydro LineString reaches for "
+                                    "polygon-bearing level 0 drainage units."
+                                ),
+                                "references_levels": [0],
+                                "weight_semantics": (
+                                    "Drainage-area weight equals inclusive "
+                                    "DSContArea in km2; higher values indicate "
+                                    "stronger drainage dominance."
+                                ),
+                            },
+                        }
+                    ],
+                    "bbox": [
+                        -170.10000610351562,
+                        -80.0999984741211,
+                        0.10000000149011612,
+                        0.10000000149011612,
+                    ],
+                    "created_at": "2026-07-23T12:34:56+00:00",
+                    "crs": "EPSG:4326",
+                    "fabric_name": "tdx_hydro",
+                    "fabric_version": "synthetic-2026.07",
+                    "format_version": "0.3.0",
+                    "has_up_area": True,
+                    "region": "tdx-hydro-partial-afd4ffb0b736",
+                    "topology": "tree",
+                    "unit_count": 7,
+                },
+            )
+            source_root = Path(__file__).parent
+            for name in ("NOTICE", "CITATION.txt"):
+                self.assertEqual(
+                    (dataset / name).read_bytes(),
+                    (source_root / name).read_bytes(),
+                )
+                text = (dataset / name).read_text()
+                self.assertIn("TDX-Hydro", text)
+                self.assertIn("National Geospatial-Intelligence Agency", text)
+            catchment_schema, graph_write_schema = merge_fixture_schemas()
+            graph_read_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("level", pa.int16(), nullable=False),
+                    pa.field(
+                        "upstream_ids",
+                        pa.list_(
+                            pa.field("element", pa.int64(), nullable=True)
+                        ),
+                        nullable=False,
+                    ),
+                    pa.field("bbox_minx", pa.float32(), nullable=False),
+                    pa.field("bbox_miny", pa.float32(), nullable=False),
+                    pa.field("bbox_maxx", pa.float32(), nullable=False),
+                    pa.field("bbox_maxy", pa.float32(), nullable=False),
+                ]
+            )
+            self.assertTrue(
+                catchments.schema.equals(catchment_schema, check_metadata=True)
+            )
+            self.assertTrue(
+                snap.schema.equals(assembly_snap_schema(), check_metadata=True)
+            )
+            self.assertTrue(
+                graph.schema.equals(graph_read_schema, check_metadata=True)
+            )
+            self.assertIsNone(graph.schema.metadata)
+            self.assertIsNone(graph_write_schema.metadata)
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "catchments.parquet"), target_version="1.1"
+                ).is_valid
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "aux" / "snap_stems.parquet"),
+                    target_version="1.1",
+                ).is_valid
+            )
+            validate_assembled_manifest(dataset / "manifest.json")
+            validate_with_release_hfx(dataset)
+
+    def test_assemble_cli_rejects_invalid_inputs(self) -> None:
+        cases = [
+            ("incompatible snap schema", "incompatible snap schema"),
+            ("non-monotonic snap input", "non-monotonic snap input"),
+            ("empty snap input file", "input snap file must be nonempty"),
+            ("invalid weight", "invalid snap weight at row 0"),
+            ("non-LineString geometry", "invalid snap geometry at row 0"),
+            ("empty geometry", "invalid snap geometry at row 0"),
+            ("invalid stem_role", "invalid snap stem_role at row 0"),
+            ("invalid bbox", "invalid snap bbox at row 0"),
+        ]
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (case, suffix) in enumerate(cases):
+                with self.subTest(case=case):
+                    input_root = root / f"input-{index}"
+                    write_assembly_fixture(
+                        input_root,
+                        "7020000010",
+                        MERGE_RUN_A,
+                        PARTIAL_SNAP_A,
+                    )
+                    snap_path = input_root / "aux" / "snap_stems.parquet"
+                    rows = pq.read_table(snap_path).to_pylist()
+                    schema = assembly_snap_schema()
+                    if case == "incompatible snap schema":
+                        schema = pa.schema(list(schema))
+                    elif case == "non-monotonic snap input":
+                        rows = [rows[1], rows[0], rows[2]]
+                    elif case == "empty snap input file":
+                        rows = []
+                    elif case == "invalid weight":
+                        rows[0]["weight"] = np.float32(-1.0)
+                    elif case == "non-LineString geometry":
+                        rows[0]["geometry"] = Point(0.0, 0.0).wkb
+                    elif case == "empty geometry":
+                        rows[0]["geometry"] = LineString().wkb
+                    elif case == "invalid stem_role":
+                        rows[0]["stem_role"] = "invalid"
+                    else:
+                        rows[0]["bbox"] = {
+                            "xmin": np.float32(1.0),
+                            "ymin": np.float32(0.0),
+                            "xmax": np.float32(0.0),
+                            "ymax": np.float32(1.0),
+                        }
+                    rewrite_snap_rows(input_root, rows, schema=schema)
+                    if case in {
+                        "incompatible snap schema",
+                        "empty snap input file",
+                    }:
+                        message = f"{input_root.resolve()}: {suffix}"
+                    else:
+                        message = suffix
+                    self.assert_rejected(
+                        [input_root], root / f"output-{index}", message
+                    )
+
+    def test_assemble_cli_rejects_duplicate_region_and_missing_snap(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            write_assembly_fixture(
+                first,
+                "7020000010",
+                [(710_000_101, -170.0, -80.0, [], 1.0, 1.0)],
+                [(91, 710_000_101, -170.0, -80.0, 1.0)],
+            )
+            write_assembly_fixture(
+                second,
+                "7020000010",
+                [(710_000_201, -120.0, -80.0, [], 1.0, 1.0)],
+                [(92, 710_000_201, -120.0, -80.0, 1.0)],
+            )
+            self.assert_rejected(
+                [first, second],
+                root / "duplicate-output",
+                "duplicate manifest region 7020000010",
+            )
+            missing = root / "missing-snap"
+            write_assembly_fixture(
+                missing, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            (missing / "aux" / "snap_stems.parquet").unlink()
+            self.assert_rejected(
+                [missing],
+                root / "missing-output",
+                "required regular aux/snap_stems.parquet is missing",
+            )
+
+    def test_assemble_cli_rejects_missing_output_parent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            write_assembly_fixture(
+                input_root, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A
+            )
+            missing_parent = root / "missing"
+            output = missing_parent / "assembled"
+            with self.assertRaises(ValueError) as raised:
+                main(
+                    [
+                        "assemble",
+                        "--input",
+                        str(input_root),
+                        "--out",
+                        str(output),
+                    ]
+                )
+            self.assertIn(
+                f"{missing_parent.resolve()}: output parent must be an existing directory",
+                str(raised.exception),
+            )
+            self.assertFalse(missing_parent.exists())
+            self.assertFalse(output.exists())
+            BuildCliTests.assert_no_temporary_entries(self, root)
+
+
+class CoreMergeTests(unittest.TestCase):
+    def assert_merge_output_scan(
+        self,
+        result: build_adapter.CoreMergeResult,
+        expected_upstream_by_id: dict[int, list[int]],
+    ) -> None:
+        catchment_file = pq.ParquetFile(result.catchments_path)
+        graph_file = pq.ParquetFile(result.graph_path)
+        previous_key = None
+        row_count = 0
+        for catchment_batch, graph_batch in zip(
+            catchment_file.iter_batches(batch_size=2),
+            graph_file.iter_batches(batch_size=2),
+            strict=True,
+        ):
+            catchment_ids = catchment_batch.column("id").to_pylist()
+            graph_ids = graph_batch.column("id").to_pylist()
+            self.assertEqual(catchment_ids, graph_ids)
+            hilbert_keys = merge_hilbert_keys(
+                catchment_batch.column("geometry").to_pylist()
+            )
+            upstream_lists = graph_batch.column("upstream_ids").to_pylist()
+            for hilbert, unit_id, upstream_ids in zip(
+                hilbert_keys,
+                catchment_ids,
+                upstream_lists,
+                strict=True,
+            ):
+                current_key = hilbert, unit_id
+                if previous_key is not None:
+                    self.assertLessEqual(previous_key, current_key)
+                previous_key = current_key
+                self.assertEqual(
+                    upstream_ids, expected_upstream_by_id[unit_id]
+                )
+                row_count += 1
+        self.assertEqual(row_count, result.metrics.total_input_rows)
+
+    def test_merge_catchments_and_graph_interleaves_sorted_runs_in_lockstep(
+        self,
+    ) -> None:
+        expected_ids = [
+            710_000_101,
+            720_000_201,
+            710_000_102,
+            720_000_202,
+            710_000_103,
+            720_000_203,
+            720_000_204,
+        ]
+        expected_upstream_ids = [
+            [],
+            [],
+            [710_000_101],
+            [720_000_201],
+            [710_000_102],
+            [720_000_202],
+            [720_000_203],
+        ]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_a_catchments, run_a_graph = write_merge_fixture(
+                root / "run-a", MERGE_RUN_A
+            )
+            run_b_catchments, run_b_graph = write_merge_fixture(
+                root / "run-b", MERGE_RUN_B
+            )
+            keys_a = merge_hilbert_keys(
+                [row["geometry"] for row in run_a_catchments]
+            )
+            keys_b = merge_hilbert_keys(
+                [row["geometry"] for row in run_b_catchments]
+            )
+            self.assertEqual(keys_a, [7_054_384, 517_598_622, 715_827_882])
+            self.assertEqual(
+                keys_b,
+                [238_609_294, 622_261_220, 715_827_882, 1_008_396_555],
+            )
+            concatenated_ids = [
+                row["id"]
+                for row in run_a_catchments + run_b_catchments
+            ]
+            self.assertEqual(
+                concatenated_ids,
+                [
+                    710_000_101,
+                    710_000_102,
+                    710_000_103,
+                    720_000_201,
+                    720_000_202,
+                    720_000_203,
+                    720_000_204,
+                ],
+            )
+            self.assertNotEqual(concatenated_ids, expected_ids)
+
+            output = root / "output"
+            result = build_adapter.merge_catchments_and_graph(
+                [root / "run-a", root / "run-b"],
+                output,
+                input_batch_size=2,
+                row_group_min=3,
+                row_group_max=4,
+            )
+            catchment_file = pq.ParquetFile(result.catchments_path)
+            graph_file = pq.ParquetFile(result.graph_path)
+            actual_catchments = catchment_file.read().to_pylist()
+            actual_graph = graph_file.read().to_pylist()
+            self.assertEqual(
+                [row["id"] for row in actual_catchments], expected_ids
+            )
+            self.assertEqual([row["id"] for row in actual_graph], expected_ids)
+            self.assertEqual(
+                [row["upstream_ids"] for row in actual_graph],
+                expected_upstream_ids,
+            )
+            source_catchments = {
+                row["id"]: row
+                for row in run_a_catchments + run_b_catchments
+            }
+            source_graph = {
+                row["id"]: row for row in run_a_graph + run_b_graph
+            }
+            for catchment_row, graph_row in zip(
+                actual_catchments, actual_graph, strict=True
+            ):
+                self.assertEqual(
+                    catchment_row, source_catchments[catchment_row["id"]]
+                )
+                self.assertEqual(graph_row, source_graph[graph_row["id"]])
+            self.assertEqual(
+                [
+                    catchment_file.metadata.row_group(index).num_rows
+                    for index in range(catchment_file.num_row_groups)
+                ],
+                [4, 3],
+            )
+            self.assertEqual(
+                [
+                    graph_file.metadata.row_group(index).num_rows
+                    for index in range(graph_file.num_row_groups)
+                ],
+                [4, 3],
+            )
+
+            previous_key = None
+            scanned_ids = []
+            catchment_batches = catchment_file.iter_batches(batch_size=2)
+            graph_batches = graph_file.iter_batches(batch_size=2)
+            for catchment_batch, graph_batch in zip(
+                catchment_batches, graph_batches, strict=True
+            ):
+                catchment_ids = catchment_batch.column("id").to_pylist()
+                graph_ids = graph_batch.column("id").to_pylist()
+                self.assertEqual(graph_ids, catchment_ids)
+                keys = merge_hilbert_keys(
+                    catchment_batch.column("geometry").to_pylist()
+                )
+                for key, unit_id in zip(keys, catchment_ids, strict=True):
+                    current_key = (key, unit_id)
+                    if previous_key is not None:
+                        self.assertLessEqual(previous_key, current_key)
+                    previous_key = current_key
+                scanned_ids.extend(catchment_ids)
+            self.assertEqual(scanned_ids, expected_ids)
+            build_adapter.assert_geoparquet_valid(result.catchments_path)
+            self.assertNotIn(b"geo", graph_file.schema_arrow.metadata or {})
+
+            reverse_output = root / "reverse-output"
+            reverse_result = build_adapter.merge_catchments_and_graph(
+                [root / "run-b", root / "run-a"],
+                reverse_output,
+                input_batch_size=2,
+                row_group_min=3,
+                row_group_max=4,
+            )
+            self.assertEqual(
+                result.catchments_path.read_bytes(),
+                reverse_result.catchments_path.read_bytes(),
+            )
+            self.assertEqual(
+                result.graph_path.read_bytes(),
+                reverse_result.graph_path.read_bytes(),
+            )
+
+    def test_merge_catchments_and_graph_buffer_ceiling_is_row_count_independent(
+        self,
+    ) -> None:
+        observed_metrics = []
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for rows_per_run in (2, 25):
+                run_a = [
+                    (
+                        710_000_000 + native_id,
+                        0.0,
+                        0.0,
+                        (
+                            []
+                            if native_id == 1
+                            else [710_000_000 + native_id - 1]
+                        ),
+                        float(native_id),
+                        float(native_id),
+                    )
+                    for native_id in range(1, rows_per_run + 1)
+                ]
+                run_b = [
+                    (
+                        720_000_000 + native_id,
+                        0.0,
+                        0.0,
+                        (
+                            []
+                            if native_id == 1
+                            else [720_000_000 + native_id - 1]
+                        ),
+                        float(native_id),
+                        float(native_id),
+                    )
+                    for native_id in range(1, rows_per_run + 1)
+                ]
+                case_root = root / f"rows-{rows_per_run}"
+                _, graph_a = write_merge_fixture(case_root / "run-a", run_a)
+                _, graph_b = write_merge_fixture(case_root / "run-b", run_b)
+                expected_upstream = {
+                    row["id"]: row["upstream_ids"]
+                    for row in graph_a + graph_b
+                }
+                result = build_adapter.merge_catchments_and_graph(
+                    [case_root / "run-a", case_root / "run-b"],
+                    case_root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+                metrics = result.metrics
+                observed_metrics.append(metrics)
+                self.assertEqual(metrics.input_count, 2)
+                self.assertEqual(metrics.total_input_rows, 2 * rows_per_run)
+                self.assertEqual(metrics.emitted_rows, 2 * rows_per_run)
+                self.assertEqual(metrics.input_batch_size, 2)
+                self.assertEqual(metrics.row_group_min, 3)
+                self.assertEqual(metrics.row_group_max, 4)
+                self.assertEqual(metrics.buffer_row_pair_ceiling, 8)
+                self.assertLessEqual(metrics.peak_input_buffer_row_pairs, 4)
+                self.assertLessEqual(metrics.peak_output_buffer_row_pairs, 4)
+                self.assertLessEqual(metrics.peak_heap_entries, 2)
+                self.assertLessEqual(metrics.peak_buffered_row_pairs, 8)
+                self.assert_merge_output_scan(result, expected_upstream)
+            self.assertEqual(
+                observed_metrics[0].buffer_row_pair_ceiling,
+                observed_metrics[1].buffer_row_pair_ceiling,
+            )
+
+    def test_merge_rejects_invalid_paths_and_size_arguments(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self.assertRaisesRegex(ValueError, "at least one input"):
+                build_adapter.merge_catchments_and_graph([], root / "output")
+
+            valid = root / "valid"
+            write_merge_fixture(valid, MERGE_RUN_A)
+            missing_catchments = root / "missing-catchments"
+            write_merge_fixture(missing_catchments, MERGE_RUN_A)
+            (missing_catchments / "catchments.parquet").unlink()
+            missing_graph = root / "missing-graph"
+            write_merge_fixture(missing_graph, MERGE_RUN_A)
+            (missing_graph / "graph.parquet").unlink()
+            for missing_root, filename in (
+                (missing_catchments, "catchments.parquet"),
+                (missing_graph, "graph.parquet"),
+            ):
+                with self.subTest(filename=filename):
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.merge_catchments_and_graph(
+                            [missing_root], root / f"output-{filename}"
+                        )
+                    self.assertIn(str(missing_root.resolve()), str(raised.exception))
+                    self.assertIn(filename, str(raised.exception))
+
+            with self.assertRaisesRegex(ValueError, "unique after resolution"):
+                build_adapter.merge_catchments_and_graph(
+                    [valid, valid / ".." / "valid"], root / "duplicate-output"
+                )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph([valid], valid)
+            self.assertIn(str(valid.resolve()), str(raised.exception))
+            self.assertIn("aliases output", str(raised.exception))
+
+            invalid_arguments = (
+                {"input_batch_size": 0},
+                {"input_batch_size": -1},
+                {"row_group_min": 0},
+                {"row_group_min": -1},
+                {"row_group_min": 4, "row_group_max": 3},
+                {"row_group_max": 0},
+            )
+            for arguments in invalid_arguments:
+                with self.subTest(arguments=arguments):
+                    with self.assertRaises(ValueError):
+                        build_adapter.merge_catchments_and_graph(
+                            [valid],
+                            root / f"invalid-{len(arguments)}",
+                            **arguments,
+                        )
+
+    def test_merge_rejects_row_count_and_exact_schema_mismatches(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            count_root = root / "count"
+            _, graph_rows = write_merge_fixture(count_root, MERGE_RUN_A)
+            rewrite_merge_rows(
+                count_root / "graph.parquet", graph_rows[:-1]
+            )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [count_root], root / "count-output"
+                )
+            self.assertIn(str(count_root.resolve()), str(raised.exception))
+            self.assertIn("row counts differ", str(raised.exception))
+
+            catchment_schema, graph_schema = merge_fixture_schemas()
+            wrong_catchment_schema = catchment_schema.remove_metadata()
+            wrong_catchment_roots = [
+                root / "wrong-catchment-a",
+                root / "wrong-catchment-b",
+            ]
+            for wrong_root in wrong_catchment_roots:
+                write_merge_fixture(
+                    wrong_root,
+                    MERGE_RUN_A,
+                    catchment_schema=wrong_catchment_schema,
+                )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    wrong_catchment_roots, root / "wrong-catchment-output"
+                )
+            self.assertIn(
+                str(wrong_catchment_roots[0].resolve()),
+                str(raised.exception),
+            )
+            self.assertIn("catchment schema", str(raised.exception))
+
+            wrong_graph_root = root / "wrong-graph"
+            write_merge_fixture(
+                wrong_graph_root,
+                MERGE_RUN_A,
+                graph_schema=graph_schema.with_metadata({b"invalid": b"schema"}),
+            )
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [wrong_graph_root], root / "wrong-graph-output"
+                )
+            self.assertIn(str(wrong_graph_root.resolve()), str(raised.exception))
+            self.assertIn("graph schema", str(raised.exception))
+
+    def test_merge_rejects_paired_row_value_mismatches(self) -> None:
+        mutations = {
+            "id": lambda rows: rows[0].update(id=rows[0]["id"] + 1),
+            "level": lambda rows: rows[0].update(level=1),
+            "bbox": lambda rows: rows[0].update(
+                bbox_minx=np.float32(rows[0]["bbox_minx"] + 1.0)
+            ),
+        }
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for condition, mutate in mutations.items():
+                with self.subTest(condition=condition):
+                    case_root = root / condition
+                    _, graph_rows = write_merge_fixture(
+                        case_root, MERGE_RUN_A
+                    )
+                    mutate(graph_rows)
+                    rewrite_merge_rows(
+                        case_root / "graph.parquet", graph_rows
+                    )
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.merge_catchments_and_graph(
+                            [case_root], root / f"{condition}-output"
+                        )
+                    message = str(raised.exception)
+                    self.assertIn(str(case_root.resolve()), message)
+                    self.assertIn(condition, message)
+
+    def test_merge_rejects_decrease_within_input_batch_without_repair(
+        self,
+    ) -> None:
+        bad_rows = [MERGE_RUN_A[1], MERGE_RUN_A[0], MERGE_RUN_A[2]]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_root = root / "within-batch"
+            write_merge_fixture(input_root, bad_rows)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [input_root],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            message = str(raised.exception)
+            self.assertIn(str(input_root.resolve()), message)
+            self.assertIn("(517598622, 710000102)", message)
+            self.assertIn("(7054384, 710000101)", message)
+            self.assertEqual(
+                pq.read_table(input_root / "catchments.parquet")
+                .column("id")
+                .to_pylist(),
+                [710_000_102, 710_000_101, 710_000_103],
+            )
+
+    def test_merge_rejects_decrease_across_input_batch_boundary_without_repair(
+        self,
+    ) -> None:
+        bad_rows = [MERGE_RUN_A[0], MERGE_RUN_A[2], MERGE_RUN_A[1]]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_root = root / "across-batch"
+            write_merge_fixture(input_root, bad_rows)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [input_root],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            message = str(raised.exception)
+            self.assertIn(str(input_root.resolve()), message)
+            self.assertIn("(715827882, 710000103)", message)
+            self.assertIn("(517598622, 710000102)", message)
+            self.assertEqual(
+                pq.read_table(input_root / "catchments.parquet")
+                .column("id")
+                .to_pylist(),
+                [710_000_101, 710_000_103, 710_000_102],
+            )
+
+    def test_merge_rejects_identical_hilbert_and_id_across_runs(self) -> None:
+        duplicate = [(710_000_101, -170.0, -80.0, [], 9.0, 9.0)]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_a = root / "run-a"
+            run_b = root / "run-b"
+            write_merge_fixture(run_a, [MERGE_RUN_A[0]])
+            write_merge_fixture(run_b, duplicate)
+            with self.assertRaises(ValueError) as raised:
+                build_adapter.merge_catchments_and_graph(
+                    [run_a, run_b],
+                    root / "output",
+                    input_batch_size=2,
+                    row_group_min=3,
+                    row_group_max=4,
+                )
+            self.assertIn("duplicate merge key", str(raised.exception))
+            self.assertIn("(7054384, 710000101)", str(raised.exception))
+
+
 class CoreHfxCompilationTests(unittest.TestCase):
     created_at = datetime(2026, 7, 21, 12, 34, 56, tzinfo=timezone.utc)
     basin_id = "7020000010"
     fabric_version = "synthetic-2026.07"
+
+    def test_compile_core_hfx_uses_dataset_global_hilbert_order(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            basins, streamnet = planetary_order_frames()
+            source = load_tdx_geopackages(
+                *write_pair(source_dir, basins, streamnet)
+            )
+            model = build_streamnet_model(
+                source.basins,
+                source.streamnet,
+                header_number=71,
+                endpoint_tolerance=0.001,
+            )
+            result = compile_core_hfx(
+                source,
+                model,
+                root / "output",
+                processing_basin_id=self.basin_id,
+                fabric_version=self.fabric_version,
+                created_at=self.created_at,
+            )
+            catchment_ids = pq.read_table(
+                result.catchments_path, columns=["id"]
+            )["id"].to_pylist()
+            snap_unit_ids = pq.read_table(
+                result.snap_path, columns=["unit_id"]
+            )["unit_id"].to_pylist()
+
+        local_catchment_distances = (
+            source.basins.geometry.centroid.hilbert_distance(
+                total_bounds=source.basins.geometry.total_bounds
+            )
+        )
+        local_stem_distances = (
+            source.streamnet.geometry.centroid.hilbert_distance(
+                total_bounds=source.basins.geometry.total_bounds
+            )
+        )
+        world_catchment_distances = (
+            source.basins.geometry.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+        world_stem_distances = (
+            source.streamnet.geometry.centroid.hilbert_distance(
+                total_bounds=[-180, -90, 180, 90]
+            )
+        )
+        self.assertEqual(
+            local_catchment_distances.tolist(),
+            [54876, 4294912416, 1431666952],
+        )
+        self.assertEqual(
+            local_stem_distances.tolist(),
+            [54876, 4294912416, 1431666952],
+        )
+        self.assertEqual(
+            world_catchment_distances.tolist(),
+            [7054384, 238609294, 1008396555],
+        )
+        self.assertEqual(
+            world_stem_distances.tolist(),
+            [7054384, 238609294, 1008396555],
+        )
+        self.assertEqual(
+            (catchment_ids, snap_unit_ids),
+            (
+                [710000100, 710000200, 710000300],
+                [710000100, 710000200, 710000300],
+            ),
+        )
 
     def compile_fixture(
         self,
@@ -1657,32 +3218,32 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 [tuple(bounds) for bounds in expected_bounds],
             )
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertEqual(
                 snap["weight"].to_pylist(),
-                [1.2309072017669678, 2.4618144035339355],
+                [2.4618144035339355, 1.2309072017669678],
             )
             self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
             self.assertEqual(
                 snap["bbox"].to_pylist(),
                 [
                     {
-                        "xmin": 0.0,
-                        "ymin": -9.999999747378752e-05,
-                        "xmax": 0.009999999776482582,
-                        "ymax": 9.999999747378752e-05,
-                    },
-                    {
                         "xmin": 0.009999999776482582,
                         "ymin": -9.999999747378752e-05,
                         "xmax": 0.019999999552965164,
                         "ymax": 9.999999747378752e-05,
                     },
+                    {
+                        "xmin": 0.0,
+                        "ymin": -9.999999747378752e-05,
+                        "xmax": 0.009999999776482582,
+                        "ymax": 9.999999747378752e-05,
+                    },
                 ],
             )
             expected_stems = [
-                LineString([(0.0, 0.0), (0.01, 0.0)]),
                 LineString([(0.01, 0.0), (0.02, 0.0)]),
+                LineString([(0.0, 0.0), (0.01, 0.0)]),
             ]
             self.assertEqual(
                 snap["geometry"].to_pylist(),
@@ -1694,12 +3255,12 @@ class CoreHfxCompilationTests(unittest.TestCase):
                     LineString([(0.0, 0.0), (0.01, 0.0)]),
                 ],
                 crs=CRS,
-            ).centroid.hilbert_distance(total_bounds=source_basins.geometry.total_bounds)
-            self.assertEqual(stem_distances.tolist(), [4026531839, 268435455])
+            ).centroid.hilbert_distance(total_bounds=[-180, -90, 180, 90])
+            self.assertEqual(stem_distances.tolist(), [3579139411, 3579139413])
             distances = source_basins.geometry.centroid.hilbert_distance(
-                total_bounds=source_basins.geometry.total_bounds
+                total_bounds=[-180, -90, 180, 90]
             )
-            self.assertEqual(distances.tolist(), [3489660928, 805306368])
+            self.assertEqual(distances.tolist(), [2147483655, 2147483649])
             for parquet_file, names in (
                 (catchments_file, [f"bbox.{name}" for name in BBOX_LEAF_NAMES]),
                 (graph_file, [f"bbox_{name}" for name in ("minx", "miny", "maxx", "maxy")]),
@@ -1807,7 +3368,7 @@ class CoreHfxCompilationTests(unittest.TestCase):
             [(0.01, 0.0), (0.02, 0.0)],
         )
         self.assertEqual(snap["id"].to_pylist(), [1, 2])
-        self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+        self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
         self.assertEqual(
             snap["weight"].to_pylist(),
             [1.2309072017669678, 1.2309072017669678],
@@ -1816,8 +3377,8 @@ class CoreHfxCompilationTests(unittest.TestCase):
         self.assertEqual(
             snap["geometry"].to_pylist(),
             [
-                LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
             ],
         )
         diagnostics = result.diagnostics.streamnet
@@ -2207,18 +3768,18 @@ class BuildCliTests(unittest.TestCase):
             })
             snap = pq.read_table(output / "aux/snap_stems.parquet")
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertNotIn(710000150, snap["unit_id"].to_pylist())
             self.assertEqual(
                 snap["weight"].to_pylist(),
-                [1.2309072017669678, 2.4618144035339355],
+                [2.4618144035339355, 1.2309072017669678],
             )
             self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
             self.assertEqual(
                 snap["geometry"].to_pylist(),
                 [
-                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                     LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 ],
             )
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output))
@@ -2329,7 +3890,7 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(json.loads(report.read_text()), self.expected_report(output, isolated=True))
             snap = pq.read_table(output / "aux/snap_stems.parquet")
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000100, 710000200])
+            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
             self.assertEqual(
                 snap["weight"].to_pylist(),
                 [1.2309072017669678, 1.2309072017669678],
@@ -2338,8 +3899,8 @@ class BuildCliTests(unittest.TestCase):
             self.assertEqual(
                 snap["geometry"].to_pylist(),
                 [
-                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                     LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
+                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 ],
             )
             messages = [record.getMessage() for record in captured.records]

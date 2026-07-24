@@ -98,7 +98,7 @@ The one-cell envelope is grounded in NGA's description of TDX-Hydro as a nominal
 
 The adapter always writes `aux/snap_stems.parquet` and declares it as `hfx.aux.snap.v2` with `metadata.name = "stems"` and `references_levels = [0]`. Only polygon-bearing native reaches are included. Polygon-less reaches are excluded without a spatial fallback, and the snap path reuses the topology model's `polygonless_dropped_reach_count`; it does not compute a second drop definition.
 
-Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance within the unit bounds, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
+Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance over the fixed EPSG:4326 world domain `[-180, -90, 180, 90]`, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
 
 For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer expands a zero-width or zero-height float32 bbox by the existing metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
 
@@ -182,14 +182,54 @@ uv run python build_adapter.py build \
 
 `--basins`, `--streamnet`, `--out`, `--report`, `--processing-basin-id`, and `--fabric-version` are required. `--endpoint-tolerance <degrees>` is optional and defaults to `0.001`; it controls only endpoint-coincidence orientation checks.
 
+Assemble explicit compiled processing-basin roots into one HFX dataset:
+
+```bash
+uv run python build_adapter.py assemble \
+  --input ./out/7020000010 \
+  --input ./out/7020014250 \
+  --out ./out/assembled
+```
+
+Repeat `--input` once per compiled per-basin HFX root. Assembly never discovers
+inputs by scanning a directory. `--out` must be absent or an empty directory.
+Assembly writes into a temporary sibling and publishes the complete dataset by
+rename only after all checks and writes succeed. A failure leaves no partial
+artifacts and preserves a caller-supplied empty directory as empty.
+
+Catchments and graph rows, and snap rows, are merged in bounded memory.
+Ordering is recomputed from WKB as centroid Hilbert distance over the fixed
+world bounds `[-180, -90, 180, 90]` in EPSG:4326, with deterministic Global
+LINKNO tie-breaks. `_hilbert` is transient and is not stored. Graph rows remain
+paired with catchments, while snap IDs are reassigned sequentially from 1
+through N.
+
+Inputs must have compatible identity and fabric versions, exact core and snap
+schemas, matching artifact counts, one known and unique processing-basin region
+per root, monotonic world-domain ordering, complete snap-to-catchment
+references, and the declared snap auxiliary contract. Attribution files are
+staged byte-identically.
+
+Only the exact set of all 62 processing-basin crosswalk entries omits `region`
+and claims `bbox = [-180, -90, 180, 90]`. Every proper subset receives
+`tdx-hydro-partial-<digest>`, where the digest is the first 12 hexadecimal
+characters of SHA-256 over the sorted region keys joined by commas, with no
+trailing separator, and its bbox is the float32 covering union. For example,
+regions `7020000010,7020014250` produce digest `afd4ffb0b736` and region
+`tdx-hydro-partial-afd4ffb0b736`.
+
 Validate all dataset layers with strict, 100-percent HFX validation plus GeoParquet 1.1 checks. `--hfx-binary` is optional and defaults to `hfx`:
 
 ```bash
-uv run python build_adapter.py validate ./out/7020000010 \
-  --hfx-binary ../../target/debug/hfx
+uv run python build_adapter.py validate ./out/assembled \
+  --hfx-binary ../../target/release/hfx
 ```
 
-The validation subcommand invokes the selected binary as `hfx <dataset> --strict --sample-pct 100 --format text`, validates `catchments.parquet` and `aux/snap_stems.parquet` as GeoParquet 1.1, and verifies that `graph.parquet` has the expected non-GeoParquet classification.
+The underlying Rust command is
+`<absolute-path>/target/release/hfx <dataset> --strict --sample-pct 100 --format text`;
+`<dataset>` is its sole positional argument. The adapter also validates
+`catchments.parquet` and `aux/snap_stems.parquet` as GeoParquet 1.1 and verifies
+that `graph.parquet` has the expected non-GeoParquet classification.
 
 ## Campaign notes
 
