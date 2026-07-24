@@ -378,7 +378,7 @@ bootstrap_post_apt_loop=$test_tmp/bootstrap-post-apt-loop
 bootstrap_final_loop=$test_tmp/bootstrap-final-loop
 runbook_convergence=$test_tmp/runbook-convergence
 campaign_array_expansion='"${campaign_command_names[''@]}"'
-sed >"$expected_campaign_commands" <<'EXPECTED_CAMPAIGN_COMMANDS'
+sed '' >"$expected_campaign_commands" <<'EXPECTED_CAMPAIGN_COMMANDS'
 aws
 chmod
 curl
