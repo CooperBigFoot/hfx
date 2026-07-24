@@ -175,6 +175,8 @@ new_assembly_workspace() {
 SCRIPT_DIR=$(cd -P -- "${BASH_SOURCE[0]%/*}" && pwd)
 repo_root=$(cd -P -- "$SCRIPT_DIR/../.." && pwd)
 runner=$SCRIPT_DIR/tdx-hydro-campaign.sh
+bootstrap=$SCRIPT_DIR/bootstrap.sh
+runbook=$SCRIPT_DIR/RUNBOOK-tdx-hydro-assembly-subset.md
 inventory=$repo_root/adapters/tdx-hydro/data/tdx_header_numbers.json
 
 if [[ -x /bin/bash ]]; then
@@ -201,6 +203,8 @@ for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
+[[ -f "$bootstrap" ]] || die "bootstrap is missing: $bootstrap"
+[[ -f "$runbook" ]] || die "runbook is missing: $runbook"
 [[ -f "$inventory" ]] || die "inventory is missing: $inventory"
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/hfx-tdx-campaign-test.XXXXXX")
@@ -364,6 +368,92 @@ assert_contains "$runner" 'ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTH
 assert_contains "$runner" 'ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}'
 assert_contains "$runner" 'HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")'
 pass 'static Bash 3.2 compatibility checks pass'
+
+expected_campaign_commands=$test_tmp/expected-campaign-commands
+runner_campaign_commands=$test_tmp/runner-campaign-commands
+bootstrap_campaign_commands_raw=$test_tmp/bootstrap-campaign-commands-raw
+bootstrap_campaign_commands=$test_tmp/bootstrap-campaign-commands
+bootstrap_apt_packages=$test_tmp/bootstrap-apt-packages
+bootstrap_post_apt_loop=$test_tmp/bootstrap-post-apt-loop
+bootstrap_final_loop=$test_tmp/bootstrap-final-loop
+runbook_convergence=$test_tmp/runbook-convergence
+campaign_array_expansion='"${campaign_command_names[''@]}"'
+sed '' >"$expected_campaign_commands" <<'EXPECTED_CAMPAIGN_COMMANDS'
+aws
+chmod
+curl
+find
+grep
+jq
+mkdir
+mv
+od
+ogrinfo
+ps
+rm
+sha256sum
+sort
+tr
+wc
+EXPECTED_CAMPAIGN_COMMANDS
+sed -n 's/.*resolve_command HFX_TDX_[A-Z0-9_]* \([a-z][a-z0-9-]*\).*/\1/p' "$runner" |
+    LC_ALL=C sort -u >"$runner_campaign_commands"
+if ! diff -u "$expected_campaign_commands" "$runner_campaign_commands"; then
+    die "runner command contract differs; paid-run failure was: hfx: error: required command 'jq' is not available"
+fi
+assert_contains "$runner" 'resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON"'
+assert_contains "$runner" 'resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX"'
+
+sed -n '/^campaign_command_names=($/,/^)$/{
+    /^campaign_command_names=($/d
+    /^)$/d
+    s/^[[:space:]]*//
+    /./p
+}' "$bootstrap" >"$bootstrap_campaign_commands_raw"
+[[ $(wc -l <"$bootstrap_campaign_commands_raw" | tr -d ' ') -eq 16 ]] ||
+    die 'bootstrap campaign_command_names does not contain exactly 16 nonempty command lines'
+LC_ALL=C sort -u "$bootstrap_campaign_commands_raw" >"$bootstrap_campaign_commands"
+if ! diff -u "$expected_campaign_commands" "$bootstrap_campaign_commands"; then
+    die "bootstrap command contract differs; paid-run failure was: hfx: error: required command 'jq' is not available"
+fi
+
+sed -n '/^apt_packages=($/,/^)$/{
+    /^apt_packages=($/d
+    /^)$/d
+    s/^[[:space:]]*//
+    /./p
+}' "$bootstrap" >"$bootstrap_apt_packages"
+[[ $(grep -Fxc -- jq "$bootstrap_apt_packages") -eq 1 ]] ||
+    die 'bootstrap apt_packages does not contain exactly one jq entry'
+[[ $(grep -Fxc -- procps "$bootstrap_apt_packages") -eq 1 ]] ||
+    die 'bootstrap apt_packages does not contain exactly one procps entry'
+
+sed -n '/^for command_name in /{
+    N
+    /is unavailable after package installation/p
+}' "$bootstrap" >"$bootstrap_post_apt_loop"
+assert_contains "$bootstrap_post_apt_loop" "for command_name in $campaign_array_expansion tmux git gdal-config clang pkg-config; do"
+assert_contains "$bootstrap_post_apt_loop" 'command -v -- "$command_name"'
+assert_contains "$bootstrap_post_apt_loop" 'is unavailable after package installation'
+sed -n '/^for command_name in /{
+    N
+    /failed final verification/p
+}' "$bootstrap" >"$bootstrap_final_loop"
+assert_contains "$bootstrap_final_loop" "for command_name in $campaign_array_expansion tmux gdal-config; do"
+assert_contains "$bootstrap_final_loop" 'command -v -- "$command_name"'
+assert_contains "$bootstrap_final_loop" 'failed final verification'
+assert_contains "$bootstrap" '[[ -x "$HFX_GEO_VENV/bin/python" ]] || bootstrap_die '\''geo environment Python failed final executable verification; rerun bootstrap'\'''
+assert_contains "$bootstrap" '[[ -x "$BUILT_CLI" ]] || bootstrap_die '\''release hfx CLI failed final executable verification; rerun bootstrap'\'''
+
+sed -n '/<<REMOTE_REF/,/^REMOTE_REF$/p' "$runbook" >"$runbook_convergence"
+assert_contains "$runbook_convergence" 'for command_name in aws jq mv mkdir rm chmod find wc tr ps curl sha256sum od ogrinfo sort grep; do'
+assert_contains "$runbook_convergence" 'command -v -- "\$command_name" >/dev/null'
+assert_contains "$runbook_convergence" 'test -x /opt/hfx-geo/bin/python'
+assert_contains "$runbook_convergence" 'test -x /root/hfx/target/release/hfx'
+if grep -F -- 'command -v -- "$command_name"' "$runbook_convergence" >/dev/null; then
+    die 'runbook convergence gate expands unescaped command_name in its unquoted heredoc'
+fi
+pass 'runner, bootstrap, apt ownership, and runbook dependency contracts remain synchronized'
 
 subset_root=$test_tmp/workspaces/subset
 mkdir "$subset_root"
