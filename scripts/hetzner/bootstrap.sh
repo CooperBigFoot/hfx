@@ -192,6 +192,25 @@ retry_apt() {
     return 1
 }
 
+campaign_command_names=(
+    aws
+    jq
+    mv
+    mkdir
+    rm
+    chmod
+    find
+    wc
+    tr
+    ps
+    curl
+    sha256sum
+    od
+    ogrinfo
+    sort
+    grep
+)
+
 apt_packages=(
     awscli
     build-essential
@@ -200,12 +219,14 @@ apt_packages=(
     curl
     gdal-bin
     git
+    jq
     libclang-dev
     libgdal-dev
     libgeos-dev
     libproj-dev
     libsqlite3-dev
     pkg-config
+    procps
     proj-bin
     proj-data
     tmux
@@ -226,7 +247,7 @@ for package in "${apt_packages[@]}"; do
     status=$(dpkg-query -W -f='${Status}' -- "$package" 2>/dev/null || true)
     [[ "$status" == 'install ok installed' ]] || bootstrap_die "required apt package $package is not installed; inspect package manager output and rerun bootstrap"
 done
-for command_name in tmux aws git curl gdal-config clang pkg-config; do
+for command_name in "${campaign_command_names[@]}" tmux git gdal-config clang pkg-config; do
     command -v -- "$command_name" >/dev/null 2>&1 || bootstrap_die "required command $command_name is unavailable after package installation; inspect packages and rerun bootstrap"
 done
 
@@ -258,6 +279,7 @@ elif [[ ! -x "$HFX_GEO_VENV/bin/python" ]]; then
 elif [[ "$($HFX_GEO_VENV/bin/python -c 'import platform; print(platform.python_version())')" != "$PYTHON_VERSION" ]]; then
     bootstrap_die "$HFX_GEO_VENV uses the wrong Python version; inspect and remove this bootstrap-owned path before rerunning"
 fi
+[[ -x "$HFX_GEO_VENV/bin/python" ]] || bootstrap_die 'geo environment Python is not executable after creation; inspect uv output and rerun bootstrap'
 
 verify_geo_packages() {
     "$HFX_GEO_VENV/bin/python" <<'PYTHON_VERIFY'
@@ -355,12 +377,13 @@ verify_mount || bootstrap_die '/mnt/hfx is not a mounted read-write campaign vol
 for directory in "$WORKSPACE_ROOT" "$DOWNLOAD_DIRECTORY" "$LOGS_DIRECTORY"; do
     [[ -d "$directory" ]] || bootstrap_die "required volume directory $directory is absent; inspect the volume and rerun bootstrap"
 done
-for command_name in tmux aws gdal-config; do
+for command_name in "${campaign_command_names[@]}" tmux gdal-config; do
     command -v -- "$command_name" >/dev/null 2>&1 || bootstrap_die "required command $command_name failed final verification; rerun bootstrap"
 done
 [[ "$($UV_EXECUTABLE --version | head -n 1)" == "uv $UV_VERSION" ]] || bootstrap_die 'uv failed final version verification; rerun bootstrap'
 managed_python=$($UV_EXECUTABLE python find "$PYTHON_VERSION") || bootstrap_die 'managed Python failed final verification; rerun bootstrap'
 [[ "$($managed_python -c 'import platform; print(platform.python_version())')" == "$PYTHON_VERSION" ]] || bootstrap_die 'managed Python failed final version verification; rerun bootstrap'
+[[ -x "$HFX_GEO_VENV/bin/python" ]] || bootstrap_die 'geo environment Python failed final executable verification; rerun bootstrap'
 [[ "$($HFX_GEO_VENV/bin/python -c 'import platform; print(platform.python_version())')" == "$PYTHON_VERSION" ]] || bootstrap_die 'geo environment failed final Python verification; rerun bootstrap'
 verify_geo_packages || bootstrap_die 'geo packages failed final verification; rerun bootstrap'
 [[ "$($RUSTUP_EXECUTABLE --version | head -n 1)" == "rustup $RUSTUP_VERSION "* ]] || bootstrap_die 'rustup failed final version verification; rerun bootstrap'
@@ -368,7 +391,8 @@ verify_geo_packages || bootstrap_die 'geo packages failed final verification; re
 [[ "$($CARGO_EXECUTABLE --version)" == "cargo $RUST_TOOLCHAIN "* ]] || bootstrap_die 'cargo failed final version verification; rerun bootstrap'
 [[ "$(git -C "$HFX_REPOSITORY_DIR" remote get-url origin)" == "$HFX_REPOSITORY_URL" ]] || bootstrap_die 'Git origin failed final anonymous URL verification; rerun bootstrap'
 [[ "$(git -C "$HFX_REPOSITORY_DIR" rev-parse HEAD)" == "$(git -C "$HFX_REPOSITORY_DIR" rev-parse refs/remotes/origin/main)" ]] || bootstrap_die 'checkout HEAD does not equal origin/main; rerun bootstrap'
-[[ -x "$BUILT_CLI" ]] && "$BUILT_CLI" --version || bootstrap_die 'release hfx CLI failed final verification; rerun bootstrap'
+[[ -x "$BUILT_CLI" ]] || bootstrap_die 'release hfx CLI failed final executable verification; rerun bootstrap'
+"$BUILT_CLI" --version || bootstrap_die 'release hfx CLI failed final verification; rerun bootstrap'
 
 bootstrap_log "mount point: $MOUNT_POINT"
 bootstrap_log "workspace root: $WORKSPACE_ROOT"

@@ -231,10 +231,10 @@ Bootstrap and retain its live output:
 
 Bootstrap must finish with the mounted `/mnt/hfx` volume, workspace
 `/mnt/hfx/work`, logs `/mnt/hfx/logs`, checkout `/root/hfx`, geo environment
-`/opt/hfx-geo`, release CLI `/root/hfx/target/release/hfx`, and AWS CLI
-available. Its final checks cover the mount, pinned geo packages, anonymous
-checkout, release CLI, and AWS CLI
-(`scripts/hetzner/bootstrap.sh:119-177,229-300,327-393`).
+`/opt/hfx-geo`, release CLI `/root/hfx/target/release/hfx`, and full runner
+dependency surface available. It explicitly installs `jq` and `procps`; its
+final checks cover the mount, pinned geo packages, anonymous checkout, release
+CLI, bootstrap-produced Python, and every command name required by the runner.
 
 Resolve the exact server IPv4 address from the exact-name listing:
 
@@ -264,6 +264,11 @@ test "\$(git -C /root/hfx rev-parse HEAD)" = "$GROUND_TRUTH_REF"
 cd /root/hfx
 /root/.cargo/bin/cargo build --release -p hfx-cli
 test -x /root/hfx/target/release/hfx
+for command_name in aws jq mv mkdir rm chmod find wc tr ps curl sha256sum od ogrinfo sort grep; do
+  command -v -- "\$command_name" >/dev/null
+done
+test -x /opt/hfx-geo/bin/python
+test -x /root/hfx/target/release/hfx
 /root/hfx/target/release/hfx --version
 /opt/hfx-geo/bin/python -c 'import geopandas, numpy, pyarrow, shapely; print(geopandas.__version__, numpy.__version__, pyarrow.__version__, shapely.__version__)'
 aws --version
@@ -282,8 +287,9 @@ fi
 ```
 
 This gate fails closed. Abort and run default teardown if the fetch, checkout,
-build, tool, credential metadata, memory, or disk check fails. Do not inspect
-or print credential values.
+build, runner dependency, credential metadata, memory, or disk check fails. A
+missing runner dependency is a hard teardown condition. Do not inspect or
+print credential values.
 
 ## 5. On-VM parity confirmation
 
