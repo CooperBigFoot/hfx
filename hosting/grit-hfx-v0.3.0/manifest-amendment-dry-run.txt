@@ -1,0 +1,21 @@
+GRIT D8 upload runbook self-test
+=================================
+PASS: scope accepts keys beneath TARGET_PREFIX
+PASS: scope out-of-prefix destination aborts: merit/0.2.0/manifest.json
+PASS: scope out-of-prefix destination aborts: grit/1.0.0/manifest.json
+PASS: membership accepts six exact paths and rejects unrelated paths
+PASS: gating requires execute plus publish-manifest
+PASS: enumeration yields six deterministic operations, one skip, and manifest last
+self-test OK
+
+GRIT D8 manifest amendment dry-run
+====================================
+upload-r2-grit-d8.sh dry-run (zero AWS calls made):
+target prefix: grit/hfx-v0.3.0/   profile: upstream-r2   staging: <STAGING>
+DRY-RUN: aws s3 cp <STAGING>/CITATION.txt s3://basin-delineations-public/grit/hfx-v0.3.0/CITATION.txt
+DRY-RUN: aws s3 cp <STAGING>/NOTICE s3://basin-delineations-public/grit/hfx-v0.3.0/NOTICE
+DRY-RUN: aws s3 cp <STAGING>/README.md s3://basin-delineations-public/grit/hfx-v0.3.0/README.md
+DRY-RUN: aws s3 cp <STAGING>/aux/d8/flow_acc.tif s3://basin-delineations-public/grit/hfx-v0.3.0/aux/d8/flow_acc.tif
+DRY-RUN: aws s3 cp <STAGING>/aux/d8/flow_dir.tif s3://basin-delineations-public/grit/hfx-v0.3.0/aux/d8/flow_dir.tif
+DRY-RUN: aws s3 cp <STAGING>/manifest.json s3://basin-delineations-public/grit/hfx-v0.3.0/manifest.json   GATED: requires --execute --publish-manifest after ticket #45 release
+6 operations; zero uploads. Manifest publication requires --execute --publish-manifest.
