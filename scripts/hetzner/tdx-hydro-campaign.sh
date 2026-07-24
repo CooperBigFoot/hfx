@@ -49,6 +49,7 @@ usage() {
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
         '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 }
@@ -154,6 +155,63 @@ validate_compile_json() {
         (.fabric_version | type == "string" and length > 0 and
             (test("[\u0000-\u001f\u007f]") | not))
     ' "$file" >/dev/null 2>&1 || hfx_die "compile state is malformed: $file"
+}
+
+validate_assembly_json() {
+    local file=$1
+    "$JQ" -e --slurpfile inventory "$campaign_dir/state/inventory.json" '
+        def valid_ids:
+            type == "array" and
+            . == (sort | unique) and
+            all(.[]; type == "string" and test("^[0-9]{10}$") and $inventory[0][.] != null);
+        type == "object" and
+        keys == ["attempts","failure_reason","input_basin_ids","output_path","report_path","schema_version","status"] and
+        .schema_version == 1 and
+        (.status == "pending" or .status == "running" or .status == "succeeded" or .status == "failed") and
+        (.attempts | type == "number" and . == floor and . >= 0) and
+        (.failure_reason == null or (.failure_reason | type == "string")) and
+        (.input_basin_ids | valid_ids) and
+        .output_path == "assembly/dataset" and
+        .report_path == "reports/assembly.json" and
+        if .status == "running" or .status == "succeeded" then
+            .attempts > 0 and (.input_basin_ids | length) > 0 and .failure_reason == null
+        elif .status == "failed" then
+            .attempts > 0 and (.failure_reason | type == "string" and length > 0)
+        else
+            if .attempts == 0 then
+                .input_basin_ids == [] and .failure_reason == null
+            else
+                (.input_basin_ids | length) > 0 and
+                .failure_reason == "interrupted before terminal state; reset by recover"
+            end
+        end
+    ' "$file" >/dev/null 2>&1 || hfx_die "assembly state is malformed: $file"
+}
+
+assembly_report_is_valid() {
+    local file=$1
+    "$JQ" -e --arg campaign "$campaign" --slurpfile inventory "$campaign_dir/state/inventory.json" '
+        type == "object" and
+        keys == ["campaign","input_basin_ids","input_dataset_paths","output_path","schema_version"] and
+        .schema_version == 1 and
+        .campaign == $campaign and
+        .output_path == "assembly/dataset" and
+        (.input_basin_ids | type == "array" and . == (sort | unique) and
+            all(.[]; type == "string" and test("^[0-9]{10}$") and $inventory[0][.] != null)) and
+        (.input_dataset_paths | type == "array") and
+        .input_dataset_paths == [.input_basin_ids[] | "basin-outputs/" + .]
+    ' "$file" >/dev/null 2>&1
+}
+
+validate_assembly_report() {
+    local file=$1
+    assembly_report_is_valid "$file" || hfx_die "assembly report is malformed: $file"
+}
+
+assembly_report_matches_inputs() {
+    local file=$1
+    assembly_report_is_valid "$file" &&
+        [[ $("$JQ" -c '.input_basin_ids' "$file") == "$assembly_inputs_json" ]]
 }
 
 validate_basin_json() {
@@ -366,6 +424,11 @@ validate_workspace_state() {
             hfx_die "compile state is not a regular file: $campaign_dir/state/compile.json"
         validate_compile_json "$campaign_dir/state/compile.json"
     fi
+    if [[ -e "$campaign_dir/state/assembly.json" || -L "$campaign_dir/state/assembly.json" ]]; then
+        [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]] ||
+            hfx_die "assembly state is not a regular file: $campaign_dir/state/assembly.json"
+        validate_assembly_json "$campaign_dir/state/assembly.json"
+    fi
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
         hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
@@ -419,6 +482,39 @@ print_status() {
                 "$campaign_dir"/state/basins/*/current.json
         done
     done
+    if [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]]; then
+        stage=$("$JQ" -r '.status' "$campaign_dir/state/assembly.json")
+    else
+        stage=pending
+    fi
+    for status in pending running succeeded failed; do
+        if [[ "$stage" == "$status" ]]; then
+            printf 'assemble_%s=1\n' "$status"
+        else
+            printf 'assemble_%s=0\n' "$status"
+        fi
+    done
+}
+
+materialize_assembly_state() {
+    local state=$campaign_dir/state/assembly.json
+    local temporary
+    if [[ -e "$state" || -L "$state" ]]; then
+        [[ -f "$state" && ! -L "$state" ]] || hfx_die "assembly state is not a regular file: $state"
+        validate_assembly_json "$state"
+        return
+    fi
+    temporary=$campaign_dir/state/tmp/assembly.json.tmp.$$
+    "$JQ" -n '{
+      schema_version: 1,
+      status: "pending",
+      attempts: 0,
+      failure_reason: null,
+      input_basin_ids: [],
+      output_path: "assembly/dataset",
+      report_path: "reports/assembly.json"
+    }' >"$temporary"
+    atomic_install "$temporary" "$state" validate_assembly_json
 }
 
 initialize_campaign() {
@@ -507,6 +603,7 @@ initialize_campaign() {
 
     atomic_install "$campaign_dir/state/.inventory.json.tmp.$$" "$campaign_dir/state/inventory.json" validate_inventory_file
     atomic_install "$temporary" "$campaign_dir/state/campaign.json" validate_campaign_json
+    materialize_assembly_state
     while IFS= read -r basin_id; do
         "$MKDIR" "$campaign_dir/state/basins/$basin_id"
         temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
@@ -580,7 +677,189 @@ recover_running_stages() {
 recover_campaign() {
     acquire_campaign_lock
     validate_workspace_state
+    materialize_assembly_state
     recover_running_stages false
+    if [[ $("$JQ" -r '.status' "$campaign_dir/state/assembly.json") == running ]]; then
+        write_assembly_state pending \
+            "$("$JQ" -r '.attempts' "$campaign_dir/state/assembly.json")" \
+            'interrupted before terminal state; reset by recover' \
+            "$("$JQ" -c '.input_basin_ids' "$campaign_dir/state/assembly.json")"
+    fi
+    validate_workspace_state
+    print_status
+}
+
+write_assembly_state() {
+    local status=$1
+    local attempts=$2
+    local reason=$3
+    local input_ids=$4
+    local state=$campaign_dir/state/assembly.json
+    local temporary=$campaign_dir/state/tmp/assembly.json.tmp.$$
+    "$JQ" -n --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" \
+        --argjson input_ids "$input_ids" '{
+          schema_version: 1,
+          status: $status,
+          attempts: $attempts,
+          failure_reason: (if $reason == "" then null else $reason end),
+          input_basin_ids: $input_ids,
+          output_path: "assembly/dataset",
+          report_path: "reports/assembly.json"
+        }' >"$temporary"
+    atomic_install "$temporary" "$state" validate_assembly_json
+}
+
+write_assembly_report() {
+    local input_ids=$1
+    local report=$campaign_dir/reports/assembly.json
+    local temporary=$campaign_dir/state/tmp/assembly-report.json.tmp.$$
+    "$JQ" -n --arg campaign "$campaign" --argjson input_ids "$input_ids" '{
+      schema_version: 1,
+      campaign: $campaign,
+      input_basin_ids: $input_ids,
+      input_dataset_paths: [$input_ids[] | "basin-outputs/" + .],
+      output_path: "assembly/dataset"
+    }' >"$temporary"
+    atomic_install "$temporary" "$report" validate_assembly_report
+}
+
+assembly_inputs_json=
+assembly_args=()
+select_assembly_inputs() {
+    local basin_id
+    local selected_file=$campaign_dir/state/tmp/assembly-inputs.$$.txt
+    : >"$selected_file"
+    assembly_args=()
+    while IFS= read -r basin_id; do
+        assembly_args[${#assembly_args[@]}]=--input
+        assembly_args[${#assembly_args[@]}]=$campaign_dir/basin-outputs/$basin_id
+        printf '%s\n' "$basin_id" >>"$selected_file"
+    done < <("$JQ" -r '
+      select(.stages.compile.status == "succeeded") |
+      .processing_basin_id
+    ' "$campaign_dir"/state/basins/*/current.json | LC_ALL=C "$SORT")
+    if ((${#assembly_args[@]} == 0)); then
+        "$RM" -- "$selected_file"
+        hfx_die 'assembly requires at least one basin with compile status succeeded'
+    fi
+    assembly_inputs_json=$("$JQ" -c -R -s 'split("\n") | map(select(length > 0))' "$selected_file")
+    "$RM" -- "$selected_file"
+}
+
+assembly_provenance_matches() {
+    local state=$campaign_dir/state/assembly.json
+    [[ $("$JQ" -r '.status' "$state") == pending ]] &&
+        [[ $("$JQ" -r '.failure_reason' "$state") == \
+            'interrupted before terminal state; reset by recover' ]] &&
+        [[ $("$JQ" -c '.input_basin_ids' "$state") == "$assembly_inputs_json" ]]
+}
+
+verify_assembly_dataset() {
+    local output=$campaign_dir/assembly/dataset
+    [[ -d "$output" && ! -L "$output" ]] || return 1
+    "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"
+}
+
+clean_attributable_assembly_staging() {
+    local entry
+    while IFS= read -r entry; do
+        [[ -d "$entry" && ! -L "$entry" ]] ||
+            hfx_die "assembly staging path is unsafe: $entry"
+        "$RM" -r -- "$entry"
+    done < <("$FIND" "$campaign_dir/assembly" -mindepth 1 -maxdepth 1 -name '.dataset.tmp-*')
+}
+
+assemble_campaign() {
+    local state=$campaign_dir/state/assembly.json
+    local output=$campaign_dir/assembly/dataset
+    local report=$campaign_dir/reports/assembly.json
+    local status
+    local attempts
+    local persisted_inputs
+
+    acquire_campaign_lock
+    validate_workspace_state
+    select_assembly_inputs
+    materialize_assembly_state
+    status=$("$JQ" -r '.status' "$state")
+    attempts=$("$JQ" -r '.attempts' "$state")
+    persisted_inputs=$("$JQ" -c '.input_basin_ids' "$state")
+
+    if [[ "$status" == succeeded ]]; then
+        if [[ "$persisted_inputs" == "$assembly_inputs_json" ]] &&
+            [[ -f "$report" && ! -L "$report" ]] &&
+            assembly_report_matches_inputs "$report" &&
+            verify_assembly_dataset; then
+            print_status
+            return
+        fi
+        write_assembly_state failed "$attempts" \
+            'existing succeeded assembly failed resume verification; retained for inspection' \
+            "$persisted_inputs"
+        hfx_die 'existing succeeded assembly failed resume verification; retained for inspection'
+    fi
+
+    if [[ -e "$output" || -L "$output" ]]; then
+        if assembly_provenance_matches; then
+            [[ -d "$output" && ! -L "$output" ]] || {
+                hfx_die 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+            }
+            if ! verify_assembly_dataset; then
+                write_assembly_state failed "$attempts" \
+                    'assembled dataset validation failed; retained for inspection' "$persisted_inputs"
+                hfx_die 'assembled dataset validation failed; retained for inspection'
+            fi
+            if [[ -e "$report" || -L "$report" ]]; then
+                [[ -f "$report" && ! -L "$report" ]] ||
+                    hfx_die 'assembly report exists without attributable dataset; retained for inspection'
+            fi
+            if [[ ! -f "$report" ]] || ! assembly_report_matches_inputs "$report"; then
+                write_assembly_report "$assembly_inputs_json"
+            fi
+            write_assembly_state succeeded "$attempts" '' "$assembly_inputs_json"
+            print_status
+            return
+        fi
+        hfx_die 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+    fi
+
+    if [[ -e "$report" || -L "$report" ]]; then
+        if assembly_provenance_matches && [[ -f "$report" && ! -L "$report" ]]; then
+            "$RM" -- "$report"
+        else
+            hfx_die 'assembly report exists without attributable dataset; retained for inspection'
+        fi
+    fi
+
+    if assembly_provenance_matches; then
+        clean_attributable_assembly_staging
+    else
+        while IFS= read -r persisted_inputs; do
+            hfx_die "assembly staging path exists without attributable interrupted state; retained for inspection: $persisted_inputs"
+        done < <("$FIND" "$campaign_dir/assembly" -mindepth 1 -maxdepth 1 -name '.dataset.tmp-*')
+    fi
+
+    attempts=$((attempts + 1))
+    write_assembly_state running "$attempts" '' "$assembly_inputs_json"
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" assemble \
+        ${assembly_args[@]+"${assembly_args[@]}"} \
+        --out "$output"; then
+        if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
+            write_assembly_state failed "$attempts" \
+                'adapter assembly failed and left an artifact; retained for inspection' "$assembly_inputs_json"
+            hfx_die 'adapter assembly failed and left an artifact; retained for inspection'
+        else
+            write_assembly_state failed "$attempts" 'adapter assembly failed' "$assembly_inputs_json"
+            hfx_die 'adapter assembly failed'
+        fi
+    fi
+    if ! verify_assembly_dataset; then
+        write_assembly_state failed "$attempts" \
+            'assembled dataset validation failed; retained for inspection' "$assembly_inputs_json"
+        hfx_die 'assembled dataset validation failed; retained for inspection'
+    fi
+    write_assembly_report "$assembly_inputs_json"
+    write_assembly_state succeeded "$attempts" '' "$assembly_inputs_json"
     validate_workspace_state
     print_status
 }
@@ -1388,7 +1667,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|evidence|publish) ;;
+    init|status|recover|acquire|compile|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -1564,10 +1843,17 @@ elif [[ "$subcommand" == compile ]]; then
     ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
     HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
     compile_campaign
+elif [[ "$subcommand" == assemble ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
+    ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
+    HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
+    SORT=$(resolve_command HFX_TDX_SORT sort)
+    assemble_campaign
 elif [[ "$subcommand" == evidence ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     generate_evidence
-else
+elif [[ "$subcommand" == publish ]]; then
     ((publication_out_seen == 1)) || usage_error 'option --out is required'
     ((publication_report_seen == 1)) || usage_error 'option --report is required'
     ((publication_notice_seen == 1)) || usage_error 'option --notice is required'
