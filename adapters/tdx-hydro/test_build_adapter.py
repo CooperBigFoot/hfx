@@ -1,8 +1,10 @@
 import json
+import hashlib
 import math
 import os
 import subprocess
 import sys
+import time
 import unittest
 from contextlib import chdir
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ from geoparquet_io.core.validate import validate_geoparquet
 from jsonschema import Draft202012Validator, FormatChecker
 from pyproj import Geod
 from shapely import from_wkb, get_coordinates
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 import build_adapter
 from build_adapter import (
@@ -79,6 +81,16 @@ PARTIAL_SNAP_B = [
     (200, 720_000_203, 0.0, 0.0, 15.0),
     (1, 720_000_204, -170.0, -20.0, 22.0),
 ]
+
+# Captured from commit a902eec after the psutil-only lock operation and before
+# the streaming compiler refactor.
+GOLDEN_M2_SHA256 = {
+    "catchments.parquet": "51e505ff49ffeaacfc6c54e24931f56ee31e85155117abf5efbb1f4279690cb9",
+    "graph.parquet": "753295debcd44204e53c409dab6da3b857a689aa3fc8b6aa0068aef9d71d8810",
+    "aux/snap_stems.parquet": "32c6b761e983fbb30f600a9cf45b5ae50b89933f293fe487d0fb9997b4bd5d21",
+    "manifest.json": "33cf21e5373f7a42c8012bd9d294978045b5c67fe21ba42ac14329c75d1ccd3e",
+}
+GOLDEN_KM2_SHA256 = dict(GOLDEN_M2_SHA256)
 
 
 def merge_fixture_polygon(x: float, y: float) -> Polygon:
@@ -404,6 +416,123 @@ def canonical_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float
     return basins, streamnet, area_100_m2, area_200_m2
 
 
+def golden_compile_frames(
+    source_unit: str,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Author the 8,193-row byte-compatibility fixture."""
+    if source_unit not in {"m2", "km2"}:
+        raise ValueError("golden source unit must be m2 or km2")
+    stream_count = 8_194
+    polygonless_id = 4_097
+    polygons: dict[int, object] = {}
+    for native_id in range(1, stream_count + 1):
+        if native_id == polygonless_id:
+            continue
+        column = native_id % 340
+        row = (native_id // 340) % 140
+        lon = -169.0 + column
+        lat = -69.0 + row
+        half = 0.001
+        polygons[native_id] = Polygon(
+            [
+                (lon - half, lat - half),
+                (lon + half, lat - half),
+                (lon + half, lat + half),
+                (lon - half, lat + half),
+                (lon - half, lat - half),
+            ]
+        )
+    polygons[1] = Polygon(
+        [
+            (-10.002, -10.002),
+            (-9.998, -10.002),
+            (-9.998, -9.998),
+            (-10.002, -9.998),
+            (-10.002, -10.002),
+        ]
+    )
+    polygons[2] = Polygon(
+        [
+            (-10.001, -10.003),
+            (-9.999, -10.003),
+            (-9.999, -9.997),
+            (-10.001, -9.997),
+            (-10.001, -10.003),
+        ]
+    )
+    polygons[3] = MultiPolygon(
+        [
+            Polygon(
+                [
+                    (-8.004, -10.001),
+                    (-8.002, -10.001),
+                    (-8.002, -9.999),
+                    (-8.004, -9.999),
+                    (-8.004, -10.001),
+                ]
+            ),
+            Polygon(
+                [
+                    (-7.998, -10.001),
+                    (-7.996, -10.001),
+                    (-7.996, -9.999),
+                    (-7.998, -9.999),
+                    (-7.998, -10.001),
+                ]
+            ),
+        ]
+    )
+    excess = COORDINATE_DOMAIN_TOLERANCE_DEGREES / 2
+    polygons[4] = Polygon(
+        [
+            (179.998, 1.0),
+            (180.0 + excess, 1.0),
+            (180.0 + excess, 1.002),
+            (179.998, 1.002),
+            (179.998, 1.0),
+        ]
+    )
+    geod = Geod(ellps="WGS84")
+    own_area = {
+        native_id: abs(float(geod.geometry_area_perimeter(geometry)[0]))
+        for native_id, geometry in polygons.items()
+    }
+    cumulative = 0.0
+    dscontarea: dict[int, float] = {}
+    for native_id in range(1, stream_count + 1):
+        cumulative += own_area.get(native_id, 0.0)
+        dscontarea[native_id] = (
+            cumulative if source_unit == "m2" else cumulative / 1_000_000
+        )
+    x = np.linspace(-20.0, 20.0, stream_count + 1, dtype="float64")
+    x[100] = x[99]
+    reaches: dict[int, LineString] = {}
+    for native_id in range(1, stream_count + 1):
+        start = float(x[native_id - 1])
+        stop = float(x[native_id])
+        reaches[native_id] = LineString([(start, 0.0), (stop, 0.0)])
+    order = list(range(stream_count, 0, -1))
+    basin_order = [native_id for native_id in order if native_id != polygonless_id]
+    basins = gpd.GeoDataFrame(
+        {"streamID": basin_order},
+        geometry=[polygons[native_id] for native_id in basin_order],
+        crs=CRS,
+    )
+    streamnet = gpd.GeoDataFrame(
+        {
+            "LINKNO": order,
+            "DSLINKNO": [
+                native_id + 1 if native_id < stream_count else -1
+                for native_id in order
+            ],
+            "DSContArea": [dscontarea[native_id] for native_id in order],
+        },
+        geometry=[reaches[native_id] for native_id in order],
+        crs=CRS,
+    )
+    return basins, streamnet
+
+
 def planetary_order_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     polygon_100 = Polygon([
         (-170.1, -80.1),
@@ -465,6 +594,443 @@ def write_pair(
         streamnet_path, layer="streamnet", driver="GPKG", engine="pyogrio"
     )
     return basins_path, streamnet_path
+
+
+class StreamingCompileGoldenTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        started = time.monotonic()
+        cls.temporary = TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        cls.inputs: dict[str, tuple[Path, Path]] = {}
+        for source_unit in ("m2", "km2"):
+            directory = cls.root / source_unit
+            directory.mkdir()
+            cls.inputs[source_unit] = write_pair(
+                directory, *golden_compile_frames(source_unit)
+            )
+        cls.events: dict[str, list[tuple[str, dict[str, int], int]]] = {}
+        cls.outputs: dict[str, Path] = {}
+        cls.reports: dict[str, dict[str, object]] = {}
+        cls._compile("m2", "m2-production", build_adapter.COMPILE_MERGE_FAN_IN)
+        cls._compile("km2", "km2-production", build_adapter.COMPILE_MERGE_FAN_IN)
+        cls._compile("m2", "m2-fan-in-2", 2)
+        elapsed = time.monotonic() - started
+        if elapsed > 540:
+            raise AssertionError(
+                f"three golden compile fixtures exceeded 540 seconds: {elapsed:.3f}"
+            )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temporary.cleanup()
+
+    @classmethod
+    def _compile(cls, source_unit: str, name: str, fan_in: int) -> None:
+        output = cls.root / name
+        report = cls.root / f"{name}.json"
+        ledger = cls.root / f"{name}.ledger.json"
+        code = """
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import build_adapter
+
+events = []
+build_adapter.COMPILE_MERGE_FAN_IN = int(sys.argv[6])
+build_adapter._COMPILE_SCRATCH_EVENT_OBSERVER = (
+    lambda label, files, final: events.append((label, files, final))
+)
+build_adapter.build_dataset(
+    Path(sys.argv[1]),
+    Path(sys.argv[2]),
+    Path(sys.argv[3]),
+    Path(sys.argv[4]),
+    processing_basin_id="7020000010",
+    fabric_version="synthetic-2026.07",
+    created_at=datetime.fromisoformat("2026-07-21T12:34:56+00:00"),
+)
+Path(sys.argv[5]).write_text(json.dumps(events))
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                str(cls.inputs[source_unit][0]),
+                str(cls.inputs[source_unit][1]),
+                str(output),
+                str(report),
+                str(ledger),
+                str(fan_in),
+            ],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"golden compile {name} failed: {completed.stderr}"
+            )
+        cls.events[name] = [
+            (str(label), dict(files), int(final))
+            for label, files, final in json.loads(ledger.read_text())
+        ]
+        cls.outputs[name] = output
+        cls.reports[name] = json.loads(report.read_text())
+
+    def _assert_hashes(self, name: str, expected: dict[str, str]) -> None:
+        output = self.outputs[name]
+        actual = {
+            relative: hashlib.sha256((output / relative).read_bytes()).hexdigest()
+            for relative in expected
+        }
+        self.assertEqual(actual, expected)
+
+    def _assert_report(self, name: str, source_unit: str) -> None:
+        report = self.reports[name]
+        self.assertEqual(
+            report["build_identity"],
+            {
+                "processing_basin_id": "7020000010",
+                "fabric_name": FABRIC_NAME,
+                "fabric_version": "synthetic-2026.07",
+                "created_at": "2026-07-21T12:34:56+00:00",
+                "adapter_version": ADAPTER_VERSION,
+                "dataset_root": str(self.outputs[name].resolve()),
+            },
+        )
+        expected_dscontarea = {
+            "m2": {
+                "source_unit": "m2",
+                "checked_polygon_bearing_link_count": 8_193,
+                "geodesic_upstream_area_sum_m2": 797052208903.0345,
+                "dscontarea_sum_raw": 797063408494.9727,
+                "m2_relative_error": 1.4051265165592808e-05,
+                "km2_relative_error": 1000013.0512651656,
+                "selected_relative_error": 1.4051265165592808e-05,
+                "signed_aggregate_relative_divergence": 1.4051265165592808e-05,
+                "absolute_aggregate_relative_divergence": 1.4051265165592808e-05,
+                "max_absolute_relative_divergence": 0.002814887486982411,
+            },
+            "km2": {
+                "source_unit": "km2",
+                "checked_polygon_bearing_link_count": 8_193,
+                "geodesic_upstream_area_sum_m2": 797052208903.0345,
+                "dscontarea_sum_raw": 797063.4084949726,
+                "m2_relative_error": 0.9999989999859487,
+                "km2_relative_error": 1.4051265165592715e-05,
+                "selected_relative_error": 1.4051265165592715e-05,
+                "signed_aggregate_relative_divergence": 1.4051265165592715e-05,
+                "absolute_aggregate_relative_divergence": 1.4051265165592715e-05,
+                "max_absolute_relative_divergence": 0.002814887486982411,
+            },
+        }[source_unit]
+        self.assertEqual(
+            report["diagnostics"]["ingestion"],
+            {
+                "basins_clamp": {
+                    "altered_vertex_count": 2,
+                    "altered_native_ids": [4],
+                },
+                "streamnet_clamp": {
+                    "altered_vertex_count": 0,
+                    "altered_native_ids": [],
+                },
+                "dscontarea": expected_dscontarea,
+            },
+        )
+        self.assertEqual(
+            report["diagnostics"]["streamnet"],
+            {
+                "polygon_bearing_link_count": 8_193,
+                "polygonless_dropped_reach_count": 1,
+                "degenerate_reach_count": 1,
+                "degenerate_reach_native_linknos": [100],
+                "degenerate_polygon_bearing_reach_count": 1,
+                "degenerate_polygon_bearing_reach_native_linknos": [100],
+                "degenerate_polygonless_reach_count": 0,
+                "degenerate_polygonless_reach_native_linknos": [],
+                "short_successor_resolved_reach_count": 0,
+                "short_successor_resolved_reach_native_linknos": [],
+                "reach_side_near_degenerate_resolved_reach_count": 0,
+                "reach_side_near_degenerate_resolved_reach_native_linknos": [],
+                "root_count": 1,
+                "contracted_edge_count": 1,
+                "contracted_root_count": 0,
+                "contracted_link_traversal_count": 1,
+                "endpoint_coincidence_proven_link_count": 8_192,
+                "predecessor_orientation_proven_root_count": 1,
+                "trusted_orientation_isolated_root_count": 0,
+                "trusted_orientation_isolated_root_native_linknos": [],
+                "trusted_orientation_polygon_bearing_isolated_root_count": 0,
+                "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                "orientation_tolerance": 0.001,
+            },
+        )
+        memory = report["diagnostics"]["memory"]
+        stable_memory = {
+            key: value
+            for key, value in memory.items()
+            if key
+            not in {
+                "observed_peak_rss_bytes",
+                "high_water_rss_bytes",
+                "peak_scratch_bytes",
+                "scratch_high_water_bytes",
+                "phases",
+            }
+        }
+        self.assertEqual(
+            stable_memory,
+            {
+                "target_bytes": 25_769_803_776,
+                "measurement_available": True,
+                "unavailable_reason": None,
+                "sample_interval_ms": 50,
+                "measurement_method": "psutil-rss-plus-os-high-water",
+                "scratch_measurement_available": True,
+                "scratch_unavailable_reason": None,
+                "basins_rows": 8_193,
+                "streamnet_rows": 8_194,
+                "basins_geometry_count": 8_193,
+                "streamnet_geometry_count": 8_194,
+                "basins_coordinate_count": 40_970,
+                "streamnet_coordinate_count": 16_388,
+                "basins_input_bytes": self.inputs[source_unit][0].stat().st_size,
+                "streamnet_input_bytes": self.inputs[source_unit][1].stat().st_size,
+                "selected_dtypes": {
+                    "native_id": "int64",
+                    "downstream_native_id": "int64",
+                    "global_id": "int64",
+                    "dscontarea": "float64",
+                    "hilbert": "uint32",
+                },
+            },
+        )
+        for field in (
+            "observed_peak_rss_bytes",
+            "high_water_rss_bytes",
+            "peak_scratch_bytes",
+            "scratch_high_water_bytes",
+        ):
+            self.assertIsInstance(memory[field], int)
+            self.assertGreater(memory[field], 0)
+        self.assertEqual(
+            set(memory["phases"]),
+            {
+                "basins_load",
+                "streamnet_load",
+                "source_validate",
+                "basins_clamp",
+                "streamnet_clamp",
+                "source_post_clamp_validate",
+                "dscontarea_infer",
+                "topology",
+                "catchment_run_creation",
+                "catchment_graph_merge_write",
+                "snap_run_creation",
+                "snap_merge_write",
+            },
+        )
+        for phase in memory["phases"].values():
+            self.assertEqual(
+                set(phase),
+                {
+                    "start_rss_bytes",
+                    "end_rss_bytes",
+                    "peak_rss_bytes",
+                    "allocation_delta_bytes",
+                    "max_intra_phase_increase_bytes",
+                    "sample_count",
+                },
+            )
+            self.assertTrue(all(isinstance(value, int) for value in phase.values()))
+
+    def _assert_decoded_dataset(self, name: str) -> None:
+        output = self.outputs[name]
+        catchments = pq.ParquetFile(output / "catchments.parquet")
+        graph = pq.ParquetFile(output / "graph.parquet")
+        snap = pq.ParquetFile(output / "aux" / "snap_stems.parquet")
+        expected_catchment, expected_graph = merge_fixture_schemas()
+        self.assertEqual(catchments.schema_arrow, expected_catchment)
+        self.assertEqual(graph.schema_arrow, expected_graph)
+        self.assertEqual(snap.schema_arrow, assembly_snap_schema())
+        self.assertEqual(
+            [catchments.metadata.row_group(i).num_rows for i in range(2)],
+            [4_097, 4_096],
+        )
+        self.assertEqual(
+            [graph.metadata.row_group(i).num_rows for i in range(2)],
+            [4_097, 4_096],
+        )
+        self.assertEqual(
+            [snap.metadata.row_group(i).num_rows for i in range(2)],
+            [4_097, 4_096],
+        )
+        catchment_table = catchments.read()
+        graph_table = graph.read()
+        snap_table = snap.read()
+        ids = catchment_table["id"].to_pylist()
+        self.assertEqual(ids, graph_table["id"].to_pylist())
+        self.assertEqual(len(ids), 8_193)
+        geometry = catchment_table["geometry"].to_pylist()
+        keys = merge_hilbert_keys(geometry)
+        self.assertEqual(list(zip(keys, ids)), sorted(zip(keys, ids)))
+        snap_ids = snap_table["id"].to_pylist()
+        unit_ids = snap_table["unit_id"].to_pylist()
+        snap_keys = merge_hilbert_keys(snap_table["geometry"].to_pylist())
+        self.assertEqual(snap_ids, list(range(1, 8_194)))
+        self.assertEqual(list(zip(snap_keys, unit_ids)), sorted(zip(snap_keys, unit_ids)))
+        self.assertEqual(set(unit_ids), set(ids))
+        for geometry_wkb, bbox in zip(
+            geometry, catchment_table["bbox"].to_pylist(), strict=True
+        ):
+            expected = build_adapter.geographic_bbox_float32_coverings(
+                np.asarray([from_wkb(geometry_wkb).bounds], dtype="float64")
+            )[0]
+            self.assertEqual(
+                [bbox[name] for name in BBOX_LEAF_NAMES], expected.tolist()
+            )
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(
+            manifest,
+            {
+                "adapter_version": ADAPTER_VERSION,
+                "auxiliary": [build_adapter.SNAP_AUXILIARY_DECLARATION],
+                "bbox": [
+                    float(catchment_table["bbox"].combine_chunks().field("xmin").to_numpy().min()),
+                    float(catchment_table["bbox"].combine_chunks().field("ymin").to_numpy().min()),
+                    float(catchment_table["bbox"].combine_chunks().field("xmax").to_numpy().max()),
+                    float(catchment_table["bbox"].combine_chunks().field("ymax").to_numpy().max()),
+                ],
+                "created_at": "2026-07-21T12:34:56+00:00",
+                "crs": CRS,
+                "fabric_name": FABRIC_NAME,
+                "fabric_version": "synthetic-2026.07",
+                "format_version": FORMAT_VERSION,
+                "has_up_area": HAS_UP_AREA,
+                "region": "7020000010",
+                "topology": TOPOLOGY,
+                "unit_count": 8_193,
+            },
+        )
+        self.assertFalse(
+            any(
+                "run-" in path.name or "normalized" in path.name
+                for path in output.rglob("*")
+            )
+        )
+
+    def test_m2_golden_files_and_decoded_contents(self) -> None:
+        self._assert_hashes("m2-production", GOLDEN_M2_SHA256)
+        self._assert_decoded_dataset("m2-production")
+        self._assert_report("m2-production", "m2")
+        memory = self.reports["m2-production"]["diagnostics"]["memory"]
+        self.assertEqual(
+            self.reports["m2-production"]["diagnostics"]["ingestion"][
+                "dscontarea"
+            ]["source_unit"],
+            "m2",
+        )
+        self.assertGreater(memory["scratch_high_water_bytes"], 0)
+
+    def test_km2_golden_files_and_decoded_contents(self) -> None:
+        self._assert_hashes("km2-production", GOLDEN_KM2_SHA256)
+        self._assert_decoded_dataset("km2-production")
+        self._assert_report("km2-production", "km2")
+        self.assertEqual(
+            self.reports["km2-production"]["diagnostics"]["ingestion"][
+                "dscontarea"
+            ]["source_unit"],
+            "km2",
+        )
+        for relative in GOLDEN_M2_SHA256:
+            self.assertEqual(
+                (self.outputs["m2-production"] / relative).read_bytes(),
+                (self.outputs["km2-production"] / relative).read_bytes(),
+            )
+
+    def test_fan_in_two_is_byte_identical_and_obeys_scratch_lifecycle(self) -> None:
+        self._assert_hashes("m2-fan-in-2", GOLDEN_M2_SHA256)
+        for relative in GOLDEN_M2_SHA256:
+            self.assertEqual(
+                (self.outputs["m2-production"] / relative).read_bytes(),
+                (self.outputs["m2-fan-in-2"] / relative).read_bytes(),
+            )
+        events = self.events["m2-fan-in-2"]
+        labels = [label for label, _, _ in events]
+        self.assertTrue(any(label.startswith("merge-run-closed:") for label in labels))
+        basin_unlinked = labels.index("basin-normalized-unlinked")
+        self.assertLess(
+            max(
+                index
+                for index, label in enumerate(labels)
+                if label.startswith("catchment-run-closed:")
+            ),
+            basin_unlinked,
+        )
+        self.assertLess(
+            basin_unlinked,
+            min(
+                index
+                for index, label in enumerate(labels)
+                if label.startswith("snap-run-closed:")
+            ),
+        )
+        for merge_close, label in enumerate(labels):
+            if not label.startswith("merge-run-closed:"):
+                continue
+            consumed = label.split(":consumed:", 1)[1].split(",")
+            for run_name in consumed:
+                unlink = labels.index(f"run-unlinked:{run_name}")
+                self.assertLess(
+                    unlink,
+                    merge_close,
+                    f"merge output closed before consumed run was unlinked: {run_name}",
+                )
+        private_run_counts = [
+            sum(".run-" in Path(name).name or ".merge-" in Path(name).name for name in files)
+            for _, files, _ in events
+        ]
+        self.assertLessEqual(
+            max(private_run_counts),
+            4,
+            "fan-in-2 fixture retained more private run files than its observed "
+            "immediate-unlink maximum",
+        )
+        normalized_event = next(
+            files for label, files, _ in events if label == "stream-normalized-closed"
+        )
+        measured_spool_equivalent_bytes = sum(
+            size
+            for path, size in normalized_event.items()
+            if path.endswith(".normalized.parquet")
+        )
+        source_bytes = sum(path.stat().st_size for path in self.inputs["m2"])
+        ratio = measured_spool_equivalent_bytes / source_bytes
+        self.assertLessEqual(ratio, 1.25)
+        scratch_high_water = max(sum(files.values()) for _, files, _ in events)
+        transient_high_water = max(
+            sum(files.values()) + final_bytes
+            for _, files, final_bytes in events
+        )
+        final_artifact_bytes = sum(
+            path.stat().st_size
+            for path in self.outputs["m2-fan-in-2"].rglob("*")
+            if path.is_file()
+        )
+        self.assertLessEqual(
+            scratch_high_water, 2 * measured_spool_equivalent_bytes
+        )
+        self.assertLessEqual(
+            transient_high_water,
+            2 * measured_spool_equivalent_bytes + final_artifact_bytes,
+        )
 
 
 def build_cli_frames() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
@@ -885,6 +1451,75 @@ class GlobalLinknoTests(unittest.TestCase):
 
 
 class StreamnetModelTests(unittest.TestCase):
+    def test_compact_topology_matches_streamnet_model_rules(self) -> None:
+        point = (-120.729444444445, 42.8208888888891)
+        basins = pd.DataFrame({"streamID": [244107, 240000]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [244107, 242123, 240000],
+                "DSLINKNO": [-1, 244107, 242123],
+                "geometry": [
+                    LineString([point, point]),
+                    LineString([point, point]),
+                    LineString([(-120.731444444445, 42.8208888888891), point]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+        order = np.argsort(streamnet["LINKNO"].to_numpy(), kind="stable")
+        sorted_streamnet = streamnet.iloc[order]
+        endpoints = np.asarray(
+            [
+                (geometry.coords[0], geometry.coords[-1])
+                for geometry in sorted_streamnet["geometry"]
+            ],
+            dtype="float64",
+        )
+        compact = build_adapter._build_compact_topology(
+            np.sort(basins["streamID"].to_numpy(dtype="int64")),
+            sorted_streamnet["LINKNO"].to_numpy(dtype="int64"),
+            sorted_streamnet["DSLINKNO"].to_numpy(dtype="int64"),
+            endpoints,
+            np.asarray(
+                [
+                    geometry.coords[0] == geometry.coords[-1]
+                    for geometry in sorted_streamnet["geometry"]
+                ],
+                dtype=bool,
+            ),
+            np.ones(len(sorted_streamnet), dtype="float64"),
+            71,
+            0.001,
+        )
+        units = sorted(model.units, key=lambda unit: unit.linkno)
+
+        self.assertEqual(compact.diagnostics, model.diagnostics)
+        np.testing.assert_array_equal(
+            compact.native_ids, [unit.linkno for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.global_ids, [unit.id for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_native_ids,
+            [unit.downstream_linkno for unit in units],
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_global_ids, [unit.downstream_id for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.contracted_counts,
+            [unit.contracted_link_count for unit in units],
+        )
+        np.testing.assert_array_equal(
+            compact.outlet_lons, [unit.outlet_lon for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.outlet_lats, [unit.outlet_lat for unit in units]
+        )
+
     def test_uses_single_coordinate_as_degenerate_polygon_bearing_root_outlet(
         self,
     ) -> None:
@@ -2860,6 +3495,49 @@ class CoreHfxCompilationTests(unittest.TestCase):
     basin_id = "7020000010"
     fabric_version = "synthetic-2026.07"
 
+    def test_catchment_merge_overcount_uses_contract_error(self) -> None:
+        topology = build_adapter._CompactTopology(
+            native_ids=np.asarray([100], dtype="int64"),
+            global_ids=np.asarray([710_000_100], dtype="int64"),
+            downstream_native_ids=np.asarray([-1], dtype="int64"),
+            downstream_global_ids=np.asarray([-1], dtype="int64"),
+            contracted_counts=np.asarray([0], dtype="int64"),
+            outlet_lons=np.asarray([0.0]),
+            outlet_lats=np.asarray([0.0]),
+            up_area_km2=np.asarray([1.0]),
+            upstream_offsets=np.asarray([0, 0], dtype="int64"),
+            upstream_global_ids=np.asarray([], dtype="int64"),
+            diagnostics=None,
+        )
+        row = {
+            "id": 710_000_100,
+            "level": 0,
+            "parent_id": None,
+            "area_km2": 1.0,
+            "up_area_km2": 1.0,
+            "outlet_lon": 0.0,
+            "outlet_lat": 0.0,
+            "bbox": {"xmin": 0.0, "ymin": 0.0, "xmax": 1.0, "ymax": 1.0},
+            "geometry": merge_fixture_polygon(0.5, 0.5).wkb,
+            "hilbert": 0,
+        }
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch(
+                "build_adapter._merged_run_rows", return_value=iter((row, row))
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "catchment merge row count does not match compact topology",
+                ):
+                    build_adapter._merge_write_catchments_and_graph(
+                        root / "catchments.parquet",
+                        root / "graph.parquet",
+                        (),
+                        topology,
+                        recorder=None,
+                    )
+
     def test_compile_core_hfx_uses_dataset_global_hilbert_order(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3600,6 +4278,44 @@ class BuildCliTests(unittest.TestCase):
             "--fabric-version", self.fabric_version,
         ]
 
+    def test_build_cli_prefixes_null_basin_geometry_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet = build_cli_frames()
+            basins.loc[basins.index[0], "geometry"] = None
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            with self.assertRaisesRegex(
+                ValueError,
+                "^basins geometry must be non-null and non-empty$",
+            ):
+                main(
+                    self.build_args(
+                        basins_path,
+                        streamnet_path,
+                        root / "output",
+                        root / "report.json",
+                    )
+                )
+
+    def test_build_cli_reports_nan_dscontarea_from_arrow_null(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet = build_cli_frames()
+            streamnet.loc[0, "DSContArea"] = float("nan")
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^streamnet\.DSContArea must contain finite positive values; got nan$",
+            ):
+                main(
+                    self.build_args(
+                        basins_path,
+                        streamnet_path,
+                        root / "output",
+                        root / "report.json",
+                    )
+                )
+
     def expected_report(self, output: Path, *, isolated: bool = False) -> dict[str, object]:
         ingestion_area = (
             2461814.409986507 if isolated else 3692721.6149797607
@@ -3657,13 +4373,97 @@ class BuildCliTests(unittest.TestCase):
                     },
                 },
                 "streamnet": streamnet,
+                "memory": {
+                    "target_bytes": 25_769_803_776,
+                    "measurement_available": True,
+                    "unavailable_reason": None,
+                    "observed_peak_rss_bytes": None,
+                    "high_water_rss_bytes": None,
+                    "sample_interval_ms": 50,
+                    "measurement_method": "psutil-rss-plus-os-high-water",
+                    "peak_scratch_bytes": None,
+                    "scratch_high_water_bytes": None,
+                    "scratch_measurement_available": True,
+                    "scratch_unavailable_reason": None,
+                    "basins_rows": 2,
+                    "streamnet_rows": 3 if not isolated else 2,
+                    "basins_geometry_count": 2,
+                    "streamnet_geometry_count": 3 if not isolated else 2,
+                    "basins_coordinate_count": 10,
+                    "streamnet_coordinate_count": 6 if not isolated else 4,
+                    "basins_input_bytes": None,
+                    "streamnet_input_bytes": None,
+                    "selected_dtypes": {
+                        "native_id": "int64",
+                        "downstream_native_id": "int64",
+                        "global_id": "int64",
+                        "dscontarea": "float64",
+                        "hilbert": "uint32",
+                    },
+                    "phases": {
+                        name: {
+                            "start_rss_bytes": None,
+                            "end_rss_bytes": None,
+                            "peak_rss_bytes": None,
+                            "allocation_delta_bytes": None,
+                            "max_intra_phase_increase_bytes": None,
+                            "sample_count": None,
+                        }
+                        for name in (
+                            "basins_load",
+                            "streamnet_load",
+                            "source_validate",
+                            "basins_clamp",
+                            "streamnet_clamp",
+                            "source_post_clamp_validate",
+                            "dscontarea_infer",
+                            "topology",
+                            "catchment_run_creation",
+                            "catchment_graph_merge_write",
+                            "snap_run_creation",
+                            "snap_merge_write",
+                        )
+                    },
+                },
             },
         }
+
+    def assert_report_equal(
+        self, actual: dict[str, object], expected: dict[str, object]
+    ) -> None:
+        memory = actual["diagnostics"]["memory"]
+        for field in (
+            "observed_peak_rss_bytes",
+            "high_water_rss_bytes",
+            "peak_scratch_bytes",
+            "scratch_high_water_bytes",
+            "basins_input_bytes",
+            "streamnet_input_bytes",
+        ):
+            self.assertIsInstance(memory[field], int)
+            self.assertGreaterEqual(memory[field], 0)
+            memory[field] = None
+        for phase in memory["phases"].values():
+            for field in (
+                "start_rss_bytes",
+                "end_rss_bytes",
+                "peak_rss_bytes",
+                "allocation_delta_bytes",
+                "max_intra_phase_increase_bytes",
+                "sample_count",
+            ):
+                self.assertIsInstance(phase[field], int)
+                phase[field] = None
+        self.assertEqual(actual, expected)
 
     def assert_no_temporary_entries(self, *parents: Path) -> None:
         for parent in parents:
             self.assertFalse(
-                any(".tmp-" in entry.name for entry in parent.iterdir()), parent
+                any(
+                    ".tmp-" in entry.name or ".compile-scratch-" in entry.name
+                    for entry in parent.iterdir()
+                ),
+                parent,
             )
 
     def test_build_cli_reports_degenerate_reaches(self) -> None:
@@ -3935,7 +4735,9 @@ class BuildCliTests(unittest.TestCase):
                     LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
                 ],
             )
-            self.assertEqual(json.loads(report.read_text()), self.expected_report(output))
+            self.assert_report_equal(
+                json.loads(report.read_text()), self.expected_report(output)
+            )
             self.assert_no_temporary_entries(output.parent, report.parent)
             messages = [record.getMessage() for record in captured.records]
             self.assertTrue(any("diagnostic=contracted_edge_count count=1" in message for message in messages))
@@ -3973,7 +4775,7 @@ class BuildCliTests(unittest.TestCase):
                 output = root / f"output-{report_suffix.name or 'equal'}"
                 report = output / report_suffix if report_suffix != Path(".") else output
                 with self.subTest(report=report):
-                    with patch("build_adapter.compile_core_hfx") as compiler:
+                    with patch("build_adapter._compile_spooled_hfx") as compiler:
                         with self.assertRaisesRegex(ValueError, "report path must be outside dataset root"):
                             main(self.build_args(basins_path, streamnet_path, output, report))
                     compiler.assert_not_called()
@@ -4000,8 +4802,8 @@ class BuildCliTests(unittest.TestCase):
 
     def test_build_cli_rolls_back_partial_compile_failure(self) -> None:
         failures = (
-            ("_write_graph", "induced graph write failure"),
-            ("_write_snap_stems", "induced snap write failure"),
+            ("_merge_write_catchments_and_graph", "induced graph write failure"),
+            ("_merge_write_snap_stems", "induced snap write failure"),
         )
         for writer, message in failures:
             for precreate_output in (False, True):
@@ -4040,7 +4842,10 @@ class BuildCliTests(unittest.TestCase):
             with patch("build_adapter._utc_now", return_value=self.created_at):
                 with self.assertLogs("tdx-hydro", level="WARNING") as captured:
                     self.assertEqual(main(self.build_args(basins_path, streamnet_path, output, report)), 0)
-            self.assertEqual(json.loads(report.read_text()), self.expected_report(output, isolated=True))
+            self.assert_report_equal(
+                json.loads(report.read_text()),
+                self.expected_report(output, isolated=True),
+            )
             snap = pq.read_table(output / "aux/snap_stems.parquet")
             self.assertEqual(snap["id"].to_pylist(), [1, 2])
             self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
