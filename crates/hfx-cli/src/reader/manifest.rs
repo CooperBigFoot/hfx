@@ -109,3 +109,25 @@ pub fn read_manifest(
     debug!("manifest.json read and deserialized successfully");
     (Some(json_value), Some(raw), vec![])
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::read_manifest;
+
+    #[test]
+    fn bbox_literal_is_correctly_rounded_through_manifest_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        fs::write(&path, r#"{"bbox":[0,0,-11.442605018615723,0]}"#).unwrap();
+
+        let (_, raw, diagnostics) = read_manifest(&path);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let parsed = raw.unwrap().bbox.unwrap()[2];
+        let expected = "-11.442605018615723".parse::<f64>().unwrap();
+        assert_eq!(expected.to_bits(), 0xc026e29d20000000);
+        assert_eq!(parsed.to_bits(), expected.to_bits());
+    }
+}
