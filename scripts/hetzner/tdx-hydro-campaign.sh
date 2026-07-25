@@ -1773,7 +1773,7 @@ fail_product() {
 
 is_positive_i64() {
     local value=$1
-    [[ "$value" =~ ^[0-9]+$ && "$value" != 0 ]] || return 1
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
     if [[ ${#value} -lt 19 ]]; then
         return 0
     fi

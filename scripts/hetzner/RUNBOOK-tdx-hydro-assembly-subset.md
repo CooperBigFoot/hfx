@@ -145,12 +145,12 @@ The `ccx33` has 8 vCPU and a 32 GB memory class. Freeze
 7.9 times the measured M3 RSS. The pre-init check below must prove the VM
 actually exposes both frozen available capacities.
 
-Expected phase times are 0.5 to 1 hour for provisioning and bootstrap, 1 to 2
+Expected phase times are 0.5 to 1 hour for provisioning and bootstrap, 2.5 to 4
 hours for acquisition, 1 to 2 hours for three serial
 compiles, 0.25 to 1 hour for assembly, and 1 to 2 hours for complete
-validation and evidence retention. The expected total is 4 to 8 hours.
+validation and evidence retention. The expected total is 5.25 to 10 hours.
 Acquisition remains uncertain because NGA has no HTTP range support and
-observed per-connection throughput is roughly 1 to 6 MB/s
+the campaign VM measured about 1.0 MB/s per connection
 (`scripts/hetzner/README.md`).
 
 This is the complete, frozen init command. It contains all seven required byte
@@ -369,10 +369,11 @@ frozen three-basin selection permits at most three concurrent basin workers and
 does not fully use that ceiling. The subset makes six product transfers totaling
 roughly 24 GB of payload against a 40 GB retention budget. At the measured
 campaign-VM rate of about 1.0 MB/s per connection, three simultaneous connections
-give about 3.7 arithmetic transfer-hours, so allow a few hours after file-size
-imbalance, verification, and request overhead. Products remain serial within a
-basin, and the runner never segments one file. See `scripts/hetzner/README.md` for
-the separately authorized planetary-scale estimate and operating policy
+give `24,000,000,000 / (3 * 1,000,000) = 8,000` seconds, or about 2.2 arithmetic
+transfer-hours. Allow 2.5 to 4 hours after file-size imbalance, verification, and
+request overhead. Products remain serial within a basin, and the runner never
+segments one file. See `scripts/hetzner/README.md` for the separately authorized
+planetary-scale estimate and operating policy
 (`scripts/hetzner/tdx-hydro-campaign.sh`; `scripts/hetzner/README.md`).
 
 Use `NGA-TDX-Hydro-20230126` as the fabric version. It follows the established

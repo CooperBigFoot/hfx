@@ -973,6 +973,7 @@ if [ -n "$continue_at" ]; then
     esac
 elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
+    [ "${HFX_TEST_LEADING_ZERO_LENGTH-}" != 1 ] || total=0$total
     printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
         "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
     printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
@@ -998,11 +999,12 @@ exit "$result"
 FAKE_CURL
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
+checksum=$(cksum <"$1")
+checksum=${checksum%% *}
 if [ "${HFX_TEST_HASH_MODE-}" = changed ]; then
-    printf '%064d  %s\n' 1 "$1"
-else
-    printf '%064d  %s\n' 0 "$1"
+    checksum=$((checksum + 1))
 fi
+printf '%064x  %s\n' "$checksum" "$1"
 FAKE_SHA
 sed >"$test_tmp/fake-ogrinfo" <<'FAKE_OGR'
 #!/bin/sh
@@ -1575,7 +1577,30 @@ jq -e '.retry_count == 1 and .resume_count == 1 and
   (.transfers | last | .result) == "succeeded"' \
     "$failure_root/tdx-hydro-failure/reports/$failure_id-basins-acquisition.json" >/dev/null ||
     die 'failed product continuation telemetry differs'
-pass 'product failure is isolated and only incomplete work retries'
+
+leading_zero_root=$test_tmp/workspaces/leading-zero
+mkdir "$leading_zero_root"
+cp -R "$subset_campaign_dir" "$leading_zero_root/tdx-hydro-subset"
+leading_zero_dir=$leading_zero_root/tdx-hydro-subset
+leading_zero_id=1020000010
+leading_zero_state=$leading_zero_dir/state/basins/$leading_zero_id/current.json
+leading_zero_final=$leading_zero_dir/downloads/$leading_zero_id-basins.gpkg
+rm "$leading_zero_final"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$leading_zero_state" >"$leading_zero_state.tmp"
+mv "$leading_zero_state.tmp" "$leading_zero_state"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_FAIL_KEY=$leading_zero_id-basins HFX_TEST_LEADING_ZERO_LENGTH=1 \
+    run_runner acquire --campaign subset --workspace-root "$leading_zero_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "failed" and
+  .stages.acquire_basins.failure_reason == "transfer failed" and
+  .stages.acquire_streamnet.status == "succeeded"' "$leading_zero_state" >/dev/null ||
+    die 'leading-zero Content-Length was not isolated to its product'
+[[ ! -e "$leading_zero_final.partial" && ! -e "$leading_zero_final.partial.json" ]] ||
+    die 'leading-zero Content-Length retained unattributable provenance'
+pass 'product failures are isolated, resumable, and contain malformed Content-Length'
 
 reuse_root=$test_tmp/workspaces/reuse-corrupt
 mkdir "$reuse_root"
@@ -1714,13 +1739,12 @@ jq -e '.stages.acquire_basins.status == "failed"' "$resume_state" >/dev/null ||
 [[ ! -e "$resume_final" ]] || die 'short continuation installed a final'
 
 prepare_resume_fixture resume-stale
-head -c 17 "$resume_partial" >"$resume_partial.tmp"
-mv "$resume_partial.tmp" "$resume_partial"
+printf 'XXXXXXXXXXXXXXXXXX' >"$resume_partial"
 stale_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
 run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
     >"$case_stdout" 2>"$case_stderr"
 [[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - stale_events)) == 1 ]] ||
-    die 'locally stale partial did not use exactly one clean GET'
+    die 'same-length hash-stale partial did not use exactly one clean GET'
 
 prepare_resume_fixture resume-lowercase
 HFX_TEST_LOWERCASE_HEADERS=1 \
