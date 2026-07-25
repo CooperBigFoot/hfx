@@ -1771,6 +1771,241 @@ fail_product() {
     write_acquire_stage "$basin_id" "$stage" failed "$attempts" "$reason" null
 }
 
+is_positive_i64() {
+    local value=$1
+    [[ "$value" =~ ^[0-9]+$ && "$value" != 0 ]] || return 1
+    if [[ ${#value} -lt 19 ]]; then
+        return 0
+    fi
+    [[ ${#value} -eq 19 ]] || return 1
+    [[ "$value" < "$HFX_TDX_MAX_I64" || "$value" == "$HFX_TDX_MAX_I64" ]]
+}
+
+strong_etag_is_safe() {
+    local value=$1
+    [[ "$value" =~ ^\"[^\"]+\"$ && "$value" != W/* && "$value" != w/* &&
+       ! "$value" =~ [[:cntrl:]] ]]
+}
+
+file_size_and_hash() {
+    local file=$1
+    local hash_output
+    provenance_bytes=$("$WC" -c <"$file" | "$TR" -d '[:space:]') || return 1
+    is_positive_i64 "$provenance_bytes" || return 1
+    hash_output=$("$SHA256SUM" "$file") || return 1
+    provenance_sha256=${hash_output%%[[:space:]]*}
+    [[ "$provenance_sha256" =~ ^[0-9a-f]{64}$ ]]
+}
+
+validate_sidecar() {
+    local sidecar=$1
+    local partial=$2
+    local basin_id=$3
+    local product=$4
+    local url=$5
+    [[ -f "$sidecar" && ! -L "$sidecar" ]] || return 1
+    "$JQ" -e --arg basin "$basin_id" --arg product "$product" --arg url "$url" '
+      (keys | sort) == ["bytes","etag","processing_basin_id","product",
+                       "remote_total_bytes","schema_version","sha256","url"] and
+      .schema_version == 1 and .processing_basin_id == $basin and
+      .product == $product and .url == $url and
+      (.bytes | type == "number" and floor == . and . > 0 and . <= 9223372036854775807) and
+      (.remote_total_bytes | type == "number" and floor == . and . > 0 and
+       . <= 9223372036854775807) and
+      .bytes <= .remote_total_bytes and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.etag | type == "string")
+    ' "$sidecar" >/dev/null || return 1
+    saved_bytes=$("$JQ" -r '.bytes' "$sidecar")
+    saved_total=$("$JQ" -r '.remote_total_bytes' "$sidecar")
+    saved_sha256=$("$JQ" -r '.sha256' "$sidecar")
+    saved_etag=$("$JQ" -r '.etag' "$sidecar")
+    strong_etag_is_safe "$saved_etag" || return 1
+    file_size_and_hash "$partial" || return 1
+    [[ "$provenance_bytes" == "$saved_bytes" && "$provenance_sha256" == "$saved_sha256" ]]
+}
+
+write_sidecar() {
+    local sidecar=$1
+    local sidecar_tmp=$2
+    local basin_id=$3
+    local product=$4
+    local url=$5
+    local etag=$6
+    local bytes=$7
+    local total=$8
+    local sha256=$9
+    strong_etag_is_safe "$etag" && is_positive_i64 "$bytes" &&
+        is_positive_i64 "$total" && ((bytes <= total)) || return 1
+    "$JQ" -cnS --arg basin "$basin_id" --arg product "$product" --arg url "$url" \
+        --arg etag "$etag" --argjson bytes "$bytes" --argjson total "$total" \
+        --arg sha256 "$sha256" '{
+          schema_version:1,processing_basin_id:$basin,product:$product,url:$url,
+          etag:$etag,bytes:$bytes,remote_total_bytes:$total,sha256:$sha256
+        }' >"$sidecar_tmp" || return 1
+    "$CHMOD" 0644 "$sidecar_tmp" && "$MV" "$sidecar_tmp" "$sidecar"
+}
+
+parse_final_headers() {
+    local file=$1
+    local line
+    local value
+    local header_etag_count
+    local header_content_range_count
+    local header_content_length_count
+    header_status=
+    header_etag=
+    header_content_range=
+    header_content_length=
+    header_etag_count=0
+    header_content_range_count=0
+    header_content_length_count=0
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ ^HTTP/[0-9.]+[[:space:]]+([0-9][0-9][0-9])([[:space:]]|$) ]]; then
+            header_status=${BASH_REMATCH[1]}
+            header_etag=
+            header_content_range=
+            header_content_length=
+            header_etag_count=0
+            header_content_range_count=0
+            header_content_length_count=0
+        elif [[ -n "$header_status" ]]; then
+            case $line in
+                [Ee][Tt][Aa][Gg]:*)
+                    header_etag_count=$((header_etag_count + 1))
+                    value=${line#*:}; value=${value# }; header_etag=$value ;;
+                [Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Rr][Aa][Nn][Gg][Ee]:*)
+                    header_content_range_count=$((header_content_range_count + 1))
+                    value=${line#*:}; value=${value# }; header_content_range=$value ;;
+                [Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:*)
+                    header_content_length_count=$((header_content_length_count + 1))
+                    value=${line#*:}; value=${value# }; header_content_length=$value ;;
+            esac
+        fi
+    done <"$file"
+    [[ -n "$header_status" && "$header_etag_count" -le 1 &&
+       "$header_content_range_count" -le 1 && "$header_content_length_count" -le 1 ]]
+}
+
+parse_transfer_stats() {
+    local file=$1
+    local line
+    stats_http=
+    stats_network=
+    stats_time=
+    stats_speed=
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    while IFS= read -r line; do
+        case $line in
+            http_status=*) stats_http=${line#*=} ;;
+            network_bytes=*) stats_network=${line#*=} ;;
+            time_total_seconds=*) stats_time=${line#*=} ;;
+            average_bytes_per_second=*) stats_speed=${line#*=} ;;
+            *) return 1 ;;
+        esac
+    done <"$file"
+    [[ "$stats_http" =~ ^[0-9][0-9][0-9]$ &&
+       "$stats_network" =~ ^[0-9]+([.][0-9]+)?$ &&
+       "$stats_time" =~ ^[0-9]+([.][0-9]+)?$ &&
+       "$stats_speed" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    stats_http=$((10#$stats_http))
+}
+
+validate_acquisition_report() {
+    local report=$1
+    local basin_id=$2
+    local product=$3
+    [[ -f "$report" && ! -L "$report" ]] || return 1
+    "$JQ" -e --arg basin "$basin_id" --arg product "$product" '
+      (keys | sort) == ["processing_basin_id","product","range_ignored_restart_count",
+                       "resume_count","retry_count","schema_version","transfers"] and
+      .schema_version == 1 and .processing_basin_id == $basin and .product == $product and
+      ([.retry_count,.resume_count,.range_ignored_restart_count] |
+       all(type == "number" and floor == . and . >= 0)) and
+      (.transfers | type == "array") and
+      all(.transfers[];
+        (keys | sort) == ["attempt","average_bytes_per_second","http_status","mode",
+                         "network_bytes","result","resume_offset_bytes","time_total_seconds"] and
+        (.attempt | type == "number" and floor == . and . >= 1) and
+        (.resume_offset_bytes | type == "number" and floor == . and . >= 0) and
+        (.http_status | type == "number" and floor == . and . >= 0 and . <= 999) and
+        (.network_bytes | type == "number" and . >= 0) and
+        (.time_total_seconds | type == "number" and . >= 0) and
+        (.average_bytes_per_second | type == "number" and . >= 0) and
+        (.mode == "fresh" or .mode == "resume" or .mode == "range_ignored_restart") and
+        (.result == "succeeded" or .result == "curl_failed" or
+         .result == "integrity_failed" or .result == "range_ignored_restart"))
+    ' "$report" >/dev/null
+}
+
+append_transfer_report() {
+    local report=$1
+    local report_tmp=$2
+    local basin_id=$3
+    local product=$4
+    local attempt=$5
+    local mode=$6
+    local offset=$7
+    local result=$8
+    local ignored_increment=$9
+    local existing
+    if [[ -e "$report" || -L "$report" ]]; then
+        validate_acquisition_report "$report" "$basin_id" "$product" || return 1
+        existing=$report
+    else
+        existing=
+    fi
+    if [[ -n "$existing" ]]; then
+        "$JQ" -cnS --slurpfile old "$existing" --argjson attempt "$attempt" \
+            --arg mode "$mode" --argjson offset "$offset" --argjson status "$stats_http" \
+            --argjson network "$stats_network" --argjson time "$stats_time" \
+            --argjson speed "$stats_speed" --arg result "$result" \
+            --argjson resumed "$([[ "$mode" == resume || "$mode" == range_ignored_restart ]] && printf 1 || printf 0)" \
+            --argjson ignored "$ignored_increment" '
+          $old[0] | .retry_count += 1 | .resume_count += $resumed |
+          .range_ignored_restart_count += $ignored |
+          .transfers += [{attempt:$attempt,mode:$mode,resume_offset_bytes:$offset,
+            http_status:$status,network_bytes:$network,time_total_seconds:$time,
+            average_bytes_per_second:$speed,result:$result}]
+        ' >"$report_tmp" || return 1
+    else
+        "$JQ" -cnS --arg basin "$basin_id" --arg product "$product" \
+            --argjson attempt "$attempt" --arg mode "$mode" --argjson offset "$offset" \
+            --argjson status "$stats_http" --argjson network "$stats_network" \
+            --argjson time "$stats_time" --argjson speed "$stats_speed" --arg result "$result" \
+            --argjson resumed "$([[ "$mode" == resume || "$mode" == range_ignored_restart ]] && printf 1 || printf 0)" \
+            --argjson ignored "$ignored_increment" '{
+          schema_version:1,processing_basin_id:$basin,product:$product,retry_count:0,
+          resume_count:$resumed,range_ignored_restart_count:$ignored,
+          transfers:[{attempt:$attempt,mode:$mode,resume_offset_bytes:$offset,
+            http_status:$status,network_bytes:$network,time_total_seconds:$time,
+            average_bytes_per_second:$speed,result:$result}]
+        }' >"$report_tmp" || return 1
+    fi
+    validate_acquisition_report "$report_tmp" "$basin_id" "$product" &&
+        "$CHMOD" 0644 "$report_tmp" && "$MV" "$report_tmp" "$report"
+}
+
+emit_acquisition_summary() {
+    local basin_id=$1
+    local product=$2
+    local status=$3
+    local report=$4
+    local retry=0 resume=0 ignored=0 network=0 time=0 speed=0
+    if [[ -f "$report" && ! -L "$report" ]] && validate_acquisition_report "$report" "$basin_id" "$product"; then
+        retry=$("$JQ" -r '.retry_count' "$report")
+        resume=$("$JQ" -r '.resume_count' "$report")
+        ignored=$("$JQ" -r '.range_ignored_restart_count' "$report")
+        network=$("$JQ" -r 'if (.transfers|length)>0 then (.transfers | last | .network_bytes) else 0 end' "$report")
+        time=$("$JQ" -r 'if (.transfers|length)>0 then (.transfers | last | .time_total_seconds) else 0 end' "$report")
+        speed=$("$JQ" -r 'if (.transfers|length)>0 then (.transfers | last | .average_bytes_per_second) else 0 end' "$report")
+    fi
+    printf 'hfx: acquisition product=%s-%s status=%s retry_count=%s resume_count=%s range_ignored_restart_count=%s last_network_bytes=%s last_time_total_seconds=%s last_average_bytes_per_second=%s\n' \
+        "$basin_id" "$product" "$status" "$retry" "$resume" "$ignored" "$network" "$time" "$speed" >&2
+}
+
 acquire_product() {
     local basin_id=$1
     local product=$2
@@ -1778,19 +2013,43 @@ acquire_product() {
     local current=$campaign_dir/state/basins/$basin_id/current.json
     local final=$campaign_dir/downloads/$basin_id-$product.gpkg
     local partial=$final.partial
+    local sidecar=$partial.json
+    local sidecar_tmp=$campaign_dir/downloads/.$basin_id-$product.gpkg.partial.json.tmp.$$
+    local headers=$campaign_dir/state/tmp/.curl-headers.$basin_id.$product.$$
+    local stats=$campaign_dir/state/tmp/.curl-stats.$basin_id.$product.$$
+    local report=$campaign_dir/reports/$basin_id-$product-acquisition.json
+    local report_tmp=$campaign_dir/reports/.$basin_id-$product-acquisition.json.tmp.$$
     local inspect=$campaign_dir/state/tmp/.ogr.$basin_id.$product.$$
     local persisted_status
     local attempts
     local expected
     local actual
+    local mode=fresh
+    local offset=0
+    local curl_status
+    local result
+    local range_start range_last range_total
+    local pre_bytes pre_sha256
+    local curl_write_out='http_status=%{http_code}\nnetwork_bytes=%{size_download}\ntime_total_seconds=%{time_total}\naverage_bytes_per_second=%{speed_download}\n'
+    local curl_args=()
     local url=https://earth-info.nga.mil/php/download.php?file=$basin_id-$product-gpkg
     persisted_status=$("$JQ" -r --arg stage "$stage" '.stages[$stage].status' "$current")
     attempts=$("$JQ" -r --arg stage "$stage" '.stages[$stage].attempts' "$current")
+
+    if [[ -e "$report" || -L "$report" ]]; then
+        if [[ ! -f "$report" || -L "$report" ]] ||
+            ! validate_acquisition_report "$report" "$basin_id" "$product"; then
+            fail_product "$basin_id" "$stage" "$attempts" 'acquisition report is unsafe or malformed; retained for inspection'
+            emit_acquisition_summary "$basin_id" "$product" failed "$report"
+            return
+        fi
+    fi
 
     if [[ -e "$final" || -L "$final" ]]; then
         if ! verify_download "$final" "$inspect"; then
             fail_product "$basin_id" "$stage" "$attempts" 'existing final file failed integrity verification; retained for inspection'
             "$RM" -f -- "$inspect"
+            emit_acquisition_summary "$basin_id" "$product" failed "$report"
             return
         fi
         actual=$(evidence_json)
@@ -1804,33 +2063,175 @@ acquire_product() {
             write_acquire_stage "$basin_id" "$stage" succeeded "$attempts" '' "$actual"
         fi
         "$RM" -f -- "$inspect"
+        emit_acquisition_summary "$basin_id" "$product" reused "$report"
         return
     fi
 
-    if [[ -e "$partial" || -L "$partial" ]]; then
-        if [[ -f "$partial" && ! -L "$partial" ]]; then
-            "$RM" -- "$partial"
-        else
-            fail_product "$basin_id" "$stage" "$attempts" 'partial path is unsafe; retained without traversal'
-            return
+    for candidate_path in "$partial" "$sidecar"; do
+        if [[ -e "$candidate_path" || -L "$candidate_path" ]]; then
+            if [[ ! -f "$candidate_path" || -L "$candidate_path" ]]; then
+                fail_product "$basin_id" "$stage" "$attempts" 'partial provenance path is unsafe; retained without traversal'
+                emit_acquisition_summary "$basin_id" "$product" failed "$report"
+                return
+            fi
         fi
+    done
+
+    if [[ -e "$partial" || -L "$partial" ]]; then
+        if [[ -e "$sidecar" ]] &&
+            validate_sidecar "$sidecar" "$partial" "$basin_id" "$product" "$url"; then
+            mode=resume
+            offset=$saved_bytes
+            pre_bytes=$saved_bytes
+            pre_sha256=$saved_sha256
+        else
+            "$RM" -f -- "$partial" "$sidecar"
+        fi
+    elif [[ -e "$sidecar" ]]; then
+        "$RM" -- "$sidecar"
     fi
 
     attempts=$((attempts + 1))
     write_acquire_stage "$basin_id" "$stage" running "$attempts" '' null
-    if ! "$CURL" --fail --show-error --location --connect-timeout 30 \
-        --speed-limit 65536 --speed-time 60 --output "$partial" "$url"; then
-        [[ ! -e "$partial" && ! -L "$partial" ]] ||
-            { [[ -f "$partial" && ! -L "$partial" ]] && "$RM" -- "$partial"; }
-        fail_product "$basin_id" "$stage" "$attempts" 'complete GET failed'
+    trap '"$RM" -f -- "$headers" "$stats"; exit 130' INT TERM
+    while :; do
+        curl_args=(--fail --show-error --location --connect-timeout 30
+            --speed-limit 65536 --speed-time 60 --dump-header "$headers"
+            --write-out "$curl_write_out" --output "$partial")
+        if [[ "$mode" == resume ]]; then
+            curl_args[${#curl_args[@]}]=--continue-at
+            curl_args[${#curl_args[@]}]=-
+            curl_args[${#curl_args[@]}]=--header
+            curl_args[${#curl_args[@]}]="If-Range: $saved_etag"
+        fi
+        curl_args[${#curl_args[@]}]=$url
+        curl_status=0
+        "$CURL" ${curl_args[@]+"${curl_args[@]}"} >"$stats" || curl_status=$?
+        parse_transfer_stats "$stats" || {
+            stats_http=0; stats_network=0; stats_time=0; stats_speed=0;
+        }
+        parse_final_headers "$headers" || header_status=
+
+        if [[ "$mode" == resume && "$header_status" == 200 &&
+              -z "$header_content_range" ]]; then
+            if ! file_size_and_hash "$partial" ||
+                [[ "$provenance_bytes" != "$pre_bytes" || "$provenance_sha256" != "$pre_sha256" ]]; then
+                append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+                    "$attempts" resume "$offset" integrity_failed 0 || {
+                        "$RM" -f -- "$headers" "$stats"
+                        trap - INT TERM
+                        return 1
+                    }
+                "$RM" -f -- "$partial" "$sidecar" "$headers" "$stats"
+                trap - INT TERM
+                fail_product "$basin_id" "$stage" "$attempts" 'partial changed during ignored-Range continuation'
+                emit_acquisition_summary "$basin_id" "$product" failed "$report"
+                return
+            fi
+            append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+                "$attempts" range_ignored_restart "$offset" range_ignored_restart 1 || {
+                    "$RM" -f -- "$headers" "$stats"
+                    trap - INT TERM
+                    return 1
+                }
+            "$RM" -- "$partial" "$sidecar"
+            mode=fresh
+            offset=0
+            continue
+        fi
+
+        if [[ "$mode" == resume ]]; then
+            if [[ "$header_status" =~ ^206$ &&
+                  "$header_content_range" =~ ^bytes[[:space:]]+([0-9]+)-([0-9]+)/([0-9]+)$ ]]; then
+                range_start=${BASH_REMATCH[1]}
+                range_last=${BASH_REMATCH[2]}
+                range_total=${BASH_REMATCH[3]}
+            else
+                range_start=
+                range_total=
+            fi
+            if [[ "$range_start" != "$offset" || "$range_total" != "$saved_total" ||
+                  "$header_etag" != "$saved_etag" ]]; then
+                result=integrity_failed
+                append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+                    "$attempts" resume "$offset" "$result" 0 || {
+                        "$RM" -f -- "$headers" "$stats"
+                        trap - INT TERM
+                        return 1
+                    }
+                "$RM" -f -- "$partial" "$sidecar" "$headers" "$stats"
+                trap - INT TERM
+                fail_product "$basin_id" "$stage" "$attempts" 'continuation response failed provenance verification'
+                emit_acquisition_summary "$basin_id" "$product" failed "$report"
+                return
+            fi
+            if ((curl_status != 0)); then
+                if file_size_and_hash "$partial" && ((provenance_bytes <= range_total)); then
+                    write_sidecar "$sidecar" "$sidecar_tmp" "$basin_id" "$product" "$url" \
+                        "$saved_etag" "$provenance_bytes" "$range_total" "$provenance_sha256" || {
+                            "$RM" -f -- "$headers" "$stats"
+                            trap - INT TERM
+                            return 1
+                        }
+                else
+                    "$RM" -f -- "$partial" "$sidecar"
+                fi
+                result=curl_failed
+            elif ! file_size_and_hash "$partial" ||
+                [[ "$provenance_bytes" != "$range_total" || "$provenance_bytes" != "$saved_total" ]]; then
+                "$RM" -f -- "$partial" "$sidecar"
+                result=integrity_failed
+            else
+                result=succeeded
+            fi
+        else
+            if ((curl_status != 0)); then
+                result=curl_failed
+                if [[ "$header_status" == 200 ]] && strong_etag_is_safe "$header_etag" &&
+                    is_positive_i64 "$header_content_length" && file_size_and_hash "$partial" &&
+                    ((provenance_bytes <= header_content_length)); then
+                    write_sidecar "$sidecar" "$sidecar_tmp" "$basin_id" "$product" "$url" \
+                        "$header_etag" "$provenance_bytes" "$header_content_length" "$provenance_sha256" || {
+                            "$RM" -f -- "$headers" "$stats"
+                            trap - INT TERM
+                            return 1
+                        }
+                else
+                    "$RM" -f -- "$partial" "$sidecar"
+                fi
+            elif [[ "$header_status" != 200 ]] || ! strong_etag_is_safe "$header_etag" ||
+                ! is_positive_i64 "$header_content_length" || ! file_size_and_hash "$partial" ||
+                [[ "$provenance_bytes" != "$header_content_length" ]]; then
+                "$RM" -f -- "$partial" "$sidecar"
+                result=integrity_failed
+            else
+                result=succeeded
+            fi
+        fi
+        break
+    done
+    "$RM" -f -- "$headers" "$stats"
+    trap - INT TERM
+    if [[ "$result" != succeeded ]]; then
+        append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+            "$attempts" "$mode" "$offset" "$result" 0 || return 1
+        fail_product "$basin_id" "$stage" "$attempts" \
+            "$([[ "$result" == curl_failed ]] && printf 'transfer failed' || printf 'download provenance or size verification failed')"
+        emit_acquisition_summary "$basin_id" "$product" failed "$report"
         return
     fi
     if ! verify_download "$partial" "$inspect"; then
+        append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+            "$attempts" "$mode" "$offset" integrity_failed 0 || return 1
         [[ -f "$partial" && ! -L "$partial" ]] && "$RM" -- "$partial"
+        "$RM" -f -- "$sidecar"
         "$RM" -f -- "$inspect"
         fail_product "$basin_id" "$stage" "$attempts" 'download failed integrity verification'
+        emit_acquisition_summary "$basin_id" "$product" failed "$report"
         return
     fi
+    append_transfer_report "$report" "$report_tmp" "$basin_id" "$product" \
+        "$attempts" "$mode" "$offset" succeeded 0 || return 1
     "$CHMOD" 0644 "$partial" || return 1
     "$MV" "$partial" "$final" || return 1
     if ! verify_download "$final" "$inspect"; then
@@ -1839,8 +2240,9 @@ acquire_product() {
         return
     fi
     actual=$(evidence_json)
-    "$RM" -f -- "$inspect"
+    "$RM" -f -- "$inspect" "$sidecar"
     write_acquire_stage "$basin_id" "$stage" succeeded "$attempts" '' "$actual"
+    emit_acquisition_summary "$basin_id" "$product" succeeded "$report"
 }
 
 acquire_basin() {

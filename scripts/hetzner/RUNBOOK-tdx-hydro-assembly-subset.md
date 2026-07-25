@@ -130,7 +130,7 @@ evidence. The weighted three-basin multiplier is therefore
 
 The runner's required disk formula is retained inputs plus retained basin
 outputs plus assembly scratch plus assembled artifact
-(`scripts/hetzner/tdx-hydro-campaign.sh:157-167,2049-2065`). It is
+(`scripts/hetzner/tdx-hydro-campaign.sh`). It is
 `40,000,000,000 + 15,000,000,000 + 20,000,000,000 + 15,000,000,000 =
 90,000,000,000` bytes. Add the one active per-basin compile-scratch reserve:
 `90,000,000,000 + 30,000,000,000 = 120,000,000,000` bytes. A 150 GB decimal
@@ -146,12 +146,12 @@ The `ccx33` has 8 vCPU and a 32 GB memory class. Freeze
 actually exposes both frozen available capacities.
 
 Expected phase times are 0.5 to 1 hour for provisioning and bootstrap, 1 to 2
-hours for acquisition at parallelism 2, 1 to 2 hours for three serial
+hours for acquisition, 1 to 2 hours for three serial
 compiles, 0.25 to 1 hour for assembly, and 1 to 2 hours for complete
 validation and evidence retention. The expected total is 4 to 8 hours.
 Acquisition remains uncertain because NGA has no HTTP range support and
 observed per-connection throughput is roughly 1 to 6 MB/s
-(`scripts/hetzner/README.md:570-591`).
+(`scripts/hetzner/README.md`).
 
 This is the complete, frozen init command. It contains all seven required byte
 arguments and the three selected basins:
@@ -339,7 +339,7 @@ returns to M4-S1 remediation.
 The runner defaults on this VM resolve to `/opt/hfx-geo/bin/python`,
 `/root/hfx/adapters/tdx-hydro/build_adapter.py`, and
 `/root/hfx/target/release/hfx`; no `HFX_TDX_*` override is required
-(`scripts/hetzner/tdx-hydro-campaign.sh:19-24,2086-2103`).
+(`scripts/hetzner/tdx-hydro-campaign.sh`).
 
 Record campaign start after parity passes:
 
@@ -354,21 +354,26 @@ exit status 0 before acquisition. The status output must show
 `selected_basin_count=3` and `unselected_basin_count=59`
 (`scripts/hetzner/tdx-hydro-campaign.sh:498-534`).
 
-Acquire with two concurrent basin workers:
+Acquire with an operating ceiling of four basin workers (the frozen three-basin selection can use at most three):
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m4-subset start --workload tdx-acquire -- \
   /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh acquire \
   --campaign tdx-m4-subset \
   --workspace-root /mnt/hfx/work \
-  --max-parallel 2
+  --max-parallel 4
 ```
 
-Parallelism 2 is modest across basins, respects the endpoint's all-or-nothing
-file contract, and avoids opening all six selected product transfers
-aggressively. The runner never segments one file
-(`scripts/hetzner/tdx-hydro-campaign.sh:1774-1844,1884-1905`;
-`scripts/hetzner/README.md:570-591`).
+Parallelism 4 is the polite operating policy across basins, but this runbook's
+frozen three-basin selection permits at most three concurrent basin workers and
+does not fully use that ceiling. The subset makes six product transfers totaling
+roughly 24 GB of payload against a 40 GB retention budget. At the measured
+campaign-VM rate of about 1.0 MB/s per connection, three simultaneous connections
+give about 3.7 arithmetic transfer-hours, so allow a few hours after file-size
+imbalance, verification, and request overhead. Products remain serial within a
+basin, and the runner never segments one file. See `scripts/hetzner/README.md` for
+the separately authorized planetary-scale estimate and operating policy
+(`scripts/hetzner/tdx-hydro-campaign.sh`; `scripts/hetzner/README.md`).
 
 Use `NGA-TDX-Hydro-20230126` as the fabric version. It follows the established
 `NGA-TDX-Hydro-YYYYMMDD` source-version format and matches the proven pilot's
@@ -432,7 +437,7 @@ Use these monitoring commands with the exact current workload:
 Replace only the workload suffix with `tdx-init`, `tdx-compile`,
 `tdx-assemble`, or `tdx-evidence` for the corresponding phase. Status 0 means
 running; status 3 means absent or finished. The canonical log's recorded exit
-status decides success (`scripts/hetzner/README.md:166-204,524-543`).
+status decides success (`scripts/hetzner/README.md`).
 
 After any interruption, rerun the same phase with byte-for-byte identical
 argv. If state remains `running`, this explicit recovery is also available:
@@ -686,7 +691,7 @@ teardown.
 The authorization supplied an approximate historical `ccx33` class of EUR
 0.10 to 0.12 per hour. Treat that range as approximate and potentially stale.
 The repository deliberately requires immediate console verification
-(`scripts/hetzner/README.md:545-568`). Current orders may be priced higher, so
+(`scripts/hetzner/README.md`). Current orders may be priced higher, so
 the recorded console value controls the estimate and the EUR 10.00 ceiling.
 
 For planning, use a conservative EUR 0.27 per hour including tax, EUR 0.044 per
