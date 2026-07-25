@@ -11,8 +11,13 @@ M4-S1 is committed as PASS. The committed parity record says
 requires VM-native confirmation after bootstrap and before acquisition or
 compile (`adapters/tdx-hydro/GEOPANDAS-HILBERT-PARITY.md:1-11,25-30,70-74,
 92-98`). Assembly wiring from PR #169 and the basin-subset contract from PR
-#170 are both present at immutable ref
-`264ab131e182260a4969587ca0744f1225f000db`.
+#170 are present at immutable ref
+`bf445eba7c714c044f2766437b07d94a7665bc82`. That ref also contains the VM
+dependency contract from PR #173, which installs and verifies `jq` and the full
+runner command surface; the `ccx43` upsize and 60,000,000,000-byte memory gates
+from PR #174; correctly rounded manifest float parsing through serde_json's
+`float_roundtrip` feature from PR #175; and the TDX-Hydro adapter's outward
+float32 bbox coverings from PR #176.
 
 Initial human authorization granted on 2026-07-24 covers one `ccx33` plus campaign
 volume, two to three real NGA basin downloads, per-basin compile, partial
@@ -43,7 +48,7 @@ set +x
 CAMPAIGN=tdx-m4-subset
 SERVER_NAME=hfx-build-tdx-m4-subset
 VOLUME_NAME=hfx-build-tdx-m4-subset-data
-GROUND_TRUTH_REF=264ab131e182260a4969587ca0744f1225f000db
+GROUND_TRUTH_REF=bf445eba7c714c044f2766437b07d94a7665bc82
 MILESTONE_BRANCH=pce/tdx-hydro-planetary-compile-and-assembly/milestone-4
 VOLUME_SIZE_GB=150
 RUN_UTC=$(date -u +%Y%m%dT%H%M%SZ)
