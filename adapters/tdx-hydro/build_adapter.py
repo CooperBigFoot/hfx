@@ -12,14 +12,16 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 from collections import Counter, deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -27,9 +29,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyogrio
+import psutil
 from geoparquet_io.core.validate import validate_geoparquet
 from pyproj import Geod
-from shapely import get_coordinates, set_coordinates
+from shapely import from_wkb, get_coordinates, set_coordinates
 from shapely.geometry import LineString
 
 
@@ -61,6 +64,13 @@ DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO = 1_000.0
 DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING = 1.0
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
 SNAP_BBOX_EPSILON = 1e-4
+COMPILE_BATCH_SIZE = 4_096
+COMPILE_MERGE_FAN_IN = 32
+COMPILE_MEMORY_TARGET_BYTES = 25_769_803_776
+COMPILE_MEMORY_SAMPLE_INTERVAL_MS = 50
+_COMPILE_SCRATCH_EVENT_OBSERVER: (
+    Callable[[str, dict[str, int], int], None] | None
+) = None
 
 
 @dataclass(frozen=True)
@@ -164,7 +174,7 @@ class TdxSourceData:
     diagnostics: IngestionDiagnostics
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StreamnetUnit:
     linkno: int
     id: int
@@ -216,6 +226,311 @@ class StreamnetModel:
 class CoreBuildDiagnostics:
     ingestion: IngestionDiagnostics
     streamnet: StreamnetDiagnostics
+    memory: CompileMemoryDiagnostics | None = None
+
+
+@dataclass(frozen=True)
+class CompilePhaseDiagnostics:
+    start_rss_bytes: int | None
+    end_rss_bytes: int | None
+    peak_rss_bytes: int | None
+    allocation_delta_bytes: int | None
+    max_intra_phase_increase_bytes: int | None
+    sample_count: int | None
+
+
+@dataclass(frozen=True)
+class CompileMemoryDiagnostics:
+    target_bytes: int
+    measurement_available: bool
+    unavailable_reason: str | None
+    observed_peak_rss_bytes: int | None
+    high_water_rss_bytes: int | None
+    sample_interval_ms: int
+    measurement_method: str
+    peak_scratch_bytes: int | None
+    scratch_high_water_bytes: int | None
+    scratch_measurement_available: bool
+    scratch_unavailable_reason: str | None
+    basins_rows: int
+    streamnet_rows: int
+    basins_geometry_count: int
+    streamnet_geometry_count: int
+    basins_coordinate_count: int
+    streamnet_coordinate_count: int
+    basins_input_bytes: int
+    streamnet_input_bytes: int
+    selected_dtypes: dict[str, str]
+    phases: dict[str, CompilePhaseDiagnostics]
+
+
+class _CompileMemoryRecorder:
+    """Retain only phase maxima while sampling process RSS and private scratch."""
+
+    def __init__(self, scratch_root: Path) -> None:
+        self._scratch_root = scratch_root
+        self._process: psutil.Process | None = None
+        self._unavailable_reason: str | None = None
+        self._scratch_unavailable_reason: str | None = None
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._active_phase: str | None = None
+        self._phases: dict[str, dict[str, int]] = {}
+        self._observed_peak = 0
+        self._peak_scratch = 0
+        self._scratch_high_water = 0
+        self._counters = {
+            "basins_rows": 0,
+            "streamnet_rows": 0,
+            "basins_geometry_count": 0,
+            "streamnet_geometry_count": 0,
+            "basins_coordinate_count": 0,
+            "streamnet_coordinate_count": 0,
+            "basins_input_bytes": 0,
+            "streamnet_input_bytes": 0,
+        }
+
+    def start(self) -> None:
+        try:
+            self._process = psutil.Process(os.getpid())
+            self._rss()
+        except Exception as exc:
+            self._unavailable_reason = f"failed to initialize process RSS sampling: {exc}"
+            return
+        self._thread = threading.Thread(
+            target=self._sample_loop,
+            name="tdx-compile-memory",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _rss(self) -> int:
+        if self._process is None:
+            raise RuntimeError("process RSS sampler is not initialized")
+        return int(self._process.memory_info().rss)
+
+    def _scratch_bytes(self) -> int:
+        dataset_root = self._scratch_root / "dataset"
+        total = 0
+        for path in self._scratch_root.rglob("*"):
+            if path.is_relative_to(dataset_root):
+                continue
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except FileNotFoundError:
+                # Run inputs are deliberately unlinked as soon as their final
+                # row is consumed, so a sampling walk may race that transition.
+                continue
+        return total
+
+    def _sample(self) -> None:
+        if self._unavailable_reason is None:
+            try:
+                rss = self._rss()
+            except Exception as exc:
+                self._unavailable_reason = f"failed to sample process RSS: {exc}"
+            else:
+                with self._lock:
+                    self._observed_peak = max(self._observed_peak, rss)
+                    if self._active_phase is not None:
+                        phase = self._phases[self._active_phase]
+                        phase["peak"] = max(phase["peak"], rss)
+                        phase["samples"] += 1
+        if self._scratch_unavailable_reason is None:
+            try:
+                scratch = self._scratch_bytes()
+            except Exception as exc:
+                self._scratch_unavailable_reason = (
+                    f"failed to sample private scratch bytes: {exc}"
+                )
+            else:
+                self._peak_scratch = max(self._peak_scratch, scratch)
+                self._scratch_high_water = max(self._scratch_high_water, scratch)
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.wait(COMPILE_MEMORY_SAMPLE_INTERVAL_MS / 1_000):
+            self._sample()
+
+    def scratch_event(self, label: str = "scratch-transition") -> None:
+        """Update the event ledger after a private-file lifecycle transition."""
+        if self._scratch_unavailable_reason is not None:
+            return
+        try:
+            scratch = self._scratch_bytes()
+        except Exception as exc:
+            self._scratch_unavailable_reason = (
+                f"failed to account private scratch bytes: {exc}"
+            )
+            return
+        self._scratch_high_water = max(self._scratch_high_water, scratch)
+        if _COMPILE_SCRATCH_EVENT_OBSERVER is not None:
+            dataset_root = self._scratch_root / "dataset"
+            private_files = {
+                str(path.relative_to(self._scratch_root)): path.stat().st_size
+                for path in self._scratch_root.rglob("*")
+                if path.is_file() and not path.is_relative_to(dataset_root)
+            }
+            final_bytes = (
+                sum(
+                    path.stat().st_size
+                    for path in dataset_root.rglob("*")
+                    if path.is_file()
+                )
+                if dataset_root.exists()
+                else 0
+            )
+            _COMPILE_SCRATCH_EVENT_OBSERVER(label, private_files, final_bytes)
+
+    def record_counts(self, **counters: int) -> None:
+        for name, value in counters.items():
+            if name not in self._counters:
+                raise ValueError(f"unknown compile counter: {name}")
+            self._counters[name] = int(value)
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        if name in self._phases:
+            raise ValueError(f"compile memory phase repeated: {name}")
+        start = None
+        if self._unavailable_reason is None:
+            try:
+                start = self._rss()
+            except Exception as exc:
+                self._unavailable_reason = f"failed to sample phase RSS: {exc}"
+        with self._lock:
+            self._phases[name] = {
+                "start": 0 if start is None else start,
+                "end": 0 if start is None else start,
+                "peak": 0 if start is None else start,
+                "samples": 0 if start is None else 1,
+            }
+            self._active_phase = name
+        try:
+            yield
+        finally:
+            end = None
+            if self._unavailable_reason is None:
+                try:
+                    end = self._rss()
+                except Exception as exc:
+                    self._unavailable_reason = f"failed to sample phase RSS: {exc}"
+            with self._lock:
+                phase = self._phases[name]
+                if end is not None:
+                    phase["end"] = end
+                    phase["peak"] = max(phase["peak"], end)
+                    phase["samples"] += 1
+                    self._observed_peak = max(self._observed_peak, end)
+                self._active_phase = None
+
+    def record_source(self, source: TdxSourceData, basins: Path, streamnet: Path) -> None:
+        self._counters.update(
+            {
+                "basins_rows": len(source.basins),
+                "streamnet_rows": len(source.streamnet),
+                "basins_geometry_count": int(source.basins.geometry.notna().sum()),
+                "streamnet_geometry_count": int(source.streamnet.geometry.notna().sum()),
+                "basins_coordinate_count": int(
+                    sum(len(get_coordinates(geometry)) for geometry in source.basins.geometry)
+                ),
+                "streamnet_coordinate_count": int(
+                    sum(
+                        len(get_coordinates(geometry))
+                        for geometry in source.streamnet.geometry
+                    )
+                ),
+                "basins_input_bytes": basins.stat().st_size,
+                "streamnet_input_bytes": streamnet.stat().st_size,
+            }
+        )
+
+    def stop(self) -> CompileMemoryDiagnostics:
+        self._sample()
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        high_water = None
+        if self._unavailable_reason is None:
+            try:
+                high_water = self._read_high_water()
+            except Exception as exc:
+                self._unavailable_reason = (
+                    f"failed to read process high-water RSS: {exc}"
+                )
+        available = self._unavailable_reason is None
+        phases: dict[str, CompilePhaseDiagnostics] = {}
+        for name, values in self._phases.items():
+            if not available:
+                phases[name] = CompilePhaseDiagnostics(
+                    None, None, None, None, None, None
+                )
+                continue
+            start = values["start"]
+            end = values["end"]
+            peak = values["peak"]
+            phases[name] = CompilePhaseDiagnostics(
+                start,
+                end,
+                peak,
+                end - start,
+                max(0, peak - start),
+                values["samples"],
+            )
+        return CompileMemoryDiagnostics(
+            target_bytes=COMPILE_MEMORY_TARGET_BYTES,
+            measurement_available=available,
+            unavailable_reason=self._unavailable_reason,
+            observed_peak_rss_bytes=self._observed_peak if available else None,
+            high_water_rss_bytes=high_water if available else None,
+            sample_interval_ms=COMPILE_MEMORY_SAMPLE_INTERVAL_MS,
+            measurement_method="psutil-rss-plus-os-high-water",
+            peak_scratch_bytes=(
+                self._peak_scratch
+                if self._scratch_unavailable_reason is None
+                else None
+            ),
+            scratch_high_water_bytes=(
+                self._scratch_high_water
+                if self._scratch_unavailable_reason is None
+                else None
+            ),
+            scratch_measurement_available=self._scratch_unavailable_reason is None,
+            scratch_unavailable_reason=self._scratch_unavailable_reason,
+            selected_dtypes={
+                "native_id": "int64",
+                "downstream_native_id": "int64",
+                "global_id": "int64",
+                "dscontarea": "float64",
+                "hilbert": "uint32",
+                "flags": "uint8",
+            },
+            phases=phases,
+            **self._counters,
+        )
+
+    def _read_high_water(self) -> int:
+        status = Path("/proc/self/status")
+        if status.is_file():
+            for line in status.read_text().splitlines():
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1_024
+        import resource
+
+        raw = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return raw if sys.platform == "darwin" else raw * 1_024
+
+
+@contextmanager
+def _record_phase(
+    recorder: _CompileMemoryRecorder | None, name: str
+) -> Iterator[None]:
+    if recorder is None:
+        yield
+    else:
+        with recorder.phase(name):
+            yield
 
 
 @dataclass(frozen=True)
@@ -399,53 +714,22 @@ def _clamp_coordinate_domain(
     layer_name: str,
     native_id_field: str,
 ) -> LayerClampDiagnostics:
-    scanned: list[np.ndarray] = []
-    for geometry, native_id in zip(
-        table.geometry, table[native_id_field].tolist(), strict=True
-    ):
-        coordinates = get_coordinates(geometry)
-        scanned.append(coordinates)
-        for coordinate in coordinates:
-            longitude = float(coordinate[0])
-            latitude = float(coordinate[1])
-            if not math.isfinite(longitude) or not math.isfinite(latitude):
-                raise ValueError(
-                    f"non-finite coordinate: layer={layer_name}, "
-                    f"{native_id_field}={native_id}, coordinate=({longitude!r}, {latitude!r})"
-                )
-            longitude_excess = max(-180.0 - longitude, longitude - 180.0, 0.0)
-            latitude_excess = max(-90.0 - latitude, latitude - 90.0, 0.0)
-            if (
-                longitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
-                or latitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
-            ):
-                raise ValueError(
-                    "coordinate-domain overshoot exceeds tolerance: "
-                    f"layer={layer_name}, {native_id_field}={native_id}, "
-                    f"coordinate=({longitude!r}, {latitude!r}), "
-                    f"longitude_excess={longitude_excess!r}, "
-                    f"latitude_excess={latitude_excess!r}, "
-                    f"tolerance={COORDINATE_DOMAIN_TOLERANCE_DEGREES!r}"
-                )
-
-    normalized_geometries = []
     altered_vertex_count = 0
     altered_native_ids: set[int] = set()
-    for geometry, coordinates, native_id in zip(
-        table.geometry, scanned, table[native_id_field].tolist(), strict=True
-    ):
-        normalized = coordinates.copy()
-        normalized[:, 0] = np.clip(normalized[:, 0], -180.0, 180.0)
-        normalized[:, 1] = np.clip(normalized[:, 1], -90.0, 90.0)
-        altered_rows = np.any(normalized[:, :2] != coordinates[:, :2], axis=1)
-        count = int(np.count_nonzero(altered_rows))
+    native_ids = table[native_id_field].to_numpy(dtype="int64", copy=False)
+    for start in range(0, len(table), COMPILE_BATCH_SIZE):
+        stop = min(start + COMPILE_BATCH_SIZE, len(table))
+        normalized, count, changed = _clamp_coordinate_batch(
+            table.geometry.iloc[start:stop],
+            native_ids[start:stop],
+            layer_name,
+            native_id_field,
+        )
         altered_vertex_count += count
-        if count:
-            altered_native_ids.add(int(native_id))
-        normalized_geometries.append(set_coordinates(geometry, normalized))
-    table[table.geometry.name] = gpd.GeoSeries(
-        normalized_geometries, index=table.index, crs=table.crs
-    )
+        altered_native_ids.update(changed)
+        table.iloc[
+            start:stop, table.columns.get_loc(table.geometry.name)
+        ] = gpd.GeoSeries(normalized, crs=table.crs).array
     diagnostics = LayerClampDiagnostics(
         altered_vertex_count,
         tuple(sorted(altered_native_ids)),
@@ -460,48 +744,130 @@ def _clamp_coordinate_domain(
     return diagnostics
 
 
+def _clamp_coordinate_batch(
+    geometries: Sequence[object],
+    native_ids: Sequence[int],
+    layer_name: str,
+    native_id_field: str,
+) -> tuple[list[object], int, set[int]]:
+    normalized: list[object] = []
+    altered_vertex_count = 0
+    altered_native_ids: set[int] = set()
+    for geometry, native_id in zip(geometries, native_ids, strict=True):
+        replacement, count = _clamp_geometry_coordinate_domain(
+            geometry, layer_name, native_id_field, int(native_id)
+        )
+        normalized.append(replacement)
+        altered_vertex_count += count
+        if count:
+            altered_native_ids.add(int(native_id))
+    return normalized, altered_vertex_count, altered_native_ids
+
+
+def _clamp_geometry_coordinate_domain(
+    geometry: object,
+    layer_name: str,
+    native_id_field: str,
+    native_id: int,
+) -> tuple[object, int]:
+    coordinates = get_coordinates(geometry)
+    for coordinate in coordinates:
+        longitude = float(coordinate[0])
+        latitude = float(coordinate[1])
+        if not math.isfinite(longitude) or not math.isfinite(latitude):
+            raise ValueError(
+                f"non-finite coordinate: layer={layer_name}, "
+                f"{native_id_field}={native_id}, coordinate=({longitude!r}, {latitude!r})"
+            )
+        longitude_excess = max(-180.0 - longitude, longitude - 180.0, 0.0)
+        latitude_excess = max(-90.0 - latitude, latitude - 90.0, 0.0)
+        if (
+            longitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
+            or latitude_excess > COORDINATE_DOMAIN_TOLERANCE_DEGREES
+        ):
+            raise ValueError(
+                "coordinate-domain overshoot exceeds tolerance: "
+                f"layer={layer_name}, {native_id_field}={native_id}, "
+                f"coordinate=({longitude!r}, {latitude!r}), "
+                f"longitude_excess={longitude_excess!r}, "
+                f"latitude_excess={latitude_excess!r}, "
+                f"tolerance={COORDINATE_DOMAIN_TOLERANCE_DEGREES!r}"
+            )
+    normalized = coordinates.copy()
+    normalized[:, 0] = np.clip(normalized[:, 0], -180.0, 180.0)
+    normalized[:, 1] = np.clip(normalized[:, 1], -90.0, 90.0)
+    count = int(np.count_nonzero(np.any(normalized[:, :2] != coordinates[:, :2], axis=1)))
+    return set_coordinates(geometry, normalized), count
+
+
 def _infer_dscontarea_unit(
     basins: gpd.GeoDataFrame,
     streamnet: gpd.GeoDataFrame,
-    relation: dict[int, int],
+    relation: Mapping[int, int],
 ) -> DSContAreaDiagnostics:
     geod = Geod(ellps="WGS84")
-    own_area_by_linkno = {linkno: 0.0 for linkno in relation}
+    native_ids = np.fromiter(relation, dtype="int64", count=len(relation))
+    native_order = np.argsort(native_ids, kind="stable")
+    sorted_native_ids = native_ids[native_order]
+    own_areas = np.zeros(len(native_ids), dtype="float64")
+    basin_linknos = basins["streamID"].to_numpy(dtype="int64", copy=False)
     for linkno, geometry in zip(
-        basins["streamID"].tolist(), basins.geometry, strict=True
+        basin_linknos, basins.geometry, strict=True
     ):
         area = abs(float(geod.geometry_area_perimeter(geometry)[0]))
         if not math.isfinite(area) or area <= 0.0:
             raise ValueError(
                 f"basins geometry for streamID {linkno} has non-positive geodesic area"
             )
-        own_area_by_linkno[linkno] = area
+        position = int(np.searchsorted(sorted_native_ids, linkno))
+        own_areas[int(native_order[position])] = area
 
-    predecessors = {linkno: [] for linkno in relation}
-    for linkno, downstream_linkno in relation.items():
-        if downstream_linkno != TDX_LINKNO_SENTINEL:
-            predecessors[downstream_linkno].append(linkno)
-    remaining = {linkno: len(values) for linkno, values in predecessors.items()}
-    ready = deque(linkno for linkno, count in remaining.items() if count == 0)
-    upstream_area: dict[int, float] = {}
-    while ready:
-        linkno = ready.popleft()
-        upstream_area[linkno] = math.fsum(
-            [own_area_by_linkno[linkno]]
-            + [upstream_area[value] for value in predecessors[linkno]]
-        )
-        downstream_linkno = relation[linkno]
-        if downstream_linkno != TDX_LINKNO_SENTINEL:
-            remaining[downstream_linkno] -= 1
-            if remaining[downstream_linkno] == 0:
-                ready.append(downstream_linkno)
-
-    raw_by_linkno = dict(
-        zip(streamnet["LINKNO"].tolist(), streamnet["DSContArea"].tolist(), strict=True)
+    downstream_native_ids = np.fromiter(
+        (downstream for _, downstream in relation.items()),
+        dtype="int64",
+        count=len(relation),
     )
-    polygon_links = basins["streamID"].tolist()
-    expected_samples = [upstream_area[linkno] for linkno in polygon_links]
-    raw_samples = [raw_by_linkno[linkno] for linkno in polygon_links]
+    downstream_rows = np.full(len(native_ids), -1, dtype="int64")
+    connected = downstream_native_ids != TDX_LINKNO_SENTINEL
+    connected_positions = np.searchsorted(
+        sorted_native_ids, downstream_native_ids[connected]
+    )
+    downstream_rows[connected] = native_order[connected_positions]
+    predecessor_counts = np.bincount(
+        downstream_rows[connected], minlength=len(native_ids)
+    ).astype("int64")
+    upstream_rows = np.flatnonzero(connected).astype("int64")
+    predecessor_order = np.argsort(
+        downstream_rows[connected], kind="stable"
+    )
+    sorted_upstream_rows = upstream_rows[predecessor_order]
+    offsets = np.empty(len(native_ids) + 1, dtype="int64")
+    offsets[0] = 0
+    np.cumsum(predecessor_counts, out=offsets[1:])
+    remaining = predecessor_counts.copy()
+    ready = deque(int(row) for row in np.flatnonzero(remaining == 0))
+    upstream_area = np.empty(len(native_ids), dtype="float64")
+    while ready:
+        row = ready.popleft()
+        predecessors = sorted_upstream_rows[offsets[row] : offsets[row + 1]]
+        upstream_area[row] = math.fsum(
+            (own_areas[row], *(upstream_area[predecessors].tolist()))
+        )
+        downstream_row = int(downstream_rows[row])
+        if downstream_row >= 0:
+            remaining[downstream_row] -= 1
+            if remaining[downstream_row] == 0:
+                ready.append(downstream_row)
+
+    basin_positions = np.searchsorted(sorted_native_ids, basin_linknos)
+    basin_rows = native_order[basin_positions]
+    expected_samples = upstream_area[basin_rows]
+    stream_ids = streamnet["LINKNO"].to_numpy(dtype="int64", copy=False)
+    stream_order = np.argsort(stream_ids, kind="stable")
+    stream_positions = np.searchsorted(stream_ids[stream_order], basin_linknos)
+    raw_samples = streamnet["DSContArea"].to_numpy(
+        dtype="float64", copy=False
+    )[stream_order[stream_positions]]
     expected_sum = math.fsum(expected_samples)
     raw_sum = math.fsum(raw_samples)
     m2_relative_error = math.fsum(
@@ -538,7 +904,7 @@ def _infer_dscontarea_unit(
     converted_samples_m2 = (
         raw_samples
         if source_unit == "m2"
-        else [raw * 1_000_000 for raw in raw_samples]
+        else raw_samples * 1_000_000
     )
     signed_aggregate_relative_divergence = math.fsum(
         converted - expected
@@ -577,7 +943,7 @@ def _infer_dscontarea_unit(
     ).astype("float64")
     diagnostics = DSContAreaDiagnostics(
         source_unit=source_unit,
-        checked_polygon_bearing_link_count=len(polygon_links),
+        checked_polygon_bearing_link_count=len(basin_linknos),
         geodesic_upstream_area_sum_m2=expected_sum,
         dscontarea_sum_raw=raw_sum,
         m2_relative_error=m2_relative_error,
@@ -617,84 +983,93 @@ def _infer_dscontarea_unit(
 def load_tdx_geopackages(
     basins_path: Path,
     streamnet_path: Path,
+    *,
+    _memory_recorder: _CompileMemoryRecorder | None = None,
 ) -> TdxSourceData:
     """Load and normalize one TDX-Hydro basin and streamnet GeoPackage pair."""
-    basins = _load_single_geopackage(basins_path, "basins")
-    streamnet = _load_single_geopackage(streamnet_path, "streamnet")
-    _require_columns(basins, "basins", {"streamID", basins.geometry.name})
-    _require_columns(
-        streamnet,
-        "streamnet",
-        {"LINKNO", "DSLINKNO", "DSContArea", streamnet.geometry.name},
-    )
-    _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(
-        streamnet,
-        "streamnet",
-        {"LineString"},
-        allow_tdx_degenerate_reaches=True,
-    )
-    _normalize_topology_column(basins, "basins", "streamID")
-    _normalize_topology_column(streamnet, "streamnet", "LINKNO")
-    _normalize_topology_column(streamnet, "streamnet", "DSLINKNO")
-    basin_linknos = basins["streamID"].tolist()
-    stream_linknos = streamnet["LINKNO"].tolist()
-    downstream_linknos = streamnet["DSLINKNO"].tolist()
-    for linkno in basin_linknos:
-        if linkno < 0:
-            raise ValueError(f"basins.streamID must be non-negative; got {linkno}")
-    for linkno in stream_linknos:
-        if linkno < 0:
-            raise ValueError(f"streamnet.LINKNO must be non-negative; got {linkno}")
-    for downstream_linkno in downstream_linknos:
-        if downstream_linkno < TDX_LINKNO_SENTINEL:
+    with _record_phase(_memory_recorder, "basins_load"):
+        basins = _load_single_geopackage(basins_path, "basins")
+    with _record_phase(_memory_recorder, "streamnet_load"):
+        streamnet = _load_single_geopackage(streamnet_path, "streamnet")
+    with _record_phase(_memory_recorder, "source_validate"):
+        _require_columns(basins, "basins", {"streamID", basins.geometry.name})
+        _require_columns(
+            streamnet,
+            "streamnet",
+            {"LINKNO", "DSLINKNO", "DSContArea", streamnet.geometry.name},
+        )
+        _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
+        _validate_layer_geometry(
+            streamnet,
+            "streamnet",
+            {"LineString"},
+            allow_tdx_degenerate_reaches=True,
+        )
+        _normalize_topology_column(basins, "basins", "streamID")
+        _normalize_topology_column(streamnet, "streamnet", "LINKNO")
+        _normalize_topology_column(streamnet, "streamnet", "DSLINKNO")
+        basin_linknos = basins["streamID"].tolist()
+        stream_linknos = streamnet["LINKNO"].tolist()
+        downstream_linknos = streamnet["DSLINKNO"].tolist()
+        for linkno in basin_linknos:
+            if linkno < 0:
+                raise ValueError(f"basins.streamID must be non-negative; got {linkno}")
+        for linkno in stream_linknos:
+            if linkno < 0:
+                raise ValueError(f"streamnet.LINKNO must be non-negative; got {linkno}")
+        for downstream_linkno in downstream_linknos:
+            if downstream_linkno < TDX_LINKNO_SENTINEL:
+                raise ValueError(
+                    "streamnet.DSLINKNO must be non-negative or -1; "
+                    f"got {downstream_linkno}"
+                )
+        _validate_duplicate_ids(basin_linknos, stream_linknos, downstream_linknos)
+        degenerate_linknos_before_clamp = tuple(
+            sorted(
+                linkno
+                for linkno, geometry in zip(
+                    stream_linknos, streamnet.geometry, strict=True
+                )
+                if _is_tdx_degenerate_reach(geometry)
+            )
+        )
+        _normalize_dscontarea(streamnet)
+        relation = _CompactRelation(stream_linknos, downstream_linknos)
+        _validate_streamnet_relation(relation)
+        missing_units = sorted(set(basin_linknos) - set(stream_linknos))
+        if missing_units:
             raise ValueError(
-                "streamnet.DSLINKNO must be non-negative or -1; "
-                f"got {downstream_linkno}"
+                "basins.streamID does not join to streamnet.LINKNO: "
+                f"{missing_units[0]}"
             )
-    _validate_duplicate_ids(basin_linknos, stream_linknos, downstream_linknos)
-    degenerate_linknos_before_clamp = tuple(
-        sorted(
-            linkno
-            for linkno, geometry in zip(
-                stream_linknos, streamnet.geometry, strict=True
+    with _record_phase(_memory_recorder, "basins_clamp"):
+        basins_clamp = _clamp_coordinate_domain(basins, "basins", "streamID")
+    with _record_phase(_memory_recorder, "streamnet_clamp"):
+        streamnet_clamp = _clamp_coordinate_domain(streamnet, "streamnet", "LINKNO")
+    with _record_phase(_memory_recorder, "source_post_clamp_validate"):
+        _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
+        _validate_layer_geometry(
+            streamnet,
+            "streamnet",
+            {"LineString"},
+            allow_tdx_degenerate_reaches=True,
+        )
+        degenerate_linknos_after_clamp = tuple(
+            sorted(
+                linkno
+                for linkno, geometry in zip(
+                    stream_linknos, streamnet.geometry, strict=True
+                )
+                if _is_tdx_degenerate_reach(geometry)
             )
-            if _is_tdx_degenerate_reach(geometry)
         )
-    )
-    _normalize_dscontarea(streamnet)
-    relation = dict(zip(stream_linknos, downstream_linknos, strict=True))
-    _validate_streamnet_relation(relation)
-    missing_units = sorted(set(basin_linknos) - set(stream_linknos))
-    if missing_units:
-        raise ValueError(
-            "basins.streamID does not join to streamnet.LINKNO: "
-            f"{missing_units[0]}"
-        )
-    basins_clamp = _clamp_coordinate_domain(basins, "basins", "streamID")
-    streamnet_clamp = _clamp_coordinate_domain(streamnet, "streamnet", "LINKNO")
-    _validate_layer_geometry(basins, "basins", {"Polygon", "MultiPolygon"})
-    _validate_layer_geometry(
-        streamnet,
-        "streamnet",
-        {"LineString"},
-        allow_tdx_degenerate_reaches=True,
-    )
-    degenerate_linknos_after_clamp = tuple(
-        sorted(
-            linkno
-            for linkno, geometry in zip(
-                stream_linknos, streamnet.geometry, strict=True
+        if degenerate_linknos_before_clamp != degenerate_linknos_after_clamp:
+            raise ValueError(
+                "streamnet degenerate reach classification changed during coordinate "
+                "normalization"
             )
-            if _is_tdx_degenerate_reach(geometry)
-        )
-    )
-    if degenerate_linknos_before_clamp != degenerate_linknos_after_clamp:
-        raise ValueError(
-            "streamnet degenerate reach classification changed during coordinate "
-            "normalization"
-        )
-    dscontarea = _infer_dscontarea_unit(basins, streamnet, relation)
+    with _record_phase(_memory_recorder, "dscontarea_infer"):
+        dscontarea = _infer_dscontarea_unit(basins, streamnet, relation)
     return TdxSourceData(
         basins=basins,
         streamnet=streamnet,
@@ -771,7 +1146,7 @@ def _normalize_column(
     ]
 
 
-def _validate_streamnet_relation(relation: dict[int, int]) -> None:
+def _validate_streamnet_relation(relation: Mapping[int, int]) -> None:
     for linkno, downstream_linkno in relation.items():
         if downstream_linkno == linkno:
             raise ValueError(f"streamnet self-link at native LINKNO {linkno}")
@@ -805,7 +1180,7 @@ def _validate_streamnet_relation(relation: dict[int, int]) -> None:
 
 def _resolve_downstream(
     linkno: int,
-    relation: dict[int, int],
+    relation: Mapping[int, int],
     polygon_bearing_links: set[int],
 ) -> tuple[int, int]:
     downstream_linkno = relation[linkno]
@@ -831,15 +1206,12 @@ def _positive_finite_tolerance(endpoint_tolerance: object) -> float:
 def _streamnet_endpoints(
     stream_linknos: list[int],
     geometries: list[object],
-) -> tuple[
-    dict[int, tuple[tuple[float, float], tuple[float, float]]],
-    frozenset[int],
-]:
-    endpoints_by_linkno: dict[
-        int, tuple[tuple[float, float], tuple[float, float]]
-    ] = {}
+) -> tuple[_StreamnetEndpoints, frozenset[int]]:
+    values = np.empty((len(stream_linknos), 2, 2), dtype="float64")
     degenerate_linknos: set[int] = set()
-    for linkno, geometry in zip(stream_linknos, geometries, strict=True):
+    for row, (linkno, geometry) in enumerate(
+        zip(stream_linknos, geometries, strict=True)
+    ):
         if not isinstance(geometry, LineString) or geometry.is_empty:
             raise ValueError(
                 f"streamnet geometry for native LINKNO {linkno} must be a non-empty LineString"
@@ -870,14 +1242,76 @@ def _streamnet_endpoints(
                     f"{linkno} has unsupported degenerate geometry"
                 )
             degenerate_linknos.add(linkno)
-        endpoints_by_linkno[linkno] = (start_xy, end_xy)
+        values[row, 0] = start_xy
+        values[row, 1] = end_xy
 
-    return endpoints_by_linkno, frozenset(degenerate_linknos)
+    native_ids = np.asarray(stream_linknos, dtype="int64")
+    order = np.argsort(native_ids, kind="stable")
+    return (
+        _StreamnetEndpoints(native_ids[order], order.astype("int64"), values),
+        frozenset(degenerate_linknos),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamnetEndpoints:
+    sorted_native_ids: np.ndarray
+    source_rows: np.ndarray
+    values: np.ndarray
+
+    def row(self, linkno: int) -> int:
+        position = int(np.searchsorted(self.sorted_native_ids, linkno))
+        if (
+            position == len(self.sorted_native_ids)
+            or int(self.sorted_native_ids[position]) != linkno
+        ):
+            raise KeyError(linkno)
+        return int(self.source_rows[position])
+
+    def get(self, linkno: int) -> np.ndarray:
+        return self.values[self.row(linkno)]
+
+
+class _CompactRelation(Mapping[int, int]):
+    """Store native topology in fixed-width columns with binary-search lookup."""
+
+    def __init__(
+        self, native_ids: Sequence[int], downstream_native_ids: Sequence[int]
+    ) -> None:
+        self.native_ids = np.asarray(native_ids, dtype="int64")
+        self.downstream_native_ids = np.asarray(
+            downstream_native_ids, dtype="int64"
+        )
+        self.order = np.argsort(self.native_ids, kind="stable")
+        self.sorted_native_ids = self.native_ids[self.order]
+
+    def __len__(self) -> int:
+        return len(self.native_ids)
+
+    def __iter__(self) -> Iterator[int]:
+        return (int(value) for value in self.native_ids)
+
+    def __getitem__(self, native_id: int) -> int:
+        position = int(np.searchsorted(self.sorted_native_ids, native_id))
+        if (
+            position == len(self.sorted_native_ids)
+            or int(self.sorted_native_ids[position]) != native_id
+        ):
+            raise KeyError(native_id)
+        return int(self.downstream_native_ids[int(self.order[position])])
+
+    def items(self) -> Iterator[tuple[int, int]]:
+        return (
+            (int(native_id), int(downstream_native_id))
+            for native_id, downstream_native_id in zip(
+                self.native_ids, self.downstream_native_ids, strict=True
+            )
+        )
 
 
 @dataclass(frozen=True)
 class _OrientationResolution:
-    downstream_endpoints: dict[int, tuple[float, float]]
+    downstream_endpoints: np.ndarray
     endpoint_coincidence_proven_link_count: int
     predecessor_orientation_proven_root_count: int
     trusted_orientation_isolated_root_native_linknos: tuple[int, ...]
@@ -886,14 +1320,14 @@ class _OrientationResolution:
 
 
 def _resolve_native_orientation(
-    relation: dict[int, int],
-    endpoints_by_linkno: dict[
-        int, tuple[tuple[float, float], tuple[float, float]]
-    ],
+    relation: Mapping[int, int],
+    endpoints_by_linkno: _StreamnetEndpoints,
     degenerate_linknos: frozenset[int],
     endpoint_tolerance: float,
 ) -> _OrientationResolution:
-    downstream_endpoints: dict[int, tuple[float, float]] = {}
+    downstream_endpoints = np.full(
+        (len(endpoints_by_linkno.values), 2), np.nan, dtype="float64"
+    )
     matched_successor_endpoints: dict[int, list[int]] = {}
     indeterminate_successor_endpoint_predecessors: dict[int, list[int]] = {}
     short_successor_resolved_linknos: set[int] = set()
@@ -904,8 +1338,8 @@ def _resolve_native_orientation(
         if downstream_linkno == TDX_LINKNO_SENTINEL:
             continue
 
-        current_endpoints = endpoints_by_linkno[linkno]
-        successor_endpoints = endpoints_by_linkno[downstream_linkno]
+        current_endpoints = endpoints_by_linkno.get(linkno)
+        successor_endpoints = endpoints_by_linkno.get(downstream_linkno)
         current_candidates = (
             ((0, current_endpoints[0]),)
             if linkno in degenerate_linknos
@@ -950,7 +1384,9 @@ def _resolve_native_orientation(
             current_index = 1
             reach_side_near_degenerate_resolved_linknos.add(linkno)
 
-        downstream_endpoints[linkno] = current_endpoints[current_index]
+        downstream_endpoints[
+            endpoints_by_linkno.row(linkno)
+        ] = current_endpoints[current_index]
         matched_successor_indexes = sorted(
             {
                 successor_index
@@ -980,7 +1416,9 @@ def _resolve_native_orientation(
             continue
 
         if root_linkno in degenerate_linknos:
-            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][0]
+            downstream_endpoints[
+                endpoints_by_linkno.row(root_linkno)
+            ] = endpoints_by_linkno.get(root_linkno)[0]
             continue
 
         predecessor_matches = matched_successor_endpoints.get(root_linkno, [])
@@ -994,15 +1432,15 @@ def _resolve_native_orientation(
             )
         if len(upstream_endpoint_indexes) == 1:
             upstream_endpoint_index = upstream_endpoint_indexes.pop()
-            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][
-                1 - upstream_endpoint_index
-            ]
+            downstream_endpoints[
+                endpoints_by_linkno.row(root_linkno)
+            ] = endpoints_by_linkno.get(root_linkno)[1 - upstream_endpoint_index]
             predecessor_proven_roots += 1
             continue
         if indeterminate_predecessors:
             root_endpoint_separation = math.dist(
-                endpoints_by_linkno[root_linkno][0],
-                endpoints_by_linkno[root_linkno][1],
+                endpoints_by_linkno.get(root_linkno)[0],
+                endpoints_by_linkno.get(root_linkno)[1],
             )
             if root_endpoint_separation > 2.0 * endpoint_tolerance:
                 raise ValueError(
@@ -1012,14 +1450,18 @@ def _resolve_native_orientation(
                     f"but endpoint separation {root_endpoint_separation} exceeds "
                     f"near-degenerate limit {2.0 * endpoint_tolerance}"
                 )
-            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
+            downstream_endpoints[
+                endpoints_by_linkno.row(root_linkno)
+            ] = endpoints_by_linkno.get(root_linkno)[1]
             reach_side_near_degenerate_resolved_linknos.add(root_linkno)
             continue
         if not predecessor_matches:
             # TDX/TauDEM native-vertex-order TRUST ASSUMPTION: a genuinely
             # isolated root has no topology from which orientation can be
             # proven, so preserve source order and use its final vertex.
-            downstream_endpoints[root_linkno] = endpoints_by_linkno[root_linkno][1]
+            downstream_endpoints[
+                endpoints_by_linkno.row(root_linkno)
+            ] = endpoints_by_linkno.get(root_linkno)[1]
             trusted_isolated_roots.append(root_linkno)
             continue
 
@@ -1089,10 +1531,7 @@ def build_streamnet_model(
                 )
             raise ValueError(f"duplicate LINKNO {linkno} in streamnet")
 
-    relation = {
-        linkno: downstream_linknos[index]
-        for index, linkno in enumerate(stream_linknos)
-    }
+    relation = _CompactRelation(stream_linknos, downstream_linknos)
     _validate_streamnet_relation(relation)
 
     missing_units = sorted(set(basin_linknos) - relation.keys())
@@ -1121,6 +1560,7 @@ def build_streamnet_model(
     )
     units: list[StreamnetUnit] = []
     for linkno in sorted(polygon_bearing_links):
+        endpoint = downstream_endpoints[endpoints_by_linkno.row(linkno)]
         downstream_linkno, contracted_link_count = _resolve_downstream(
             linkno, relation, polygon_bearing_links
         )
@@ -1133,8 +1573,8 @@ def build_streamnet_model(
                 downstream_linkno=downstream_linkno,
                 downstream_id=global_linkno(downstream_linkno, header_number),
                 contracted_link_count=contracted_link_count,
-                outlet_lon=downstream_endpoints[linkno][0],
-                outlet_lat=downstream_endpoints[linkno][1],
+                outlet_lon=float(endpoint[0]),
+                outlet_lat=float(endpoint[1]),
             )
         )
 
@@ -2432,10 +2872,15 @@ def _prepare_core_units(
         )
 
     geod = Geod(ellps="WGS84")
-    records: list[dict[str, object]] = []
-    geometries = []
-    for native_id, geometry in zip(
-        source.basins["streamID"], source.basins.geometry, strict=True
+    row_count = len(source.basins)
+    ids = np.empty(row_count, dtype="int64")
+    levels = np.empty(row_count, dtype="int16")
+    areas = np.empty(row_count, dtype="float32")
+    up_areas = np.empty(row_count, dtype="float32")
+    outlet_lons = np.empty(row_count, dtype="float64")
+    outlet_lats = np.empty(row_count, dtype="float64")
+    for index, (native_id, geometry) in enumerate(
+        zip(source.basins["streamID"], source.basins.geometry, strict=True)
     ):
         unit = units_by_native[int(native_id)]
         area_km2 = abs(geod.geometry_area_perimeter(geometry)[0]) / 1_000_000
@@ -2448,21 +2893,29 @@ def _prepare_core_units(
         up_area_f32 = np.float32(up_area)
         if not np.isfinite(up_area_f32) or up_area_f32 <= 0:
             raise ValueError("catchment float32 upstream area must be positive and finite")
-        records.append(
-            {
-                "native_id": unit.linkno,
-                "id": unit.id,
-                "level": unit.level,
-                "parent_id": unit.parent_id,
-                "area_km2": area_f32,
-                "up_area_km2": up_area_f32,
-                "outlet_lon": unit.outlet_lon,
-                "outlet_lat": unit.outlet_lat,
-            }
-        )
-        geometries.append(geometry)
+        ids[index] = unit.id
+        levels[index] = unit.level
+        areas[index] = area_f32
+        up_areas[index] = up_area_f32
+        outlet_lons[index] = unit.outlet_lon
+        outlet_lats[index] = unit.outlet_lat
 
-    ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
+    ordered = gpd.GeoDataFrame(
+        {
+            "native_id": source.basins["streamID"].to_numpy(
+                dtype="int64", copy=False
+            ),
+            "id": ids,
+            "level": levels,
+            "parent_id": pd.array([None] * row_count, dtype="Int64"),
+            "area_km2": areas,
+            "up_area_km2": up_areas,
+            "outlet_lon": outlet_lons,
+            "outlet_lat": outlet_lats,
+        },
+        geometry=source.basins.geometry.array,
+        crs=CRS,
+    )
     ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
         total_bounds=[-180, -90, 180, 90]
     )
@@ -2518,18 +2971,36 @@ def _write_catchments(path: Path, units: gpd.GeoDataFrame) -> np.ndarray:
             pa.field("geometry", pa.binary(), nullable=False),
         ]
     ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
-    columns = [
-        pa.array(units["id"], type=pa.int64()),
-        pa.array(units["level"], type=pa.int16()),
-        pa.array(units["parent_id"], type=pa.int64()),
-        pa.array(units["area_km2"], type=pa.float32()),
-        pa.array(units["up_area_km2"], type=pa.float32()),
-        pa.array(units["outlet_lon"], type=pa.float64()),
-        pa.array(units["outlet_lat"], type=pa.float64()),
-        build_bbox_struct(bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]),
-        pa.array([geometry.wkb for geometry in units.geometry], type=pa.binary()),
-    ]
-    _write_table(path, schema, columns, len(units))
+    with pq.ParquetWriter(
+        path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for start, stop in balanced_row_group_bounds(len(units)):
+            group = units.iloc[start:stop]
+            group_bounds = bounds[start:stop]
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(group["id"], type=pa.int64()),
+                        pa.array(group["level"], type=pa.int16()),
+                        pa.array(group["parent_id"], type=pa.int64()),
+                        pa.array(group["area_km2"], type=pa.float32()),
+                        pa.array(group["up_area_km2"], type=pa.float32()),
+                        pa.array(group["outlet_lon"], type=pa.float64()),
+                        pa.array(group["outlet_lat"], type=pa.float64()),
+                        build_bbox_struct(
+                            group_bounds[:, 0],
+                            group_bounds[:, 1],
+                            group_bounds[:, 2],
+                            group_bounds[:, 3],
+                        ),
+                        pa.array(
+                            [geometry.wkb for geometry in group.geometry],
+                            type=pa.binary(),
+                        ),
+                    ],
+                    schema=schema,
+                )
+            )
     assert_geoparquet_valid(path)
     return bounds
 
@@ -2542,9 +3013,9 @@ def _write_graph(
 ) -> None:
     units_by_id = {unit.id: unit for unit in streamnet_model.units}
     _validate_edge_relation(units_by_id, streamnet_model.edges)
-    upstream_by_id = {int(unit_id): [] for unit_id in units["id"]}
+    upstream_by_id: dict[int, list[int]] = {}
     for upstream_id, downstream_id in streamnet_model.edges:
-        upstream_by_id[downstream_id].append(upstream_id)
+        upstream_by_id.setdefault(downstream_id, []).append(upstream_id)
     for upstream_ids in upstream_by_id.values():
         upstream_ids.sort()
 
@@ -2563,19 +3034,32 @@ def _write_graph(
             pa.field("bbox_maxy", pa.float32(), nullable=False),
         ]
     )
-    columns = [
-        pa.array(units["id"], type=pa.int64()),
-        pa.array(units["level"], type=pa.int16()),
-        pa.array(
-            [upstream_by_id[int(unit_id)] for unit_id in units["id"]],
-            type=pa.list_(pa.int64()),
-        ),
-        pa.array(bounds[:, 0], type=pa.float32()),
-        pa.array(bounds[:, 1], type=pa.float32()),
-        pa.array(bounds[:, 2], type=pa.float32()),
-        pa.array(bounds[:, 3], type=pa.float32()),
-    ]
-    _write_table(path, schema, columns, len(units))
+    with pq.ParquetWriter(
+        path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for start, stop in balanced_row_group_bounds(len(units)):
+            group = units.iloc[start:stop]
+            group_bounds = bounds[start:stop]
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(group["id"], type=pa.int64()),
+                        pa.array(group["level"], type=pa.int16()),
+                        pa.array(
+                            [
+                                upstream_by_id.get(int(unit_id), [])
+                                for unit_id in group["id"]
+                            ],
+                            type=pa.list_(pa.int64()),
+                        ),
+                        pa.array(group_bounds[:, 0], type=pa.float32()),
+                        pa.array(group_bounds[:, 1], type=pa.float32()),
+                        pa.array(group_bounds[:, 2], type=pa.float32()),
+                        pa.array(group_bounds[:, 3], type=pa.float32()),
+                    ],
+                    schema=schema,
+                )
+            )
 
 
 def _prepare_snap_stems(
@@ -2587,7 +3071,10 @@ def _prepare_snap_stems(
     if len(units_by_native) != len(streamnet_model.units):
         raise ValueError("streamnet_model unit native linkno must be unique")
 
-    selected_rows: dict[int, tuple[object, float]] = {}
+    selected_unit_ids: list[int] = []
+    selected_weights: list[np.float32] = []
+    geometries: list[object] = []
+    seen: set[int] = set()
     for linkno, weight, geometry in zip(
         source.streamnet["LINKNO"],
         source.streamnet["DSContArea_km2"],
@@ -2597,7 +3084,7 @@ def _prepare_snap_stems(
         native_id = int(linkno)
         if native_id not in units_by_native:
             continue
-        if native_id in selected_rows:
+        if native_id in seen:
             raise ValueError("selected source.streamnet.LINKNO must be unique")
         weight_value = float(weight)
         if not math.isfinite(weight_value) or weight_value <= 0.0:
@@ -2609,30 +3096,29 @@ def _prepare_snap_stems(
             raise ValueError(
                 "selected snap float32 weight must be finite and non-negative"
             )
-        selected_rows[native_id] = (geometry, float(weight_f32))
+        seen.add(native_id)
+        selected_unit_ids.append(units_by_native[native_id].id)
+        selected_weights.append(weight_f32)
+        geometries.append(geometry)
 
-    missing_linknos = sorted(set(units_by_native) - set(selected_rows))
+    missing_linknos = sorted(set(units_by_native) - seen)
     if missing_linknos:
         raise ValueError(
             "streamnet_model unit linkno must join exactly once to "
             f"source.streamnet.LINKNO: {missing_linknos[0]}"
         )
-    if len(selected_rows) != len(units_by_native):
+    if len(seen) != len(units_by_native):
         raise ValueError("selected source.streamnet rows must match model units exactly")
 
-    records: list[dict[str, object]] = []
-    geometries = []
-    for native_id, (geometry, weight) in selected_rows.items():
-        records.append(
-            {
-                "unit_id": units_by_native[native_id].id,
-                "weight": np.float32(weight),
-                "stem_role": None,
-            }
-        )
-        geometries.append(geometry)
-
-    ordered = gpd.GeoDataFrame(records, geometry=geometries, crs=CRS)
+    ordered = gpd.GeoDataFrame(
+        {
+            "unit_id": np.asarray(selected_unit_ids, dtype="int64"),
+            "weight": np.asarray(selected_weights, dtype="float32"),
+            "stem_role": pd.array([None] * len(seen), dtype="string"),
+        },
+        geometry=geometries,
+        crs=CRS,
+    )
     ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
         total_bounds=[-180, -90, 180, 90]
     )
@@ -2667,46 +3153,1655 @@ def _write_snap_stems(path: Path, stems: gpd.GeoDataFrame) -> None:
         ]
     ).with_metadata(build_geo_metadata(["LineString"]))
     row_count = len(stems)
-    columns = [
-        pa.array(np.arange(1, row_count + 1, dtype="int64"), type=pa.int64()),
-        pa.array(stems["unit_id"], type=pa.int64()),
-        pa.array(stems["weight"], type=pa.float32()),
-        pa.array(stems["stem_role"], type=pa.string()),
-        build_bbox_struct(bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]),
-        pa.array([geometry.wkb for geometry in stems.geometry], type=pa.binary()),
-    ]
-    _write_table(path, schema, columns, row_count)
+    with pq.ParquetWriter(
+        path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for start, stop in balanced_row_group_bounds(row_count):
+            group = stems.iloc[start:stop]
+            group_bounds = bounds[start:stop]
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(
+                            np.arange(start + 1, stop + 1, dtype="int64"),
+                            type=pa.int64(),
+                        ),
+                        pa.array(group["unit_id"], type=pa.int64()),
+                        pa.array(group["weight"], type=pa.float32()),
+                        pa.array(group["stem_role"], type=pa.string()),
+                        build_bbox_struct(
+                            group_bounds[:, 0],
+                            group_bounds[:, 1],
+                            group_bounds[:, 2],
+                            group_bounds[:, 3],
+                        ),
+                        pa.array(
+                            [geometry.wkb for geometry in group.geometry],
+                            type=pa.binary(),
+                        ),
+                    ],
+                    schema=schema,
+                )
+            )
     assert_geoparquet_valid(path)
 
 
-def compile_core_hfx(
-    source: TdxSourceData,
-    streamnet_model: StreamnetModel,
-    out_dir: Path,
+def _basin_raw_spool_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("native_id", pa.int64(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    )
+
+
+def _stream_raw_spool_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("native_id", pa.int64(), nullable=False),
+            pa.field("downstream_native_id", pa.int64(), nullable=False),
+            pa.field("dscontarea_raw", pa.float64(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    )
+
+
+def _basin_spool_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("native_id", pa.int64(), nullable=False),
+            pa.field("area_km2", pa.float32(), nullable=False),
+            pa.field("exact_minx", pa.float64(), nullable=False),
+            pa.field("exact_miny", pa.float64(), nullable=False),
+            pa.field("exact_maxx", pa.float64(), nullable=False),
+            pa.field("exact_maxy", pa.float64(), nullable=False),
+            pa.field("hilbert", pa.uint32(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    )
+
+
+def _stream_spool_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("native_id", pa.int64(), nullable=False),
+            pa.field("downstream_native_id", pa.int64(), nullable=False),
+            pa.field("dscontarea_raw", pa.float64(), nullable=False),
+            pa.field("start_lon", pa.float64(), nullable=False),
+            pa.field("start_lat", pa.float64(), nullable=False),
+            pa.field("end_lon", pa.float64(), nullable=False),
+            pa.field("end_lat", pa.float64(), nullable=False),
+            pa.field("is_degenerate", pa.bool_(), nullable=False),
+            pa.field("exact_minx", pa.float64(), nullable=False),
+            pa.field("exact_miny", pa.float64(), nullable=False),
+            pa.field("exact_maxx", pa.float64(), nullable=False),
+            pa.field("exact_maxy", pa.float64(), nullable=False),
+            pa.field("hilbert", pa.uint32(), nullable=False),
+            pa.field("geometry", pa.binary(), nullable=False),
+        ]
+    )
+
+
+@dataclass(frozen=True)
+class _NormalizedSpools:
+    basin_path: Path
+    stream_path: Path
+    basin_crs: object
+    stream_crs: object
+    diagnostics: IngestionDiagnostics
+
+
+@dataclass(frozen=True)
+class _CompactTopology:
+    native_ids: np.ndarray
+    global_ids: np.ndarray
+    downstream_native_ids: np.ndarray
+    downstream_global_ids: np.ndarray
+    contracted_counts: np.ndarray
+    outlet_lons: np.ndarray
+    outlet_lats: np.ndarray
+    up_area_km2: np.ndarray
+    upstream_offsets: np.ndarray
+    upstream_global_ids: np.ndarray
+    diagnostics: StreamnetDiagnostics
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            int(values.nbytes)
+            for values in (
+                self.native_ids,
+                self.global_ids,
+                self.downstream_native_ids,
+                self.downstream_global_ids,
+                self.contracted_counts,
+                self.outlet_lons,
+                self.outlet_lats,
+                self.up_area_km2,
+                self.upstream_offsets,
+                self.upstream_global_ids,
+            )
+        )
+
+    def rows_for(self, native_ids: np.ndarray) -> np.ndarray:
+        positions = np.searchsorted(self.native_ids, native_ids)
+        if (
+            np.any(positions == len(self.native_ids))
+            or np.any(self.native_ids[np.minimum(positions, len(self.native_ids) - 1)] != native_ids)
+        ):
+            raise ValueError("native ID does not join to compact topology")
+        return positions.astype("int64", copy=False)
+
+
+@dataclass(frozen=True)
+class _StreamingSource:
+    spools: _NormalizedSpools
+    basin_native_ids: np.ndarray
+    stream_native_ids: np.ndarray
+    downstream_native_ids: np.ndarray
+    endpoints: np.ndarray
+    degenerate: np.ndarray
+    up_area_km2: np.ndarray
+
+
+def _validate_compile_tuning(batch_size: int, merge_fan_in: int) -> None:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, Integral) or batch_size <= 0:
+        raise ValueError("compile batch size must be a positive integer")
+    if (
+        isinstance(merge_fan_in, bool)
+        or not isinstance(merge_fan_in, Integral)
+        or merge_fan_in < 2
+    ):
+        raise ValueError("compile merge fan-in must be an integer of at least 2")
+
+
+def _single_layer_metadata(path: Path, layer_name: str) -> tuple[str, dict[str, object]]:
+    expanded = path.expanduser()
+    if expanded.suffix.lower() != ".gpkg" or not expanded.is_file():
+        raise ValueError(
+            f"{layer_name} path must be an existing regular .gpkg file: {expanded}"
+        )
+    try:
+        discovered = pyogrio.list_layers(expanded)
+    except Exception as exc:
+        raise ValueError(f"failed to list {layer_name} layers in {expanded}: {exc}") from exc
+    names = [str(name) for name in discovered[:, 0].tolist()]
+    if len(names) != 1:
+        raise ValueError(
+            f"{layer_name} GeoPackage {expanded} must contain exactly one vector "
+            f"layer; discovered layer names: {names}"
+        )
+    try:
+        info = pyogrio.read_info(expanded, layer=names[0])
+    except Exception as exc:
+        raise ValueError(f"failed to inspect {layer_name} layer in {expanded}: {exc}") from exc
+    return names[0], info
+
+
+def _raw_wkb_values(batch: pa.RecordBatch, geometry_name: str) -> pa.Array:
+    geometry = batch.column(batch.schema.get_field_index(geometry_name))
+    if geometry.null_count:
+        raise ValueError("geometry must be non-null and non-empty")
+    return geometry
+
+
+def _write_raw_layer_spool(
+    source_path: Path,
+    destination: Path,
+    layer_name: str,
+    fields: tuple[str, ...],
+    schema: pa.Schema,
     *,
+    batch_size: int,
+    recorder: _CompileMemoryRecorder | None,
+) -> tuple[object, int]:
+    layer, info = _single_layer_metadata(source_path, layer_name)
+    available = set(str(name) for name in info["fields"])
+    missing = sorted(set(fields) - available)
+    if missing:
+        raise ValueError(f"{layer_name} is missing required columns: {missing}")
+    crs = info.get("crs")
+    if crs is None:
+        raise ValueError(f"{layer_name} must declare a CRS")
+    row_count = 0
+    try:
+        with pyogrio.open_arrow(
+            source_path,
+            layer=layer,
+            columns=list(fields),
+            batch_size=batch_size,
+            use_pyarrow=True,
+        ) as (metadata, reader), pq.ParquetWriter(
+            destination,
+            schema=schema,
+            compression="snappy",
+            write_statistics=True,
+        ) as writer:
+            geometry_name = str(metadata.get("geometry_name") or "wkb_geometry")
+            for batch in reader:
+                if batch.num_rows > batch_size:
+                    raise ValueError("source Arrow batch exceeds compile batch size")
+                geometry = _raw_wkb_values(batch, geometry_name)
+                if layer_name == "basins":
+                    native = [
+                        _topology_integer(value.as_py(), "basins", "streamID")
+                        for value in batch.column(batch.schema.get_field_index("streamID"))
+                    ]
+                    table = pa.Table.from_arrays(
+                        [
+                            pa.array(native, type=pa.int64()),
+                            pa.array(geometry, type=pa.binary()),
+                        ],
+                        schema=schema,
+                    )
+                else:
+                    native = [
+                        _topology_integer(value.as_py(), "streamnet", "LINKNO")
+                        for value in batch.column(batch.schema.get_field_index("LINKNO"))
+                    ]
+                    downstream = [
+                        _topology_integer(value.as_py(), "streamnet", "DSLINKNO")
+                        for value in batch.column(batch.schema.get_field_index("DSLINKNO"))
+                    ]
+                    raw_values = [
+                        value.as_py()
+                        for value in batch.column(batch.schema.get_field_index("DSContArea"))
+                    ]
+                    converted: list[float] = []
+                    for original in raw_values:
+                        if isinstance(original, bool) or original is None:
+                            raise ValueError(
+                                "streamnet.DSContArea must contain finite positive "
+                                f"values; got {original!r}"
+                            )
+                        try:
+                            value = float(original)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                "streamnet.DSContArea must contain finite positive "
+                                f"values; got {original!r}"
+                            ) from exc
+                        if not math.isfinite(value) or value <= 0.0:
+                            raise ValueError(
+                                "streamnet.DSContArea must contain finite positive "
+                                f"values; got {original!r}"
+                            )
+                        converted.append(value)
+                    table = pa.Table.from_arrays(
+                        [
+                            pa.array(native, type=pa.int64()),
+                            pa.array(downstream, type=pa.int64()),
+                            pa.array(converted, type=pa.float64()),
+                            pa.array(geometry, type=pa.binary()),
+                        ],
+                        schema=schema,
+                    )
+                writer.write_table(table)
+                row_count += batch.num_rows
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"failed to read {layer_name} layer from {source_path}: {exc}") from exc
+    if row_count == 0:
+        raise ValueError(f"{layer_name} must be a non-empty GeoDataFrame")
+    if recorder is not None:
+        recorder.scratch_event(f"{layer_name}-raw-closed")
+    return crs, row_count
+
+
+def _geometry_series_from_wkb(values: pa.Array, crs: object) -> gpd.GeoSeries:
+    geometries = from_wkb(values.to_numpy(zero_copy_only=False), on_invalid="ignore")
+    series = gpd.GeoSeries(geometries, crs=crs)
+    if series.crs is None:
+        raise ValueError("source geometry batch must declare a CRS")
+    if series.crs.to_epsg() != 4326:
+        try:
+            series = series.to_crs(CRS)
+        except Exception as exc:
+            raise ValueError(f"failed to transform source batch to {CRS}: {exc}") from exc
+    return series
+
+
+def _scan_raw_geometry_spool(
+    path: Path,
+    crs: object,
+    layer_name: str,
+    allowed_types: set[str],
+    *,
+    allow_degenerate: bool = False,
+) -> tuple[int, ...]:
+    degenerate: list[int] = []
+    columns = ["native_id", "geometry"]
+    for batch in pq.ParquetFile(path).iter_batches(
+        batch_size=COMPILE_BATCH_SIZE, columns=columns
+    ):
+        native_ids = batch.column(0).to_numpy(zero_copy_only=False)
+        series = _geometry_series_from_wkb(batch.column(1), crs)
+        frame = gpd.GeoDataFrame(
+            {"native_id": native_ids}, geometry=series, crs=CRS
+        )
+        _validate_layer_geometry(
+            frame,
+            layer_name,
+            allowed_types,
+            allow_tdx_degenerate_reaches=allow_degenerate,
+        )
+        if allow_degenerate:
+            degenerate.extend(
+                int(native_id)
+                for native_id, geometry in zip(native_ids, series, strict=True)
+                if _is_tdx_degenerate_reach(geometry)
+            )
+    return tuple(sorted(degenerate))
+
+
+def _hilbert_for_series(series: gpd.GeoSeries) -> np.ndarray:
+    values = series.centroid.hilbert_distance(
+        total_bounds=[-180, -90, 180, 90]
+    ).to_numpy(dtype="uint32", copy=False)
+    return values
+
+
+def _normalize_basin_spool(
+    raw_path: Path,
+    normalized_path: Path,
+    crs: object,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> tuple[LayerClampDiagnostics, int, int, np.ndarray, np.ndarray]:
+    schema = _basin_spool_schema()
+    altered = 0
+    altered_ids: set[int] = set()
+    geometry_count = 0
+    coordinate_count = 0
+    all_native: list[np.ndarray] = []
+    all_own_area_m2: list[np.ndarray] = []
+    geod = Geod(ellps="WGS84")
+    with pq.ParquetWriter(
+        normalized_path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for batch in pq.ParquetFile(raw_path).iter_batches(
+            batch_size=COMPILE_BATCH_SIZE
+        ):
+            native = batch.column(batch.schema.get_field_index("native_id")).to_numpy(
+                zero_copy_only=False
+            ).astype("int64", copy=False)
+            series = _geometry_series_from_wkb(
+                batch.column(batch.schema.get_field_index("geometry")), crs
+            )
+            normalized, count, changed = _clamp_coordinate_batch(
+                series, native, "basins", "streamID"
+            )
+            series = gpd.GeoSeries(normalized, crs=CRS)
+            altered += count
+            altered_ids.update(changed)
+            geometry_count += len(series)
+            coordinate_count += sum(len(get_coordinates(geometry)) for geometry in series)
+            own_area_m2 = np.asarray(
+                [
+                    abs(float(geod.geometry_area_perimeter(geometry)[0]))
+                    for geometry in series
+                ],
+                dtype="float64",
+            )
+            if np.any(~np.isfinite(own_area_m2)) or np.any(own_area_m2 <= 0):
+                bad = int(native[np.flatnonzero((~np.isfinite(own_area_m2)) | (own_area_m2 <= 0))[0]])
+                raise ValueError(
+                    f"basins geometry for streamID {bad} has non-positive geodesic area"
+                )
+            area_km2 = (own_area_m2 / 1_000_000).astype("float32")
+            if np.any(~np.isfinite(area_km2)) or np.any(area_km2 <= 0):
+                raise ValueError("catchment float32 area must be positive and finite")
+            bounds = series.bounds.to_numpy(dtype="float64")
+            hilbert = _hilbert_for_series(series)
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(native, type=pa.int64()),
+                        pa.array(area_km2, type=pa.float32()),
+                        pa.array(bounds[:, 0], type=pa.float64()),
+                        pa.array(bounds[:, 1], type=pa.float64()),
+                        pa.array(bounds[:, 2], type=pa.float64()),
+                        pa.array(bounds[:, 3], type=pa.float64()),
+                        pa.array(hilbert, type=pa.uint32()),
+                        pa.array([geometry.wkb for geometry in series], type=pa.binary()),
+                    ],
+                    schema=schema,
+                )
+            )
+            all_native.append(native.copy())
+            all_own_area_m2.append(own_area_m2)
+    if recorder is not None:
+        recorder.scratch_event("basin-normalized-closed")
+    return (
+        LayerClampDiagnostics(altered, tuple(sorted(altered_ids))),
+        geometry_count,
+        coordinate_count,
+        np.concatenate(all_native),
+        np.concatenate(all_own_area_m2),
+    )
+
+
+def _normalize_stream_spool(
+    raw_path: Path,
+    normalized_path: Path,
+    crs: object,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> tuple[LayerClampDiagnostics, int, int]:
+    schema = _stream_spool_schema()
+    altered = 0
+    altered_ids: set[int] = set()
+    geometry_count = 0
+    coordinate_count = 0
+    with pq.ParquetWriter(
+        normalized_path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for batch in pq.ParquetFile(raw_path).iter_batches(
+            batch_size=COMPILE_BATCH_SIZE
+        ):
+            names = batch.schema.names
+            native = batch.column(names.index("native_id")).to_numpy(
+                zero_copy_only=False
+            ).astype("int64", copy=False)
+            downstream = batch.column(names.index("downstream_native_id")).to_numpy(
+                zero_copy_only=False
+            ).astype("int64", copy=False)
+            raw = batch.column(names.index("dscontarea_raw")).to_numpy(
+                zero_copy_only=False
+            ).astype("float64", copy=False)
+            series = _geometry_series_from_wkb(batch.column(names.index("geometry")), crs)
+            normalized, count, changed = _clamp_coordinate_batch(
+                series, native, "streamnet", "LINKNO"
+            )
+            series = gpd.GeoSeries(normalized, crs=CRS)
+            altered += count
+            altered_ids.update(changed)
+            geometry_count += len(series)
+            coordinate_count += sum(len(get_coordinates(geometry)) for geometry in series)
+            endpoints = np.empty((len(series), 4), dtype="float64")
+            degenerate = np.zeros(len(series), dtype=bool)
+            for row, (native_id, geometry) in enumerate(zip(native, series, strict=True)):
+                coordinates = list(geometry.coords)
+                if len(coordinates) < 2:
+                    raise ValueError(
+                        f"streamnet geometry for native LINKNO {native_id} must have at least two coordinates"
+                    )
+                endpoints[row] = (
+                    float(coordinates[0][0]),
+                    float(coordinates[0][1]),
+                    float(coordinates[-1][0]),
+                    float(coordinates[-1][1]),
+                )
+                degenerate[row] = _is_tdx_degenerate_reach(geometry)
+                if endpoints[row, 0] == endpoints[row, 2] and endpoints[row, 1] == endpoints[row, 3] and not degenerate[row]:
+                    raise ValueError(
+                        "streamnet geometry for native LINKNO "
+                        f"{native_id} has unsupported degenerate geometry"
+                    )
+            bounds = series.bounds.to_numpy(dtype="float64")
+            hilbert = _hilbert_for_series(series)
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(native, type=pa.int64()),
+                        pa.array(downstream, type=pa.int64()),
+                        pa.array(raw, type=pa.float64()),
+                        pa.array(endpoints[:, 0], type=pa.float64()),
+                        pa.array(endpoints[:, 1], type=pa.float64()),
+                        pa.array(endpoints[:, 2], type=pa.float64()),
+                        pa.array(endpoints[:, 3], type=pa.float64()),
+                        pa.array(degenerate, type=pa.bool_()),
+                        pa.array(bounds[:, 0], type=pa.float64()),
+                        pa.array(bounds[:, 1], type=pa.float64()),
+                        pa.array(bounds[:, 2], type=pa.float64()),
+                        pa.array(bounds[:, 3], type=pa.float64()),
+                        pa.array(hilbert, type=pa.uint32()),
+                        pa.array([geometry.wkb for geometry in series], type=pa.binary()),
+                    ],
+                    schema=schema,
+                )
+            )
+    if recorder is not None:
+        recorder.scratch_event("stream-normalized-closed")
+    return (
+        LayerClampDiagnostics(altered, tuple(sorted(altered_ids))),
+        geometry_count,
+        coordinate_count,
+    )
+
+
+def _spool_numpy(path: Path, columns: Sequence[str]) -> tuple[np.ndarray, ...]:
+    table = pq.read_table(path, columns=list(columns))
+    return tuple(
+        table.column(name).combine_chunks().to_numpy(zero_copy_only=False)
+        for name in columns
+    )
+
+
+def _sorted_unique_ids(values: np.ndarray, label: str) -> np.ndarray:
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    duplicates = np.flatnonzero(sorted_values[1:] == sorted_values[:-1])
+    if len(duplicates):
+        duplicate = int(sorted_values[int(duplicates[0])])
+        if label == "basins":
+            raise ValueError(f"duplicate unit identity for streamID {duplicate}")
+        raise ValueError(f"duplicate LINKNO {duplicate} in streamnet")
+    return sorted_values
+
+
+def _compact_downstream_rows(
+    native_ids: np.ndarray, downstream_native_ids: np.ndarray
+) -> np.ndarray:
+    rows = np.full(len(native_ids), -1, dtype="int64")
+    connected = downstream_native_ids != TDX_LINKNO_SENTINEL
+    positions = np.searchsorted(native_ids, downstream_native_ids[connected])
+    missing = (positions == len(native_ids)) | (
+        native_ids[np.minimum(positions, len(native_ids) - 1)]
+        != downstream_native_ids[connected]
+    )
+    if np.any(missing):
+        missing_id = int(downstream_native_ids[connected][np.flatnonzero(missing)[0]])
+        raise ValueError(
+            f"streamnet missing downstream LINKNO {missing_id} referenced by native LINKNO "
+            f"{int(native_ids[np.flatnonzero(connected)[np.flatnonzero(missing)[0]]])}"
+        )
+    rows[connected] = positions
+    self_links = np.flatnonzero(rows == np.arange(len(rows)))
+    if len(self_links):
+        raise ValueError(
+            f"streamnet self-link at native LINKNO {int(native_ids[int(self_links[0])])}"
+        )
+    return rows
+
+
+def _topological_order(
+    native_ids: np.ndarray, downstream_rows: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    connected_rows = np.flatnonzero(downstream_rows >= 0).astype("int64")
+    predecessor_counts = np.bincount(
+        downstream_rows[connected_rows], minlength=len(native_ids)
+    ).astype("int64")
+    order = np.argsort(downstream_rows[connected_rows], kind="stable")
+    upstream_rows = connected_rows[order]
+    offsets = np.empty(len(native_ids) + 1, dtype="int64")
+    offsets[0] = 0
+    np.cumsum(predecessor_counts, out=offsets[1:])
+    remaining = predecessor_counts.copy()
+    queue = np.empty(len(native_ids), dtype="int64")
+    ready = np.flatnonzero(remaining == 0)
+    queue[: len(ready)] = ready
+    head = 0
+    tail = len(ready)
+    topology = np.empty(len(native_ids), dtype="int64")
+    count = 0
+    while head < tail:
+        row = int(queue[head])
+        head += 1
+        topology[count] = row
+        count += 1
+        downstream = int(downstream_rows[row])
+        if downstream >= 0:
+            remaining[downstream] -= 1
+            if remaining[downstream] == 0:
+                queue[tail] = downstream
+                tail += 1
+    if count != len(native_ids):
+        cycle_row = int(np.flatnonzero(remaining > 0)[0])
+        cycle = [int(native_ids[cycle_row])]
+        current = int(downstream_rows[cycle_row])
+        while current != cycle_row and current >= 0 and len(cycle) <= len(native_ids):
+            cycle.append(int(native_ids[current]))
+            current = int(downstream_rows[current])
+        cycle.append(int(native_ids[cycle_row]))
+        raise ValueError(
+            "streamnet cycle detected: " + " -> ".join(str(value) for value in cycle)
+        )
+    return topology, offsets, upstream_rows
+
+
+def _infer_dscontarea_from_columns(
+    basin_native_ids: np.ndarray,
+    own_area_m2: np.ndarray,
+    stream_native_ids: np.ndarray,
+    downstream_rows: np.ndarray,
+    dscontarea_raw: np.ndarray,
+    topology_order: np.ndarray,
+    predecessor_offsets: np.ndarray,
+    predecessor_rows: np.ndarray,
+) -> tuple[DSContAreaDiagnostics, np.ndarray]:
+    upstream_area = np.empty(len(stream_native_ids), dtype="float64")
+    basin_positions = np.searchsorted(stream_native_ids, basin_native_ids)
+    own_by_stream = np.zeros(len(stream_native_ids), dtype="float64")
+    own_by_stream[basin_positions] = own_area_m2
+    for row_value in topology_order:
+        row = int(row_value)
+        predecessors = predecessor_rows[
+            predecessor_offsets[row] : predecessor_offsets[row + 1]
+        ]
+        upstream_area[row] = math.fsum(
+            (own_by_stream[row], *(upstream_area[predecessors].tolist()))
+        )
+    expected_samples = upstream_area[basin_positions]
+    raw_samples = dscontarea_raw[basin_positions]
+    expected_sum = math.fsum(expected_samples)
+    raw_sum = math.fsum(raw_samples)
+    m2_relative_error = math.fsum(
+        abs(raw - expected)
+        for raw, expected in zip(raw_samples, expected_samples, strict=True)
+    ) / expected_sum
+    km2_relative_error = math.fsum(
+        abs(raw * 1_000_000 - expected)
+        for raw, expected in zip(raw_samples, expected_samples, strict=True)
+    ) / expected_sum
+    if m2_relative_error == km2_relative_error:
+        raise ValueError(
+            "DSContArea unit candidates are numerically tied: "
+            f"m2_relative_error={m2_relative_error!r}, "
+            f"km2_relative_error={km2_relative_error!r}"
+        )
+    source_unit = "m2" if m2_relative_error < km2_relative_error else "km2"
+    selected_relative_error = min(m2_relative_error, km2_relative_error)
+    losing_relative_error = max(m2_relative_error, km2_relative_error)
+    ratio = (
+        math.inf
+        if selected_relative_error == 0.0
+        else losing_relative_error / selected_relative_error
+    )
+    if ratio < DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO:
+        raise ValueError(
+            "DSContArea unit candidates are not decisive: "
+            f"m2_relative_error={m2_relative_error!r}, "
+            f"km2_relative_error={km2_relative_error!r}, "
+            f"unit_decisiveness_ratio={ratio!r}, "
+            f"minimum_ratio={DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO!r}"
+        )
+    converted = raw_samples if source_unit == "m2" else raw_samples * 1_000_000
+    signed = math.fsum(
+        value - expected
+        for value, expected in zip(converted, expected_samples, strict=True)
+    ) / expected_sum
+    absolute = math.fsum(
+        abs(value - expected)
+        for value, expected in zip(converted, expected_samples, strict=True)
+    ) / expected_sum
+    maximum = max(
+        abs(value - expected) / expected
+        for value, expected in zip(converted, expected_samples, strict=True)
+    )
+    if selected_relative_error > DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING:
+        raise ValueError(
+            "DSContArea fabric divergence sanity check failed: "
+            f"source_unit={source_unit!r}, "
+            f"selected_relative_error={selected_relative_error!r}, "
+            f"sanity_ceiling={DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING!r}"
+        )
+    diagnostics = DSContAreaDiagnostics(
+        source_unit=source_unit,
+        checked_polygon_bearing_link_count=len(basin_native_ids),
+        geodesic_upstream_area_sum_m2=expected_sum,
+        dscontarea_sum_raw=raw_sum,
+        m2_relative_error=m2_relative_error,
+        km2_relative_error=km2_relative_error,
+        selected_relative_error=selected_relative_error,
+        signed_aggregate_relative_divergence=signed,
+        absolute_aggregate_relative_divergence=absolute,
+        max_absolute_relative_divergence=maximum,
+    )
+    up_area_km2 = (
+        dscontarea_raw / 1_000_000
+        if source_unit == "m2"
+        else dscontarea_raw.copy()
+    )
+    return diagnostics, up_area_km2.astype("float64", copy=False)
+
+
+def _build_compact_topology(
+    basin_native_ids: np.ndarray,
+    stream_native_ids: np.ndarray,
+    downstream_native_ids: np.ndarray,
+    endpoints: np.ndarray,
+    degenerate: np.ndarray,
+    up_area_km2: np.ndarray,
+    header_number: int,
+    endpoint_tolerance: float,
+) -> _CompactTopology:
+    tolerance = _positive_finite_tolerance(endpoint_tolerance)
+    polygon_positions = np.searchsorted(stream_native_ids, basin_native_ids)
+    if (
+        np.any(polygon_positions == len(stream_native_ids))
+        or np.any(
+            stream_native_ids[
+                np.minimum(polygon_positions, len(stream_native_ids) - 1)
+            ]
+            != basin_native_ids
+        )
+    ):
+        missing = int(
+            basin_native_ids[
+                np.flatnonzero(
+                    (polygon_positions == len(stream_native_ids))
+                    | (
+                        stream_native_ids[
+                            np.minimum(polygon_positions, len(stream_native_ids) - 1)
+                        ]
+                        != basin_native_ids
+                    )
+                )[0]
+            ]
+        )
+        raise ValueError(
+            f"basins.streamID does not join to streamnet.LINKNO: {missing}"
+        )
+    polygon_mask = np.zeros(len(stream_native_ids), dtype=bool)
+    polygon_mask[polygon_positions] = True
+    downstream_rows = _compact_downstream_rows(
+        stream_native_ids, downstream_native_ids
+    )
+    topology_order, predecessor_offsets, predecessor_rows = _topological_order(
+        stream_native_ids, downstream_rows
+    )
+
+    downstream_endpoints = np.full((len(stream_native_ids), 2), np.nan)
+    successor_match = np.full(len(stream_native_ids), -1, dtype="int8")
+    successor_conflict = np.zeros(len(stream_native_ids), dtype=bool)
+    indeterminate = np.zeros(len(stream_native_ids), dtype=bool)
+    short_resolved = np.zeros(len(stream_native_ids), dtype=bool)
+    near_resolved = np.zeros(len(stream_native_ids), dtype=bool)
+    endpoint_proven = 0
+    for row in np.flatnonzero(downstream_rows >= 0):
+        successor = int(downstream_rows[row])
+        current_candidates = (0,) if degenerate[row] else (0, 1)
+        successor_candidates = (0,) if degenerate[successor] else (0, 1)
+        matches = [
+            (current_index, successor_index)
+            for current_index in current_candidates
+            for successor_index in successor_candidates
+            if math.dist(
+                endpoints[row, current_index], endpoints[successor, successor_index]
+            )
+            <= tolerance
+        ]
+        if not matches:
+            raise ValueError(
+                "orientation proof for native LINKNO "
+                f"{int(stream_native_ids[row])} and downstream LINKNO "
+                f"{int(stream_native_ids[successor])} is non-coincident"
+            )
+        current_indexes = sorted({current for current, _ in matches})
+        if len(current_indexes) == 1:
+            current_index = current_indexes[0]
+            if not degenerate[row]:
+                endpoint_proven += 1
+        else:
+            separation = math.dist(endpoints[row, 0], endpoints[row, 1])
+            if separation > 2.0 * tolerance:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{int(stream_native_ids[row])} and downstream LINKNO "
+                    f"{int(stream_native_ids[successor])} is reach-side ambiguous: "
+                    "both current endpoints coincide within tolerance but endpoint "
+                    f"separation {separation} exceeds near-degenerate limit {2.0 * tolerance}"
+                )
+            current_index = 1
+            near_resolved[row] = True
+        downstream_endpoints[row] = endpoints[row, current_index]
+        successor_indexes = sorted(
+            {
+                successor_index
+                for matched_current, successor_index in matches
+                if matched_current == current_index
+            }
+        )
+        if len(successor_indexes) == 1:
+            matched = successor_indexes[0]
+            if successor_match[successor] < 0:
+                successor_match[successor] = matched
+            elif successor_match[successor] != matched:
+                successor_conflict[successor] = True
+        else:
+            indeterminate[successor] = True
+            if (
+                not degenerate[row]
+                and not degenerate[successor]
+                and len(current_indexes) == 1
+            ):
+                short_resolved[row] = True
+
+    predecessor_proven_roots = 0
+    trusted_roots: list[int] = []
+    for row in np.flatnonzero(downstream_rows < 0):
+        native_id = int(stream_native_ids[row])
+        if degenerate[row]:
+            downstream_endpoints[row] = endpoints[row, 0]
+        elif successor_conflict[row]:
+            raise ValueError(
+                f"orientation proof for root LINKNO {native_id} has conflicting predecessor matches"
+            )
+        elif successor_match[row] >= 0:
+            downstream_endpoints[row] = endpoints[row, 1 - successor_match[row]]
+            predecessor_proven_roots += 1
+        elif indeterminate[row]:
+            separation = math.dist(endpoints[row, 0], endpoints[row, 1])
+            if separation > 2.0 * tolerance:
+                predecessor_ids = tuple(
+                    sorted(
+                        int(stream_native_ids[value])
+                        for value in predecessor_rows[
+                            predecessor_offsets[row] : predecessor_offsets[row + 1]
+                        ]
+                    )
+                )
+                raise ValueError(
+                    "orientation proof for root LINKNO "
+                    f"{native_id} is reach-side ambiguous: predecessors "
+                    f"{predecessor_ids} match both root endpoints but endpoint "
+                    f"separation {separation} exceeds near-degenerate limit {2.0 * tolerance}"
+                )
+            downstream_endpoints[row] = endpoints[row, 1]
+            near_resolved[row] = True
+        else:
+            downstream_endpoints[row] = endpoints[row, 1]
+            trusted_roots.append(native_id)
+
+    next_polygon = np.full(len(stream_native_ids), -1, dtype="int64")
+    distance_to_polygon_or_root = np.zeros(len(stream_native_ids), dtype="int64")
+    for row_value in topology_order[::-1]:
+        row = int(row_value)
+        if polygon_mask[row]:
+            next_polygon[row] = row
+            distance_to_polygon_or_root[row] = 0
+        else:
+            downstream = int(downstream_rows[row])
+            if downstream >= 0:
+                next_polygon[row] = next_polygon[downstream]
+                distance_to_polygon_or_root[row] = (
+                    distance_to_polygon_or_root[downstream] + 1
+                )
+    unit_native_ids = stream_native_ids[polygon_positions]
+    unit_order = np.argsort(unit_native_ids, kind="stable")
+    unit_native_ids = unit_native_ids[unit_order]
+    unit_stream_rows = polygon_positions[unit_order]
+    resolved_rows = np.full(len(unit_native_ids), -1, dtype="int64")
+    contracted = np.zeros(len(unit_native_ids), dtype="int64")
+    for unit_row, stream_row in enumerate(unit_stream_rows):
+        downstream = int(downstream_rows[stream_row])
+        if downstream >= 0:
+            resolved_rows[unit_row] = next_polygon[downstream]
+            contracted[unit_row] = (
+                0
+                if polygon_mask[downstream]
+                else distance_to_polygon_or_root[downstream]
+            )
+    resolved_native = np.full(len(unit_native_ids), TDX_LINKNO_SENTINEL, dtype="int64")
+    connected_units = resolved_rows >= 0
+    resolved_native[connected_units] = stream_native_ids[
+        resolved_rows[connected_units]
+    ]
+    global_ids = unit_native_ids + header_number * GLOBAL_LINKNO_STRIDE
+    downstream_global = np.full(len(unit_native_ids), TDX_LINKNO_SENTINEL, dtype="int64")
+    downstream_global[connected_units] = (
+        resolved_native[connected_units] + header_number * GLOBAL_LINKNO_STRIDE
+    )
+    outlet_lons = downstream_endpoints[unit_stream_rows, 0].copy()
+    outlet_lats = downstream_endpoints[unit_stream_rows, 1].copy()
+    unit_up_area = up_area_km2[unit_stream_rows].copy()
+
+    connected_unit_rows = np.flatnonzero(connected_units)
+    downstream_unit_rows = np.searchsorted(
+        unit_native_ids, resolved_native[connected_units]
+    )
+    edge_order = np.lexsort(
+        (global_ids[connected_unit_rows], downstream_global[connected_units])
+    )
+    sorted_upstream = global_ids[connected_unit_rows][edge_order]
+    sorted_downstream_rows = downstream_unit_rows[edge_order]
+    upstream_counts = np.bincount(
+        sorted_downstream_rows, minlength=len(unit_native_ids)
+    )
+    upstream_offsets = np.empty(len(unit_native_ids) + 1, dtype="int64")
+    upstream_offsets[0] = 0
+    np.cumsum(upstream_counts, out=upstream_offsets[1:])
+
+    degenerate_ids = tuple(int(value) for value in stream_native_ids[degenerate])
+    degenerate_polygon = tuple(
+        int(value) for value in stream_native_ids[degenerate & polygon_mask]
+    )
+    degenerate_polygonless = tuple(
+        int(value) for value in stream_native_ids[degenerate & ~polygon_mask]
+    )
+    short_ids = tuple(int(value) for value in stream_native_ids[short_resolved])
+    near_ids = tuple(int(value) for value in stream_native_ids[near_resolved])
+    trusted_ids = tuple(sorted(trusted_roots))
+    trusted_polygon_ids = tuple(
+        value
+        for value in trusted_ids
+        if polygon_mask[int(np.searchsorted(stream_native_ids, value))]
+    )
+    diagnostics = StreamnetDiagnostics(
+        polygon_bearing_link_count=len(unit_native_ids),
+        polygonless_dropped_reach_count=len(stream_native_ids) - len(unit_native_ids),
+        degenerate_reach_count=len(degenerate_ids),
+        degenerate_reach_native_linknos=degenerate_ids,
+        degenerate_polygon_bearing_reach_count=len(degenerate_polygon),
+        degenerate_polygon_bearing_reach_native_linknos=degenerate_polygon,
+        degenerate_polygonless_reach_count=len(degenerate_polygonless),
+        degenerate_polygonless_reach_native_linknos=degenerate_polygonless,
+        short_successor_resolved_reach_count=len(short_ids),
+        short_successor_resolved_reach_native_linknos=short_ids,
+        reach_side_near_degenerate_resolved_reach_count=len(near_ids),
+        reach_side_near_degenerate_resolved_reach_native_linknos=near_ids,
+        root_count=int(np.count_nonzero(~connected_units)),
+        contracted_edge_count=int(np.count_nonzero(connected_units & (contracted > 0))),
+        contracted_root_count=int(np.count_nonzero(~connected_units & (contracted > 0))),
+        contracted_link_traversal_count=int(contracted.sum()),
+        endpoint_coincidence_proven_link_count=endpoint_proven,
+        predecessor_orientation_proven_root_count=predecessor_proven_roots,
+        trusted_orientation_isolated_root_count=len(trusted_ids),
+        trusted_orientation_isolated_root_native_linknos=trusted_ids,
+        trusted_orientation_polygon_bearing_isolated_root_count=len(
+            trusted_polygon_ids
+        ),
+        trusted_orientation_polygon_bearing_isolated_root_native_linknos=(
+            trusted_polygon_ids
+        ),
+        orientation_tolerance=tolerance,
+    )
+    return _CompactTopology(
+        native_ids=unit_native_ids,
+        global_ids=global_ids,
+        downstream_native_ids=resolved_native,
+        downstream_global_ids=downstream_global,
+        contracted_counts=contracted,
+        outlet_lons=outlet_lons,
+        outlet_lats=outlet_lats,
+        up_area_km2=unit_up_area,
+        upstream_offsets=upstream_offsets,
+        upstream_global_ids=sorted_upstream,
+        diagnostics=diagnostics,
+    )
+
+
+def _ingest_source_spools(
+    basins_path: Path,
+    streamnet_path: Path,
+    scratch_root: Path,
+    recorder: _CompileMemoryRecorder,
+) -> _StreamingSource:
+    _validate_compile_tuning(COMPILE_BATCH_SIZE, COMPILE_MERGE_FAN_IN)
+    basin_raw = scratch_root / "basins.raw.parquet"
+    stream_raw = scratch_root / "streamnet.raw.parquet"
+    basin_spool = scratch_root / "basins.normalized.parquet"
+    stream_spool = scratch_root / "streamnet.normalized.parquet"
+    with recorder.phase("basins_load"):
+        basin_crs, basin_rows = _write_raw_layer_spool(
+            basins_path,
+            basin_raw,
+            "basins",
+            ("streamID",),
+            _basin_raw_spool_schema(),
+            batch_size=COMPILE_BATCH_SIZE,
+            recorder=recorder,
+        )
+    with recorder.phase("streamnet_load"):
+        stream_crs, stream_rows = _write_raw_layer_spool(
+            streamnet_path,
+            stream_raw,
+            "streamnet",
+            ("LINKNO", "DSLINKNO", "DSContArea"),
+            _stream_raw_spool_schema(),
+            batch_size=COMPILE_BATCH_SIZE,
+            recorder=recorder,
+        )
+    with recorder.phase("source_validate"):
+        degenerate_before = _scan_raw_geometry_spool(
+            stream_raw,
+            stream_crs,
+            "streamnet",
+            {"LineString"},
+            allow_degenerate=True,
+        )
+        _scan_raw_geometry_spool(
+            basin_raw, basin_crs, "basins", {"Polygon", "MultiPolygon"}
+        )
+        (basin_native_input,) = _spool_numpy(basin_raw, ("native_id",))
+        stream_native_input, downstream_input = _spool_numpy(
+            stream_raw, ("native_id", "downstream_native_id")
+        )
+        basin_native_input = basin_native_input.astype("int64", copy=False)
+        stream_native_input = stream_native_input.astype("int64", copy=False)
+        downstream_input = downstream_input.astype("int64", copy=False)
+        if np.any(basin_native_input < 0):
+            raise ValueError(
+                "basins.streamID must be non-negative; got "
+                f"{int(basin_native_input[np.flatnonzero(basin_native_input < 0)[0]])}"
+            )
+        if np.any(stream_native_input < 0):
+            raise ValueError(
+                "streamnet.LINKNO must be non-negative; got "
+                f"{int(stream_native_input[np.flatnonzero(stream_native_input < 0)[0]])}"
+            )
+        if np.any(downstream_input < TDX_LINKNO_SENTINEL):
+            raise ValueError(
+                "streamnet.DSLINKNO must be non-negative or -1; got "
+                f"{int(downstream_input[np.flatnonzero(downstream_input < TDX_LINKNO_SENTINEL)[0]])}"
+            )
+        basin_sorted = _sorted_unique_ids(basin_native_input, "basins")
+        stream_order = np.argsort(stream_native_input, kind="stable")
+        stream_sorted = stream_native_input[stream_order]
+        downstream_sorted = downstream_input[stream_order]
+        duplicates = np.flatnonzero(stream_sorted[1:] == stream_sorted[:-1])
+        if len(duplicates):
+            duplicate = int(stream_sorted[int(duplicates[0])])
+            targets = downstream_sorted[stream_sorted == duplicate]
+            if len(np.unique(targets)) > 1:
+                raise ValueError(
+                    f"bifurcation: duplicate LINKNO {duplicate} has multiple DSLINKNO targets"
+                )
+            raise ValueError(f"duplicate LINKNO {duplicate} in streamnet")
+        missing_positions = np.searchsorted(stream_sorted, basin_sorted)
+        missing = (missing_positions == len(stream_sorted)) | (
+            stream_sorted[np.minimum(missing_positions, len(stream_sorted) - 1)]
+            != basin_sorted
+        )
+        if np.any(missing):
+            raise ValueError(
+                "basins.streamID does not join to streamnet.LINKNO: "
+                f"{int(basin_sorted[np.flatnonzero(missing)[0]])}"
+            )
+        _compact_downstream_rows(stream_sorted, downstream_sorted)
+        _topological_order(
+            stream_sorted,
+            _compact_downstream_rows(stream_sorted, downstream_sorted),
+        )
+    with recorder.phase("basins_clamp"):
+        (
+            basins_clamp,
+            basin_geometry_count,
+            basin_coordinate_count,
+            basin_native_normalized,
+            own_area_m2,
+        ) = _normalize_basin_spool(
+            basin_raw, basin_spool, basin_crs, recorder=recorder
+        )
+        basin_raw.unlink()
+        recorder.scratch_event("basin-raw-unlinked")
+    with recorder.phase("streamnet_clamp"):
+        streamnet_clamp, stream_geometry_count, stream_coordinate_count = (
+            _normalize_stream_spool(
+                stream_raw, stream_spool, stream_crs, recorder=recorder
+            )
+        )
+        stream_raw.unlink()
+        recorder.scratch_event("stream-raw-unlinked")
+    with recorder.phase("source_post_clamp_validate"):
+        _scan_raw_geometry_spool(
+            basin_spool, CRS, "basins", {"Polygon", "MultiPolygon"}
+        )
+        degenerate_after = _scan_raw_geometry_spool(
+            stream_spool,
+            CRS,
+            "streamnet",
+            {"LineString"},
+            allow_degenerate=True,
+        )
+        if degenerate_before != degenerate_after:
+            raise ValueError(
+                "streamnet degenerate reach classification changed during coordinate "
+                "normalization"
+            )
+    with recorder.phase("dscontarea_infer"):
+        stream_columns = (
+            "native_id",
+            "downstream_native_id",
+            "dscontarea_raw",
+            "start_lon",
+            "start_lat",
+            "end_lon",
+            "end_lat",
+            "is_degenerate",
+        )
+        stream_values = _spool_numpy(stream_spool, stream_columns)
+        stream_order = np.argsort(stream_values[0], kind="stable")
+        stream_native = stream_values[0][stream_order].astype("int64", copy=False)
+        downstream_native = stream_values[1][stream_order].astype(
+            "int64", copy=False
+        )
+        dscontarea_raw = stream_values[2][stream_order].astype(
+            "float64", copy=False
+        )
+        endpoints = np.column_stack(
+            [
+                stream_values[3][stream_order],
+                stream_values[4][stream_order],
+                stream_values[5][stream_order],
+                stream_values[6][stream_order],
+            ]
+        ).reshape(-1, 2, 2)
+        degenerate = stream_values[7][stream_order].astype(bool, copy=False)
+        basin_order = np.argsort(basin_native_normalized, kind="stable")
+        basin_native = basin_native_normalized[basin_order].astype(
+            "int64", copy=False
+        )
+        own_area_m2 = own_area_m2[basin_order]
+        downstream_rows = _compact_downstream_rows(
+            stream_native, downstream_native
+        )
+        topology_order, predecessor_offsets, predecessor_rows = _topological_order(
+            stream_native, downstream_rows
+        )
+        dscontarea, up_area_km2 = _infer_dscontarea_from_columns(
+            basin_native,
+            own_area_m2,
+            stream_native,
+            downstream_rows,
+            dscontarea_raw,
+            topology_order,
+            predecessor_offsets,
+            predecessor_rows,
+        )
+    recorder.record_counts(
+        basins_rows=basin_rows,
+        streamnet_rows=stream_rows,
+        basins_geometry_count=basin_geometry_count,
+        streamnet_geometry_count=stream_geometry_count,
+        basins_coordinate_count=basin_coordinate_count,
+        streamnet_coordinate_count=stream_coordinate_count,
+        basins_input_bytes=basins_path.stat().st_size,
+        streamnet_input_bytes=streamnet_path.stat().st_size,
+    )
+    return _StreamingSource(
+        spools=_NormalizedSpools(
+            basin_path=basin_spool,
+            stream_path=stream_spool,
+            basin_crs=CRS,
+            stream_crs=CRS,
+            diagnostics=IngestionDiagnostics(
+                basins_clamp=basins_clamp,
+                streamnet_clamp=streamnet_clamp,
+                dscontarea=dscontarea,
+            ),
+        ),
+        basin_native_ids=basin_native,
+        stream_native_ids=stream_native,
+        downstream_native_ids=downstream_native,
+        endpoints=endpoints,
+        degenerate=degenerate,
+        up_area_km2=up_area_km2,
+    )
+
+
+def _compile_graph_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("level", pa.int16(), nullable=False),
+            pa.field(
+                "upstream_ids",
+                pa.list_(pa.field("item", pa.int64(), nullable=True)),
+                nullable=False,
+            ),
+            pa.field("bbox_minx", pa.float32(), nullable=False),
+            pa.field("bbox_miny", pa.float32(), nullable=False),
+            pa.field("bbox_maxx", pa.float32(), nullable=False),
+            pa.field("bbox_maxy", pa.float32(), nullable=False),
+        ]
+    )
+
+
+def _catchment_run_schema() -> pa.Schema:
+    return _merge_catchment_schema().append(
+        pa.field("hilbert", pa.uint32(), nullable=False)
+    )
+
+
+def _snap_run_schema() -> pa.Schema:
+    return _snap_merge_schema().append(
+        pa.field("hilbert", pa.uint32(), nullable=False)
+    )
+
+
+def _table_with_schema_rows(rows: list[dict[str, object]], schema: pa.Schema) -> pa.Table:
+    return pa.Table.from_pylist(rows, schema=schema)
+
+
+@dataclass
+class _CompileRunCursor:
+    path: Path
+    source: pa.NativeFile
+    batches: Iterator[pa.RecordBatch]
+    recorder: _CompileMemoryRecorder | None
+    batch: pa.RecordBatch | None = None
+    row: int = 0
+    exhausted: bool = False
+
+    def _advance_batch(self) -> bool:
+        try:
+            self.batch = next(self.batches)
+        except StopIteration:
+            self.batch = None
+            self.exhausted = True
+            self.source.close()
+            self.path.unlink()
+            if self.recorder is not None:
+                self.recorder.scratch_event(f"run-unlinked:{self.path.name}")
+            return False
+        self.row = 0
+        return True
+
+    def current(self) -> dict[str, object]:
+        if self.batch is None and not self._advance_batch():
+            raise StopIteration
+        assert self.batch is not None
+        return {
+            name: self.batch.column(index)[self.row].as_py()
+            for index, name in enumerate(self.batch.schema.names)
+        }
+
+    def advance(self) -> bool:
+        assert self.batch is not None
+        self.row += 1
+        if self.row < self.batch.num_rows:
+            return True
+        return self._advance_batch()
+
+
+def _merged_run_rows(
+    paths: Sequence[Path],
+    key_fields: tuple[str, str],
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> Iterator[dict[str, object]]:
+    with ExitStack() as stack:
+        cursors: list[_CompileRunCursor] = []
+        heap: list[tuple[int, int, int]] = []
+        for index, path in enumerate(paths):
+            source = stack.enter_context(pa.memory_map(str(path), "r"))
+            parquet = pq.ParquetFile(source)
+            cursor = _CompileRunCursor(
+                path=path,
+                source=source,
+                batches=iter(
+                    parquet.iter_batches(batch_size=COMPILE_BATCH_SIZE)
+                ),
+                recorder=recorder,
+            )
+            cursors.append(cursor)
+            row = cursor.current()
+            heapq.heappush(
+                heap,
+                (int(row[key_fields[0]]), int(row[key_fields[1]]), index),
+            )
+        while heap:
+            _, _, index = heapq.heappop(heap)
+            cursor = cursors[index]
+            row = cursor.current()
+            yield row
+            if cursor.advance():
+                next_row = cursor.current()
+                heapq.heappush(
+                    heap,
+                    (
+                        int(next_row[key_fields[0]]),
+                        int(next_row[key_fields[1]]),
+                        index,
+                    ),
+                )
+
+
+def _merge_run_group(
+    paths: Sequence[Path],
+    destination: Path,
+    schema: pa.Schema,
+    key_fields: tuple[str, str],
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> None:
+    buffer: list[dict[str, object]] = []
+    with pq.ParquetWriter(
+        destination, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for row in _merged_run_rows(paths, key_fields, recorder=recorder):
+            buffer.append(row)
+            if len(buffer) == COMPILE_BATCH_SIZE:
+                writer.write_table(_table_with_schema_rows(buffer, schema))
+                buffer.clear()
+                if recorder is not None:
+                    recorder.scratch_event("merge-output-batch-written")
+        if buffer:
+            writer.write_table(_table_with_schema_rows(buffer, schema))
+    if recorder is not None:
+        recorder.scratch_event(f"merge-run-closed:{destination.name}")
+
+
+def _reduce_run_fan_in(
+    paths: list[Path],
+    scratch_root: Path,
+    stem: str,
+    schema: pa.Schema,
+    key_fields: tuple[str, str],
+    merge_fan_in: int,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> list[Path]:
+    generation = 1
+    current = paths
+    while len(current) > merge_fan_in:
+        replacement: list[Path] = []
+        for group_index, start in enumerate(range(0, len(current), merge_fan_in)):
+            group = current[start : start + merge_fan_in]
+            destination = (
+                scratch_root
+                / f"{stem}.merge-{generation:03d}-{group_index:06d}.parquet"
+            )
+            _merge_run_group(
+                group,
+                destination,
+                schema,
+                key_fields,
+                recorder=recorder,
+            )
+            replacement.append(destination)
+        current = replacement
+        generation += 1
+    return current
+
+
+def _create_catchment_runs(
+    basin_spool: Path,
+    scratch_root: Path,
+    topology: _CompactTopology,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> list[Path]:
+    schema = _catchment_run_schema()
+    paths: list[Path] = []
+    parquet = pq.ParquetFile(basin_spool)
+    for run_number, batch in enumerate(
+        parquet.iter_batches(batch_size=COMPILE_BATCH_SIZE)
+    ):
+        names = batch.schema.names
+        native = batch.column(names.index("native_id")).to_numpy(
+            zero_copy_only=False
+        ).astype("int64", copy=False)
+        unit_rows = topology.rows_for(native)
+        hilbert = batch.column(names.index("hilbert")).to_numpy(
+            zero_copy_only=False
+        ).astype("uint32", copy=False)
+        global_ids = topology.global_ids[unit_rows]
+        order = np.lexsort((global_ids, hilbert))
+        exact_bounds = np.column_stack(
+            [
+                batch.column(names.index(name)).to_numpy(zero_copy_only=False)
+                for name in ("exact_minx", "exact_miny", "exact_maxx", "exact_maxy")
+            ]
+        )[order]
+        bounds = geographic_bbox_float32_coverings(exact_bounds)
+        count = len(order)
+        table = pa.Table.from_arrays(
+            [
+                pa.array(global_ids[order], type=pa.int64()),
+                pa.array(np.zeros(count, dtype="int16"), type=pa.int16()),
+                pa.nulls(count, type=pa.int64()),
+                pa.array(
+                    batch.column(names.index("area_km2"))
+                    .to_numpy(zero_copy_only=False)[order],
+                    type=pa.float32(),
+                ),
+                pa.array(
+                    topology.up_area_km2[unit_rows][order].astype("float32"),
+                    type=pa.float32(),
+                ),
+                pa.array(topology.outlet_lons[unit_rows][order], type=pa.float64()),
+                pa.array(topology.outlet_lats[unit_rows][order], type=pa.float64()),
+                build_bbox_struct(
+                    bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]
+                ),
+                pa.array(
+                    [
+                        batch.column(names.index("geometry"))[int(index)].as_py()
+                        for index in order
+                    ],
+                    type=pa.binary(),
+                ),
+                pa.array(hilbert[order], type=pa.uint32()),
+            ],
+            schema=schema,
+        )
+        path = scratch_root / f"catchment.run-{run_number:06d}.parquet"
+        with pq.ParquetWriter(
+            path, schema=schema, compression="snappy", write_statistics=True
+        ) as writer:
+            writer.write_table(table)
+        paths.append(path)
+        if recorder is not None:
+            recorder.scratch_event(f"catchment-run-closed:{path.name}")
+    return paths
+
+
+def _create_snap_runs(
+    stream_spool: Path,
+    scratch_root: Path,
+    topology: _CompactTopology,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> list[Path]:
+    schema = _snap_run_schema()
+    paths: list[Path] = []
+    parquet = pq.ParquetFile(stream_spool)
+    for run_number, batch in enumerate(
+        parquet.iter_batches(batch_size=COMPILE_BATCH_SIZE)
+    ):
+        names = batch.schema.names
+        native = batch.column(names.index("native_id")).to_numpy(
+            zero_copy_only=False
+        ).astype("int64", copy=False)
+        positions = np.searchsorted(topology.native_ids, native)
+        selected = (positions < len(topology.native_ids)) & (
+            topology.native_ids[
+                np.minimum(positions, len(topology.native_ids) - 1)
+            ]
+            == native
+        )
+        selected_rows = np.flatnonzero(selected)
+        if not len(selected_rows):
+            continue
+        unit_rows = positions[selected]
+        hilbert = batch.column(names.index("hilbert")).to_numpy(
+            zero_copy_only=False
+        ).astype("uint32", copy=False)[selected]
+        unit_ids = topology.global_ids[unit_rows]
+        order = np.lexsort((unit_ids, hilbert))
+        exact_bounds = np.column_stack(
+            [
+                batch.column(names.index(name)).to_numpy(zero_copy_only=False)[selected]
+                for name in ("exact_minx", "exact_miny", "exact_maxx", "exact_maxy")
+            ]
+        )[order]
+        bounds = geographic_bbox_float32_coverings(exact_bounds)
+        x_degenerate = exact_bounds[:, 0] == exact_bounds[:, 2]
+        y_degenerate = exact_bounds[:, 1] == exact_bounds[:, 3]
+        bounds[x_degenerate, 0] -= np.float32(SNAP_BBOX_EPSILON)
+        bounds[x_degenerate, 2] += np.float32(SNAP_BBOX_EPSILON)
+        bounds[y_degenerate, 1] -= np.float32(SNAP_BBOX_EPSILON)
+        bounds[y_degenerate, 3] += np.float32(SNAP_BBOX_EPSILON)
+        count = len(order)
+        table = pa.Table.from_arrays(
+            [
+                pa.array(np.zeros(count, dtype="int64"), type=pa.int64()),
+                pa.array(unit_ids[order], type=pa.int64()),
+                pa.array(
+                    topology.up_area_km2[unit_rows][order].astype("float32"),
+                    type=pa.float32(),
+                ),
+                pa.nulls(count, type=pa.string()),
+                build_bbox_struct(
+                    bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]
+                ),
+                pa.array(
+                    [
+                        batch.column(names.index("geometry"))[
+                            int(selected_rows[int(index)])
+                        ].as_py()
+                        for index in order
+                    ],
+                    type=pa.binary(),
+                ),
+                pa.array(hilbert[order], type=pa.uint32()),
+            ],
+            schema=schema,
+        )
+        path = scratch_root / f"snap.run-{run_number:06d}.parquet"
+        with pq.ParquetWriter(
+            path, schema=schema, compression="snappy", write_statistics=True
+        ) as writer:
+            writer.write_table(table)
+        paths.append(path)
+        if recorder is not None:
+            recorder.scratch_event(f"snap-run-closed:{path.name}")
+    return paths
+
+
+def _merge_write_catchments_and_graph(
+    catchments_path: Path,
+    graph_path: Path,
+    run_paths: Sequence[Path],
+    topology: _CompactTopology,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> np.ndarray:
+    """Merge catchment runs and write catchments and graph in lockstep."""
+    catchment_schema = _merge_catchment_schema()
+    graph_schema = _compile_graph_schema()
+    targets = [
+        stop - start
+        for start, stop in balanced_row_group_bounds(len(topology.native_ids))
+    ]
+    bounds_union = np.asarray(
+        [np.inf, np.inf, -np.inf, -np.inf], dtype="float32"
+    )
+    rows: list[dict[str, object]] = []
+    target_index = 0
+    catchments_path.parent.mkdir(parents=True, exist_ok=True)
+    with pq.ParquetWriter(
+        catchments_path,
+        schema=catchment_schema,
+        compression="snappy",
+        write_statistics=True,
+    ) as catchment_writer, pq.ParquetWriter(
+        graph_path,
+        schema=graph_schema,
+        compression="snappy",
+        write_statistics=True,
+    ) as graph_writer:
+        for row in _merged_run_rows(
+            run_paths, ("hilbert", "id"), recorder=recorder
+        ):
+            rows.append(row)
+            if len(rows) != targets[target_index]:
+                continue
+            catchment_rows = [
+                {name: value for name, value in item.items() if name != "hilbert"}
+                for item in rows
+            ]
+            catchment_writer.write_table(
+                _table_with_schema_rows(catchment_rows, catchment_schema)
+            )
+            ids = np.asarray([int(item["id"]) for item in rows], dtype="int64")
+            unit_rows = np.searchsorted(topology.global_ids, ids)
+            bbox = np.asarray(
+                [
+                    [
+                        item["bbox"]["xmin"],
+                        item["bbox"]["ymin"],
+                        item["bbox"]["xmax"],
+                        item["bbox"]["ymax"],
+                    ]
+                    for item in rows
+                ],
+                dtype="float32",
+            )
+            upstream = [
+                topology.upstream_global_ids[
+                    topology.upstream_offsets[unit_row] :
+                    topology.upstream_offsets[unit_row + 1]
+                ].tolist()
+                for unit_row in unit_rows
+            ]
+            graph_writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(ids, type=pa.int64()),
+                        pa.array(np.zeros(len(rows), dtype="int16"), type=pa.int16()),
+                        pa.array(
+                            upstream,
+                            type=pa.list_(
+                                pa.field("item", pa.int64(), nullable=True)
+                            ),
+                        ),
+                        pa.array(bbox[:, 0], type=pa.float32()),
+                        pa.array(bbox[:, 1], type=pa.float32()),
+                        pa.array(bbox[:, 2], type=pa.float32()),
+                        pa.array(bbox[:, 3], type=pa.float32()),
+                    ],
+                    schema=graph_schema,
+                )
+            )
+            bounds_union[0] = min(bounds_union[0], bbox[:, 0].min())
+            bounds_union[1] = min(bounds_union[1], bbox[:, 1].min())
+            bounds_union[2] = max(bounds_union[2], bbox[:, 2].max())
+            bounds_union[3] = max(bounds_union[3], bbox[:, 3].max())
+            rows.clear()
+            target_index += 1
+    if rows or target_index != len(targets):
+        raise ValueError("catchment merge row count does not match compact topology")
+    assert_geoparquet_valid(catchments_path)
+    return bounds_union
+
+
+def _merge_write_snap_stems(
+    path: Path,
+    run_paths: Sequence[Path],
+    total_rows: int,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> None:
+    """Merge snap runs and assign sequential snap IDs in file order."""
+    schema = _snap_merge_schema()
+    targets = [
+        stop - start for start, stop in balanced_row_group_bounds(total_rows)
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    target_index = 0
+    next_id = 1
+    with pq.ParquetWriter(
+        path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for row in _merged_run_rows(
+            run_paths, ("hilbert", "unit_id"), recorder=recorder
+        ):
+            row["id"] = next_id
+            next_id += 1
+            rows.append({name: value for name, value in row.items() if name != "hilbert"})
+            if len(rows) == targets[target_index]:
+                writer.write_table(_table_with_schema_rows(rows, schema))
+                rows.clear()
+                target_index += 1
+    if rows or next_id - 1 != total_rows or target_index != len(targets):
+        raise ValueError("snap merge row count does not match compact topology")
+    assert_geoparquet_valid(path)
+
+
+def _manifest_for_compiled_spools(
     processing_basin_id: str,
     fabric_version: str,
     created_at: datetime,
-) -> CoreBuildResult:
-    """Compile normalized TDX-Hydro inputs into HFX v0.3.0 core artifacts."""
-    if not processing_basin_id or not processing_basin_id.isdigit():
-        raise ValueError("processing_basin_id must be a non-empty digit string")
-    if not fabric_version or not fabric_version.strip():
-        raise ValueError("fabric_version must be a non-empty, non-whitespace string")
-    if created_at.tzinfo is None or created_at.utcoffset() is None:
-        raise ValueError("created_at must be timezone-aware")
-
-    units = _prepare_core_units(source, streamnet_model)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    catchments_path = out_dir / "catchments.parquet"
-    graph_path = out_dir / "graph.parquet"
-    snap_path = out_dir / "aux" / "snap_stems.parquet"
-    manifest_path = out_dir / "manifest.json"
-    bounds = _write_catchments(catchments_path, units)
-    _write_graph(graph_path, units, bounds, streamnet_model)
-    stems = _prepare_snap_stems(source, streamnet_model, units)
-    _write_snap_stems(snap_path, stems)
-    manifest = {
+    bounds: np.ndarray,
+    unit_count: int,
+) -> dict[str, object]:
+    return {
         "format_version": FORMAT_VERSION,
         "fabric_name": FABRIC_NAME,
         "fabric_version": fabric_version,
@@ -2714,13 +4809,8 @@ def compile_core_hfx(
         "has_up_area": HAS_UP_AREA,
         "topology": TOPOLOGY,
         "region": processing_basin_id,
-        "bbox": [
-            float(bounds[:, 0].min()),
-            float(bounds[:, 1].min()),
-            float(bounds[:, 2].max()),
-            float(bounds[:, 3].max()),
-        ],
-        "unit_count": len(units),
+        "bbox": [float(value) for value in bounds],
+        "unit_count": unit_count,
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "adapter_version": ADAPTER_VERSION,
         "auxiliary": [
@@ -2736,6 +4826,94 @@ def compile_core_hfx(
             }
         ],
     }
+
+
+def _compile_spooled_hfx(
+    spools: _NormalizedSpools,
+    topology: _CompactTopology,
+    out_dir: Path,
+    scratch_root: Path,
+    *,
+    processing_basin_id: str,
+    fabric_version: str,
+    created_at: datetime,
+    merge_fan_in: int = COMPILE_MERGE_FAN_IN,
+    _memory_recorder: _CompileMemoryRecorder | None = None,
+) -> CoreBuildResult:
+    """Compile normalized spools with bounded sorted runs and k-way merges."""
+    _validate_compile_tuning(COMPILE_BATCH_SIZE, merge_fan_in)
+    if not processing_basin_id or not processing_basin_id.isdigit():
+        raise ValueError("processing_basin_id must be a non-empty digit string")
+    if not fabric_version or not fabric_version.strip():
+        raise ValueError("fabric_version must be a non-empty, non-whitespace string")
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("created_at must be timezone-aware")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    catchments_path = out_dir / "catchments.parquet"
+    graph_path = out_dir / "graph.parquet"
+    snap_path = out_dir / "aux" / "snap_stems.parquet"
+    manifest_path = out_dir / "manifest.json"
+
+    with _record_phase(_memory_recorder, "catchment_run_creation"):
+        catchment_runs = _create_catchment_runs(
+            spools.basin_path,
+            scratch_root,
+            topology,
+            recorder=_memory_recorder,
+        )
+    with _record_phase(_memory_recorder, "catchment_graph_merge_write"):
+        spools.basin_path.unlink()
+        if _memory_recorder is not None:
+            _memory_recorder.scratch_event("basin-normalized-unlinked")
+        catchment_runs = _reduce_run_fan_in(
+            catchment_runs,
+            scratch_root,
+            "catchment",
+            _catchment_run_schema(),
+            ("hilbert", "id"),
+            merge_fan_in,
+            recorder=_memory_recorder,
+        )
+        bounds = _merge_write_catchments_and_graph(
+            catchments_path,
+            graph_path,
+            catchment_runs,
+            topology,
+            recorder=_memory_recorder,
+        )
+    with _record_phase(_memory_recorder, "snap_run_creation"):
+        snap_runs = _create_snap_runs(
+            spools.stream_path,
+            scratch_root,
+            topology,
+            recorder=_memory_recorder,
+        )
+    with _record_phase(_memory_recorder, "snap_merge_write"):
+        spools.stream_path.unlink()
+        if _memory_recorder is not None:
+            _memory_recorder.scratch_event("stream-normalized-unlinked")
+        snap_runs = _reduce_run_fan_in(
+            snap_runs,
+            scratch_root,
+            "snap",
+            _snap_run_schema(),
+            ("hilbert", "unit_id"),
+            merge_fan_in,
+            recorder=_memory_recorder,
+        )
+        _merge_write_snap_stems(
+            snap_path,
+            snap_runs,
+            len(topology.native_ids),
+            recorder=_memory_recorder,
+        )
+    manifest = _manifest_for_compiled_spools(
+        processing_basin_id,
+        fabric_version,
+        created_at,
+        bounds,
+        len(topology.native_ids),
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return CoreBuildResult(
         catchments_path=catchments_path,
@@ -2743,10 +4921,205 @@ def compile_core_hfx(
         snap_path=snap_path,
         manifest_path=manifest_path,
         diagnostics=CoreBuildDiagnostics(
-            ingestion=source.diagnostics,
-            streamnet=streamnet_model.diagnostics,
+            ingestion=spools.diagnostics,
+            streamnet=topology.diagnostics,
         ),
     )
+
+
+def _compact_topology_from_model(
+    source: TdxSourceData, model: StreamnetModel
+) -> _CompactTopology:
+    _validate_core_model(source, model)
+    units = sorted(model.units, key=lambda unit: unit.linkno)
+    native_ids = np.asarray([unit.linkno for unit in units], dtype="int64")
+    global_ids = np.asarray([unit.id for unit in units], dtype="int64")
+    downstream_native_ids = np.asarray(
+        [unit.downstream_linkno for unit in units], dtype="int64"
+    )
+    downstream_global_ids = np.asarray(
+        [unit.downstream_id for unit in units], dtype="int64"
+    )
+    contracted = np.asarray(
+        [unit.contracted_link_count for unit in units], dtype="int64"
+    )
+    outlet_lons = np.asarray([unit.outlet_lon for unit in units], dtype="float64")
+    outlet_lats = np.asarray([unit.outlet_lat for unit in units], dtype="float64")
+    stream_native = source.streamnet["LINKNO"].to_numpy(dtype="int64", copy=False)
+    stream_order = np.argsort(stream_native, kind="stable")
+    sorted_stream_native = stream_native[stream_order]
+    positions = np.searchsorted(sorted_stream_native, native_ids)
+    up_area = source.streamnet["DSContArea_km2"].to_numpy(
+        dtype="float64", copy=False
+    )[stream_order[positions]]
+    edges = np.asarray(model.edges, dtype="int64")
+    if len(edges):
+        downstream_rows = np.searchsorted(global_ids, edges[:, 1])
+        edge_order = np.lexsort((edges[:, 0], edges[:, 1]))
+        upstream_ids = edges[:, 0][edge_order]
+        counts = np.bincount(
+            downstream_rows[edge_order], minlength=len(global_ids)
+        )
+    else:
+        upstream_ids = np.empty(0, dtype="int64")
+        counts = np.zeros(len(global_ids), dtype="int64")
+    offsets = np.empty(len(global_ids) + 1, dtype="int64")
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    return _CompactTopology(
+        native_ids=native_ids,
+        global_ids=global_ids,
+        downstream_native_ids=downstream_native_ids,
+        downstream_global_ids=downstream_global_ids,
+        contracted_counts=contracted,
+        outlet_lons=outlet_lons,
+        outlet_lats=outlet_lats,
+        up_area_km2=up_area,
+        upstream_offsets=offsets,
+        upstream_global_ids=upstream_ids,
+        diagnostics=model.diagnostics,
+    )
+
+
+def _write_materialized_normalized_spools(
+    source: TdxSourceData,
+    scratch_root: Path,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> _NormalizedSpools:
+    basin_path = scratch_root / "basins.normalized.parquet"
+    stream_path = scratch_root / "streamnet.normalized.parquet"
+    geod = Geod(ellps="WGS84")
+    with pq.ParquetWriter(
+        basin_path,
+        schema=_basin_spool_schema(),
+        compression="snappy",
+        write_statistics=True,
+    ) as writer:
+        for start in range(0, len(source.basins), COMPILE_BATCH_SIZE):
+            frame = source.basins.iloc[start : start + COMPILE_BATCH_SIZE]
+            series = frame.geometry
+            own_area = np.asarray(
+                [
+                    abs(float(geod.geometry_area_perimeter(geometry)[0]))
+                    for geometry in series
+                ],
+                dtype="float64",
+            )
+            bounds = series.bounds.to_numpy(dtype="float64")
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(frame["streamID"], type=pa.int64()),
+                        pa.array((own_area / 1_000_000).astype("float32"), type=pa.float32()),
+                        pa.array(bounds[:, 0], type=pa.float64()),
+                        pa.array(bounds[:, 1], type=pa.float64()),
+                        pa.array(bounds[:, 2], type=pa.float64()),
+                        pa.array(bounds[:, 3], type=pa.float64()),
+                        pa.array(_hilbert_for_series(series), type=pa.uint32()),
+                        pa.array([geometry.wkb for geometry in series], type=pa.binary()),
+                    ],
+                    schema=_basin_spool_schema(),
+                )
+            )
+    if recorder is not None:
+        recorder.scratch_event("facade-basin-normalized-closed")
+    with pq.ParquetWriter(
+        stream_path,
+        schema=_stream_spool_schema(),
+        compression="snappy",
+        write_statistics=True,
+    ) as writer:
+        for start in range(0, len(source.streamnet), COMPILE_BATCH_SIZE):
+            frame = source.streamnet.iloc[start : start + COMPILE_BATCH_SIZE]
+            series = frame.geometry
+            endpoints = np.asarray(
+                [
+                    (
+                        float(geometry.coords[0][0]),
+                        float(geometry.coords[0][1]),
+                        float(geometry.coords[-1][0]),
+                        float(geometry.coords[-1][1]),
+                    )
+                    for geometry in series
+                ],
+                dtype="float64",
+            )
+            bounds = series.bounds.to_numpy(dtype="float64")
+            raw = (
+                frame["DSContArea"].to_numpy(dtype="float64", copy=False)
+                if "DSContArea" in frame
+                else frame["DSContArea_km2"].to_numpy(dtype="float64", copy=False)
+            )
+            writer.write_table(
+                pa.Table.from_arrays(
+                    [
+                        pa.array(frame["LINKNO"], type=pa.int64()),
+                        pa.array(frame["DSLINKNO"], type=pa.int64()),
+                        pa.array(raw, type=pa.float64()),
+                        pa.array(endpoints[:, 0], type=pa.float64()),
+                        pa.array(endpoints[:, 1], type=pa.float64()),
+                        pa.array(endpoints[:, 2], type=pa.float64()),
+                        pa.array(endpoints[:, 3], type=pa.float64()),
+                        pa.array(
+                            [_is_tdx_degenerate_reach(geometry) for geometry in series],
+                            type=pa.bool_(),
+                        ),
+                        pa.array(bounds[:, 0], type=pa.float64()),
+                        pa.array(bounds[:, 1], type=pa.float64()),
+                        pa.array(bounds[:, 2], type=pa.float64()),
+                        pa.array(bounds[:, 3], type=pa.float64()),
+                        pa.array(_hilbert_for_series(series), type=pa.uint32()),
+                        pa.array([geometry.wkb for geometry in series], type=pa.binary()),
+                    ],
+                    schema=_stream_spool_schema(),
+                )
+            )
+    if recorder is not None:
+        recorder.scratch_event("facade-stream-normalized-closed")
+    return _NormalizedSpools(
+        basin_path=basin_path,
+        stream_path=stream_path,
+        basin_crs=CRS,
+        stream_crs=CRS,
+        diagnostics=source.diagnostics,
+    )
+
+
+def compile_core_hfx(
+    source: TdxSourceData,
+    streamnet_model: StreamnetModel,
+    out_dir: Path,
+    *,
+    processing_basin_id: str,
+    fabric_version: str,
+    created_at: datetime,
+    _memory_recorder: _CompileMemoryRecorder | None = None,
+    _merge_fan_in: int = COMPILE_MERGE_FAN_IN,
+) -> CoreBuildResult:
+    """Compile through the same private compiler used by the build command."""
+    _validate_compile_tuning(COMPILE_BATCH_SIZE, _merge_fan_in)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{out_dir.name}.compile-scratch-",
+        dir=out_dir.parent,
+    ) as temporary:
+        scratch_root = Path(temporary)
+        spools = _write_materialized_normalized_spools(
+            source, scratch_root, recorder=_memory_recorder
+        )
+        topology = _compact_topology_from_model(source, streamnet_model)
+        return _compile_spooled_hfx(
+            spools,
+            topology,
+            out_dir,
+            scratch_root,
+            processing_basin_id=processing_basin_id,
+            fabric_version=fabric_version,
+            created_at=created_at,
+            merge_fan_in=_merge_fan_in,
+            _memory_recorder=_memory_recorder,
+        )
 
 
 def build_diagnostics_report(
@@ -2858,6 +5231,8 @@ def build_dataset(
     published_dataset = False
     published_report = False
     removed_existing_output = False
+    recorder: _CompileMemoryRecorder | None = None
+    recorder_stopped = False
     try:
         staging_root = Path(
             tempfile.mkdtemp(
@@ -2865,28 +5240,61 @@ def build_dataset(
             )
         )
         staging_dataset_root = staging_root / "dataset"
-        source = load_tdx_geopackages(basins_path, streamnet_path)
-        header_number = load_header_crosswalk()[processing_basin_id]
-        model = build_streamnet_model(
-            source.basins,
-            source.streamnet,
-            header_number,
-            endpoint_tolerance=endpoint_tolerance,
+        recorder = _CompileMemoryRecorder(staging_root)
+        recorder.start()
+        source = _ingest_source_spools(
+            basins_path,
+            streamnet_path,
+            staging_root,
+            recorder,
         )
-        staging_result = compile_core_hfx(
-            source,
-            model,
+        with recorder.phase("topology"):
+            header_number = load_header_crosswalk()[processing_basin_id]
+            topology = _build_compact_topology(
+                source.basin_native_ids,
+                source.stream_native_ids,
+                source.downstream_native_ids,
+                source.endpoints,
+                source.degenerate,
+                source.up_area_km2,
+                header_number,
+                endpoint_tolerance,
+            )
+            LOGGER.info(
+                "compact_topology rows=%d bytes=%d representation=numpy-fixed-width",
+                len(topology.native_ids),
+                topology.nbytes,
+            )
+        staging_result = _compile_spooled_hfx(
+            source.spools,
+            topology,
             staging_dataset_root,
+            staging_root,
             processing_basin_id=processing_basin_id,
             fabric_version=fabric_version,
             created_at=created_at,
+            merge_fan_in=COMPILE_MERGE_FAN_IN,
+            _memory_recorder=recorder,
         )
+        memory = recorder.stop()
+        recorder_stopped = True
         result = CoreBuildResult(
             catchments_path=output_root / "catchments.parquet",
             graph_path=output_root / "graph.parquet",
             snap_path=output_root / "aux" / "snap_stems.parquet",
             manifest_path=output_root / "manifest.json",
             diagnostics=staging_result.diagnostics,
+        )
+        result = CoreBuildResult(
+            catchments_path=result.catchments_path,
+            graph_path=result.graph_path,
+            snap_path=result.snap_path,
+            manifest_path=result.manifest_path,
+            diagnostics=CoreBuildDiagnostics(
+                ingestion=result.diagnostics.ingestion,
+                streamnet=result.diagnostics.streamnet,
+                memory=memory,
+            ),
         )
         report = build_diagnostics_report(
             result,
@@ -2923,6 +5331,8 @@ def build_dataset(
             output_root.mkdir(parents=True)
         raise
     finally:
+        if recorder is not None and not recorder_stopped:
+            recorder.stop()
         if report_temporary is not None:
             report_temporary.unlink(missing_ok=True)
         if staging_root is not None:
