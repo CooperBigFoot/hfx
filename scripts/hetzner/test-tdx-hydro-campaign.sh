@@ -199,7 +199,7 @@ if [[ -x /bin/bash && "$selected_bash" != /bin/bash ]]; then
     die 'the harness did not select /bin/bash'
 fi
 
-for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep; do
+for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
@@ -350,9 +350,10 @@ for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
     forbidden_v='\[\[[^]]+[[:space:]]-v[[:space:]]'
     forbidden_nameref='(declare|local)[[:space:]]+-n'
     forbidden_lock='f''lock'
+    forbidden_bashpid='BASH''PID'
     if grep -En -e "$forbidden_assoc" -e "$forbidden_wait" -e "$forbidden_map" -e "$forbidden_read" \
         -e "$forbidden_case_change" -e "$forbidden_glob" -e "$forbidden_negative" -e "$forbidden_v" \
-        -e "$forbidden_nameref" -e "$forbidden_lock" "$script" >"$case_stdout"; then
+        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" "$script" >"$case_stdout"; then
         die "forbidden Bash-4 construct found in $script"
     fi
     if grep -En '"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"' "$script" |
@@ -367,6 +368,13 @@ assert_contains "$runner" 'readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/
 assert_contains "$runner" 'ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")'
 assert_contains "$runner" 'ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}'
 assert_contains "$runner" 'HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")'
+assert_contains "$runner" 'option --max-parallel must be a base-10 integer from 1 through 62'
+assert_contains "$runner" '((max_parallel >= 1 && max_parallel <= 62))'
+assert_contains "$runner" '--continue-at'
+assert_contains "$runner" 'header_status" == 200'
+assert_contains "$runner" '[Ee][Tt][Aa][Gg]:*'
+assert_contains "$runner" '.curl-headers.$basin_id.$product.$$'
+assert_contains "$runner" '.curl-stats.$basin_id.$product.$$'
 pass 'static Bash 3.2 compatibility checks pass'
 
 expected_campaign_commands=$test_tmp/expected-campaign-commands
@@ -801,6 +809,10 @@ sed >"$test_tmp/fake-curl" <<'FAKE_CURL'
 set -eu
 output=
 url=
+headers=
+write_out=
+continue_at=
+if_range=
 seen_fail=0
 seen_show=0
 seen_location=0
@@ -831,7 +843,23 @@ while [ "$#" -gt 0 ]; do
             shift
             output=${1-}
             ;;
-        --range|-r|--continue-at|-C|--parallel|--head|-I|--retry|--retry-all-errors)
+        --dump-header)
+            shift
+            headers=${1-}
+            ;;
+        --write-out)
+            shift
+            write_out=${1-}
+            ;;
+        --continue-at)
+            shift
+            continue_at=${1-}
+            ;;
+        --header)
+            shift
+            if_range=${1-}
+            ;;
+        --range|-r|-C|--parallel|--head|-I|--retry|--retry-all-errors)
             exit 92
             ;;
         https://earth-info.nga.mil/php/download.php?file=*-basins-gpkg|https://earth-info.nga.mil/php/download.php?file=*-streamnet-gpkg)
@@ -842,9 +870,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ "$seen_fail$seen_show$seen_location$seen_connect$seen_speed_limit$seen_speed_time" = 111111 ]
-[ -n "$output" ] && [ -n "$url" ]
+[ -n "$output" ] && [ -n "$url" ] && [ -n "$headers" ] && [ -n "$write_out" ]
+[ "$write_out" = 'http_status=%{http_code}\nnetwork_bytes=%{size_download}\ntime_total_seconds=%{time_total}\naverage_bytes_per_second=%{speed_download}\n' ] || exit 91
+[ -z "$continue_at" ] || { [ "$continue_at" = - ] && [ "${if_range#If-Range: }" != "$if_range" ]; }
 base=${output##*/}
 key=${base%.gpkg.partial}
+stats_path=${headers/.curl-headers./.curl-stats.}
+printf '%s\t%s\t%s\n' "$key" "$headers" "$stats_path" >>"${HFX_TEST_TRANSFER_STATE:?}/paths"
 mutex=${HFX_TEST_TRANSFER_STATE:?}/mutex
 while ! mkdir "$mutex" 2>/dev/null; do sleep 0.01; done
 active=0
@@ -857,6 +889,10 @@ maximum=0
 printf 'start %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
 if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
+    total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
+    head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
+    printf 'HTTP/1.1 200 OK\r\nETag: \"fixture-v1\"\r\nContent-Length: %s\r\n\r\n' "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
     printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/curl.$$"
     printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/worker.$PPID"
     if mkdir "$HFX_TEST_TRANSFER_STATE/signal-owner" 2>/dev/null; then
@@ -889,11 +925,68 @@ if [ -n "${HFX_TEST_BARRIER_COUNT-}" ]; then
         [ "$barrier_deadline" -lt 1000 ] || exit 94
     done
 fi
-if [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
-    printf 'partial\n' >"$output"
+total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
+if [ "${HFX_TEST_RESUME_MODE-}" = changed ]; then
+    total=$((total + 3))
+fi
+header_etag='"fixture-v1"'
+header_name_etag=ETag
+header_name_length=Content-Length
+header_name_range=Content-Range
+[ "${HFX_TEST_LOWERCASE_HEADERS-}" != 1 ] || {
+    header_name_etag=etag
+    header_name_length=content-length
+    header_name_range=content-range
+}
+if [ -n "$continue_at" ]; then
+    offset=$(wc -c <"$output" | tr -d ' ')
+    [ "$if_range" = "If-Range: $header_etag" ] || exit 91
+    case ${HFX_TEST_RESUME_MODE-honor} in
+        ignored|changed)
+            [ "${HFX_TEST_RESUME_MODE-honor}" != changed ] || header_etag='"fixture-v2"'
+            printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+            printf 'http_status=200\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=33
+            ;;
+        mutate-ignored)
+            printf x >>"$output"
+            printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+            printf 'http_status=200\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=33
+            ;;
+        short)
+            printf 'HTTP/1.1 206 Partial Content\r\n%s: %s\r\n%s: bytes %s-%s/%s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_range" "$offset" "$((total - 1))" "$total" >"$headers"
+            printf 'http_status=206\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=0
+            ;;
+        honor)
+            tail -c +$((offset + 1)) "$HFX_TEST_GPKG_TEMPLATE" >>"$output"
+            printf 'HTTP/1.1 206 Partial Content\r\n%s: %s\r\n%s: bytes %s-%s/%s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_range" "$offset" "$((total - 1))" "$total" >"$headers"
+            printf 'http_status=206\nnetwork_bytes=%s\ntime_total_seconds=1.25\naverage_bytes_per_second=8\n' "$((total - offset))"
+            result=0
+            ;;
+        *) exit 96 ;;
+    esac
+elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
+    head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
+    [ "${HFX_TEST_LEADING_ZERO_LENGTH-}" != 1 ] || total=0$total
+    printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+        "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
     result=22
 else
     cp "${HFX_TEST_GPKG_TEMPLATE:?}" "$output"
+    if [ "${HFX_TEST_RESUME_MODE-}" = changed ]; then
+        printf v2x >>"$output"
+        header_etag='"fixture-v2"'
+    fi
+    printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+        "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=%s\ntime_total_seconds=1.25\naverage_bytes_per_second=20\n' "$total"
     result=0
 fi
 while ! mkdir "$mutex" 2>/dev/null; do sleep 0.01; done
@@ -906,11 +999,12 @@ exit "$result"
 FAKE_CURL
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
+checksum=$(cksum <"$1")
+checksum=${checksum%% *}
 if [ "${HFX_TEST_HASH_MODE-}" = changed ]; then
-    printf '%064d  %s\n' 1 "$1"
-else
-    printf '%064d  %s\n' 0 "$1"
+    checksum=$((checksum + 1))
 fi
+printf '%064x  %s\n' "$checksum" "$1"
 FAKE_SHA
 sed >"$test_tmp/fake-ogrinfo" <<'FAKE_OGR'
 #!/bin/sh
@@ -1283,9 +1377,11 @@ HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
         --connect-timeout 30 \
         --speed-limit 65536 \
         --speed-time 60 \
+        --dump-header "$test_tmp/lone-basins.headers" \
+        --write-out 'http_status=%{http_code}\nnetwork_bytes=%{size_download}\ntime_total_seconds=%{time_total}\naverage_bytes_per_second=%{speed_download}\n' \
         --output "$test_tmp/lone-basins.gpkg.partial" \
         'https://earth-info.nga.mil/php/download.php?file=1020000010-basins-gpkg' \
-        >"$case_stdout" 2>"$case_stderr" || rendezvous_status=$?
+        >"$test_tmp/lone-basins.stats" 2>"$case_stderr" || rendezvous_status=$?
 [[ "$rendezvous_status" -eq 95 ]] ||
     die "single-marker drain rendezvous exited $rendezvous_status instead of 95"
 [[ $(find "$test_tmp/transfer-state" -name 'curl.*' -type f | wc -l | tr -d ' ') == 1 ]] ||
@@ -1337,6 +1433,19 @@ for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/c
 done
 [[ -e "$test_tmp/transfer-state/signal-owner" ]] ||
     die 'repeated drain TERM did not start its signal coordinator'
+drain_campaign_dir=$drain_interrupt_root/tdx-hydro-interrupt-drain
+[[ $(find "$drain_campaign_dir/state/tmp" \
+    \( -name '.curl-headers.*' -o -name '.curl-stats.*' \) -type f |
+    wc -l | tr -d ' ') == 0 ]] ||
+    die 'interrupted acquisition retained header or stats temporaries'
+while IFS= read -r interrupted_partial; do
+    [[ -f "$interrupted_partial" && ! -L "$interrupted_partial" ]] ||
+        die "interrupted acquisition retained an unsafe partial: $interrupted_partial"
+    if [[ -e "$interrupted_partial.json" ]]; then
+        [[ -f "$interrupted_partial.json" && ! -L "$interrupted_partial.json" ]] ||
+            die "interrupted acquisition retained an unsafe sidecar: $interrupted_partial.json"
+    fi
+done < <(find "$drain_campaign_dir/downloads" -name '*.gpkg.partial' -type f)
 pass 'repeated INT/TERM during worker drain exits 130, reaps workers, and releases the lock'
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
@@ -1345,16 +1454,50 @@ acquire_root=$test_tmp/workspaces/acquire
 mkdir "$acquire_root"
 set -- $(init_args acquire "$acquire_root")
 run_runner "$@" >"$case_stdout"
-export HFX_TEST_BARRIER_COUNT=2
-run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 3 >"$case_stdout"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+export HFX_TEST_BARRIER_COUNT=4
+if ! run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"; then
+    sed 's/^/all-62 acquire: /' "$case_stderr" >&2
+    die 'all-62 acquisition failed'
+fi
 unset HFX_TEST_BARRIER_COUNT
 acquire_dir=$acquire_root/tdx-hydro-acquire
-[[ $(<"$test_tmp/transfer-state/maximum") -ge 2 && $(<"$test_tmp/transfer-state/maximum") -le 3 ]] ||
-    die 'bounded parallel acquisition did not observe deterministic overlap'
+[[ $(<"$test_tmp/transfer-state/maximum") == 4 ]] ||
+    die 'bounded parallel acquisition did not observe exactly four transfers'
 [[ $(find "$acquire_dir/downloads" -name '*.gpkg' -type f | wc -l | tr -d ' ') == 124 ]] ||
     die 'complete acquisition did not install 124 files'
 [[ $(grep -c '^start ' "$test_tmp/transfer-state/events") == 124 ]] ||
     die 'complete acquisition did not invoke 124 transfers'
+[[ $(grep -c '^hfx: acquisition product=.* status=succeeded ' "$case_stderr") == 124 ]] ||
+    die 'complete acquisition did not emit 124 succeeded summaries'
+[[ $(find "$acquire_dir/reports" -name '*-acquisition.json' -type f | wc -l | tr -d ' ') == 124 ]] ||
+    die 'complete acquisition did not install 124 acquisition reports'
+[[ $(cut -f2 "$test_tmp/transfer-state/paths" | sort -u | wc -l | tr -d ' ') == 124 &&
+    $(cut -f3 "$test_tmp/transfer-state/paths" | sort -u | wc -l | tr -d ' ') == 124 ]] ||
+    die 'acquisition header and stats paths are not distinct'
+while IFS=$'\t' read -r captured_key captured_headers captured_stats; do
+    captured_basin=${captured_key%-*}
+    captured_product=${captured_key##*-}
+    case $captured_headers in
+        *".curl-headers.$captured_basin.$captured_product."*) ;;
+        *) die "header path lacks basin/product identity: $captured_headers" ;;
+    esac
+    case $captured_stats in
+        *".curl-stats.$captured_basin.$captured_product."*) ;;
+        *) die "stats path lacks basin/product identity: $captured_stats" ;;
+    esac
+done <"$test_tmp/transfer-state/paths"
+jq -e -s '
+  length == 124 and all(
+    .schema_version == 1 and .retry_count == 0 and .resume_count == 0 and
+    .range_ignored_restart_count == 0 and (.transfers | length) == 1 and
+    .transfers[0].mode == "fresh" and .transfers[0].result == "succeeded" and
+    .transfers[0].http_status == 200 and .transfers[0].time_total_seconds == 1.25
+  )
+' "$acquire_dir"/reports/*-acquisition.json >/dev/null ||
+    die 'fresh acquisition reports differ'
 jq -e -s '
   length == 62 and all(
     .schema_version == 3 and
@@ -1371,9 +1514,12 @@ jq -e -s '
   )
 ' "$acquire_dir"/state/basins/*/current.json >/dev/null || die 'successful acquisition evidence differs'
 events_before=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
-run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
 events_after=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
 [[ "$events_before" == "$events_after" ]] || die 'verified reuse fetched files again'
+[[ $(grep -c ' status=reused ' "$case_stderr") == 124 ]] ||
+    die 'verified reuse summaries differ'
 pass 'all 62 basins acquire with bounded concurrency and exact reusable evidence'
 
 serial_root=$test_tmp/workspaces/serial
@@ -1382,8 +1528,15 @@ set -- $(init_args serial "$serial_root")
 run_runner "$@" >"$case_stdout"
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
-run_runner acquire --campaign serial --workspace-root "$serial_root" --max-parallel 1 >"$case_stdout"
+run_runner acquire --campaign serial --workspace-root "$serial_root" --max-parallel 1 \
+    >"$case_stdout" 2>"$case_stderr"
 [[ $(<"$test_tmp/transfer-state/maximum") == 1 ]] || die 'serial acquisition exceeded one active transfer'
+[[ $(find "$serial_root/tdx-hydro-serial/reports" -name '*-acquisition.json' -type f |
+    wc -l | tr -d ' ') == 124 ]] ||
+    die 'serial acquisition did not atomically install every product report'
+[[ $(find "$serial_root/tdx-hydro-serial/reports" -name '.*.tmp.*' -type f |
+    wc -l | tr -d ' ') == 0 ]] ||
+    die 'serial acquisition left a report writer temporary'
 pass 'maximum parallel one remains strictly serial'
 
 failure_root=$test_tmp/workspaces/failure
@@ -1394,8 +1547,16 @@ rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
 failure_id=$(jq -r 'keys[0]' "$inventory")
 export HFX_TEST_FAIL_KEY=$failure_id-basins
-run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 \
+    >"$case_stdout" 2>"$case_stderr"
 failure_state=$failure_root/tdx-hydro-failure/state/basins/$failure_id/current.json
+failure_partial=$failure_root/tdx-hydro-failure/downloads/$failure_id-basins.gpkg.partial
+[[ -f "$failure_partial" && -f "$failure_partial.json" ]] ||
+    die 'interrupted product did not retain attributable provenance'
+[[ $(find "$failure_root/tdx-hydro-failure/state/tmp" \
+    \( -name ".curl-headers.$failure_id.basins.*" -o -name ".curl-stats.$failure_id.basins.*" \) \
+    -type f | wc -l | tr -d ' ') == 0 ]] ||
+    die 'failed transfer retained its header or stats temporary'
 jq -e '
   .stages.acquire_basins.status == "failed" and
   .stages.acquire_basins.attempts == 1 and
@@ -1405,12 +1566,41 @@ jq -e '
 ' "$failure_state" >/dev/null || die 'isolated transfer failure state differs'
 unset HFX_TEST_FAIL_KEY
 events_before=$(grep -c '^start ' "$test_tmp/transfer-state/events")
-run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 \
+    >"$case_stdout" 2>"$case_stderr"
 events_after=$(grep -c '^start ' "$test_tmp/transfer-state/events")
 [[ $((events_after - events_before)) == 1 ]] || die 'retry fetched work other than the failed product'
 jq -e '.stages.acquire_basins.status == "succeeded" and .stages.acquire_basins.attempts == 2' \
     "$failure_state" >/dev/null || die 'failed product did not converge on retry'
-pass 'product failure is isolated and only incomplete work retries'
+jq -e '.retry_count == 1 and .resume_count == 1 and
+  (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "succeeded"' \
+    "$failure_root/tdx-hydro-failure/reports/$failure_id-basins-acquisition.json" >/dev/null ||
+    die 'failed product continuation telemetry differs'
+
+leading_zero_root=$test_tmp/workspaces/leading-zero
+mkdir "$leading_zero_root"
+cp -R "$subset_campaign_dir" "$leading_zero_root/tdx-hydro-subset"
+leading_zero_dir=$leading_zero_root/tdx-hydro-subset
+leading_zero_id=1020000010
+leading_zero_state=$leading_zero_dir/state/basins/$leading_zero_id/current.json
+leading_zero_final=$leading_zero_dir/downloads/$leading_zero_id-basins.gpkg
+rm "$leading_zero_final"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$leading_zero_state" >"$leading_zero_state.tmp"
+mv "$leading_zero_state.tmp" "$leading_zero_state"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_FAIL_KEY=$leading_zero_id-basins HFX_TEST_LEADING_ZERO_LENGTH=1 \
+    run_runner acquire --campaign subset --workspace-root "$leading_zero_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "failed" and
+  .stages.acquire_basins.failure_reason == "transfer failed" and
+  .stages.acquire_streamnet.status == "succeeded"' "$leading_zero_state" >/dev/null ||
+    die 'leading-zero Content-Length was not isolated to its product'
+[[ ! -e "$leading_zero_final.partial" && ! -e "$leading_zero_final.partial.json" ]] ||
+    die 'leading-zero Content-Length retained unattributable provenance'
+pass 'product failures are isolated, resumable, and contain malformed Content-Length'
 
 reuse_root=$test_tmp/workspaces/reuse-corrupt
 mkdir "$reuse_root"
@@ -1481,6 +1671,120 @@ jq -e '.stages.acquire_basins.status == "succeeded" and .stages.acquire_basins.a
 [[ $(grep -c "^start $reuse_id-basins$" "$test_tmp/transfer-state/events") == 1 ]] ||
     die 'partial retry did not issue exactly one complete GET'
 
+prepare_resume_fixture() {
+    local name=$1
+    resume_root=$test_tmp/workspaces/$name
+    mkdir "$resume_root"
+    cp -R "$subset_campaign_dir" "$resume_root/tdx-hydro-subset"
+    resume_dir=$resume_root/tdx-hydro-subset
+    resume_id=1020000010
+    resume_state=$resume_dir/state/basins/$resume_id/current.json
+    resume_final=$resume_dir/downloads/$resume_id-basins.gpkg
+    resume_partial=$resume_final.partial
+    resume_sidecar=$resume_partial.json
+    resume_report=$resume_dir/reports/$resume_id-basins-acquisition.json
+    rm "$resume_final"
+    jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+        "$resume_state" >"$resume_state.tmp"
+    mv "$resume_state.tmp" "$resume_state"
+    rm -r "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    HFX_TEST_FAIL_KEY=$resume_id-basins \
+        run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+        >"$case_stdout" 2>"$case_stderr"
+    [[ -f "$resume_partial" && -f "$resume_sidecar" && ! -e "$resume_final" ]] ||
+        die "$name did not establish an attributable interrupted partial"
+}
+
+prepare_resume_fixture resume-honored
+run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+cmp "$resume_final" "$test_tmp/geopackage-template" >/dev/null ||
+    die 'honored continuation did not install the exact fixture'
+jq -e '.resume_count == 1 and (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "succeeded" and
+  (.transfers | last | .http_status) == 206' \
+    "$resume_report" >/dev/null || die 'honored continuation report differs'
+
+prepare_resume_fixture resume-ignored
+ignored_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+HFX_TEST_RESUME_MODE=ignored \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - ignored_events)) == 2 ]] ||
+    die 'ignored Range did not issue one continuation and one clean GET'
+cmp "$resume_final" "$test_tmp/geopackage-template" >/dev/null ||
+    die 'ignored Range concatenated data'
+jq -e '.transfers as $t | .range_ignored_restart_count == 1 and
+  $t[($t|length)-2].mode == "range_ignored_restart" and
+  $t[($t|length)-2].result == "range_ignored_restart" and
+  ($t | last | .mode) == "fresh"' "$resume_report" >/dev/null ||
+    die 'ignored Range report differs'
+
+prepare_resume_fixture resume-changed
+HFX_TEST_RESUME_MODE=changed \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(wc -c <"$resume_final" | tr -d ' ') == 27 ]] ||
+    die 'changed ETag did not install only the new representation'
+tail -c 3 "$resume_final" | grep -Fx v2x >/dev/null ||
+    die 'changed ETag fixture differs'
+
+prepare_resume_fixture resume-short
+HFX_TEST_RESUME_MODE=short \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "failed"' "$resume_state" >/dev/null ||
+    die 'short continuation unexpectedly succeeded'
+[[ ! -e "$resume_final" ]] || die 'short continuation installed a final'
+
+prepare_resume_fixture resume-stale
+printf 'XXXXXXXXXXXXXXXXXX' >"$resume_partial"
+stale_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - stale_events)) == 1 ]] ||
+    die 'same-length hash-stale partial did not use exactly one clean GET'
+
+prepare_resume_fixture resume-lowercase
+HFX_TEST_LOWERCASE_HEADERS=1 \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '(.transfers | last | .http_status) == 206 and
+  (.transfers | last | .result) == "succeeded"' \
+    "$resume_report" >/dev/null || die 'lowercase continuation headers were not accepted'
+
+prepare_resume_fixture resume-mutated-ignored
+mutated_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+HFX_TEST_RESUME_MODE=mutate-ignored \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - mutated_events)) == 1 ]] ||
+    die 'mutated ignored-Range continuation made a clean GET'
+jq -e '.stages.acquire_basins.status == "failed" and
+  .stages.acquire_basins.failure_reason == "partial changed during ignored-Range continuation"' \
+    "$resume_state" >/dev/null || die 'mutated ignored-Range failure differs'
+jq -e '.range_ignored_restart_count == 0 and
+  (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "integrity_failed"' "$resume_report" >/dev/null ||
+    die 'mutated ignored-Range telemetry differs'
+
+lowercase_fresh_root=$test_tmp/workspaces/lowercase-fresh
+mkdir "$lowercase_fresh_root"
+cp -R "$subset_campaign_dir" "$lowercase_fresh_root/tdx-hydro-subset"
+lowercase_fresh_dir=$lowercase_fresh_root/tdx-hydro-subset
+rm "$lowercase_fresh_dir/downloads/1020000010-basins.gpkg"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$lowercase_fresh_dir/state/basins/1020000010/current.json" >"$case_stdout"
+mv "$case_stdout" "$lowercase_fresh_dir/state/basins/1020000010/current.json"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_LOWERCASE_HEADERS=1 \
+    run_runner acquire --campaign subset --workspace-root "$lowercase_fresh_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ -f "$lowercase_fresh_dir/downloads/1020000010-basins.gpkg" ]] ||
+    die 'lowercase fresh headers were not accepted'
+
 unsafe_partial_root=$test_tmp/workspaces/unsafe-partial
 mkdir "$unsafe_partial_root"
 cp -R "$acquire_dir" "$unsafe_partial_root/tdx-hydro-acquire"
@@ -1498,7 +1802,7 @@ jq -e '.stages.acquire_basins.status == "failed" and .stages.acquire_basins.atte
     "$unsafe_state" >/dev/null || die 'unsafe partial was not isolated without a new attempt'
 [[ -L "$unsafe_final.partial" ]] || die 'unsafe partial was removed or traversed'
 [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'unsafe partial triggered a fetch'
-pass 'verified finals are adopted and partial paths follow safe all-or-nothing retry rules'
+pass 'verified finals are adopted and partials resume only with safe provenance'
 
 compile_physical_parent=$test_tmp/workspaces/compile-physical-parent
 compile_link_parent=$test_tmp/workspaces/compile-link-parent
