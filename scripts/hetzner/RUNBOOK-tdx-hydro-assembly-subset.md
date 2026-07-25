@@ -12,19 +12,23 @@ requires VM-native confirmation after bootstrap and before acquisition or
 compile (`adapters/tdx-hydro/GEOPANDAS-HILBERT-PARITY.md:1-11,25-30,70-74,
 92-98`). Assembly wiring from PR #169 and the basin-subset contract from PR
 #170 are present at immutable ref
-`bf445eba7c714c044f2766437b07d94a7665bc82`. That ref also contains the VM
+`8a614e72f989420dccb84c1f7f2ca28043a36a63`. That ref also contains the VM
 dependency contract from PR #173, which installs and verifies `jq` and the full
-runner command surface; the `ccx43` upsize and 60,000,000,000-byte memory gates
-from PR #174; correctly rounded manifest float parsing through serde_json's
-`float_roundtrip` feature from PR #175; and the TDX-Hydro adapter's outward
-float32 bbox coverings from PR #176.
+runner command surface; the historical `ccx43` upsize and 60,000,000,000-byte
+memory gates from PR #174; correctly rounded manifest float parsing through
+serde_json's `float_roundtrip` feature from PR #175; the TDX-Hydro adapter's
+outward float32 bbox coverings from PR #176; and the bounded streaming
+compiler from PR #178.
 
 Initial human authorization granted on 2026-07-24 covers one `ccx33` plus campaign
 volume, two to three real NGA basin downloads, per-basin compile, partial
 assembly, validation, evidence retention, and zero-footprint teardown. The
-server type was upsized to `ccx43` after the 2026-07-24 OOM on basin
-`1020000010`; authorized by the user on 2026-07-25; the ceiling remains EUR
-10.00. This run uses exactly three inventory-backed basins:
+server type was historically upsized to `ccx43` after the 2026-07-24 OOM on basin
+`1020000010` and authorized by the user on 2026-07-25. The server type returned
+to `ccx33` on 2026-07-25 because the account cannot provision a `ccx43`
+(dedicated-vCPU quota 8, limit increase unavailable); compile now fits 32 GB
+via the bounded streaming compiler in PR #178. The ceiling remains EUR 10.00.
+This run uses exactly three inventory-backed basins:
 
 - `1020000010`, crosswalk header `11`
 - `7020000010`, crosswalk header `71`
@@ -48,7 +52,7 @@ set +x
 CAMPAIGN=tdx-m4-subset
 SERVER_NAME=hfx-build-tdx-m4-subset
 VOLUME_NAME=hfx-build-tdx-m4-subset-data
-GROUND_TRUTH_REF=bf445eba7c714c044f2766437b07d94a7665bc82
+GROUND_TRUTH_REF=8a614e72f989420dccb84c1f7f2ca28043a36a63
 MILESTONE_BRANCH=pce/tdx-hydro-planetary-compile-and-assembly/milestone-4
 VOLUME_SIZE_GB=150
 RUN_UTC=$(date -u +%Y%m%dT%H%M%SZ)
@@ -119,7 +123,7 @@ evidence. The weighted three-basin multiplier is therefore
 | Category | Basis | Frozen bytes |
 |---|---:|---:|
 | Download retention | `4 * 7,584,165,888 = 30,336,663,552`, then 31.9 percent headroom and decimal round-up | `40,000,000,000` |
-| Compile scratch reserve | More than twice the estimated largest unproven output of `1.5 * 2,847,381,989`; compiles are serial | `10,000,000,000` |
+| Compile scratch reserve | M4-S4f rounded per-basin reserve for private spools, sorted runs, intermediate merge passes, and staged final artifacts; compiles are serial | `30,000,000,000` |
 | Retained basin outputs | `4 * 2,847,381,989 = 11,389,527,956`, then 31.7 percent headroom and round-up | `15,000,000,000` |
 | Assembly scratch | One full real-byte output staging allowance plus the measured M3 scratch ceiling, rounded up | `20,000,000,000` |
 | Assembled output | Same weighted real dataset basis as retained outputs with 31.7 percent headroom | `15,000,000,000` |
@@ -127,13 +131,16 @@ evidence. The weighted three-basin multiplier is therefore
 The runner's required disk formula is retained inputs plus retained basin
 outputs plus assembly scratch plus assembled artifact
 (`scripts/hetzner/tdx-hydro-campaign.sh:157-167,2049-2065`). It is
-`90,000,000,000` bytes. A 150 GB decimal volume is expected to expose at least
-`140,000,000,000` usable bytes after filesystem overhead. The resulting
-50,000,000,000-byte reserve covers the separate 10,000,000,000-byte compile
-scratch allowance, filesystem overhead, logs, reports, and estimation error.
+`40,000,000,000 + 15,000,000,000 + 20,000,000,000 + 15,000,000,000 =
+90,000,000,000` bytes. Add the one active per-basin compile-scratch reserve:
+`90,000,000,000 + 30,000,000,000 = 120,000,000,000` bytes. A 150 GB decimal
+volume is expected to expose at least `140,000,000,000` usable bytes after
+filesystem overhead, so the frozen total fits with
+`140,000,000,000 - 120,000,000,000 = 20,000,000,000` bytes remaining for logs,
+reports, and estimation error.
 
-The `ccx43` has 16 vCPU and a 64 GB memory class. Freeze
-`60,000,000,000` bytes as available memory after operating-system reserve and
+The `ccx33` has 8 vCPU and a 32 GB memory class. Freeze
+`30,000,000,000` bytes as available memory after operating-system reserve and
 `8,000,000,000` bytes as the assembly ceiling. The assembly ceiling is nearly
 7.9 times the measured M3 RSS. The pre-init check below must prove the VM
 actually exposes both frozen available capacities.
@@ -157,7 +164,7 @@ arguments and the three selected basins:
   --basin 1020000010 \
   --basin 7020000010 \
   --basin 9020000010 \
-  --available-memory-bytes 60000000000 \
+  --available-memory-bytes 30000000000 \
   --available-disk-bytes 140000000000 \
   --retained-input-bytes 40000000000 \
   --retained-basin-output-bytes 15000000000 \
@@ -188,20 +195,20 @@ test -s "$S3_ENV_FILE"
 ```
 
 Immediately before provisioning, use the Hetzner console to verify the
-`ccx43` hourly price, 150 GB volume price per GB-month, included traffic, and
+`ccx33` hourly price, 150 GB volume price per GB-month, included traffic, and
 traffic overage price. Record them without credentials:
 
 ```bash
-printf '%s' 'Console ccx43 EUR/hour: '
-IFS= read -r CCX43_EUR_PER_HOUR
+printf '%s' 'Console ccx33 EUR/hour: '
+IFS= read -r CCX33_EUR_PER_HOUR
 printf '%s' 'Console volume EUR/GB-month: '
 IFS= read -r VOLUME_EUR_PER_GB_MONTH
 printf '%s' 'Console included traffic: '
 IFS= read -r INCLUDED_TRAFFIC
 printf '%s' 'Console traffic overage EUR/TB: '
 IFS= read -r TRAFFIC_OVERAGE_EUR_PER_TB
-printf 'ccx43_eur_per_hour=%s\nvolume_eur_per_gb_month=%s\nincluded_traffic=%s\ntraffic_overage_eur_per_tb=%s\n' \
-  "$CCX43_EUR_PER_HOUR" \
+printf 'ccx33_eur_per_hour=%s\nvolume_eur_per_gb_month=%s\nincluded_traffic=%s\ntraffic_overage_eur_per_tb=%s\n' \
+  "$CCX33_EUR_PER_HOUR" \
   "$VOLUME_EUR_PER_GB_MONTH" \
   "$INCLUDED_TRAFFIC" \
   "$TRAFFIC_OVERAGE_EUR_PER_TB" \
@@ -214,7 +221,7 @@ identity parameter explicit:
 ```bash
 ./scripts/hetzner/provision.sh \
   --campaign tdx-m4-subset \
-  --server-type ccx43 \
+  --server-type ccx33 \
   --volume-size-gb 150 \
   --ssh-key nicolas-workstation \
   --image debian-12 \
@@ -282,7 +289,7 @@ aws --version
 test -f /etc/pourpoint-hfx.env
 test ! -L /etc/pourpoint-hfx.env
 test "\$(stat -c '%U:%G %a' /etc/pourpoint-hfx.env)" = 'root:root 600'
-awk '/MemAvailable:/ {exit !(\$2 * 1024 >= 60000000000)}' /proc/meminfo
+awk '/MemAvailable:/ {exit !(\$2 * 1024 >= 30000000000)}' /proc/meminfo
 test "\$(df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ')" -ge 140000000000
 REMOTE_REF
   :
@@ -676,29 +683,25 @@ teardown.
 
 ## 11. Budget
 
-Hetzner documents the `ccx43` in Germany at approximately EUR 0.4423 per hour
-excluding VAT and EUR 0.5263 per hour including 19 percent VAT for new orders
-from 2026-06-15. Treat those rates as approximate for this account. The
-repository deliberately requires immediate console verification
+The authorization supplied an approximate historical `ccx33` class of EUR
+0.10 to 0.12 per hour. Treat that range as approximate and potentially stale.
+The repository deliberately requires immediate console verification
 (`scripts/hetzner/README.md:545-568`). Current orders may be priced higher, so
 the recorded console value controls the estimate and the EUR 10.00 ceiling.
 
-For planning, use a conservative EUR 0.53 per hour including tax, EUR 0.044 per
+For planning, use a conservative EUR 0.27 per hour including tax, EUR 0.044 per
 GB-month for volume, and eight hours:
 
 ```text
-server: 8 h * EUR 0.53/h                         = EUR 4.24
+server: 8 h * EUR 0.27/h                         = EUR 2.16
 volume: 150 GB * EUR 0.044/GB-month * 8/730 h   = EUR 0.07
 traffic: expected within console-confirmed allowance = EUR 0.00
-expected rounded total                            = EUR 5.00
+expected rounded total                            = EUR 3.00
 hard ceiling                                      = EUR 10.00
 ```
 
 NGA downloads are incoming traffic. Local evidence copy is outgoing traffic.
 Confirm the included allowance and overage terms in the console before
-provisioning. At the planning rate, the EUR 10.00 spend ceiling can fire before
-the unchanged 24-hour elapsed ceiling; whichever limit occurs first still
-requires default teardown. If current prices make the expected total exceed
-EUR 5.00 materially or leave insufficient margin under EUR 10.00 for the
-expected eight-hour run, abort before provisioning and obtain renewed
-authorization.
+provisioning. If current prices make either the expected total exceed EUR 3.00
+materially or the 24-hour worst case approach EUR 10.00, abort before
+provisioning and obtain renewed authorization.
