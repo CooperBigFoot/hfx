@@ -8,7 +8,7 @@ discipline. Nothing durable survives on the VM. Inputs are re-fetchable,
 outputs are re-creatable, and delivered artifacts live outside the VM before
 teardown.
 
-Completed pilot evidence: [TDX-Hydro processing basin 7020000010](CAMPAIGN-tdx-hydro-7020000010.md).
+Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md) and [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md).
 
 The scripts in this directory compose one lifecycle and remain independently
 runnable. Campaign identifiers use 1-32 lowercase letters, digits, or hyphens
