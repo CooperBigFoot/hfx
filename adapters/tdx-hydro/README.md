@@ -58,6 +58,8 @@ Degenerate reaches do not change unit selection or contraction. A polygon-bearin
 
 Tree topology is enforced, not inferred from the manifest declaration. The adapter rejects native self-links, missing downstream targets, cycles, duplicate `LINKNO` rows, and duplicate rows that imply a bifurcation. It then verifies that every emitted unit has at most one downstream edge and that the contracted emitted relation is acyclic. A violation is a fatal build error.
 
+Catchment and graph bbox columns are identical float32 coverings rounded outward from each catchment's exact float64 geometry bounds. Each per-basin manifest bbox is the component-wise union of the emitted catchment covering columns, with the selected float32 values widened exactly to float64 for JSON. The manifest therefore equals the validator's catchment-column union while enclosing the source geometries.
+
 ## Reach orientation and outlets
 
 For every healthy native reach whose `DSLINKNO` names a successor, the adapter compares both endpoints of the reach with the distinct endpoint coordinates of that immediate native successor. Orientation ambiguity is decided from the reach's own endpoints: if matches use exactly one reach endpoint, that exact source coordinate is the proven downstream endpoint. The successor endpoint need not be unique. TDX-Hydro contains many nonzero reaches shorter than twice the default `0.001`-degree coincidence tolerance, approximately 222 m, so one endpoint of a predecessor can legitimately coincide within tolerance with both endpoints of its short successor. This successor-side multi-match is accepted and reported; it does not make the predecessor's orientation ambiguous.
@@ -100,7 +102,7 @@ The adapter always writes `aux/snap_stems.parquet` and declares it as `hfx.aux.s
 
 Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance over the fixed EPSG:4326 world domain `[-180, -90, 180, 90]`, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
 
-For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer expands a zero-width or zero-height float32 bbox by the existing metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
+Snap bbox columns are float32 coverings rounded outward from exact float64 geometry bounds. For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer then expands each dimension that was degenerate in the exact bounds by the existing float32 metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
 
 `weight` is the same empirically normalized inclusive `DSContArea` in km2 used by `up_area_km2`, stored as float32. The manifest records this exact producer definition:
 
@@ -211,10 +213,13 @@ references, and the declared snap auxiliary contract. Attribution files are
 staged byte-identically.
 
 Only the exact set of all 62 processing-basin crosswalk entries omits `region`
-and claims `bbox = [-180, -90, 180, 90]`. Every proper subset receives
+and claims the independently exact planetary declaration
+`bbox = [-180, -90, 180, 90]`. Every proper subset receives
 `tdx-hydro-partial-<digest>`, where the digest is the first 12 hexadecimal
 characters of SHA-256 over the sorted region keys joined by commas, with no
-trailing separator, and its bbox is the float32 covering union. For example,
+trailing separator. Its manifest bbox is the exact union of child
+covering-union manifest bboxes and therefore exactly equals the union of the
+copied float32 catchment columns. For example,
 regions `7020000010,7020014250` produce digest `afd4ffb0b736` and region
 `tdx-hydro-partial-afd4ffb0b736`.
 

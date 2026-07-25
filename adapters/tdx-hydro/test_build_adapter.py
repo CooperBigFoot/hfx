@@ -36,6 +36,7 @@ from build_adapter import (
     CoreBuildResult,
     StreamnetDiagnostics,
     StreamnetUnit,
+    assemble_hfx,
     build_dataset,
     build_diagnostics_report,
     build_streamnet_model,
@@ -2965,6 +2966,143 @@ class CoreHfxCompilationTests(unittest.TestCase):
         )
         return source, model, result, basins
 
+    def test_float32_bbox_narrowing_never_breaks_geometry_enclosure(self) -> None:
+        min_x = -11.4626055
+        split_x = -11.4526055
+        max_x = -11.4426055
+        min_y = 0.0
+        max_y = 0.01
+        polygon_100 = Polygon([
+            (min_x, min_y),
+            (split_x, min_y),
+            (split_x, max_y),
+            (min_x, max_y),
+            (min_x, min_y),
+        ])
+        polygon_200 = Polygon([
+            (split_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            (split_x, max_y),
+            (split_x, min_y),
+        ])
+        reach_100 = LineString([(min_x, min_y), (split_x, min_y)])
+        reach_200 = LineString([(split_x, min_y), (max_x, min_y)])
+        basins = gpd.GeoDataFrame(
+            {"streamID": [200, 100]},
+            geometry=[polygon_200, polygon_100],
+            crs="EPSG:4326",
+        )
+        streamnet = gpd.GeoDataFrame(
+            {
+                "LINKNO": [200, 100],
+                "DSLINKNO": [-1, 200],
+                "DSContArea": [2.461814409986454, 1.230907204993227],
+            },
+            geometry=[reach_200, reach_100],
+            crs="EPSG:4326",
+        )
+        expected_bbox = [
+            -11.462606430053711,
+            0.0,
+            -11.442605018615723,
+            0.010000000707805157,
+        ]
+
+        self.assertEqual(float(np.float32(max_x)), -11.442605972290039)
+        self.assertLess(float(np.float32(max_x)), max_x)
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source = load_tdx_geopackages(
+                *write_pair(source_dir, basins, streamnet)
+            )
+            model = build_streamnet_model(
+                source.basins,
+                source.streamnet,
+                header_number=71,
+                endpoint_tolerance=0.001,
+            )
+            result = compile_core_hfx(
+                source,
+                model,
+                root / "output",
+                processing_basin_id=self.basin_id,
+                fabric_version=self.fabric_version,
+                created_at=self.created_at,
+            )
+            catchments = pq.read_table(result.catchments_path)
+            graph = pq.read_table(result.graph_path)
+            snap = pq.read_table(result.snap_path)
+            manifest = json.loads(result.manifest_path.read_text())
+
+            self.assertEqual(manifest["bbox"], expected_bbox)
+            catchment_bounds = catchments["bbox"].to_pylist()
+            catchment_geometries = from_wkb(catchments["geometry"].to_pylist())
+            for covering, geometry in zip(
+                catchment_bounds, catchment_geometries, strict=True
+            ):
+                minx, miny, maxx, maxy = geometry.bounds
+                self.assertLessEqual(covering["xmin"], minx)
+                self.assertLessEqual(covering["ymin"], miny)
+                self.assertGreaterEqual(covering["xmax"], maxx)
+                self.assertGreaterEqual(covering["ymax"], maxy)
+            covering_union = [
+                float(min(row["xmin"] for row in catchment_bounds)),
+                float(min(row["ymin"] for row in catchment_bounds)),
+                float(max(row["xmax"] for row in catchment_bounds)),
+                float(max(row["ymax"] for row in catchment_bounds)),
+            ]
+            self.assertEqual(covering_union, manifest["bbox"])
+
+            catchment_bounds_by_id = dict(
+                zip(catchments["id"].to_pylist(), catchment_bounds, strict=True)
+            )
+            for row in graph.to_pylist():
+                covering = catchment_bounds_by_id[row["id"]]
+                self.assertEqual(
+                    [
+                        row["bbox_minx"],
+                        row["bbox_miny"],
+                        row["bbox_maxx"],
+                        row["bbox_maxy"],
+                    ],
+                    [covering[name] for name in BBOX_LEAF_NAMES],
+                )
+
+            for covering, geometry in zip(
+                snap["bbox"].to_pylist(),
+                from_wkb(snap["geometry"].to_pylist()),
+                strict=True,
+            ):
+                minx, miny, maxx, maxy = geometry.bounds
+                self.assertLessEqual(covering["xmin"], minx)
+                self.assertLessEqual(covering["ymin"], miny)
+                self.assertGreaterEqual(covering["xmax"], maxx)
+                self.assertGreaterEqual(covering["ymax"], maxy)
+                self.assertLess(covering["ymin"], covering["ymax"])
+
+            validate_with_release_hfx(root / "output")
+            assembled = assemble_hfx(
+                [root / "output"],
+                root / "assembled",
+                created_at=self.created_at,
+            )
+            assembled_manifest = json.loads(assembled.manifest_path.read_text())
+            self.assertEqual(assembled_manifest["bbox"], expected_bbox)
+            assembled_catchments = pq.read_table(assembled.catchments_path)
+            assembled_bounds = assembled_catchments["bbox"].to_pylist()
+            assembled_union = [
+                float(min(row["xmin"] for row in assembled_bounds)),
+                float(min(row["ymin"] for row in assembled_bounds)),
+                float(max(row["xmax"] for row in assembled_bounds)),
+                float(max(row["ymax"] for row in assembled_bounds)),
+            ]
+            self.assertEqual(assembled_union, assembled_manifest["bbox"])
+            validate_with_release_hfx(root / "assembled")
+
     def test_compile_core_hfx_writes_deterministic_artifacts_and_preserves_diagnostics(
         self,
     ) -> None:
@@ -3194,9 +3332,16 @@ class CoreHfxCompilationTests(unittest.TestCase):
                 strict=True,
             ):
                 self.assertTrue(actual.equals(expected))
+            # Nearest float32 values below exact maxima advance one float32
+            # ULP toward +inf; exact minima retain their nearest lower value.
             expected_bounds = [
-                [0.0, 0.0, 0.009999999776482582, 0.009999999776482582],
-                [0.009999999776482582, 0.0, 0.019999999552965164, 0.009999999776482582],
+                [0.0, 0.0, 0.010000000707805157, 0.010000000707805157],
+                [
+                    0.009999999776482582,
+                    0.0,
+                    0.020000001415610313,
+                    0.010000000707805157,
+                ],
             ]
             actual_bounds = [
                 [row[name] for name in BBOX_LEAF_NAMES]
@@ -3230,13 +3375,13 @@ class CoreHfxCompilationTests(unittest.TestCase):
                     {
                         "xmin": 0.009999999776482582,
                         "ymin": -9.999999747378752e-05,
-                        "xmax": 0.019999999552965164,
+                        "xmax": 0.020000001415610313,
                         "ymax": 9.999999747378752e-05,
                     },
                     {
                         "xmin": 0.0,
                         "ymin": -9.999999747378752e-05,
-                        "xmax": 0.009999999776482582,
+                        "xmax": 0.010000000707805157,
                         "ymax": 9.999999747378752e-05,
                     },
                 ],
@@ -3305,7 +3450,8 @@ class CoreHfxCompilationTests(unittest.TestCase):
             "has_up_area": True,
             "topology": "tree",
             "region": "7020000010",
-            "bbox": [0.0, 0.0, 0.019999999552965164, 0.009999999776482582],
+            # Union of the outward float32 catchment coverings above.
+            "bbox": [0.0, 0.0, 0.020000001415610313, 0.010000000707805157],
             "unit_count": 2,
             "created_at": "2026-07-21T12:34:56+00:00",
             "adapter_version": "0.1.0",
@@ -3582,7 +3728,8 @@ class BuildCliTests(unittest.TestCase):
                 {
                     "xmin": 0.00989999994635582,
                     "ymin": -9.999999747378752e-05,
-                    "xmax": 0.010099999606609344,
+                    # Directed upper 0.01 plus float32(1e-4).
+                    "xmax": 0.010100000537931919,
                     "ymax": 9.999999747378752e-05,
                 },
             )
@@ -3752,7 +3899,13 @@ class BuildCliTests(unittest.TestCase):
                 "format_version": "0.3.0", "fabric_name": "tdx_hydro",
                 "fabric_version": self.fabric_version, "crs": "EPSG:4326",
                 "has_up_area": True, "topology": "tree", "region": self.basin_id,
-                "bbox": [0.0, 0.0, 0.019999999552965164, 0.009999999776482582],
+                # Union of the outward float32 catchment coverings.
+                "bbox": [
+                    0.0,
+                    0.0,
+                    0.020000001415610313,
+                    0.010000000707805157,
+                ],
                 "unit_count": 2, "created_at": "2026-07-21T12:34:56+00:00",
                 "adapter_version": "0.1.0",
                 "auxiliary": [{

@@ -2471,13 +2471,40 @@ def _prepare_core_units(
     return ordered
 
 
-def _float32_bounds(units: gpd.GeoDataFrame) -> np.ndarray:
-    bounds = units.geometry.bounds.to_numpy(dtype="float64")
-    return bounds.astype("float32")
+def geographic_bbox_float32_coverings(exact_bounds: object) -> np.ndarray:
+    """Round geographic min/min/max/max bounds outward to float32 coverings."""
+    exact = np.asarray(exact_bounds, dtype="float64")
+    if exact.ndim != 2 or exact.shape[1] != 4:
+        raise ValueError("geographic bbox bounds must have shape (N, 4)")
+    covering = exact.astype("float32")
+    widened = covering.astype("float64")
+    lower_inward = widened[:, :2] > exact[:, :2]
+    upper_inward = widened[:, 2:] < exact[:, 2:]
+    covering[:, :2] = np.where(
+        lower_inward,
+        np.nextafter(
+            covering[:, :2],
+            np.float32(-np.inf),
+            dtype=np.float32,
+        ),
+        covering[:, :2],
+    )
+    covering[:, 2:] = np.where(
+        upper_inward,
+        np.nextafter(
+            covering[:, 2:],
+            np.float32(np.inf),
+            dtype=np.float32,
+        ),
+        covering[:, 2:],
+    )
+    return covering
 
 
 def _write_catchments(path: Path, units: gpd.GeoDataFrame) -> np.ndarray:
-    bounds = _float32_bounds(units)
+    bounds = geographic_bbox_float32_coverings(
+        units.geometry.bounds.to_numpy(dtype="float64")
+    )
     schema = pa.schema(
         [
             pa.field("id", pa.int64(), nullable=False),
@@ -2615,9 +2642,10 @@ def _prepare_snap_stems(
 
 def _write_snap_stems(path: Path, stems: gpd.GeoDataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    bounds = stems.geometry.bounds.to_numpy(dtype="float64").astype("float32")
-    x_degenerate = bounds[:, 0] == bounds[:, 2]
-    y_degenerate = bounds[:, 1] == bounds[:, 3]
+    exact_bounds = stems.geometry.bounds.to_numpy(dtype="float64")
+    x_degenerate = exact_bounds[:, 0] == exact_bounds[:, 2]
+    y_degenerate = exact_bounds[:, 1] == exact_bounds[:, 3]
+    bounds = geographic_bbox_float32_coverings(exact_bounds)
     bounds[x_degenerate, 0] -= np.float32(SNAP_BBOX_EPSILON)
     bounds[x_degenerate, 2] += np.float32(SNAP_BBOX_EPSILON)
     bounds[y_degenerate, 1] -= np.float32(SNAP_BBOX_EPSILON)
@@ -2686,7 +2714,12 @@ def compile_core_hfx(
         "has_up_area": HAS_UP_AREA,
         "topology": TOPOLOGY,
         "region": processing_basin_id,
-        "bbox": [float(np.float32(value)) for value in units.geometry.total_bounds],
+        "bbox": [
+            float(bounds[:, 0].min()),
+            float(bounds[:, 1].min()),
+            float(bounds[:, 2].max()),
+            float(bounds[:, 3].max()),
+        ],
         "unit_count": len(units),
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "adapter_version": ADAPTER_VERSION,

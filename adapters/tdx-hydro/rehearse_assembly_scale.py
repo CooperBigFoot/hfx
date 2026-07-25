@@ -28,6 +28,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from shapely.geometry import LineString, Polygon
 
+from build_adapter import geographic_bbox_float32_coverings
+
 CATCHMENT_ORDER_FAILURE = (
     "catchments.parquet is not non-decreasing by (hilbert, id) in file order"
 )
@@ -596,12 +598,16 @@ def _generate_inputs(
                         ]
                     )
                     polygon_bounds = tuple(
-                        pa.scalar(value, type=pa.float32()).as_py()
-                        for value in polygon.bounds
+                        float(value)
+                        for value in geographic_bbox_float32_coverings(
+                            [polygon.bounds]
+                        )[0]
                     )
                     line_bounds = tuple(
-                        pa.scalar(value, type=pa.float32()).as_py()
-                        for value in line.bounds
+                        float(value)
+                        for value in geographic_bbox_float32_coverings(
+                            [line.bounds]
+                        )[0]
                     )
                     covering = [
                         min(covering[0], polygon_bounds[0]),
