@@ -809,7 +809,6 @@ Path(sys.argv[5]).write_text(json.dumps(events))
                     "global_id": "int64",
                     "dscontarea": "float64",
                     "hilbert": "uint32",
-                    "flags": "uint8",
                 },
             },
         )
@@ -983,9 +982,27 @@ Path(sys.argv[5]).write_text(json.dumps(events))
                 if label.startswith("snap-run-closed:")
             ),
         )
-        for label, files, _ in events:
-            if label.startswith("run-unlinked:"):
-                self.assertNotIn(label.split(":", 1)[1], {Path(name).name for name in files})
+        for merge_close, label in enumerate(labels):
+            if not label.startswith("merge-run-closed:"):
+                continue
+            consumed = label.split(":consumed:", 1)[1].split(",")
+            for run_name in consumed:
+                unlink = labels.index(f"run-unlinked:{run_name}")
+                self.assertLess(
+                    unlink,
+                    merge_close,
+                    f"merge output closed before consumed run was unlinked: {run_name}",
+                )
+        private_run_counts = [
+            sum(".run-" in Path(name).name or ".merge-" in Path(name).name for name in files)
+            for _, files, _ in events
+        ]
+        self.assertLessEqual(
+            max(private_run_counts),
+            4,
+            "fan-in-2 fixture retained more private run files than its observed "
+            "immediate-unlink maximum",
+        )
         normalized_event = next(
             files for label, files, _ in events if label == "stream-normalized-closed"
         )
@@ -1434,6 +1451,75 @@ class GlobalLinknoTests(unittest.TestCase):
 
 
 class StreamnetModelTests(unittest.TestCase):
+    def test_compact_topology_matches_streamnet_model_rules(self) -> None:
+        point = (-120.729444444445, 42.8208888888891)
+        basins = pd.DataFrame({"streamID": [244107, 240000]})
+        streamnet = pd.DataFrame(
+            {
+                "LINKNO": [244107, 242123, 240000],
+                "DSLINKNO": [-1, 244107, 242123],
+                "geometry": [
+                    LineString([point, point]),
+                    LineString([point, point]),
+                    LineString([(-120.731444444445, 42.8208888888891), point]),
+                ],
+            }
+        )
+        model = build_streamnet_model(
+            basins, streamnet, header_number=71, endpoint_tolerance=0.001
+        )
+        order = np.argsort(streamnet["LINKNO"].to_numpy(), kind="stable")
+        sorted_streamnet = streamnet.iloc[order]
+        endpoints = np.asarray(
+            [
+                (geometry.coords[0], geometry.coords[-1])
+                for geometry in sorted_streamnet["geometry"]
+            ],
+            dtype="float64",
+        )
+        compact = build_adapter._build_compact_topology(
+            np.sort(basins["streamID"].to_numpy(dtype="int64")),
+            sorted_streamnet["LINKNO"].to_numpy(dtype="int64"),
+            sorted_streamnet["DSLINKNO"].to_numpy(dtype="int64"),
+            endpoints,
+            np.asarray(
+                [
+                    geometry.coords[0] == geometry.coords[-1]
+                    for geometry in sorted_streamnet["geometry"]
+                ],
+                dtype=bool,
+            ),
+            np.ones(len(sorted_streamnet), dtype="float64"),
+            71,
+            0.001,
+        )
+        units = sorted(model.units, key=lambda unit: unit.linkno)
+
+        self.assertEqual(compact.diagnostics, model.diagnostics)
+        np.testing.assert_array_equal(
+            compact.native_ids, [unit.linkno for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.global_ids, [unit.id for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_native_ids,
+            [unit.downstream_linkno for unit in units],
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_global_ids, [unit.downstream_id for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.contracted_counts,
+            [unit.contracted_link_count for unit in units],
+        )
+        np.testing.assert_array_equal(
+            compact.outlet_lons, [unit.outlet_lon for unit in units]
+        )
+        np.testing.assert_array_equal(
+            compact.outlet_lats, [unit.outlet_lat for unit in units]
+        )
+
     def test_uses_single_coordinate_as_degenerate_polygon_bearing_root_outlet(
         self,
     ) -> None:
@@ -3409,6 +3495,49 @@ class CoreHfxCompilationTests(unittest.TestCase):
     basin_id = "7020000010"
     fabric_version = "synthetic-2026.07"
 
+    def test_catchment_merge_overcount_uses_contract_error(self) -> None:
+        topology = build_adapter._CompactTopology(
+            native_ids=np.asarray([100], dtype="int64"),
+            global_ids=np.asarray([710_000_100], dtype="int64"),
+            downstream_native_ids=np.asarray([-1], dtype="int64"),
+            downstream_global_ids=np.asarray([-1], dtype="int64"),
+            contracted_counts=np.asarray([0], dtype="int64"),
+            outlet_lons=np.asarray([0.0]),
+            outlet_lats=np.asarray([0.0]),
+            up_area_km2=np.asarray([1.0]),
+            upstream_offsets=np.asarray([0, 0], dtype="int64"),
+            upstream_global_ids=np.asarray([], dtype="int64"),
+            diagnostics=None,
+        )
+        row = {
+            "id": 710_000_100,
+            "level": 0,
+            "parent_id": None,
+            "area_km2": 1.0,
+            "up_area_km2": 1.0,
+            "outlet_lon": 0.0,
+            "outlet_lat": 0.0,
+            "bbox": {"xmin": 0.0, "ymin": 0.0, "xmax": 1.0, "ymax": 1.0},
+            "geometry": merge_fixture_polygon(0.5, 0.5).wkb,
+            "hilbert": 0,
+        }
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch(
+                "build_adapter._merged_run_rows", return_value=iter((row, row))
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "catchment merge row count does not match compact topology",
+                ):
+                    build_adapter._merge_write_catchments_and_graph(
+                        root / "catchments.parquet",
+                        root / "graph.parquet",
+                        (),
+                        topology,
+                        recorder=None,
+                    )
+
     def test_compile_core_hfx_uses_dataset_global_hilbert_order(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -4149,6 +4278,44 @@ class BuildCliTests(unittest.TestCase):
             "--fabric-version", self.fabric_version,
         ]
 
+    def test_build_cli_prefixes_null_basin_geometry_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet = build_cli_frames()
+            basins.loc[basins.index[0], "geometry"] = None
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            with self.assertRaisesRegex(
+                ValueError,
+                "^basins geometry must be non-null and non-empty$",
+            ):
+                main(
+                    self.build_args(
+                        basins_path,
+                        streamnet_path,
+                        root / "output",
+                        root / "report.json",
+                    )
+                )
+
+    def test_build_cli_reports_nan_dscontarea_from_arrow_null(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet = build_cli_frames()
+            streamnet.loc[0, "DSContArea"] = float("nan")
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^streamnet\.DSContArea must contain finite positive values; got nan$",
+            ):
+                main(
+                    self.build_args(
+                        basins_path,
+                        streamnet_path,
+                        root / "output",
+                        root / "report.json",
+                    )
+                )
+
     def expected_report(self, output: Path, *, isolated: bool = False) -> dict[str, object]:
         ingestion_area = (
             2461814.409986507 if isolated else 3692721.6149797607
@@ -4232,7 +4399,6 @@ class BuildCliTests(unittest.TestCase):
                         "global_id": "int64",
                         "dscontarea": "float64",
                         "hilbert": "uint32",
-                        "flags": "uint8",
                     },
                     "phases": {
                         name: {

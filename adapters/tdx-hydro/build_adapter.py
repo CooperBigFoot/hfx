@@ -425,27 +425,6 @@ class _CompileMemoryRecorder:
                     self._observed_peak = max(self._observed_peak, end)
                 self._active_phase = None
 
-    def record_source(self, source: TdxSourceData, basins: Path, streamnet: Path) -> None:
-        self._counters.update(
-            {
-                "basins_rows": len(source.basins),
-                "streamnet_rows": len(source.streamnet),
-                "basins_geometry_count": int(source.basins.geometry.notna().sum()),
-                "streamnet_geometry_count": int(source.streamnet.geometry.notna().sum()),
-                "basins_coordinate_count": int(
-                    sum(len(get_coordinates(geometry)) for geometry in source.basins.geometry)
-                ),
-                "streamnet_coordinate_count": int(
-                    sum(
-                        len(get_coordinates(geometry))
-                        for geometry in source.streamnet.geometry
-                    )
-                ),
-                "basins_input_bytes": basins.stat().st_size,
-                "streamnet_input_bytes": streamnet.stat().st_size,
-            }
-        )
-
     def stop(self) -> CompileMemoryDiagnostics:
         self._sample()
         self._stop_event.set()
@@ -504,7 +483,6 @@ class _CompileMemoryRecorder:
                 "global_id": "int64",
                 "dscontarea": "float64",
                 "hilbert": "uint32",
-                "flags": "uint8",
             },
             phases=phases,
             **self._counters,
@@ -1777,23 +1755,6 @@ def balanced_row_group_bounds(
     return [(0, total_rows)]
 
 
-def _write_table(
-    path: Path,
-    schema: pa.Schema,
-    columns: list[pa.Array],
-    row_count: int,
-) -> None:
-    table = pa.Table.from_arrays(columns, schema=schema)
-    with pq.ParquetWriter(
-        path,
-        schema=schema,
-        compression="snappy",
-        write_statistics=True,
-    ) as writer:
-        for start, stop in balanced_row_group_bounds(row_count):
-            writer.write_table(table.slice(start, stop - start))
-
-
 def _assert_geoparquet_result(path: Path, result: object) -> None:
     if result.is_valid:
         return
@@ -2845,85 +2806,6 @@ def _validate_edge_relation(
             current = downstream_by_upstream[current]
 
 
-def _prepare_core_units(
-    source: TdxSourceData,
-    streamnet_model: StreamnetModel,
-) -> gpd.GeoDataFrame:
-    _validate_core_model(source, streamnet_model)
-    units_by_native = {unit.linkno: unit for unit in streamnet_model.units}
-    stream_rows: dict[int, float] = {}
-    for linkno, up_area in zip(
-        source.streamnet["LINKNO"],
-        source.streamnet["DSContArea_km2"],
-        strict=True,
-    ):
-        native_id = int(linkno)
-        if native_id in stream_rows:
-            raise ValueError("source.streamnet.LINKNO must be unique")
-        value = float(up_area)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError("source.streamnet.DSContArea_km2 must be positive and finite")
-        stream_rows[native_id] = value
-    missing_stream_rows = sorted(set(units_by_native) - set(stream_rows))
-    if missing_stream_rows:
-        raise ValueError(
-            "streamnet_model unit linkno must join to source.streamnet.LINKNO: "
-            f"{missing_stream_rows[0]}"
-        )
-
-    geod = Geod(ellps="WGS84")
-    row_count = len(source.basins)
-    ids = np.empty(row_count, dtype="int64")
-    levels = np.empty(row_count, dtype="int16")
-    areas = np.empty(row_count, dtype="float32")
-    up_areas = np.empty(row_count, dtype="float32")
-    outlet_lons = np.empty(row_count, dtype="float64")
-    outlet_lats = np.empty(row_count, dtype="float64")
-    for index, (native_id, geometry) in enumerate(
-        zip(source.basins["streamID"], source.basins.geometry, strict=True)
-    ):
-        unit = units_by_native[int(native_id)]
-        area_km2 = abs(geod.geometry_area_perimeter(geometry)[0]) / 1_000_000
-        if not math.isfinite(area_km2) or area_km2 <= 0.0:
-            raise ValueError("catchment geodesic area must be positive and finite")
-        area_f32 = np.float32(area_km2)
-        if not np.isfinite(area_f32) or area_f32 <= 0:
-            raise ValueError("catchment float32 area must be positive and finite")
-        up_area = stream_rows[unit.linkno]
-        up_area_f32 = np.float32(up_area)
-        if not np.isfinite(up_area_f32) or up_area_f32 <= 0:
-            raise ValueError("catchment float32 upstream area must be positive and finite")
-        ids[index] = unit.id
-        levels[index] = unit.level
-        areas[index] = area_f32
-        up_areas[index] = up_area_f32
-        outlet_lons[index] = unit.outlet_lon
-        outlet_lats[index] = unit.outlet_lat
-
-    ordered = gpd.GeoDataFrame(
-        {
-            "native_id": source.basins["streamID"].to_numpy(
-                dtype="int64", copy=False
-            ),
-            "id": ids,
-            "level": levels,
-            "parent_id": pd.array([None] * row_count, dtype="Int64"),
-            "area_km2": areas,
-            "up_area_km2": up_areas,
-            "outlet_lon": outlet_lons,
-            "outlet_lat": outlet_lats,
-        },
-        geometry=source.basins.geometry.array,
-        crs=CRS,
-    )
-    ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
-        total_bounds=[-180, -90, 180, 90]
-    )
-    ordered = ordered.sort_values(["_hilbert", "id"], kind="mergesort")
-    ordered = ordered.drop(columns=["_hilbert"]).reset_index(drop=True)
-    return ordered
-
-
 def geographic_bbox_float32_coverings(exact_bounds: object) -> np.ndarray:
     """Round geographic min/min/max/max bounds outward to float32 coverings."""
     exact = np.asarray(exact_bounds, dtype="float64")
@@ -2952,238 +2834,6 @@ def geographic_bbox_float32_coverings(exact_bounds: object) -> np.ndarray:
         covering[:, 2:],
     )
     return covering
-
-
-def _write_catchments(path: Path, units: gpd.GeoDataFrame) -> np.ndarray:
-    bounds = geographic_bbox_float32_coverings(
-        units.geometry.bounds.to_numpy(dtype="float64")
-    )
-    schema = pa.schema(
-        [
-            pa.field("id", pa.int64(), nullable=False),
-            pa.field("level", pa.int16(), nullable=False),
-            pa.field("parent_id", pa.int64(), nullable=True),
-            pa.field("area_km2", pa.float32(), nullable=False),
-            pa.field("up_area_km2", pa.float32(), nullable=True),
-            pa.field("outlet_lon", pa.float64(), nullable=False),
-            pa.field("outlet_lat", pa.float64(), nullable=False),
-            pa.field("bbox", bbox_struct_type(), nullable=False),
-            pa.field("geometry", pa.binary(), nullable=False),
-        ]
-    ).with_metadata(build_geo_metadata(["Polygon", "MultiPolygon"]))
-    with pq.ParquetWriter(
-        path, schema=schema, compression="snappy", write_statistics=True
-    ) as writer:
-        for start, stop in balanced_row_group_bounds(len(units)):
-            group = units.iloc[start:stop]
-            group_bounds = bounds[start:stop]
-            writer.write_table(
-                pa.Table.from_arrays(
-                    [
-                        pa.array(group["id"], type=pa.int64()),
-                        pa.array(group["level"], type=pa.int16()),
-                        pa.array(group["parent_id"], type=pa.int64()),
-                        pa.array(group["area_km2"], type=pa.float32()),
-                        pa.array(group["up_area_km2"], type=pa.float32()),
-                        pa.array(group["outlet_lon"], type=pa.float64()),
-                        pa.array(group["outlet_lat"], type=pa.float64()),
-                        build_bbox_struct(
-                            group_bounds[:, 0],
-                            group_bounds[:, 1],
-                            group_bounds[:, 2],
-                            group_bounds[:, 3],
-                        ),
-                        pa.array(
-                            [geometry.wkb for geometry in group.geometry],
-                            type=pa.binary(),
-                        ),
-                    ],
-                    schema=schema,
-                )
-            )
-    assert_geoparquet_valid(path)
-    return bounds
-
-
-def _write_graph(
-    path: Path,
-    units: gpd.GeoDataFrame,
-    bounds: np.ndarray,
-    streamnet_model: StreamnetModel,
-) -> None:
-    units_by_id = {unit.id: unit for unit in streamnet_model.units}
-    _validate_edge_relation(units_by_id, streamnet_model.edges)
-    upstream_by_id: dict[int, list[int]] = {}
-    for upstream_id, downstream_id in streamnet_model.edges:
-        upstream_by_id.setdefault(downstream_id, []).append(upstream_id)
-    for upstream_ids in upstream_by_id.values():
-        upstream_ids.sort()
-
-    schema = pa.schema(
-        [
-            pa.field("id", pa.int64(), nullable=False),
-            pa.field("level", pa.int16(), nullable=False),
-            pa.field(
-                "upstream_ids",
-                pa.list_(pa.field("item", pa.int64(), nullable=True)),
-                nullable=False,
-            ),
-            pa.field("bbox_minx", pa.float32(), nullable=False),
-            pa.field("bbox_miny", pa.float32(), nullable=False),
-            pa.field("bbox_maxx", pa.float32(), nullable=False),
-            pa.field("bbox_maxy", pa.float32(), nullable=False),
-        ]
-    )
-    with pq.ParquetWriter(
-        path, schema=schema, compression="snappy", write_statistics=True
-    ) as writer:
-        for start, stop in balanced_row_group_bounds(len(units)):
-            group = units.iloc[start:stop]
-            group_bounds = bounds[start:stop]
-            writer.write_table(
-                pa.Table.from_arrays(
-                    [
-                        pa.array(group["id"], type=pa.int64()),
-                        pa.array(group["level"], type=pa.int16()),
-                        pa.array(
-                            [
-                                upstream_by_id.get(int(unit_id), [])
-                                for unit_id in group["id"]
-                            ],
-                            type=pa.list_(pa.int64()),
-                        ),
-                        pa.array(group_bounds[:, 0], type=pa.float32()),
-                        pa.array(group_bounds[:, 1], type=pa.float32()),
-                        pa.array(group_bounds[:, 2], type=pa.float32()),
-                        pa.array(group_bounds[:, 3], type=pa.float32()),
-                    ],
-                    schema=schema,
-                )
-            )
-
-
-def _prepare_snap_stems(
-    source: TdxSourceData,
-    streamnet_model: StreamnetModel,
-    units: gpd.GeoDataFrame,
-) -> gpd.GeoDataFrame:
-    units_by_native = {unit.linkno: unit for unit in streamnet_model.units}
-    if len(units_by_native) != len(streamnet_model.units):
-        raise ValueError("streamnet_model unit native linkno must be unique")
-
-    selected_unit_ids: list[int] = []
-    selected_weights: list[np.float32] = []
-    geometries: list[object] = []
-    seen: set[int] = set()
-    for linkno, weight, geometry in zip(
-        source.streamnet["LINKNO"],
-        source.streamnet["DSContArea_km2"],
-        source.streamnet.geometry,
-        strict=True,
-    ):
-        native_id = int(linkno)
-        if native_id not in units_by_native:
-            continue
-        if native_id in seen:
-            raise ValueError("selected source.streamnet.LINKNO must be unique")
-        weight_value = float(weight)
-        if not math.isfinite(weight_value) or weight_value <= 0.0:
-            raise ValueError(
-                "selected source.streamnet.DSContArea_km2 must be positive and finite"
-            )
-        weight_f32 = np.float32(weight_value)
-        if not np.isfinite(weight_f32) or weight_f32 < 0:
-            raise ValueError(
-                "selected snap float32 weight must be finite and non-negative"
-            )
-        seen.add(native_id)
-        selected_unit_ids.append(units_by_native[native_id].id)
-        selected_weights.append(weight_f32)
-        geometries.append(geometry)
-
-    missing_linknos = sorted(set(units_by_native) - seen)
-    if missing_linknos:
-        raise ValueError(
-            "streamnet_model unit linkno must join exactly once to "
-            f"source.streamnet.LINKNO: {missing_linknos[0]}"
-        )
-    if len(seen) != len(units_by_native):
-        raise ValueError("selected source.streamnet rows must match model units exactly")
-
-    ordered = gpd.GeoDataFrame(
-        {
-            "unit_id": np.asarray(selected_unit_ids, dtype="int64"),
-            "weight": np.asarray(selected_weights, dtype="float32"),
-            "stem_role": pd.array([None] * len(seen), dtype="string"),
-        },
-        geometry=geometries,
-        crs=CRS,
-    )
-    ordered["_hilbert"] = ordered.geometry.centroid.hilbert_distance(
-        total_bounds=[-180, -90, 180, 90]
-    )
-    ordered = ordered.sort_values(["_hilbert", "unit_id"], kind="mergesort")
-    return ordered.drop(columns=["_hilbert"]).reset_index(drop=True)
-
-
-def _write_snap_stems(path: Path, stems: gpd.GeoDataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exact_bounds = stems.geometry.bounds.to_numpy(dtype="float64")
-    x_degenerate = exact_bounds[:, 0] == exact_bounds[:, 2]
-    y_degenerate = exact_bounds[:, 1] == exact_bounds[:, 3]
-    bounds = geographic_bbox_float32_coverings(exact_bounds)
-    bounds[x_degenerate, 0] -= np.float32(SNAP_BBOX_EPSILON)
-    bounds[x_degenerate, 2] += np.float32(SNAP_BBOX_EPSILON)
-    bounds[y_degenerate, 1] -= np.float32(SNAP_BBOX_EPSILON)
-    bounds[y_degenerate, 3] += np.float32(SNAP_BBOX_EPSILON)
-    if not np.isfinite(bounds).all() or not (
-        (bounds[:, 0] < bounds[:, 2]).all()
-        and (bounds[:, 1] < bounds[:, 3]).all()
-    ):
-        raise ValueError("snap float32 bbox values must be finite and ordered")
-
-    schema = pa.schema(
-        [
-            pa.field("id", pa.int64(), nullable=False),
-            pa.field("unit_id", pa.int64(), nullable=False),
-            pa.field("weight", pa.float32(), nullable=False),
-            pa.field("stem_role", pa.string(), nullable=True),
-            pa.field("bbox", bbox_struct_type(), nullable=True),
-            pa.field("geometry", pa.binary(), nullable=False),
-        ]
-    ).with_metadata(build_geo_metadata(["LineString"]))
-    row_count = len(stems)
-    with pq.ParquetWriter(
-        path, schema=schema, compression="snappy", write_statistics=True
-    ) as writer:
-        for start, stop in balanced_row_group_bounds(row_count):
-            group = stems.iloc[start:stop]
-            group_bounds = bounds[start:stop]
-            writer.write_table(
-                pa.Table.from_arrays(
-                    [
-                        pa.array(
-                            np.arange(start + 1, stop + 1, dtype="int64"),
-                            type=pa.int64(),
-                        ),
-                        pa.array(group["unit_id"], type=pa.int64()),
-                        pa.array(group["weight"], type=pa.float32()),
-                        pa.array(group["stem_role"], type=pa.string()),
-                        build_bbox_struct(
-                            group_bounds[:, 0],
-                            group_bounds[:, 1],
-                            group_bounds[:, 2],
-                            group_bounds[:, 3],
-                        ),
-                        pa.array(
-                            [geometry.wkb for geometry in group.geometry],
-                            type=pa.binary(),
-                        ),
-                    ],
-                    schema=schema,
-                )
-            )
-    assert_geoparquet_valid(path)
 
 
 def _basin_raw_spool_schema() -> pa.Schema:
@@ -3338,10 +2988,12 @@ def _single_layer_metadata(path: Path, layer_name: str) -> tuple[str, dict[str, 
     return names[0], info
 
 
-def _raw_wkb_values(batch: pa.RecordBatch, geometry_name: str) -> pa.Array:
+def _raw_wkb_values(
+    batch: pa.RecordBatch, geometry_name: str, layer_name: str
+) -> pa.Array:
     geometry = batch.column(batch.schema.get_field_index(geometry_name))
     if geometry.null_count:
-        raise ValueError("geometry must be non-null and non-empty")
+        raise ValueError(f"{layer_name} geometry must be non-null and non-empty")
     return geometry
 
 
@@ -3381,7 +3033,7 @@ def _write_raw_layer_spool(
             for batch in reader:
                 if batch.num_rows > batch_size:
                     raise ValueError("source Arrow batch exceeds compile batch size")
-                geometry = _raw_wkb_values(batch, geometry_name)
+                geometry = _raw_wkb_values(batch, geometry_name, layer_name)
                 if layer_name == "basins":
                     native = [
                         _topology_integer(value.as_py(), "basins", "streamID")
@@ -3409,7 +3061,9 @@ def _write_raw_layer_spool(
                     ]
                     converted: list[float] = []
                     for original in raw_values:
-                        if isinstance(original, bool) or original is None:
+                        if original is None:
+                            original = float("nan")
+                        if isinstance(original, bool):
                             raise ValueError(
                                 "streamnet.DSContArea must contain finite positive "
                                 f"values; got {original!r}"
@@ -4472,7 +4126,10 @@ def _merge_run_group(
         if buffer:
             writer.write_table(_table_with_schema_rows(buffer, schema))
     if recorder is not None:
-        recorder.scratch_event(f"merge-run-closed:{destination.name}")
+        consumed = ",".join(path.name for path in paths)
+        recorder.scratch_event(
+            f"merge-run-closed:{destination.name}:consumed:{consumed}"
+        )
 
 
 def _reduce_run_fan_in(
@@ -4698,6 +4355,10 @@ def _merge_write_catchments_and_graph(
         for row in _merged_run_rows(
             run_paths, ("hilbert", "id"), recorder=recorder
         ):
+            if target_index == len(targets):
+                raise ValueError(
+                    "catchment merge row count does not match compact topology"
+                )
             rows.append(row)
             if len(rows) != targets[target_index]:
                 continue
