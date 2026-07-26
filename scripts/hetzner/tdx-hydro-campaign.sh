@@ -58,6 +58,8 @@ usage() {
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
         '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -424,6 +426,8 @@ release_takeover_guard() {
 }
 
 release_lock() {
+    # Release retains its pre-existing missing-symlink guard on owner.pid. Re-entry
+    # is stronger because it authorizes work and therefore explicitly rejects one.
     if ((lock_owned == 1)) && [[ -n "$lock_path" && -d "$lock_path" && ! -L "$lock_path" ]] &&
         [[ -f "$lock_path/owner.pid" ]] && [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
         "$RM" -r -- "$lock_path"
@@ -468,6 +472,12 @@ acquire_campaign_lock() {
     local state
     lock_path=$locks_dir/campaign.lock
     takeover_path=$locks_dir/campaign.lock.takeover
+    if ((lock_owned == 1)) &&
+        [[ -d "$lock_path" && ! -L "$lock_path" ]] &&
+        [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]] &&
+        [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
+        return
+    fi
     if "$MKDIR" "$lock_path" 2>/dev/null; then
         printf '%s\n' "$$" >"$lock_path/owner.pid"
         lock_owned=1
@@ -522,14 +532,7 @@ acquire_campaign_lock() {
     release_takeover_guard
 }
 
-validate_workspace_state() {
-    local expected_count
-    local basin_id
-    local basin_dir
-    local actual_dirs
-    local actual_files
-    local candidate_path
-
+validate_campaign_structure() {
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign path is not a safe directory: $campaign_dir"
     for required_dir in downloads basin-outputs reports assembly assembly/scratch publication state state/basins state/locks state/tmp; do
         [[ -d "$campaign_dir/$required_dir" && ! -L "$campaign_dir/$required_dir" ]] ||
@@ -554,6 +557,57 @@ validate_workspace_state() {
             hfx_die "basin selection state is not a regular file: $campaign_dir/state/selection.json"
         validate_selection_file "$campaign_dir/state/selection.json"
     fi
+}
+
+validate_reclaimed_sources_absent() {
+    local basin_id=$1
+    local candidate_path
+    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed' "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
+        for candidate_path in \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg" \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial" \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"; do
+            [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]] ||
+                hfx_die "reclaimed basin source artifact remains for $basin_id: $candidate_path; move that exact path out of downloads, then rerun recover"
+        done
+    fi
+}
+
+validate_target_basin() {
+    local basin_id=$1
+    local basin_dir=$campaign_dir/state/basins/$basin_id
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '$basin_id'; expected an authoritative 10-digit ID"
+    "$JQ" -e --arg id "$basin_id" 'has($id)' "$campaign_dir/state/inventory.json" >/dev/null ||
+        hfx_die "processing basin ID is not in the authoritative inventory: $basin_id"
+    if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -e --arg id "$basin_id" '.basin_ids | index($id) != null' \
+            "$campaign_dir/state/selection.json" >/dev/null ||
+            hfx_die "processing basin ID is not in the frozen campaign selection: $basin_id"
+    fi
+    [[ -d "$basin_dir" && ! -L "$basin_dir" ]] ||
+        hfx_die "basin directory is missing or unsafe: $basin_id"
+    validate_basin_json "$basin_dir/current.json" "$basin_id"
+    validate_reclaimed_sources_absent "$basin_id"
+}
+
+validate_target_workspace_state() {
+    local basin_id=$1
+    validate_campaign_structure
+    validate_target_basin "$basin_id"
+}
+
+validate_workspace_state() {
+    local expected_count
+    local basin_id
+    local basin_dir
+    local actual_dirs
+    local actual_files
+
+    validate_campaign_structure
     expected_count=$("$JQ" -r 'length' "$campaign_dir/state/inventory.json")
     actual_dirs=$("$FIND" "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d | "$WC" -l | "$TR" -d ' ')
     [[ "$actual_dirs" == "$expected_count" ]] || hfx_die "expected $expected_count basin directories; found $actual_dirs"
@@ -563,18 +617,7 @@ validate_workspace_state() {
         basin_dir=$campaign_dir/state/basins/$basin_id
         [[ -d "$basin_dir" && ! -L "$basin_dir" ]] || hfx_die "basin directory is missing or unsafe: $basin_id"
         validate_basin_json "$basin_dir/current.json" "$basin_id"
-        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed' "$basin_dir/current.json") == true ]]; then
-            for candidate_path in \
-                "$campaign_dir/downloads/$basin_id-basins.gpkg" \
-                "$campaign_dir/downloads/$basin_id-basins.gpkg.partial" \
-                "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json" \
-                "$campaign_dir/downloads/$basin_id-streamnet.gpkg" \
-                "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial" \
-                "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"; do
-                [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]] ||
-                    hfx_die "reclaimed basin source artifact remains for $basin_id: $candidate_path; move that exact path out of downloads, then rerun recover"
-            done
-        fi
+        validate_reclaimed_sources_absent "$basin_id"
     done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
     if "$FIND" "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d |
         while IFS= read -r basin_dir; do
@@ -847,8 +890,8 @@ initialize_campaign() {
     print_status
 }
 
-migrate_basin_states() {
-    local basin_id
+migrate_basin_state() {
+    local basin_id=$1
     local current
     local temporary
     local policy
@@ -859,11 +902,10 @@ migrate_basin_states() {
     else
         target_version=3
     fi
-    while IFS= read -r basin_id; do
-        current=$campaign_dir/state/basins/$basin_id/current.json
-        if [[ $("$JQ" -r '.schema_version' "$current") != "$target_version" ]]; then
-            temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-            "$JQ" --argjson target_version "$target_version" --arg policy "$policy" '
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    if [[ $("$JQ" -r '.schema_version' "$current") != "$target_version" ]]; then
+        temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+        "$JQ" --argjson target_version "$target_version" --arg policy "$policy" '
                 .schema_version as $version |
                 .schema_version = $target_version |
                 if $version == 1 then
@@ -880,22 +922,27 @@ migrate_basin_states() {
                 if $target_version == 4 then
                     .retention = {inputs_reclaimed:false,policy:$policy}
                 else del(.retention) end
-            ' "$current" >"$temporary"
-            atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
-        fi
+        ' "$current" >"$temporary"
+        atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+    fi
+}
+
+migrate_basin_states() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
     done < <(effective_basin_ids)
 }
 
-recover_running_stages() {
-    local acquisition_only=${1-false}
-    local basin_id
+recover_running_stages_for_basin() {
+    local basin_id=$1
+    local acquisition_only=${2-false}
     local current
     local temporary
-    while IFS= read -r basin_id; do
-        current=$campaign_dir/state/basins/$basin_id/current.json
-        if "$JQ" -e '[.stages[].status] | any(. == "running")' "$current" >/dev/null; then
-            temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-            "$JQ" --argjson acquisition_only "$acquisition_only" '
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    if "$JQ" -e '[.stages[].status] | any(. == "running")' "$current" >/dev/null; then
+        temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+        "$JQ" --argjson acquisition_only "$acquisition_only" '
                 .stages |= with_entries(
                     if .value.status == "running" and
                         (($acquisition_only | not) or .key == "acquire_basins" or .key == "acquire_streamnet") then
@@ -906,9 +953,16 @@ recover_running_stages() {
                     else .
                     end
                 )
-            ' "$current" >"$temporary"
-            atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
-        fi
+        ' "$current" >"$temporary"
+        atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+    fi
+}
+
+recover_running_stages() {
+    local acquisition_only=${1-false}
+    local basin_id
+    while IFS= read -r basin_id; do
+        recover_running_stages_for_basin "$basin_id" "$acquisition_only"
     done < <(effective_basin_ids)
 }
 
@@ -1313,8 +1367,8 @@ reconcile_reclaim_basin() {
     return 0
 }
 
-compile_campaign() {
-    local basin_id
+compile_basin_core() {
+    local basin_id=$1
     local current
     local acquire_basins_status
     local acquire_streamnet_status
@@ -1325,107 +1379,160 @@ compile_campaign() {
     local output
     local report
 
+    if reconcile_reclaim_basin "$basin_id" true; then
+        return
+    fi
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    acquire_basins_status=$("$JQ" -r '.stages.acquire_basins.status' "$current")
+    acquire_streamnet_status=$("$JQ" -r '.stages.acquire_streamnet.status' "$current")
+    compile_status=$("$JQ" -r '.stages.compile.status' "$current")
+    attempts=$("$JQ" -r '.stages.compile.attempts' "$current")
+
+    [[ "$acquire_basins_status" == succeeded && "$acquire_streamnet_status" == succeeded ]] ||
+        hfx_die "acquisition prerequisites are not both succeeded for $basin_id"
+
+    basins=$campaign_dir/downloads/$basin_id-basins.gpkg
+    streamnet=$campaign_dir/downloads/$basin_id-streamnet.gpkg
+    output=$campaign_dir/basin-outputs/$basin_id
+    report=$campaign_dir/reports/$basin_id-build-report.json
+
+    if [[ "$compile_status" == succeeded ]]; then
+        diagnostic_report_json=
+        if verify_compile_artifacts "$basin_id" "$output" "$report"; then
+            if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
+                write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+                if reconcile_reclaim_basin "$basin_id" true; then
+                    :
+                fi
+            fi
+            return
+        fi
+        write_compile_stage "$basin_id" failed "$attempts" \
+            'existing compile artifacts failed resume verification; retained for inspection' \
+            "${diagnostic_report_json:-null}"
+        return
+    fi
+
+    if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
+        diagnostic_report_json=
+        verify_compile_report "$basin_id" "$output" "$report" || :
+        write_compile_stage "$basin_id" failed "$attempts" \
+            'compile artifact path already exists; retained for inspection' \
+            "${diagnostic_report_json:-null}"
+        return
+    fi
+
+    attempts=$((attempts + 1))
+    write_compile_stage "$basin_id" running "$attempts" ''
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
+        --basins "$basins" \
+        --streamnet "$streamnet" \
+        --out "$output" \
+        --report "$report" \
+        --processing-basin-id "$basin_id" \
+        --fabric-version "$fabric_version"; then
+        diagnostic_report_json=
+        verify_compile_report "$basin_id" "$output" "$report" || :
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
+            "${diagnostic_report_json:-null}"
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    diagnostic_report_json=
+    if ! verify_compile_report "$basin_id" "$output" "$report"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+    interrupt_reclaim_boundary "$basin_id" terminal-state
+    if reconcile_reclaim_basin "$basin_id" true; then
+        :
+    fi
+}
+
+print_basin_compile_status() {
+    local basin_id=$1
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    printf 'processing_basin_id=%s\n' "$basin_id"
+    "$JQ" -r '
+      "compile_status=\(.stages.compile.status)",
+      "compile_attempts=\(.stages.compile.attempts)",
+      (if .schema_version == 4
+       then "inputs_reclaimed=\(.retention.inputs_reclaimed)"
+       else "inputs_reclaimed=not-applicable" end)
+    ' "$current"
+}
+
+compile_basin_locked() {
+    local basin_id=$1
+    acquire_campaign_lock
+    validate_target_workspace_state "$basin_id"
+    migrate_basin_state "$basin_id"
+    recover_running_stages_for_basin "$basin_id" false
+    validate_target_workspace_state "$basin_id"
+    if reconcile_reclaim_basin "$basin_id" true; then
+        :
+    else
+        [[ $("$JQ" -r '.stages.acquire_basins.status' "$campaign_dir/state/basins/$basin_id/current.json") == succeeded &&
+            $("$JQ" -r '.stages.acquire_streamnet.status' "$campaign_dir/state/basins/$basin_id/current.json") == succeeded ]] ||
+            hfx_die "acquisition prerequisites are not both succeeded for $basin_id"
+    fi
+    establish_compile_contract
+    compile_basin_core "$basin_id"
+    validate_target_workspace_state "$basin_id"
+    print_basin_compile_status "$basin_id"
+}
+
+compile_selected_basin() {
+    local basin_id=$1
+    acquire_campaign_lock
+    validate_target_workspace_state "$basin_id"
+    compile_basin_locked "$basin_id"
+}
+
+compile_campaign() {
+    local basin_id
+    local current
+    local attempts
     acquire_campaign_lock
     validate_workspace_state
     establish_compile_contract
     migrate_basin_states
     recover_running_stages false
     validate_workspace_state
-
     while IFS= read -r basin_id; do
         if reconcile_reclaim_basin "$basin_id" true; then
             continue
         fi
         current=$campaign_dir/state/basins/$basin_id/current.json
-        acquire_basins_status=$("$JQ" -r '.stages.acquire_basins.status' "$current")
-        acquire_streamnet_status=$("$JQ" -r '.stages.acquire_streamnet.status' "$current")
-        compile_status=$("$JQ" -r '.stages.compile.status' "$current")
         attempts=$("$JQ" -r '.stages.compile.attempts' "$current")
-
-        if [[ "$acquire_basins_status" != succeeded || "$acquire_streamnet_status" != succeeded ]]; then
+        if [[ $("$JQ" -r '.stages.acquire_basins.status' "$current") != succeeded ||
+            $("$JQ" -r '.stages.acquire_streamnet.status' "$current") != succeeded ]]; then
             write_compile_stage "$basin_id" failed "$attempts" \
                 'acquisition prerequisites are not both succeeded'
             continue
         fi
-
-        basins=$campaign_dir/downloads/$basin_id-basins.gpkg
-        streamnet=$campaign_dir/downloads/$basin_id-streamnet.gpkg
-        output=$campaign_dir/basin-outputs/$basin_id
-        report=$campaign_dir/reports/$basin_id-build-report.json
-
-        if [[ "$compile_status" == succeeded ]]; then
-            diagnostic_report_json=
-            if verify_compile_artifacts "$basin_id" "$output" "$report"; then
-                if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
-                    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
-                    if reconcile_reclaim_basin "$basin_id" true; then
-                        :
-                    fi
-                fi
-                continue
-            fi
-            write_compile_stage "$basin_id" failed "$attempts" \
-                'existing compile artifacts failed resume verification; retained for inspection' \
-                "${diagnostic_report_json:-null}"
-            continue
-        fi
-
-        if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
-            diagnostic_report_json=
-            verify_compile_report "$basin_id" "$output" "$report" || :
-            write_compile_stage "$basin_id" failed "$attempts" \
-                'compile artifact path already exists; retained for inspection' \
-                "${diagnostic_report_json:-null}"
-            continue
-        fi
-
-        attempts=$((attempts + 1))
-        write_compile_stage "$basin_id" running "$attempts" ''
-        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
-            --basins "$basins" \
-            --streamnet "$streamnet" \
-            --out "$output" \
-            --report "$report" \
-            --processing-basin-id "$basin_id" \
-            --fabric-version "$fabric_version"; then
-            diagnostic_report_json=
-            verify_compile_report "$basin_id" "$output" "$report" || :
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
-                "${diagnostic_report_json:-null}"
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-            continue
-        fi
-        diagnostic_report_json=
-        if ! verify_compile_report "$basin_id" "$output" "$report"; then
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-            continue
-        fi
-        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-            continue
-        fi
-        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-        write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
-        interrupt_reclaim_boundary "$basin_id" terminal-state
-        if reconcile_reclaim_basin "$basin_id" true; then
-            :
-        fi
+        compile_basin_core "$basin_id"
     done < <(effective_basin_ids)
-
     validate_workspace_state
     print_status
 }
@@ -2542,6 +2649,8 @@ acquire_product() {
 
 acquire_basin() {
     local basin_id=$1
+    # Bash clears a parent-set EXIT trap in an & subshell. These resets remain
+    # defense in depth so a worker can never satisfy campaign-lock re-entry.
     lock_owned=0
     takeover_owned=0
     if reconcile_reclaim_basin "$basin_id" false; then
@@ -2617,7 +2726,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|assemble|evidence|publish) ;;
+    init|status|recover|acquire|compile|compile-basin|progress|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -2681,7 +2790,8 @@ while (($# > 0)); do
             workspace_root=$value
             ;;
         --basin)
-            [[ "$subcommand" == init ]] || usage_error 'option --basin is valid only for init'
+            [[ "$subcommand" == init || "$subcommand" == compile-basin ]] ||
+                usage_error 'option --basin is valid only for init or compile-basin'
             basin_ids[${#basin_ids[@]}]=$value
             ;;
         --retention-policy)
@@ -2697,7 +2807,8 @@ while (($# > 0)); do
             max_parallel=$value
             ;;
         --fabric-version)
-            [[ "$subcommand" == compile ]] || usage_error 'option --fabric-version is valid only for compile'
+            [[ "$subcommand" == compile || "$subcommand" == compile-basin ]] ||
+                usage_error 'option --fabric-version is valid only for compile or compile-basin'
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
             fabric_version=$value
@@ -2765,6 +2876,21 @@ validate_inventory_file "$inventory_source"
 campaign_dir=$workspace_root/tdx-hydro-$campaign
 trap 'release_takeover_guard; release_lock' EXIT
 
+if [[ "$subcommand" == compile-basin ]]; then
+    ((${#basin_ids[@]} > 0)) || usage_error 'option --basin is required for compile-basin'
+    ((${#basin_ids[@]} == 1)) ||
+        usage_error 'option --basin may be specified exactly once for compile-basin'
+    [[ "${basin_ids[0]}" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '${basin_ids[0]}'; expected an authoritative 10-digit ID"
+fi
+if [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then
+    ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
+    [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
+        usage_error 'option --fabric-version requires a non-empty non-option value'
+    [[ ! "$fabric_version" =~ [[:cntrl:]] ]] ||
+        usage_error 'option --fabric-version must not contain ASCII control characters'
+fi
+
 if [[ "$subcommand" == init ]]; then
     case $retention_policy in
         retain-all-through-publication)
@@ -2814,6 +2940,10 @@ elif [[ "$subcommand" == status ]]; then
     acquire_campaign_lock
     validate_workspace_state
     print_status
+elif [[ "$subcommand" == progress ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_workspace_state
+    print_status
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
@@ -2834,17 +2964,16 @@ elif [[ "$subcommand" == acquire ]]; then
     OD=$(resolve_command HFX_TDX_OD od)
     OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
     acquire_campaign
-elif [[ "$subcommand" == compile ]]; then
-    ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
-    [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
-        usage_error 'option --fabric-version requires a non-empty non-option value'
-    [[ ! "$fabric_version" =~ [[:cntrl:]] ]] ||
-        usage_error 'option --fabric-version must not contain ASCII control characters'
+elif [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
     ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
     HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
-    compile_campaign
+    if [[ "$subcommand" == compile-basin ]]; then
+        compile_selected_basin "${basin_ids[0]}"
+    else
+        compile_campaign
+    fi
 elif [[ "$subcommand" == assemble ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")

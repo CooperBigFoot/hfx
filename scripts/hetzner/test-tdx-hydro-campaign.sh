@@ -273,6 +273,8 @@ run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
 assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -300,6 +302,27 @@ expect_failure 'option-shaped fabric version' compile --campaign compile --works
     --fabric-version --campaign
 expect_failure 'control fabric version' compile --campaign compile --workspace-root "$argument_root" \
     --fabric-version $'bad\nversion'
+expect_failure 'missing compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
+expect_failure 'repeated compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --basin 1020000010 --basin 7020000010 --fabric-version version
+expect_failure 'malformed compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --basin malformed --fabric-version version
+expect_failure 'missing compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010
+expect_failure 'repeated compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 \
+    --fabric-version version --fabric-version version
+expect_failure 'empty compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version ''
+expect_failure 'option-shaped compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version --campaign
+expect_failure 'control compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version $'bad\nversion'
+expect_failure 'fabric version on progress' progress --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
+expect_failure 'basin on progress' progress --campaign compile --workspace-root "$argument_root" \
+    --basin 1020000010
 expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
 expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
@@ -328,10 +351,10 @@ for invalid_parallel in 0 -1 x 63; do
     assert_contains "$case_stderr" \
         'hfx: error: option --max-parallel must be a base-10 integer from 1 through 62'
 done
-for foreign_basin_command in status recover acquire compile assemble evidence publish; do
+for foreign_basin_command in status recover acquire compile progress assemble evidence publish; do
     expect_failure "basin on $foreign_basin_command" "$foreign_basin_command" \
         --campaign foreign --workspace-root "$argument_root" --basin 1020000010
-    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init' ]] ||
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init or compile-basin' ]] ||
         die "foreign --basin diagnostic differs for $foreign_basin_command"
 done
 for publication_option in --out --report --notice --citation --scratch-prefix; do
@@ -471,6 +494,13 @@ assert_contains "$runner" 'header_status" == 200'
 assert_contains "$runner" '[Ee][Tt][Aa][Gg]:*'
 assert_contains "$runner" '.curl-headers.$basin_id.$product.$$'
 assert_contains "$runner" '.curl-stats.$basin_id.$product.$$'
+[[ $(grep -Fc '"$JQ" -r '\''keys[]'\'' "$campaign_dir/state/inventory.json"' "$runner") -eq 3 ]] ||
+    die 'runner does not contain exactly three textual three-argument keys[] reads'
+sed -n '/^acquire_basin() {$/,/^}$/p' "$runner" >"$case_stdout"
+reset_lock_line=$(grep -n '^    lock_owned=0$' "$case_stdout" | cut -d: -f1)
+reset_takeover_line=$(grep -n '^    takeover_owned=0$' "$case_stdout" | cut -d: -f1)
+[[ "$reset_takeover_line" -eq "$((reset_lock_line + 1))" ]] ||
+    die 'acquisition child ownership resets are not adjacent and ordered'
 pass 'static Bash 3.2 compatibility checks pass'
 
 expected_campaign_commands=$test_tmp/expected-campaign-commands
@@ -1224,7 +1254,26 @@ if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
             [ "$rendezvous_deadline" -lt "$rendezvous_limit" ] || exit 95
         done
         campaign_dir=${output%/downloads/*}
-        runner_pid=$(cat "$campaign_dir/state/locks/campaign.lock/owner.pid")
+        owner_file=$campaign_dir/state/locks/campaign.lock/owner.pid
+        runner_pid=$(cat "$owner_file")
+        child_exit_deadline=0
+        child_exited=0
+        while [ "$child_exited" -eq 0 ]; do
+            for pid_file in "$HFX_TEST_TRANSFER_STATE"/worker.*; do
+                [ -f "$pid_file" ] || continue
+                observed_pid=$(cat "$pid_file")
+                if [ "$observed_pid" != "$PPID" ] && ! kill -0 "$observed_pid" 2>/dev/null; then
+                    child_exited=1
+                    break
+                fi
+            done
+            child_exit_deadline=$((child_exit_deadline + 1))
+            [ "$child_exit_deadline" -lt "$rendezvous_limit" ] || exit 95
+            [ "$child_exited" -eq 1 ] || sleep 0.01
+        done
+        [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || exit 95
+        [ "$(cat "$owner_file")" = "$runner_pid" ] || exit 95
+        printf '%s\n' "$runner_pid" >"$HFX_TEST_TRANSFER_STATE/lock-owner-stable"
         kill -TERM "$runner_pid"
         sleep 0.05
         kill -INT "$runner_pid" 2>/dev/null || :
@@ -1369,6 +1418,40 @@ if [ "${HFX_TEST_INTERRUPT_EMPTY-}" = 1 ] &&
         exit 0
     fi
 fi
+if [ -n "${HFX_TEST_REENTRY_TAMPER-}" ] &&
+    [ ! -e "$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER" ]; then
+    jq_input=${!#}
+    case $jq_input in
+        */state/campaign.json)
+            campaign_dir=${jq_input%/state/campaign.json}
+            lock_path=$campaign_dir/state/locks/campaign.lock
+            if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+                case $HFX_TEST_REENTRY_TAMPER in
+                    live-owner)
+                        printf '%s\n' "${HFX_TEST_COMPETING_PID:?}" >"$lock_path/owner.pid"
+                        ;;
+                    owner-symlink)
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER"
+                        rm "$lock_path/owner.pid"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path/owner.pid"
+                        ;;
+                    lock-symlink)
+                        mkdir "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER"
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER/owner.pid"
+                        rm -r "$lock_path"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path"
+                        ;;
+                    *) exit 96 ;;
+                esac
+                : >"$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER"
+            fi
+            ;;
+    esac
+fi
 exec "${HFX_TEST_REAL_JQ:?}" "$@"
 FAKE_JQ
 sed >"$test_tmp/fake-adapter" <<'FAKE_ADAPTER'
@@ -1400,6 +1483,13 @@ case $command_name in
         esac
         [ "${out##*/}" = "$basin_id" ] || exit 85
         [ "${report##*/}" = "$basin_id-build-report.json" ] || exit 85
+        if [ "${HFX_TEST_REQUIRE_LOCK_OWNER-}" = 1 ]; then
+            owner_file=${out%/basin-outputs/*}/state/locks/campaign.lock/owner.pid
+            [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || exit 94
+            owner=$(cat "$owner_file")
+            [ "$owner" = "$PPID" ] || exit 94
+            printf '%s\n' "$owner" >"${HFX_TEST_LOCK_OWNER_LOG:?}"
+        fi
         if [ "${HFX_TEST_REQUIRE_CLEARED_DIAGNOSTIC-}" = 1 ]; then
             state=${out%/basin-outputs/*}/state/basins/$basin_id/current.json
             "${HFX_TEST_REAL_JQ:?}" -e '
@@ -1642,6 +1732,191 @@ assert_contains "$case_stdout" 'acquire_basins_succeeded=3'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=3'
 pass 'three-basin acquisition schedules only the frozen selection'
 
+named_root=$test_tmp/workspaces/named-compile
+mkdir "$named_root"
+cp -R "$subset_campaign_dir" "$named_root/tdx-hydro-subset"
+named_campaign_dir=$named_root/tdx-hydro-subset
+cp "$named_campaign_dir/state/basins/7020000010/current.json" "$test_tmp/named-702-before"
+cp "$named_campaign_dir/state/basins/9020000010/current.json" "$test_tmp/named-902-before"
+: >"$HFX_TEST_ADAPTER_LOG"
+export HFX_TEST_REQUIRE_LOCK_OWNER=1
+export HFX_TEST_LOCK_OWNER_LOG=$test_tmp/named-lock-owner
+run_runner compile-basin --campaign subset --workspace-root "$named_root" \
+    --basin 1020000010 --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+unset HFX_TEST_REQUIRE_LOCK_OWNER HFX_TEST_LOCK_OWNER_LOG
+[[ -s "$test_tmp/named-lock-owner" ]] || die 'named compile adapter did not observe the runner lock owner'
+[[ ! -d "$named_campaign_dir/state/locks/campaign.lock" ]] ||
+    die 'named compile left its campaign lock behind'
+assert_contains "$case_stdout" 'processing_basin_id=1020000010'
+assert_contains "$case_stdout" 'compile_status=succeeded'
+assert_contains "$case_stdout" 'compile_attempts=1'
+assert_contains "$case_stdout" 'inputs_reclaimed=not-applicable'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 1 ]] ||
+    die 'named compile did not issue exactly one adapter build'
+[[ $(grep '^build' "$HFX_TEST_ADAPTER_LOG" | cut -f11) == 1020000010 ]] ||
+    die 'named compile adapter build targeted another basin'
+cmp "$test_tmp/named-702-before" "$named_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/named-902-before" "$named_campaign_dir/state/basins/9020000010/current.json"
+for untouched_id in 7020000010 9020000010; do
+    jq -e '.stages.compile == {
+      status:"pending",attempts:0,failure_reason:null,diagnostic_report:null
+    }' "$named_campaign_dir/state/basins/$untouched_id/current.json" >/dev/null ||
+        die "named compile changed pending compile state for $untouched_id"
+    [[ ! -e "$named_campaign_dir/basin-outputs/$untouched_id" &&
+        ! -e "$named_campaign_dir/reports/$untouched_id-build-report.json" ]] ||
+        die "named compile created an artifact for $untouched_id"
+done
+if grep -R -F 'acquisition prerequisites are not both succeeded' \
+    "$named_campaign_dir/state/basins" >"$case_stdout"; then
+    die 'named compile manufactured a prerequisite failure'
+fi
+run_runner evidence --campaign subset --workspace-root "$named_root" >"$case_stdout"
+jq -e '
+  .excluded_basins == [] and
+  (.outcomes | map(select(.processing_basin_id == "1020000010"))[0] |
+    .status == "succeeded" and .attempts == 1) and
+  (.outcomes | map(select(.processing_basin_id != "1020000010")) |
+    all(.status == "pending" and .attempts == 0 and .failure_reason == null))
+' "$named_campaign_dir/publication/evidence/outcomes.json" >/dev/null ||
+    die 'named compile evidence manufactured an exclusion or changed pending outcomes'
+cmp "$test_tmp/named-702-before" "$named_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/named-902-before" "$named_campaign_dir/state/basins/9020000010/current.json"
+pass 'compile-basin re-enters its exact owner lock and preserves untouched basin outcomes'
+
+for reentry_tamper in live-owner owner-symlink lock-symlink; do
+    reentry_root=$test_tmp/workspaces/reentry-$reentry_tamper
+    mkdir "$reentry_root"
+    cp -R "$named_campaign_dir" "$reentry_root/tdx-hydro-subset"
+    reentry_campaign_dir=$reentry_root/tdx-hydro-subset
+    reentry_lock=$reentry_campaign_dir/state/locks/campaign.lock
+    cp "$reentry_campaign_dir/state/basins/7020000010/current.json" \
+        "$test_tmp/reentry-$reentry_tamper-current-before"
+    cp "$reentry_campaign_dir/state/compile.json" \
+        "$test_tmp/reentry-$reentry_tamper-compile-before"
+    HFX_TEST_REENTRY_TAMPER=$reentry_tamper HFX_TEST_COMPETING_PID=$$ \
+        HFX_TDX_JQ=$test_tmp/fake-jq \
+        expect_failure "named compile $reentry_tamper re-entry" compile-basin \
+        --campaign subset --workspace-root "$reentry_root" --basin 7020000010 \
+        --fabric-version NGA-TDX-Hydro-20230126
+    case $reentry_tamper in
+        live-owner)
+            [[ $(tail -1 "$case_stderr") == "hfx: error: campaign lock is held by live PID $$" ]] ||
+                die 'named compile live-owner re-entry diagnostic differs'
+            ;;
+        owner-symlink|lock-symlink)
+            [[ $(tail -1 "$case_stderr") == \
+                "hfx: error: campaign lock owner is indeterminate; preserved at $reentry_lock" ]] ||
+                die "named compile $reentry_tamper re-entry diagnostic differs"
+            ;;
+    esac
+    cmp "$test_tmp/reentry-$reentry_tamper-current-before" \
+        "$reentry_campaign_dir/state/basins/7020000010/current.json"
+    cmp "$test_tmp/reentry-$reentry_tamper-compile-before" \
+        "$reentry_campaign_dir/state/compile.json"
+    [[ ! -e "$reentry_campaign_dir/basin-outputs/7020000010" &&
+        ! -e "$reentry_campaign_dir/reports/7020000010-build-report.json" ]] ||
+        die "named compile $reentry_tamper re-entry wrote compile artifacts"
+done
+pass 'compile-basin refuses live-owner and symlink tampering before compile writes'
+
+cleared_repo=$test_tmp/cleared-reentry-repo
+mkdir -p "$cleared_repo/scripts/hetzner"
+ln -s "$repo_root/adapters" "$cleared_repo/adapters"
+sed 's/^    compile_basin_locked "$basin_id"$/    lock_owned=0\
+    takeover_owned=0\
+&/' "$runner" >"$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+chmod +x "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+cleared_root=$test_tmp/workspaces/reentry-cleared
+mkdir "$cleared_root"
+cp -R "$named_campaign_dir" "$cleared_root/tdx-hydro-subset"
+cleared_campaign_dir=$cleared_root/tdx-hydro-subset
+cp "$cleared_campaign_dir/state/basins/7020000010/current.json" \
+    "$test_tmp/reentry-cleared-current-before"
+cp "$cleared_campaign_dir/state/compile.json" "$test_tmp/reentry-cleared-compile-before"
+cleared_status=0
+"$selected_bash" "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh" compile-basin \
+    --campaign subset --workspace-root "$cleared_root" --basin 7020000010 \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout" 2>"$case_stderr" ||
+    cleared_status=$?
+[[ "$cleared_status" -ne 0 ]] || die 'named compile with cleared ownership unexpectedly succeeded'
+cleared_lock=$cleared_campaign_dir/state/locks/campaign.lock
+cleared_owner=$(<"$cleared_lock/owner.pid")
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: campaign lock is held by live PID $cleared_owner" ]] ||
+    die 'named compile with cleared ownership diagnostic differs'
+cmp "$test_tmp/reentry-cleared-current-before" \
+    "$cleared_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/reentry-cleared-compile-before" "$cleared_campaign_dir/state/compile.json"
+[[ ! -e "$cleared_campaign_dir/basin-outputs/7020000010" &&
+    ! -e "$cleared_campaign_dir/reports/7020000010-build-report.json" ]] ||
+    die 'named compile with cleared ownership wrote compile artifacts'
+pass 'compile-basin refuses second lock acquisition after ownership flags are cleared'
+
+jq '.stages.acquire_basins={
+  status:"pending",attempts:0,failure_reason:null,evidence:null
+}' "$named_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/named-pending"
+mv "$test_tmp/named-pending" "$named_campaign_dir/state/basins/7020000010/current.json"
+cp -R "$named_campaign_dir/state" "$test_tmp/named-state-before-refusal"
+expect_failure 'named compile pending prerequisite' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 \
+    --fabric-version NGA-TDX-Hydro-20230126
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: acquisition prerequisites are not both succeeded for 7020000010' ]] ||
+    die 'named compile prerequisite diagnostic differs'
+diff -ru "$test_tmp/named-state-before-refusal" "$named_campaign_dir/state"
+[[ ! -e "$named_campaign_dir/basin-outputs/7020000010" &&
+    ! -e "$named_campaign_dir/reports/7020000010-build-report.json" ]] ||
+    die 'named compile prerequisite refusal created artifacts'
+pass 'compile-basin prerequisite refusal writes no failure or other basin state'
+
+expect_failure 'named compile unknown inventory basin' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 9999999999 --fabric-version version
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: processing basin ID is not in the authoritative inventory: 9999999999' ]] ||
+    die 'named compile authoritative-inventory diagnostic differs'
+expect_failure 'named compile unselected inventory basin' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 1020011530 --fabric-version version
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: processing basin ID is not in the frozen campaign selection: 1020011530' ]] ||
+    die 'named compile frozen-selection diagnostic differs'
+pass 'compile-basin validates inventory and frozen selection in an initialized campaign'
+
+named_lock=$named_campaign_dir/state/locks/campaign.lock
+mkdir "$named_lock"
+printf '%s\n' "$$" >"$named_lock/owner.pid"
+cp "$named_lock/owner.pid" "$test_tmp/named-live-owner-before"
+expect_failure 'named compile competing live owner' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 --fabric-version version
+assert_contains "$case_stderr" "campaign lock is held by live PID $$"
+cmp "$test_tmp/named-live-owner-before" "$named_lock/owner.pid"
+rm -r "$named_lock"
+mkdir "$named_lock"
+printf '%s\n' 99999999 >"$named_lock/owner.pid"
+expect_failure 'named compile stale owner prerequisite' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 --fabric-version version
+assert_contains "$case_stderr" 'acquisition prerequisites are not both succeeded for 7020000010'
+[[ ! -d "$named_lock" ]] || die 'named compile stale takeover left its replacement lock behind'
+pass 'compile-basin preserves competing live owners and converges stale takeover'
+
+progress_root=$test_tmp/workspaces/progress
+mkdir "$progress_root"
+cp -R "$named_campaign_dir" "$progress_root/tdx-hydro-subset"
+progress_dir=$progress_root/tdx-hydro-subset
+mkdir "$progress_dir/state/locks/campaign.lock"
+printf '%s\n' "$$" >"$progress_dir/state/locks/campaign.lock/owner.pid"
+cp -R "$progress_dir" "$test_tmp/progress-baseline"
+run_runner progress --campaign subset --workspace-root "$progress_root" >"$test_tmp/progress-one"
+run_runner progress --campaign subset --workspace-root "$progress_root" >"$test_tmp/progress-two"
+cmp "$test_tmp/progress-one" "$test_tmp/progress-two"
+assert_contains "$test_tmp/progress-one" 'acquire_basins_succeeded=2'
+assert_contains "$test_tmp/progress-one" 'compile_succeeded=1'
+assert_contains "$test_tmp/progress-one" 'compile_pending=2'
+cmp "$test_tmp/progress-baseline/state/locks/campaign.lock/owner.pid" \
+    "$progress_dir/state/locks/campaign.lock/owner.pid"
+diff -ru "$test_tmp/progress-baseline" "$progress_dir"
+rm -r "$progress_dir/state/locks/campaign.lock"
+pass 'progress is deterministic and byte-preserving under a live campaign lock'
+
 : >"$HFX_TEST_ADAPTER_LOG"
 run_runner compile --campaign subset --workspace-root "$subset_root" \
     --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
@@ -1848,6 +2123,11 @@ for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/c
 done
 [[ -e "$test_tmp/transfer-state/signal-owner" ]] ||
     die 'repeated drain TERM did not start its signal coordinator'
+# The rendezvous waits for a real acquire_basin subshell to exit before checking
+# that the parent still owns the operational lock. The source-order check
+# separately enforces the defense-in-depth ownership resets.
+[[ -s "$test_tmp/transfer-state/lock-owner-stable" ]] ||
+    die 'campaign lock did not remain owned by the parent after an acquire_basin child exited'
 drain_campaign_dir=$drain_interrupt_root/tdx-hydro-interrupt-drain
 [[ $(find "$drain_campaign_dir/state/tmp" \
     \( -name '.curl-headers.*' -o -name '.curl-stats.*' \) -type f |
