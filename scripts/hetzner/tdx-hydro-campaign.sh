@@ -41,6 +41,9 @@ hfx_die() {
     exit 1
 }
 
+((HFX_TDX_RECLAIM_PAIR_COUNT * HFX_TDX_RECLAIM_PAIR_BYTES == HFX_TDX_RECLAIM_PEAK_BYTES)) ||
+    hfx_die 'internal reclaim sizing constants are inconsistent'
+
 hfx_log() {
     local message
     local IFS=' '
@@ -2612,8 +2615,8 @@ elif [[ "$subcommand" == acquire ]]; then
     validate_campaign_json "$campaign_dir/state/campaign.json"
     acquire_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
     if [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]]; then
-        ((max_parallel >= 1 && max_parallel <= 4)) ||
-            usage_error 'option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+        ((max_parallel >= 1 && max_parallel <= HFX_TDX_RECLAIM_MAX_PARALLEL)) ||
+            usage_error "option --max-parallel must be a base-10 integer from 1 through $HFX_TDX_RECLAIM_MAX_PARALLEL for retention policy reclaim-inputs-after-terminal"
     fi
     CURL=$(resolve_command HFX_TDX_CURL curl)
     SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)

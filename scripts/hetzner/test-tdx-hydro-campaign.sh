@@ -1315,6 +1315,19 @@ printf 'end %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
 exit "$result"
 FAKE_CURL
+sed >"$test_tmp/recording-mkdir" <<'RECORDING_MKDIR'
+#!/bin/bash
+set -eu
+if "${HFX_TEST_REAL_MKDIR:?}" "$@"; then
+    for argument do
+        if [ "$argument" = "${HFX_TEST_REJECTED_LOCK_PATH-}" ]; then
+            : >"${HFX_TEST_REJECTED_LOCK_CREATED:?}"
+        fi
+    done
+else
+    exit $?
+fi
+RECORDING_MKDIR
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
 checksum=$(cksum <"$1")
@@ -1502,7 +1515,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 [ "$6" = text ] || exit 73
 exit 0
 FAKE_HFX
-chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
+chmod +x "$test_tmp/fake-curl" "$test_tmp/recording-mkdir" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
     "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx"
 export HFX_TDX_CURL=$test_tmp/fake-curl
 export HFX_TDX_SHA256SUM=$test_tmp/fake-sha256sum
@@ -1569,6 +1582,23 @@ for rejected_parallel in 5 62; do
     [[ ! -e "$test_tmp/invocations/curl.log" ]] ||
         die 'reclaim parallelism refusal invoked the PATH poison curl'
 done
+export HFX_TEST_REAL_MKDIR
+HFX_TEST_REAL_MKDIR=$(command -v mkdir)
+export HFX_TEST_REJECTED_LOCK_PATH=$valid_root/tdx-hydro-reclaim-parallel-reject/state/locks/campaign.lock
+export HFX_TEST_REJECTED_LOCK_CREATED=$test_tmp/rejected-reclaim-lock-created
+export HFX_TDX_MKDIR=$test_tmp/recording-mkdir
+expect_failure 'reclaim parallelism pre-lock ordering' acquire \
+    --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+    --max-parallel 5
+assert_contains "$case_stderr" \
+    'hfx: error: option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+[[ ! -e "$HFX_TEST_REJECTED_LOCK_CREATED" ]] ||
+    die 'rejected reclaim parallelism created the campaign lock directory'
+[[ ! -d "$HFX_TEST_REJECTED_LOCK_PATH" ]] ||
+    die 'rejected reclaim parallelism left the campaign lock directory present'
+unset HFX_TDX_MKDIR HFX_TEST_REAL_MKDIR HFX_TEST_REJECTED_LOCK_PATH HFX_TEST_REJECTED_LOCK_CREATED
+pass 'reclaim parallelism refusal occurs before campaign lock creation'
+
 printf '%s\n' \
     1020000010-basins 1020000010-streamnet \
     7020000010-basins 7020000010-streamnet \
