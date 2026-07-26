@@ -276,6 +276,8 @@ tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>
 tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>
+tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>
+tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
 ```
@@ -400,6 +402,21 @@ SQLite identity, layer name, and persisted evidence. A resumed compile re-valida
 each succeeded dataset and external report. Existing failed or conflicting compile
 artifacts are retained for inspection.
 
+`compile` remains the phase-separated whole-effective-set sweep.
+`compile-basin` requires exactly one authoritative processing basin in the
+frozen campaign selection and requires both acquisitions to have succeeded. It
+compiles or resume-verifies only that basin. A prerequisite refusal does not
+write a compile failure for the named basin and never evaluates or writes
+another basin's stage state. A future pipeline must use `compile-basin`
+semantics, not the whole `compile` sweep.
+
+Campaign-lock re-entry is allowed only when the current process already owns
+the safe campaign lock and its regular, non-symlink `owner.pid` matches that
+process. Competing live owners retain the existing refusal, and stale owners
+retain the existing takeover behavior. Forked workers clear inherited
+ownership flags. Bash resets a parent-set `EXIT` trap in an `&` subshell, so
+the ownership reset is defense in depth rather than the only protection.
+
 The runner phases are:
 
 1. `init` creates the fixed campaign layout and records sizing, inventory, and
@@ -422,8 +439,15 @@ The runner phases are:
    nonempty regular files and uploads the exact persisted inventory; it does
    not invoke assembly or validate dataset semantics.
 
-`status` validates state and prints sizing plus deterministic per-stage counts.
-Only reclaim mode also prints a deterministic reclaimed-input count.
+`status` retains its lock-taking validation semantics and prints sizing plus
+deterministic per-stage counts. Only reclaim mode also prints a deterministic
+reclaimed-input count. `progress` renders the same deterministic counts
+directly from the current atomically installed campaign, basin, and assembly
+state without locking, migration, recovery, reconciliation, or writes. It is
+therefore suitable for timed checkpoints while a pipeline owns the lock.
+Scheduler-specific progress fields do not exist in this step; M5-S3B will add
+persisted scheduler counts without weakening the lock-free, write-free
+contract.
 `recover` changes interrupted `running` stages back to `pending` and completes
 an interrupted terminal reclaim; `acquire` and `compile` also perform the
 applicable recovery before work. Operational
