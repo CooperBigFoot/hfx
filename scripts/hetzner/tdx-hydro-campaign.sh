@@ -22,6 +22,12 @@ readonly HFX_TDX_SQLITE_MAGIC=53514c69746520666f726d6174203300
 readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/bin/python
 readonly HFX_TDX_DEFAULT_HFX=/root/hfx/target/release/hfx
 readonly HFX_TDX_MAX_LIST_PAGES=1000
+# Reclaim mode reserves five copies of the largest measured source pair:
+# 5 * (6,979,305,472 basins bytes + 1,880,039,424 streamnet bytes).
+readonly HFX_TDX_RECLAIM_PAIR_COUNT=5
+readonly HFX_TDX_RECLAIM_MAX_PARALLEL=4
+readonly HFX_TDX_RECLAIM_PAIR_BYTES=8859344896
+readonly HFX_TDX_RECLAIM_PEAK_BYTES=44296724480
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -35,6 +41,9 @@ hfx_die() {
     exit 1
 }
 
+((HFX_TDX_RECLAIM_PAIR_COUNT * HFX_TDX_RECLAIM_PAIR_BYTES == HFX_TDX_RECLAIM_PEAK_BYTES)) ||
+    hfx_die 'internal reclaim sizing constants are inconsistent'
+
 hfx_log() {
     local message
     local IFS=' '
@@ -44,7 +53,7 @@ hfx_log() {
 
 usage() {
     printf '%s\n' \
-        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
+        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
@@ -141,31 +150,91 @@ effective_basin_ids() {
 
 validate_campaign_json() {
     local file=$1
-    "$JQ" -e --arg campaign "$campaign" --argjson max_i64 "$HFX_TDX_MAX_I64" '
+    local policy
+    local input_bytes
+    local retained_output_bytes
+    local active_scratch_bytes
+    local assembly_scratch_bytes
+    local artifact_bytes
+    local overhead_bytes
+    local assembly_peak_bytes
+    local expected_disk_bytes=0
+    local persisted_disk_bytes
+    "$JQ" -e --arg campaign "$campaign" --argjson max_i64 "$HFX_TDX_MAX_I64" \
+        --argjson reclaim_peak "$HFX_TDX_RECLAIM_PEAK_BYTES" '
+        def positive_i64:
+            type == "number" and . == floor and . > 0 and . <= $max_i64;
         type == "object" and
         (keys == ["campaign","inventory","retention","schema_version","sizing"]) and
-        .schema_version == 1 and
+        .schema_version == 2 and
         .campaign == $campaign and
         (.inventory | type == "object" and keys == ["count","source"] and
             .source == "adapters/tdx-hydro/data/tdx_header_numbers.json" and .count == 62) and
-        (.retention | type == "object" and
-            keys == ["policy","reclaim_inputs","retain_acquired_inputs","retain_basin_outputs","retain_external_reports"] and
-            .policy == "retain-all-through-publication" and
-            .reclaim_inputs == false and .retain_acquired_inputs == true and
-            .retain_basin_outputs == true and .retain_external_reports == true) and
-        (.sizing | type == "object" and
-            keys == ["assembled_artifact_bytes","assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
-                     "available_disk_bytes","available_memory_bytes","required_disk_bytes","required_memory_bytes",
-                     "retained_basin_output_bytes","retained_input_bytes"] and
-            (to_entries | all(.value | type == "number" and . == floor and . > 0 and . <= $max_i64)) and
-            .required_memory_bytes == .assembly_memory_ceiling_bytes and
-            .required_disk_bytes == (
-                .retained_input_bytes + .retained_basin_output_bytes +
-                .assembly_scratch_ceiling_bytes + .assembled_artifact_bytes
-            ) and
-            .available_memory_bytes >= .required_memory_bytes and
-            .available_disk_bytes >= .required_disk_bytes)
+        if .retention.policy == "retain-all-through-publication" then
+            (.retention == {
+                policy: "retain-all-through-publication",
+                reclaim_inputs: false,
+                retain_acquired_inputs: true,
+                retain_basin_outputs: true,
+                retain_external_reports: true
+            }) and
+            (.sizing | type == "object" and
+                keys == ["active_compile_scratch_bytes","assembled_artifact_bytes",
+                         "assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
+                         "available_disk_bytes","available_memory_bytes","filesystem_overhead_bytes",
+                         "required_disk_bytes","required_memory_bytes","retained_basin_output_bytes",
+                         "retained_input_bytes"] and
+                (to_entries | all(.value | positive_i64)))
+        elif .retention.policy == "reclaim-inputs-after-terminal" then
+            (.retention == {
+                policy: "reclaim-inputs-after-terminal",
+                reclaim_inputs: true,
+                retain_acquired_inputs: false,
+                retain_basin_outputs: true,
+                retain_external_reports: true
+            }) and
+            (.sizing | type == "object" and
+                keys == ["active_compile_scratch_bytes","assembled_artifact_bytes",
+                         "assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
+                         "available_disk_bytes","available_memory_bytes","filesystem_overhead_bytes",
+                         "peak_in_flight_download_bytes","required_disk_bytes","required_memory_bytes",
+                         "retained_basin_output_bytes"] and
+                (to_entries | all(.value | positive_i64)) and
+                .peak_in_flight_download_bytes == $reclaim_peak)
+        else false
+        end and
+        (.sizing.required_memory_bytes == .sizing.assembly_memory_ceiling_bytes) and
+        (.sizing.available_memory_bytes >= .sizing.required_memory_bytes) and
+        (.sizing.available_disk_bytes >= .sizing.required_disk_bytes)
     ' "$file" >/dev/null 2>&1 || hfx_die "campaign state is malformed: $file"
+
+    policy=$("$JQ" -r '.retention.policy' "$file")
+    case $policy in
+        retain-all-through-publication)
+            input_bytes=$("$JQ" -r '.sizing.retained_input_bytes' "$file")
+            ;;
+        reclaim-inputs-after-terminal)
+            input_bytes=$("$JQ" -r '.sizing.peak_in_flight_download_bytes' "$file")
+            ;;
+        *) hfx_die "campaign state is malformed: $file" ;;
+    esac
+    retained_output_bytes=$("$JQ" -r '.sizing.retained_basin_output_bytes' "$file")
+    active_scratch_bytes=$("$JQ" -r '.sizing.active_compile_scratch_bytes' "$file")
+    assembly_scratch_bytes=$("$JQ" -r '.sizing.assembly_scratch_ceiling_bytes' "$file")
+    artifact_bytes=$("$JQ" -r '.sizing.assembled_artifact_bytes' "$file")
+    overhead_bytes=$("$JQ" -r '.sizing.filesystem_overhead_bytes' "$file")
+    persisted_disk_bytes=$("$JQ" -r '.sizing.required_disk_bytes' "$file")
+    assembly_peak_bytes=$assembly_scratch_bytes
+    if ((artifact_bytes > assembly_peak_bytes)); then
+        assembly_peak_bytes=$artifact_bytes
+    fi
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$input_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$retained_output_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$active_scratch_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$assembly_peak_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$overhead_bytes")
+    [[ "$persisted_disk_bytes" == "$expected_disk_bytes" ]] ||
+        hfx_die "campaign state is malformed: $file"
 }
 
 validate_compile_json() {
@@ -482,14 +551,20 @@ validate_workspace_state() {
 
 print_sizing() {
     "$JQ" -r '
-        .sizing |
+        . as $root |
+        $root.sizing |
+        "retention_policy=\($root.retention.policy)",
         "available_memory_bytes=\(.available_memory_bytes)",
         "available_disk_bytes=\(.available_disk_bytes)",
-        "retained_input_bytes=\(.retained_input_bytes)",
+        (if $root.retention.policy == "retain-all-through-publication"
+         then "retained_input_bytes=\(.retained_input_bytes)"
+         else "peak_in_flight_download_bytes=\(.peak_in_flight_download_bytes)" end),
         "retained_basin_output_bytes=\(.retained_basin_output_bytes)",
         "assembly_memory_ceiling_bytes=\(.assembly_memory_ceiling_bytes)",
         "assembly_scratch_ceiling_bytes=\(.assembly_scratch_ceiling_bytes)",
         "assembled_artifact_bytes=\(.assembled_artifact_bytes)",
+        "active_compile_scratch_bytes=\(.active_compile_scratch_bytes)",
+        "filesystem_overhead_bytes=\(.filesystem_overhead_bytes)",
         "required_memory_bytes=\(.required_memory_bytes)",
         "required_disk_bytes=\(.required_disk_bytes)"
     ' "$campaign_dir/state/campaign.json"
@@ -564,6 +639,8 @@ initialize_campaign() {
     local requested_basin_id
     local seen_basin_ids=' '
     local selection_temporary=$campaign_dir/state/.selection.json.tmp.$$
+    local retention_json
+    local sizing_input_json
 
     if [[ -e "$campaign_dir" || -L "$campaign_dir" ]]; then
         [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] ||
@@ -611,40 +688,50 @@ initialize_campaign() {
         validate_selection_file "$selection_temporary" "$temporary"
     fi
 
+    case $retention_policy in
+        retain-all-through-publication)
+            retention_json='{"policy":"retain-all-through-publication","reclaim_inputs":false,"retain_acquired_inputs":true,"retain_basin_outputs":true,"retain_external_reports":true}'
+            sizing_input_json="{\"retained_input_bytes\":$retained_input_bytes}"
+            ;;
+        reclaim-inputs-after-terminal)
+            retention_json='{"policy":"reclaim-inputs-after-terminal","reclaim_inputs":true,"retain_acquired_inputs":false,"retain_basin_outputs":true,"retain_external_reports":true}'
+            sizing_input_json="{\"peak_in_flight_download_bytes\":$peak_in_flight_download_bytes}"
+            ;;
+        *) hfx_die "unsupported retention policy: $retention_policy" ;;
+    esac
+
     temporary=$campaign_dir/state/.campaign.json.tmp.$$
     "$JQ" -n \
         --arg campaign "$campaign" \
+        --argjson retention "$retention_json" \
+        --argjson sizing_input "$sizing_input_json" \
         --argjson available_memory_bytes "$available_memory_bytes" \
         --argjson available_disk_bytes "$available_disk_bytes" \
-        --argjson retained_input_bytes "$retained_input_bytes" \
         --argjson retained_basin_output_bytes "$retained_basin_output_bytes" \
         --argjson assembly_memory_ceiling_bytes "$assembly_memory_ceiling_bytes" \
         --argjson assembly_scratch_ceiling_bytes "$assembly_scratch_ceiling_bytes" \
         --argjson assembled_artifact_bytes "$assembled_artifact_bytes" \
+        --argjson active_compile_scratch_bytes "$active_compile_scratch_bytes" \
+        --argjson filesystem_overhead_bytes "$filesystem_overhead_bytes" \
         --argjson required_memory_bytes "$required_memory_bytes" \
         --argjson required_disk_bytes "$required_disk_bytes" '
         {
-          schema_version: 1,
+          schema_version: 2,
           campaign: $campaign,
           inventory: {source: "adapters/tdx-hydro/data/tdx_header_numbers.json", count: 62},
-          retention: {
-            policy: "retain-all-through-publication",
-            reclaim_inputs: false,
-            retain_acquired_inputs: true,
-            retain_basin_outputs: true,
-            retain_external_reports: true
-          },
-          sizing: {
+          retention: $retention,
+          sizing: ({
             available_memory_bytes: $available_memory_bytes,
             available_disk_bytes: $available_disk_bytes,
-            retained_input_bytes: $retained_input_bytes,
             retained_basin_output_bytes: $retained_basin_output_bytes,
             assembly_memory_ceiling_bytes: $assembly_memory_ceiling_bytes,
             assembly_scratch_ceiling_bytes: $assembly_scratch_ceiling_bytes,
             assembled_artifact_bytes: $assembled_artifact_bytes,
+            active_compile_scratch_bytes: $active_compile_scratch_bytes,
+            filesystem_overhead_bytes: $filesystem_overhead_bytes,
             required_memory_bytes: $required_memory_bytes,
             required_disk_bytes: $required_disk_bytes
-          }
+          } + $sizing_input)
         }' >"$temporary"
     validate_campaign_json "$temporary"
 
@@ -2285,8 +2372,12 @@ interrupt_acquisition() {
 
 acquire_campaign() {
     local basin_id
+    local locked_retention_policy
     acquire_campaign_lock
     validate_workspace_state
+    locked_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$locked_retention_policy" == "$acquire_retention_policy" ]] ||
+        hfx_die 'campaign retention policy changed while acquiring the campaign lock'
     migrate_basin_states
     recover_running_stages true
     validate_workspace_state
@@ -2326,11 +2417,16 @@ workspace_seen=0
 available_memory_bytes=
 available_disk_bytes=
 retained_input_bytes=
+peak_in_flight_download_bytes=
 retained_basin_output_bytes=
 assembly_memory_ceiling_bytes=
 assembly_scratch_ceiling_bytes=
 assembled_artifact_bytes=
+active_compile_scratch_bytes=
+filesystem_overhead_bytes=
 sizing_seen=' '
+retention_policy=retain-all-through-publication
+retention_policy_seen=0
 max_parallel=
 max_parallel_seen=0
 fabric_version=
@@ -2350,9 +2446,13 @@ basin_ids=()
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--basin|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
+        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
             shift
-            (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
+            (($# > 0)) && [[ -n "$1" ]] || usage_error "option $option requires a value"
+            if [[ "$1" == -* ]] &&
+                ! [[ "$option" == --max-parallel && "$1" =~ ^-[0-9]+$ ]]; then
+                usage_error "option $option requires a value"
+            fi
             value=$1
             ;;
         -*) usage_error "unknown option $option" ;;
@@ -2372,6 +2472,12 @@ while (($# > 0)); do
         --basin)
             [[ "$subcommand" == init ]] || usage_error 'option --basin is valid only for init'
             basin_ids[${#basin_ids[@]}]=$value
+            ;;
+        --retention-policy)
+            [[ "$subcommand" == init ]] || usage_error 'option --retention-policy is valid only for init'
+            ((retention_policy_seen == 0)) || usage_error 'option --retention-policy may not be repeated'
+            retention_policy_seen=1
+            retention_policy=$value
             ;;
         --max-parallel)
             [[ "$subcommand" == acquire ]] || usage_error 'option --max-parallel is valid only for acquire'
@@ -2449,18 +2555,44 @@ campaign_dir=$workspace_root/tdx-hydro-$campaign
 trap 'release_takeover_guard; release_lock' EXIT
 
 if [[ "$subcommand" == init ]]; then
-    for variable_name in available_memory_bytes available_disk_bytes retained_input_bytes retained_basin_output_bytes assembly_memory_ceiling_bytes assembly_scratch_ceiling_bytes assembled_artifact_bytes; do
+    case $retention_policy in
+        retain-all-through-publication)
+            [[ -n "$retained_input_bytes" ]] || usage_error 'option --retained-input-bytes is required'
+            [[ -z "$peak_in_flight_download_bytes" ]] ||
+                usage_error 'option --peak-in-flight-download-bytes is incompatible with retention policy retain-all-through-publication'
+            policy_input_name=retained_input_bytes
+            ;;
+        reclaim-inputs-after-terminal)
+            [[ -n "$peak_in_flight_download_bytes" ]] ||
+                usage_error 'option --peak-in-flight-download-bytes is required'
+            [[ -z "$retained_input_bytes" ]] ||
+                usage_error 'option --retained-input-bytes is incompatible with retention policy reclaim-inputs-after-terminal'
+            policy_input_name=peak_in_flight_download_bytes
+            ;;
+        *) usage_error "invalid retention policy '$retention_policy'; expected retain-all-through-publication or reclaim-inputs-after-terminal" ;;
+    esac
+    for variable_name in available_memory_bytes available_disk_bytes retained_basin_output_bytes assembly_memory_ceiling_bytes assembly_scratch_ceiling_bytes assembled_artifact_bytes active_compile_scratch_bytes filesystem_overhead_bytes "$policy_input_name"; do
         eval "value=\${$variable_name-}"
         [[ -n "$value" ]] || usage_error "option --${variable_name//_/-} is required"
         value=$(normalize_positive_i64 "$variable_name" "$value")
         eval "$variable_name=\$value"
     done
+    if [[ "$retention_policy" == reclaim-inputs-after-terminal ]] &&
+        [[ "$peak_in_flight_download_bytes" != "$HFX_TDX_RECLAIM_PEAK_BYTES" ]]; then
+        usage_error "option --peak-in-flight-download-bytes must equal $HFX_TDX_RECLAIM_PEAK_BYTES for retention policy reclaim-inputs-after-terminal"
+    fi
     required_memory_bytes=$assembly_memory_ceiling_bytes
+    assembly_peak_bytes=$assembly_scratch_ceiling_bytes
+    if ((assembled_artifact_bytes > assembly_peak_bytes)); then
+        assembly_peak_bytes=$assembled_artifact_bytes
+    fi
     required_disk_bytes=0
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$retained_input_bytes")
+    eval "policy_input_bytes=\${$policy_input_name}"
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$policy_input_bytes")
     required_disk_bytes=$(checked_add "$required_disk_bytes" "$retained_basin_output_bytes")
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembly_scratch_ceiling_bytes")
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembled_artifact_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$active_compile_scratch_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembly_peak_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$filesystem_overhead_bytes")
     ((available_memory_bytes >= required_memory_bytes)) ||
         hfx_die "insufficient memory: available $available_memory_bytes bytes; required $required_memory_bytes bytes"
     ((available_disk_bytes >= required_disk_bytes)) ||
@@ -2480,6 +2612,12 @@ elif [[ "$subcommand" == acquire ]]; then
     ((max_parallel >= 1 && max_parallel <= 62)) ||
         usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_campaign_json "$campaign_dir/state/campaign.json"
+    acquire_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    if [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]]; then
+        ((max_parallel >= 1 && max_parallel <= HFX_TDX_RECLAIM_MAX_PARALLEL)) ||
+            usage_error "option --max-parallel must be a base-10 integer from 1 through $HFX_TDX_RECLAIM_MAX_PARALLEL for retention policy reclaim-inputs-after-terminal"
+    fi
     CURL=$(resolve_command HFX_TDX_CURL curl)
     SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
     OD=$(resolve_command HFX_TDX_OD od)

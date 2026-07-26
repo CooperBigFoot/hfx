@@ -271,7 +271,7 @@ interpreter exits with
 The accepted command forms are:
 
 ```text
-tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>
+tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>
 tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>
@@ -281,34 +281,102 @@ tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <d
 ```
 
 `--workspace-root` defaults to `/mnt/hfx/work`, giving campaign directory
-`/mnt/hfx/work/tdx-hydro-<campaign>`. All seven `init` byte values are required,
-positive base-10 integers within the signed 64-bit range. The feasibility
-checks are:
+`/mnt/hfx/work/tdx-hydro-<campaign>`. The retention selector defaults to
+`retain-all-through-publication`. Both policies require available memory and
+disk, retained basin output, assembly memory and scratch ceilings, assembled
+artifact, active compile scratch, and filesystem overhead. Retain-all also
+requires `--retained-input-bytes`; reclaim instead requires the exact frozen
+`--peak-in-flight-download-bytes 44296724480`. Supplying the other policy's
+input term is an error. Every byte value is a positive base-10 integer within
+the signed 64-bit range.
+
+The common calculations are:
 
 ```text
 required_memory_bytes = assembly_memory_ceiling_bytes
-required_disk_bytes = retained_input_bytes
-                    + retained_basin_output_bytes
-                    + assembly_scratch_ceiling_bytes
-                    + assembled_artifact_bytes
+assembly_peak_bytes = max(assembly_scratch_ceiling_bytes, assembled_artifact_bytes)
 available_memory_bytes >= required_memory_bytes
 available_disk_bytes >= required_disk_bytes
 ```
+
+Retain-all calculates:
+
+```text
+required_disk_bytes = retained_input_bytes
+                    + retained_basin_output_bytes
+                    + active_compile_scratch_bytes
+                    + assembly_peak_bytes
+                    + filesystem_overhead_bytes
+```
+
+Reclaim calculates:
+
+```text
+required_disk_bytes = peak_in_flight_download_bytes
+                    + retained_basin_output_bytes
+                    + active_compile_scratch_bytes
+                    + assembly_peak_bytes
+                    + filesystem_overhead_bytes
+```
+
+Assembly builds in a staging directory beside the destination and publishes
+with a same-filesystem replace. Staging and final output are therefore one
+artifact-sized term at a time, so the formula uses the maximum of scratch and
+artifact rather than their sum.
 
 Insufficient capacity is reported as
 `hfx: error: insufficient memory: available <available> bytes; required <required> bytes`
 or
 `hfx: error: insufficient disk: available <available> bytes; required <required> bytes`.
 Re-running `init` for an existing campaign requires the same normalized sizing
-values and the same 62-basin inventory. Changed parameters require a new
-campaign ID.
+values, retention policy, and the same 62-basin inventory. Schema-1 campaign
+state predates this contract and fails closed; use a new campaign ID. Changed
+parameters also require a new campaign ID.
 
-The persisted policy is `retain-all-through-publication`. Acquired final
-GeoPackages, resumable attributable partials, per-basin outputs, and external
-diagnostic reports remain on the campaign volume. Acquisition retains an invalid
-final for inspection. It continues a regular partial only when its sidecar's exact
-identity, URL, strong ETag, byte count, remote total, and SHA-256 validate; otherwise
-it discards a safe ordinary incomplete partial before one complete-file retry.
+Retain-all keeps acquired final GeoPackages, resumable attributable partials,
+per-basin outputs, and external diagnostic reports through publication.
+It accepts acquisition `--max-parallel` from `1` through `62`; the exact common
+range diagnostic remains
+`option --max-parallel must be a base-10 integer from 1 through 62`.
+Use `4` as the polite NGA operating value.
+
+Reclaim policy records the intent that future terminal basins surrender both
+source GeoPackages while landed basin outputs and external diagnostic reports
+remain for assembly and evidence. Its acquisition range is `1` through `4` and
+fails closed above four. Across all campaign source pairs present on the volume,
+its future scheduling invariant permits at most five distinct basin pairs at
+once. A basin counts when any in-flight `.partial` product or installed
+`basins` or `streamnet` GeoPackage exists, including fully acquired basins
+waiting for a terminal result and the basin currently compiling. One slot is
+reserved for the serial compile, leaving at most four acquisition workers:
+
+```text
+6,979,305,472 + 1,880,039,424 = 8,859,344,896 bytes per source pair
+5 * 8,859,344,896 = 44,296,724,480 peak input bytes
+max_parallel <= 5 - 1
+max_parallel <= 4
+```
+
+A later dispatch guard will assert the same `44,296,724,480`-byte quantity
+against actual occupancy and free disk.
+
+**M5-S1 only persists and sizes reclaim mode. It performs no reclaim
+behavior.** M5-S2 owns reclaim after durable terminal evidence, including the
+terminal acquisition-failure path. No provisioning gate occurs before M5-S4,
+and M5-S5 is the only paid execution step. Do not use this intermediate state
+for a paid campaign.
+
+Today `fail_product` retains a failed acquisition's `.partial` or installed
+GeoPackage for inspection, and that basin never reaches compile. This residue
+is outside the reclaim five-pair invariant until M5-S2. Each terminal
+acquisition failure can consume up to an additional `8,859,344,896` bytes
+beyond the `44,296,724,480` reserve. S1 does not add an unbounded failure count
+to the sizing formula or remove that residue.
+
+Acquisition retains an invalid final for inspection. It continues a regular
+partial only when its sidecar's exact identity, URL, strong ETag, byte count,
+remote total, and SHA-256 validate; otherwise it discards a safe ordinary
+incomplete partial before one complete-file retry.
 A resumed acquisition re-verifies every installed final's byte count, SHA-256,
 SQLite identity, layer name, and persisted evidence. A resumed compile re-validates
 each succeeded dataset and external report. Existing failed or conflicting compile
@@ -318,10 +386,10 @@ The runner phases are:
 
 1. `init` creates the fixed campaign layout and records sizing, inventory, and
    retention policy.
-2. `acquire --max-parallel <1-62>` performs bounded parallel work across
-   basins, with products serial within each basin. The runner retains the full
-   range; use `4` as the polite NGA campaign operating policy. It safely continues
-   only a server-honored HTTP range tied to a validated strong ETag.
+2. `acquire` performs bounded parallel work across basins, with products serial
+   within each basin. Retain-all accepts `1..62`; reclaim accepts `1..4`.
+   Use `4` as the polite NGA campaign operating policy. The runner safely
+   continues only a server-honored HTTP range tied to a validated strong ETag.
 3. `compile --fabric-version <value>` invokes one isolated adapter build per
    basin after both products succeed. It retains
    `basin-outputs/<basin>` and `reports/<basin>-build-report.json`.
@@ -342,6 +410,45 @@ parallelism, fabric version, paths, attribution inputs, and scratch prefix.
 Do not sweep resources, enumerate by name pattern or label selector, or perform
 opportunistic cleanup. Inspect and retry only the exact campaign resources and
 retained paths named by the diagnostic.
+
+The authored 600 GB reclaim model is:
+
+```text
+44,296,724,480 peak input bytes
++ 206,220,202,290 retained basin output bytes
++ 30,000,000,000 active compile scratch bytes
++ 206,220,202,290 assembled artifact bytes
++ 5,000,000,000 filesystem overhead bytes
+= 491,737,129,060 required disk bytes
+
+560,000,000,000 - 491,737,129,060 = 68,262,870,940 bytes headroom
+```
+
+This is approximately 492 GB required against approximately 560 GB usable.
+The five-pair peak and active compile scratch do not coincide with assembly,
+but the conservative formula deliberately sums them. Retaining all projected
+source downloads with outputs, compile scratch, assembly, and overhead
+approaches a terabyte and does not fit safely within the account's 1024 GB
+volume quota.
+
+The full model is authored planning, not a measured or verified planetary
+result. Term provenance is:
+
+| Term | Provenance |
+|---|---|
+| `6,530,924,497`, `5,541,794,376`, `5,396,674,014` | Measured compile peak-scratch values for basins `1020000010`, `7020000010`, and `9020000010` in the completed three-basin campaign. |
+| `6,979,305,472`, `1,880,039,424`, `8,859,344,896` | Measured largest source-pair components and their arithmetic sum. |
+| `549,279,383,552`, `206,220,202,290`, `30,000,000,000` | Carried-forward M4-S4 capacity-disclosure terms, not measurements from the three-basin campaign. The retained-download projection is `8,859,344,896 * 62 = 549,279,383,552`. |
+| `206,220,202,290` assembled artifact | Authored conservative assumption. The measured three-basin assembled aggregate is `9,037,936,480`; the authored value is `22.817x` that aggregate versus the count-linear basin multiplier of `20.667x`. |
+| Five pairs, `44,296,724,480` peak, `5,000,000,000` overhead, `491,737,129,060` total | Authored planning choices derived from the stated terms. |
+| `560,000,000,000` usable bytes for a 600 GB volume | Account-model convention, consistent with `140,000,000,000` usable for 150 GB; not a measured filesystem reading for a future planetary volume. |
+
+The completed
+[`RUNBOOK-tdx-hydro-assembly-subset.md`](RUNBOOK-tdx-hydro-assembly-subset.md)
+calls its schema-1 subset command “complete, frozen” and refers to “all seven
+required byte arguments.” Those statements predate schema 2 and remain
+historical. The old command is intentionally not executable with the current
+runner unless the new common fields are supplied.
 
 On the VM, compile defaults to Python `/opt/hfx-geo/bin/python`, adapter script
 `/root/hfx/adapters/tdx-hydro/build_adapter.py`, and validator
@@ -366,7 +473,24 @@ parameters. They document usage and do not authorize provisioning:
   --retained-basin-output-bytes <retained-basin-output-bytes> \
   --assembly-memory-ceiling-bytes <assembly-memory-ceiling-bytes> \
   --assembly-scratch-ceiling-bytes <assembly-scratch-ceiling-bytes> \
-  --assembled-artifact-bytes <assembled-artifact-bytes>
+  --assembled-artifact-bytes <assembled-artifact-bytes> \
+  --active-compile-scratch-bytes <active-compile-scratch-bytes> \
+  --filesystem-overhead-bytes <filesystem-overhead-bytes>
+
+# Sizing only until M5-S2 lands. Do not use for a paid campaign.
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-init -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh init \
+  --campaign <campaign> \
+  --retention-policy reclaim-inputs-after-terminal \
+  --available-memory-bytes <available-memory-bytes> \
+  --available-disk-bytes <available-disk-bytes> \
+  --peak-in-flight-download-bytes 44296724480 \
+  --retained-basin-output-bytes <retained-basin-output-bytes> \
+  --assembly-memory-ceiling-bytes <assembly-memory-ceiling-bytes> \
+  --assembly-scratch-ceiling-bytes <assembly-scratch-ceiling-bytes> \
+  --assembled-artifact-bytes <assembled-artifact-bytes> \
+  --active-compile-scratch-bytes <active-compile-scratch-bytes> \
+  --filesystem-overhead-bytes <filesystem-overhead-bytes>
 
 ./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-acquire -- \
   /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh acquire \
@@ -591,7 +715,8 @@ Per-connection throughput was erratic. During the paid run a laptop sustained
 about 13 MB/s while the campaign VM received about 1.0 MB/s on its own simultaneous
 connection, showing server headroom and a per-connection constraint. Use
 `--max-parallel 4` as the polite operating policy for separate product files; the
-runner retains its `1..62` accepted range. At four connections sustaining the
+retain-all policy retains its `1..62` accepted range, while reclaim mode accepts
+only `1..4`. At four connections sustaining the
 measured VM rate, roughly 500 GB needs about 35 transfer-hours; allow 36-40 hours
 for a 62-basin acquisition. Do not segment a single file. Observed basin
 GeoPackages were `5.9-7.0 GB` each. The observed stream-network GeoPackage was
@@ -616,7 +741,7 @@ campaign runner and remains an all-or-nothing probe.
 | Credential metadata or required variable failure | The installed environment file is absent, unsafe, unloadable, or incomplete. | Correct the operator-managed source, rerun provisioning to reinstall `/etc/pourpoint-hfx.env`, then rerun smoke. |
 | Missing bootstrap state | Required directories, packages, or tools are absent. | Rerun the idempotent bootstrap, then retry launch or smoke. |
 | Duplicate workload session | The exact tmux session already exists. | Use `attach`, `status`, or `tail`; start again after the exact session finishes. |
-| NGA transfer interruption | The response may not honor Range, or the saved partial may lack safe provenance. | The campaign runner continues only a validated strong-ETag 206 response; otherwise it discards the safe partial and performs one clean GET. Use `--max-parallel 4` as operating policy across separate files, never segments of one file; the runner accepts `1..62`. |
+| NGA transfer interruption | The response may not honor Range, or the saved partial may lack safe provenance. | The campaign runner continues only a validated strong-ETag 206 response; otherwise it discards the safe partial and performs one clean GET. Use `--max-parallel 4` as operating policy across separate files, never segments of one file; retain-all accepts `1..62` and reclaim accepts `1..4`. |
 | Safe teardown refusal | Exact-name ownership, labels, IDs, or attachment state failed validation. | Inspect only the exact campaign resource names and labels named by the diagnostic, correct ownership or attachment state, and rerun. |
 
 Scope zero-footprint verification to the current campaign's deterministic

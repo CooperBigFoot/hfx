@@ -84,12 +84,14 @@ init_args() {
     printf '%s\n' \
         init --campaign "$1" --workspace-root "$2" \
         --available-memory-bytes 11 \
-        --available-disk-bytes 26 \
+        --available-disk-bytes 29 \
         --retained-input-bytes 5 \
         --retained-basin-output-bytes 6 \
         --assembly-memory-ceiling-bytes 11 \
         --assembly-scratch-ceiling-bytes 7 \
-        --assembled-artifact-bytes 8
+        --assembled-artifact-bytes 8 \
+        --active-compile-scratch-bytes 9 \
+        --filesystem-overhead-bytes 1
 }
 
 subset_init_args() {
@@ -99,12 +101,14 @@ subset_init_args() {
         --basin 1020000010 \
         --basin 9020000010 \
         --available-memory-bytes 11 \
-        --available-disk-bytes 26 \
+        --available-disk-bytes 29 \
         --retained-input-bytes 5 \
         --retained-basin-output-bytes 6 \
         --assembly-memory-ceiling-bytes 11 \
         --assembly-scratch-ceiling-bytes 7 \
-        --assembled-artifact-bytes 8
+        --assembled-artifact-bytes 8 \
+        --active-compile-scratch-bytes 9 \
+        --filesystem-overhead-bytes 1
 }
 
 copy_workspace() {
@@ -267,7 +271,7 @@ skipped=0
 
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
-assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>'
+assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
@@ -300,6 +304,30 @@ expect_failure 'foreign fabric version' status --campaign compile --workspace-ro
     --fabric-version version
 expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+expect_failure 'empty retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy ''
+expect_failure 'option-shaped retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy --available-memory-bytes
+expect_failure 'unknown retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-some
+expect_failure 'case-changed retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy Retain-all-through-publication
+expect_failure 'repeated retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-all-through-publication \
+    --retention-policy retain-all-through-publication
+expect_failure 'foreign retention policy' status --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-all-through-publication
+expect_failure 'missing max parallel' acquire --campaign arguments --workspace-root "$argument_root"
+expect_failure 'repeated max parallel' acquire --campaign arguments --workspace-root "$argument_root" \
+    --max-parallel 1 --max-parallel 2
+expect_failure 'foreign max parallel' status --campaign arguments --workspace-root "$argument_root" \
+    --max-parallel 1
+for invalid_parallel in 0 -1 x 63; do
+    expect_failure "invalid max parallel $invalid_parallel" acquire --campaign arguments \
+        --workspace-root "$argument_root" --max-parallel "$invalid_parallel"
+    assert_contains "$case_stderr" \
+        'hfx: error: option --max-parallel must be a base-10 integer from 1 through 62'
+done
 for foreign_basin_command in status recover acquire compile assemble evidence publish; do
     expect_failure "basin on $foreign_basin_command" "$foreign_basin_command" \
         --campaign foreign --workspace-root "$argument_root" --basin 1020000010
@@ -317,26 +345,94 @@ for publication_option in --out --report --notice --citation --scratch-prefix; d
         "$publication_option"
 done
 expect_failure 'zero sizing' init --campaign zero --workspace-root "$argument_root" \
-    --available-memory-bytes 0 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 0 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'negative sizing' init --campaign negative --workspace-root "$argument_root" \
-    --available-memory-bytes -1 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes -1 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'nonnumeric sizing' init --campaign text --workspace-root "$argument_root" \
-    --available-memory-bytes nope --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes nope --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'scalar overflow' init --campaign scalar-overflow --workspace-root "$argument_root" \
-    --available-memory-bytes 9223372036854775808 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 9223372036854775808 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+for invalid_byte in 0 -1 nope 9223372036854775808; do
+    expect_failure "invalid active scratch $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --available-memory-bytes 1 --available-disk-bytes 5 \
+        --retained-input-bytes 1 --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes "$invalid_byte" \
+        --filesystem-overhead-bytes 1
+    expect_failure "invalid filesystem overhead $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --available-memory-bytes 1 --available-disk-bytes 5 \
+        --retained-input-bytes 1 --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes "$invalid_byte"
+    expect_failure "invalid reclaim peak $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 1 --available-disk-bytes 5 \
+        --peak-in-flight-download-bytes "$invalid_byte" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+done
+expect_failure 'retain-all incompatible peak' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+expect_failure 'reclaim incompatible retained input' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy reclaim-inputs-after-terminal --available-memory-bytes 1 \
+    --available-disk-bytes 44296724484 --retained-input-bytes 1 \
+    --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+for unsafe_peak in 44296724479 44296724481; do
+    expect_failure "unsafe reclaim peak $unsafe_peak" init --campaign arguments \
+        --workspace-root "$argument_root" --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 1 --available-disk-bytes 44296724484 \
+        --peak-in-flight-download-bytes "$unsafe_peak" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+    assert_contains "$case_stderr" 'option --peak-in-flight-download-bytes must equal 44296724480'
+done
+expect_failure 'missing active scratch' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --filesystem-overhead-bytes 1
+expect_failure 'missing filesystem overhead' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1
+expect_failure 'missing reclaim peak' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy reclaim-inputs-after-terminal --available-memory-bytes 1 \
+    --available-disk-bytes 5 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+    --filesystem-overhead-bytes 1
+for repeated_byte_option in active-compile-scratch-bytes filesystem-overhead-bytes; do
+    set -- $(init_args arguments "$argument_root")
+    expect_failure "repeated $repeated_byte_option" "$@" \
+        "--$repeated_byte_option" 1
+done
 touch "$argument_root/tdx-hydro-unsafe"
 expect_failure 'unsafe pre-existing path' init --campaign unsafe --workspace-root "$argument_root" \
-    --available-memory-bytes 1 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 pass 'argument and path validation rejects invalid forms'
 
 for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
@@ -531,17 +627,18 @@ assert_contains "$case_stderr" "required command '/root/hfx/target/release/hfx' 
 pass 'compile resolves both frozen command defaults behaviorally'
 jq -e '
     keys == ["campaign","inventory","retention","schema_version","sizing"] and
-    .schema_version == 1 and .campaign == "equal" and
+    .schema_version == 2 and .campaign == "equal" and
     .inventory == {source:"adapters/tdx-hydro/data/tdx_header_numbers.json",count:62} and
     .retention == {
       policy:"retain-all-through-publication",reclaim_inputs:false,
       retain_acquired_inputs:true,retain_basin_outputs:true,retain_external_reports:true
     } and
     .sizing == {
-      available_memory_bytes:11,available_disk_bytes:26,retained_input_bytes:5,
+      available_memory_bytes:11,available_disk_bytes:29,retained_input_bytes:5,
       retained_basin_output_bytes:6,assembly_memory_ceiling_bytes:11,
       assembly_scratch_ceiling_bytes:7,assembled_artifact_bytes:8,
-      required_memory_bytes:11,required_disk_bytes:26
+      active_compile_scratch_bytes:9,filesystem_overhead_bytes:1,
+      required_memory_bytes:11,required_disk_bytes:29
     }
 ' "$campaign_dir/state/campaign.json" >/dev/null || die 'campaign JSON shape differs'
 jq -S '.' "$inventory" >"$test_tmp/expected-inventory.json"
@@ -580,20 +677,33 @@ pass 'equal-capacity init creates the complete 62-basin contract'
 
 memory_root=$test_tmp/workspaces/memory
 mkdir "$memory_root"
-expect_failure 'memory undersizing' init --campaign memory --workspace-root "$memory_root" \
-    --available-memory-bytes 10 --available-disk-bytes 26 --retained-input-bytes 5 \
+
+under_reserved_root=$test_tmp/workspaces/under-reserved
+mkdir "$under_reserved_root"
+expect_failure 'missing active compile scratch' init --campaign under-reserved \
+    --workspace-root "$under_reserved_root" \
+    --available-memory-bytes 11 --available-disk-bytes 26 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
     --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
+[[ ! -e "$under_reserved_root/tdx-hydro-under-reserved" ]] ||
+    die 'missing active compile scratch refusal created campaign state'
+
+expect_failure 'memory undersizing' init --campaign memory --workspace-root "$memory_root" \
+    --available-memory-bytes 10 --available-disk-bytes 29 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'insufficient memory: available 10 bytes; required 11 bytes'
 [[ ! -e "$memory_root/tdx-hydro-memory" ]] || die 'memory refusal created campaign state'
 
 disk_root=$test_tmp/workspaces/disk
 mkdir "$disk_root"
 expect_failure 'disk undersizing' init --campaign disk --workspace-root "$disk_root" \
-    --available-memory-bytes 11 --available-disk-bytes 25 --retained-input-bytes 5 \
+    --available-memory-bytes 11 --available-disk-bytes 28 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
-    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
-assert_contains "$case_stderr" 'insufficient disk: available 25 bytes; required 26 bytes'
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
+assert_contains "$case_stderr" 'insufficient disk: available 28 bytes; required 29 bytes'
 [[ ! -e "$disk_root/tdx-hydro-disk" ]] || die 'disk refusal created campaign state'
 
 overflow_root=$test_tmp/workspaces/overflow
@@ -602,9 +712,48 @@ expect_failure 'sum overflow' init --campaign overflow --workspace-root "$overfl
     --available-memory-bytes 1 --available-disk-bytes 9223372036854775807 \
     --retained-input-bytes 9223372036854775807 --retained-basin-output-bytes 1 \
     --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
-    --assembled-artifact-bytes 1
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+    --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'required disk byte sum overflows signed 64-bit range'
 [[ ! -e "$overflow_root/tdx-hydro-overflow" ]] || die 'overflow refusal created campaign state'
+for overflow_spec in \
+    'overflow-active 9223372036854775806 1 1 1' \
+    'overflow-assembly 9223372036854775805 1 1 1' \
+    'overflow-overhead 9223372036854775804 1 1 1'; do
+    overflow_campaign=${overflow_spec%% *}
+    overflow_values=${overflow_spec#* }
+    overflow_input=${overflow_values%% *}
+    expect_failure "$overflow_campaign" init --campaign "$overflow_campaign" \
+        --workspace-root "$overflow_root" --available-memory-bytes 1 \
+        --available-disk-bytes 9223372036854775807 \
+        --retained-input-bytes "$overflow_input" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+    assert_contains "$case_stderr" 'required disk byte sum overflows signed 64-bit range'
+    [[ ! -e "$overflow_root/tdx-hydro-$overflow_campaign" ]] ||
+        die "$overflow_campaign refusal created campaign state"
+done
+
+inverse_assembly_root=$test_tmp/workspaces/inverse-assembly-max
+mkdir "$inverse_assembly_root"
+run_runner init --campaign inverse-assembly-max --workspace-root "$inverse_assembly_root" \
+    --available-memory-bytes 11 --available-disk-bytes 31 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 10 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1 >"$case_stdout"
+jq -e '.sizing.required_disk_bytes == 31 and .sizing.available_disk_bytes == 31' \
+    "$inverse_assembly_root/tdx-hydro-inverse-assembly-max/state/campaign.json" >/dev/null ||
+    die 'inverse assembly maximum total differs'
+expect_failure 'inverse assembly one byte short' init --campaign inverse-assembly-max-short \
+    --workspace-root "$inverse_assembly_root" \
+    --available-memory-bytes 11 --available-disk-bytes 30 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 10 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
+assert_contains "$case_stderr" 'insufficient disk: available 30 bytes; required 31 bytes'
+[[ ! -e "$inverse_assembly_root/tdx-hydro-inverse-assembly-max-short" ]] ||
+    die 'inverse assembly refusal created campaign state'
 pass 'memory, disk, and arithmetic preflight refuse before writes'
 
 selected_id=$(jq -r 'keys[0]' "$inventory")
@@ -613,14 +762,62 @@ jq '.stages.compile={status:"succeeded",attempts:3,failure_reason:null,diagnosti
 mv "$selected_state.tmp" "$selected_state"
 cp "$selected_state" "$test_tmp/preserved-state.json"
 cp "$campaign_dir/state/campaign.json" "$test_tmp/preserved-campaign.json"
-set -- $(init_args equal "$valid_root")
-run_runner "$@" >"$case_stdout"
+run_runner init --campaign equal --workspace-root "$valid_root" \
+    --available-memory-bytes 00011 --available-disk-bytes 00029 \
+    --retained-input-bytes 0005 --retained-basin-output-bytes 0006 \
+    --assembly-memory-ceiling-bytes 00011 --assembly-scratch-ceiling-bytes 0007 \
+    --assembled-artifact-bytes 0008 --active-compile-scratch-bytes 0009 \
+    --filesystem-overhead-bytes 0001 >"$case_stdout"
 diff -u "$test_tmp/preserved-state.json" "$selected_state"
 expect_failure 'changed contract' init --campaign equal --workspace-root "$valid_root" \
-    --available-memory-bytes 12 --available-disk-bytes 26 --retained-input-bytes 5 \
+    --available-memory-bytes 12 --available-disk-bytes 29 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
-    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+diff -u "$test_tmp/preserved-state.json" "$selected_state"
+diff -u "$test_tmp/preserved-campaign.json" "$campaign_dir/state/campaign.json"
+expect_failure 'changed retention policy' init --campaign equal --workspace-root "$valid_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000
+assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+for changed_pair in 'active-compile-scratch-bytes 10 30' 'filesystem-overhead-bytes 2 30' \
+    'retained-input-bytes 6 30'; do
+    changed_option=${changed_pair%% *}
+    changed_remainder=${changed_pair#* }
+    changed_value=${changed_remainder%% *}
+    changed_disk=${changed_remainder#* }
+    if [[ "$changed_option" == active-compile-scratch-bytes ]]; then
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes 5 --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes "$changed_value" \
+            --filesystem-overhead-bytes 1
+    elif [[ "$changed_option" == filesystem-overhead-bytes ]]; then
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes 5 --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes 9 \
+            --filesystem-overhead-bytes "$changed_value"
+    else
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes "$changed_value" --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes 9 \
+            --filesystem-overhead-bytes 1
+    fi
+    assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+done
 diff -u "$test_tmp/preserved-state.json" "$selected_state"
 diff -u "$test_tmp/preserved-campaign.json" "$campaign_dir/state/campaign.json"
 pass 'init converges only for an equivalent contract and preserves basin state'
@@ -746,6 +943,34 @@ jq '.sizing.available_memory_bytes=1' \
 mv "$sizing_root/campaign.tmp" "$sizing_root/tdx-hydro-equal/state/campaign.json"
 expect_failure 'malformed sizing' status --campaign equal --workspace-root "$sizing_root"
 
+mutate_campaign_state() {
+    local name=$1
+    local filter=$2
+    local root
+    local state
+    root=$(copy_workspace "$name")
+    state=$root/tdx-hydro-equal/state/campaign.json
+    jq "$filter" "$state" >"$root/campaign.tmp"
+    mv "$root/campaign.tmp" "$state"
+    expect_failure "$name" status --campaign equal --workspace-root "$root"
+    assert_contains "$case_stderr" "campaign state is malformed: $state"
+}
+mutate_campaign_state schema-one '.schema_version=1'
+mutate_campaign_state extra-sizing-key '.sizing.extra=1'
+mutate_campaign_state absent-sizing-key 'del(.sizing.active_compile_scratch_bytes)'
+mutate_campaign_state string-sizing '.sizing.active_compile_scratch_bytes="9"'
+mutate_campaign_state fractional-sizing '.sizing.active_compile_scratch_bytes=9.5'
+mutate_campaign_state zero-sizing '.sizing.active_compile_scratch_bytes=0'
+mutate_campaign_state negative-sizing '.sizing.active_compile_scratch_bytes=-1'
+mutate_campaign_state oversized-sizing '.sizing.active_compile_scratch_bytes=9223372036854775808'
+mutate_campaign_state wrong-reclaim-flag '.retention.reclaim_inputs=true'
+mutate_campaign_state wrong-retain-input-flag '.retention.retain_acquired_inputs=false'
+mutate_campaign_state altered-required-total '.sizing.required_disk_bytes=30'
+mutate_campaign_state insufficient-disk '.sizing.available_disk_bytes=28'
+mutate_campaign_state assembly-maximum-drift \
+    '.sizing.assembly_scratch_ceiling_bytes=10 | .sizing.required_disk_bytes=29'
+unset -f mutate_campaign_state
+
 compile_state_root=$(copy_workspace bad-compile-state)
 jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
     >"$compile_state_root/tdx-hydro-equal/state/compile.json"
@@ -773,6 +998,15 @@ jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnost
     die 'shared status fixture lost the v3 compile diagnostic member'
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
 assert_contains "$case_stdout" 'inventory_count=62'
+assert_contains "$case_stdout" 'retention_policy=retain-all-through-publication'
+assert_contains "$case_stdout" 'available_disk_bytes=29'
+assert_contains "$case_stdout" 'retained_input_bytes=5'
+assert_contains "$case_stdout" 'active_compile_scratch_bytes=9'
+assert_contains "$case_stdout" 'filesystem_overhead_bytes=1'
+assert_contains "$case_stdout" 'required_disk_bytes=29'
+cp "$case_stdout" "$test_tmp/status-first"
+run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
+cmp "$test_tmp/status-first" "$case_stdout"
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=1'
 assert_contains "$case_stdout" 'compile_succeeded=1'
@@ -783,24 +1017,108 @@ assert_contains "$case_stdout" 'assemble_failed=0'
 pass 'status rejects all malformed state and reports deterministic counts'
 
 run_runner --help >"$case_stdout"
-if grep -i 'reclaim' "$case_stdout" >/dev/null; then
-    die 'help exposes an input-reclaim mode'
+assert_contains "$case_stdout" 'retain-all-through-publication'
+assert_contains "$case_stdout" 'reclaim-inputs-after-terminal'
+policy_root=$test_tmp/workspaces/policy-aware
+mkdir "$policy_root"
+set -- $(init_args policy-retain-default "$policy_root")
+run_runner "$@" >"$case_stdout"
+run_runner init --campaign policy-reclaim-equal --workspace-root "$policy_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+expect_failure 'reclaim one byte short' init --campaign policy-reclaim-short \
+    --workspace-root "$policy_root" --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129059 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000
+assert_contains "$case_stderr" \
+    'insufficient disk: available 491737129059 bytes; required 491737129060 bytes'
+[[ ! -e "$policy_root/tdx-hydro-policy-reclaim-short" ]] ||
+    die 'reclaim disk refusal created campaign state'
+run_runner init --campaign policy-reclaim-headroom --workspace-root "$policy_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 560000000000 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+jq -e '
+  .schema_version == 2 and
+  .retention == {
+    policy:"retain-all-through-publication",reclaim_inputs:false,
+    retain_acquired_inputs:true,retain_basin_outputs:true,retain_external_reports:true
+  } and
+  (.sizing | has("retained_input_bytes") and (has("peak_in_flight_download_bytes") | not))
+' "$policy_root/tdx-hydro-policy-retain-default/state/campaign.json" >/dev/null ||
+    die 'default retain-all policy shape differs'
+jq -e '
+  .retention == {
+    policy:"reclaim-inputs-after-terminal",reclaim_inputs:true,
+    retain_acquired_inputs:false,retain_basin_outputs:true,retain_external_reports:true
+  } and
+  .sizing == {
+    available_memory_bytes:30000000000,available_disk_bytes:491737129060,
+    peak_in_flight_download_bytes:44296724480,retained_basin_output_bytes:206220202290,
+    assembly_memory_ceiling_bytes:30000000000,assembly_scratch_ceiling_bytes:206220202290,
+    assembled_artifact_bytes:206220202290,active_compile_scratch_bytes:30000000000,
+    filesystem_overhead_bytes:5000000000,required_memory_bytes:30000000000,
+    required_disk_bytes:491737129060
+  }
+' "$policy_root/tdx-hydro-policy-reclaim-equal/state/campaign.json" >/dev/null ||
+    die 'reclaim policy shape differs'
+jq -e '
+  .sizing.available_disk_bytes == 560000000000 and
+  .sizing.required_disk_bytes == 491737129060 and
+  (.sizing.available_disk_bytes - .sizing.required_disk_bytes) == 68262870940
+' "$policy_root/tdx-hydro-policy-reclaim-headroom/state/campaign.json" >/dev/null ||
+    die 'reclaim headroom model differs'
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+assert_contains "$case_stdout" 'retention_policy=reclaim-inputs-after-terminal'
+assert_contains "$case_stdout" 'peak_in_flight_download_bytes=44296724480'
+if grep -F 'retained_input_bytes=' "$case_stdout" >/dev/null; then
+    die 'reclaim status printed the inactive input term'
 fi
-assert_contains "$campaign_dir/state/campaign.json" '"reclaim_inputs": false'
-assert_contains "$case_stdout" '--retained-input-bytes'
-assert_contains "$case_stdout" '--retained-basin-output-bytes'
-assert_contains "$case_stdout" '--assembly-scratch-ceiling-bytes'
-assert_contains "$case_stdout" '--assembled-artifact-bytes'
-pass 'retain-all sizing has no reclaim interface'
-
-expect_failure 'missing max parallel' acquire --campaign equal --workspace-root "$valid_root"
-expect_failure 'repeated max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 1 --max-parallel 2
-expect_failure 'zero max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 0
-expect_failure 'negative max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel -1
-expect_failure 'nonnumeric max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel x
-expect_failure 'large max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 63
-expect_failure 'foreign max parallel' status --campaign equal --workspace-root "$valid_root" --max-parallel 1
-pass 'acquire concurrency argument is required and bounded'
+cp "$case_stdout" "$test_tmp/reclaim-status-first"
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+cmp "$test_tmp/reclaim-status-first" "$case_stdout"
+for reclaim_mutation in wrong-peak wrong-input-key wrong-retention-flag; do
+    mutation_root=$test_tmp/workspaces/$reclaim_mutation
+    mkdir "$mutation_root"
+    cp -R "$policy_root/tdx-hydro-policy-reclaim-equal" \
+        "$mutation_root/tdx-hydro-policy-reclaim-equal"
+    mutation_state=$mutation_root/tdx-hydro-policy-reclaim-equal/state/campaign.json
+    case $reclaim_mutation in
+        wrong-peak) mutation_filter='.sizing.peak_in_flight_download_bytes=44296724479' ;;
+        wrong-input-key)
+            mutation_filter='del(.sizing.peak_in_flight_download_bytes) | .sizing.retained_input_bytes=44296724480'
+            ;;
+        wrong-retention-flag) mutation_filter='.retention.retain_acquired_inputs=true' ;;
+    esac
+    jq "$mutation_filter" "$mutation_state" >"$mutation_root/campaign.tmp"
+    mv "$mutation_root/campaign.tmp" "$mutation_state"
+    expect_failure "$reclaim_mutation" status --campaign policy-reclaim-equal \
+        --workspace-root "$mutation_root"
+    assert_contains "$case_stderr" "campaign state is malformed: $mutation_state"
+done
+printf '%s\n' retained >"$policy_root/tdx-hydro-policy-reclaim-equal/downloads/input-fixture"
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+assert_contains "$policy_root/tdx-hydro-policy-reclaim-equal/downloads/input-fixture" retained
+pass 'policy-aware sizing preserves retain-all and sizes reclaim mode'
 
 printf 'SQLite format 3\0fixture\n' >"$test_tmp/geopackage-template"
 mkdir "$test_tmp/transfer-state"
@@ -997,6 +1315,19 @@ printf 'end %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
 exit "$result"
 FAKE_CURL
+sed >"$test_tmp/recording-mkdir" <<'RECORDING_MKDIR'
+#!/bin/bash
+set -eu
+if "${HFX_TEST_REAL_MKDIR:?}" "$@"; then
+    for argument do
+        if [ "$argument" = "${HFX_TEST_REJECTED_LOCK_PATH-}" ]; then
+            : >"${HFX_TEST_REJECTED_LOCK_CREATED:?}"
+        fi
+    done
+else
+    exit $?
+fi
+RECORDING_MKDIR
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
 checksum=$(cksum <"$1")
@@ -1184,7 +1515,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 [ "$6" = text ] || exit 73
 exit 0
 FAKE_HFX
-chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
+chmod +x "$test_tmp/fake-curl" "$test_tmp/recording-mkdir" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
     "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx"
 export HFX_TDX_CURL=$test_tmp/fake-curl
 export HFX_TDX_SHA256SUM=$test_tmp/fake-sha256sum
@@ -1201,6 +1532,90 @@ export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
 export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
 export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
 export HFX_TEST_DIFF=$(command -v diff)
+
+run_runner init --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+run_runner init --campaign reclaim-parallel-one --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+run_runner init --campaign reclaim-parallel-four --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+for rejected_parallel in 5 62; do
+    rm -r "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    snapshot=$test_tmp/reclaim-parallel-$rejected_parallel
+    cp -R "$valid_root/tdx-hydro-reclaim-parallel-reject" "$snapshot"
+    expect_failure "reclaim parallelism $rejected_parallel" acquire \
+        --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+        --max-parallel "$rejected_parallel"
+    assert_contains "$case_stderr" \
+        'hfx: error: option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+    diff -ru "$snapshot" "$valid_root/tdx-hydro-reclaim-parallel-reject"
+    [[ ! -e "$test_tmp/transfer-state/events" ]] ||
+        die 'reclaim parallelism refusal allowed an acquisition worker to start'
+    [[ ! -e "$test_tmp/invocations/curl.log" ]] ||
+        die 'reclaim parallelism refusal invoked the PATH poison curl'
+done
+export HFX_TEST_REAL_MKDIR
+HFX_TEST_REAL_MKDIR=$(command -v mkdir)
+export HFX_TEST_REJECTED_LOCK_PATH=$valid_root/tdx-hydro-reclaim-parallel-reject/state/locks/campaign.lock
+export HFX_TEST_REJECTED_LOCK_CREATED=$test_tmp/rejected-reclaim-lock-created
+export HFX_TDX_MKDIR=$test_tmp/recording-mkdir
+expect_failure 'reclaim parallelism pre-lock ordering' acquire \
+    --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+    --max-parallel 5
+assert_contains "$case_stderr" \
+    'hfx: error: option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+[[ ! -e "$HFX_TEST_REJECTED_LOCK_CREATED" ]] ||
+    die 'rejected reclaim parallelism created the campaign lock directory'
+[[ ! -d "$HFX_TEST_REJECTED_LOCK_PATH" ]] ||
+    die 'rejected reclaim parallelism left the campaign lock directory present'
+unset HFX_TDX_MKDIR HFX_TEST_REAL_MKDIR HFX_TEST_REJECTED_LOCK_PATH HFX_TEST_REJECTED_LOCK_CREATED
+pass 'reclaim parallelism refusal occurs before campaign lock creation'
+
+printf '%s\n' \
+    1020000010-basins 1020000010-streamnet \
+    7020000010-basins 7020000010-streamnet \
+    9020000010-basins 9020000010-streamnet >"$test_tmp/expected-reclaim-starts"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-parallel-one --workspace-root "$valid_root" \
+    --max-parallel 1 >"$case_stdout"
+sed -n 's/^start //p' "$test_tmp/transfer-state/events" | sort >"$test_tmp/reclaim-starts"
+diff -u "$test_tmp/expected-reclaim-starts" "$test_tmp/reclaim-starts"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-parallel-four --workspace-root "$valid_root" \
+    --max-parallel 4 >"$case_stdout"
+sed -n 's/^start //p' "$test_tmp/transfer-state/events" | sort >"$test_tmp/reclaim-starts"
+diff -u "$test_tmp/expected-reclaim-starts" "$test_tmp/reclaim-starts"
+pass 'policy-dependent acquisition concurrency preserves retain-all and bounds reclaim'
 
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
