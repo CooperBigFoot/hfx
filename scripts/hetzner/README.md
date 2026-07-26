@@ -410,6 +410,14 @@ write a compile failure for the named basin and never evaluates or writes
 another basin's stage state. A future pipeline must use `compile-basin`
 semantics, not the whole `compile` sweep.
 
+The compile-contract check deliberately has different placement in the two
+entrypoints. `compile` establishes the contract before migration and recovery.
+`compile-basin` establishes it after target-only migration, recovery, and the
+prerequisite check so that a prerequisite refusal remains write-free. As a
+result, a conflicting `compile-basin --fabric-version` may perform migration or
+recovery writes before reporting the conflict, and an unmet prerequisite is
+reported before the fabric-version conflict.
+
 Campaign-lock re-entry is allowed only when the current process already owns
 the safe campaign lock and its regular, non-symlink `owner.pid` matches that
 process. Competing live owners retain the existing refusal, and stale owners

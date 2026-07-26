@@ -467,14 +467,12 @@ pid_state() {
 
 acquire_campaign_lock() {
     local locks_dir=$campaign_dir/state/locks
-    local previous_lock_path=$lock_path
     local owner=
     local stale=
     local state
     lock_path=$locks_dir/campaign.lock
     takeover_path=$locks_dir/campaign.lock.takeover
     if ((lock_owned == 1)) &&
-        [[ "$previous_lock_path" == "$locks_dir/campaign.lock" ]] &&
         [[ -d "$lock_path" && ! -L "$lock_path" ]] &&
         [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]] &&
         [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
@@ -1427,48 +1425,48 @@ compile_basin_core() {
     attempts=$((attempts + 1))
     write_compile_stage "$basin_id" running "$attempts" ''
     if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
-            --basins "$basins" \
-            --streamnet "$streamnet" \
-            --out "$output" \
-            --report "$report" \
-            --processing-basin-id "$basin_id" \
-            --fabric-version "$fabric_version"; then
-            diagnostic_report_json=
-            verify_compile_report "$basin_id" "$output" "$report" || :
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
-                "${diagnostic_report_json:-null}"
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-        return
-        fi
+        --basins "$basins" \
+        --streamnet "$streamnet" \
+        --out "$output" \
+        --report "$report" \
+        --processing-basin-id "$basin_id" \
+        --fabric-version "$fabric_version"; then
         diagnostic_report_json=
-        if ! verify_compile_report "$basin_id" "$output" "$report"; then
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-        return
-        fi
-        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
-            interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
-            interrupt_reclaim_boundary "$basin_id" terminal-state
-            if reconcile_reclaim_basin "$basin_id" true; then
-                :
-            fi
-        return
-        fi
+        verify_compile_report "$basin_id" "$output" "$report" || :
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-        write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
+            "${diagnostic_report_json:-null}"
         interrupt_reclaim_boundary "$basin_id" terminal-state
         if reconcile_reclaim_basin "$basin_id" true; then
             :
         fi
+        return
+    fi
+    diagnostic_report_json=
+    if ! verify_compile_report "$basin_id" "$output" "$report"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+    interrupt_reclaim_boundary "$basin_id" terminal-state
+    if reconcile_reclaim_basin "$basin_id" true; then
+        :
+    fi
 }
 
 print_basin_compile_status() {

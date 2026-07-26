@@ -1259,10 +1259,10 @@ if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
         child_exit_deadline=0
         child_exited=0
         while [ "$child_exited" -eq 0 ]; do
-            for pid_file in "$HFX_TEST_TRANSFER_STATE"/curl.*; do
+            for pid_file in "$HFX_TEST_TRANSFER_STATE"/worker.*; do
                 [ -f "$pid_file" ] || continue
                 observed_pid=$(cat "$pid_file")
-                if [ "$observed_pid" != "$$" ] && ! kill -0 "$observed_pid" 2>/dev/null; then
+                if [ "$observed_pid" != "$PPID" ] && ! kill -0 "$observed_pid" 2>/dev/null; then
                     child_exited=1
                     break
                 fi
@@ -1417,6 +1417,40 @@ if [ "${HFX_TEST_INTERRUPT_EMPTY-}" = 1 ] &&
         kill -TERM "$runner_pid"
         exit 0
     fi
+fi
+if [ -n "${HFX_TEST_REENTRY_TAMPER-}" ] &&
+    [ ! -e "$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER" ]; then
+    jq_input=${!#}
+    case $jq_input in
+        */state/campaign.json)
+            campaign_dir=${jq_input%/state/campaign.json}
+            lock_path=$campaign_dir/state/locks/campaign.lock
+            if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+                case $HFX_TEST_REENTRY_TAMPER in
+                    live-owner)
+                        printf '%s\n' "${HFX_TEST_COMPETING_PID:?}" >"$lock_path/owner.pid"
+                        ;;
+                    owner-symlink)
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER"
+                        rm "$lock_path/owner.pid"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path/owner.pid"
+                        ;;
+                    lock-symlink)
+                        mkdir "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER"
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER/owner.pid"
+                        rm -r "$lock_path"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path"
+                        ;;
+                    *) exit 96 ;;
+                esac
+                : >"$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER"
+            fi
+            ;;
+    esac
 fi
 exec "${HFX_TEST_REAL_JQ:?}" "$@"
 FAKE_JQ
@@ -1749,6 +1783,75 @@ cmp "$test_tmp/named-702-before" "$named_campaign_dir/state/basins/7020000010/cu
 cmp "$test_tmp/named-902-before" "$named_campaign_dir/state/basins/9020000010/current.json"
 pass 'compile-basin re-enters its exact owner lock and preserves untouched basin outcomes'
 
+for reentry_tamper in live-owner owner-symlink lock-symlink; do
+    reentry_root=$test_tmp/workspaces/reentry-$reentry_tamper
+    mkdir "$reentry_root"
+    cp -R "$named_campaign_dir" "$reentry_root/tdx-hydro-subset"
+    reentry_campaign_dir=$reentry_root/tdx-hydro-subset
+    reentry_lock=$reentry_campaign_dir/state/locks/campaign.lock
+    cp "$reentry_campaign_dir/state/basins/7020000010/current.json" \
+        "$test_tmp/reentry-$reentry_tamper-current-before"
+    cp "$reentry_campaign_dir/state/compile.json" \
+        "$test_tmp/reentry-$reentry_tamper-compile-before"
+    HFX_TEST_REENTRY_TAMPER=$reentry_tamper HFX_TEST_COMPETING_PID=$$ \
+        HFX_TDX_JQ=$test_tmp/fake-jq \
+        expect_failure "named compile $reentry_tamper re-entry" compile-basin \
+        --campaign subset --workspace-root "$reentry_root" --basin 7020000010 \
+        --fabric-version NGA-TDX-Hydro-20230126
+    case $reentry_tamper in
+        live-owner)
+            [[ $(tail -1 "$case_stderr") == "hfx: error: campaign lock is held by live PID $$" ]] ||
+                die 'named compile live-owner re-entry diagnostic differs'
+            ;;
+        owner-symlink|lock-symlink)
+            [[ $(tail -1 "$case_stderr") == \
+                "hfx: error: campaign lock owner is indeterminate; preserved at $reentry_lock" ]] ||
+                die "named compile $reentry_tamper re-entry diagnostic differs"
+            ;;
+    esac
+    cmp "$test_tmp/reentry-$reentry_tamper-current-before" \
+        "$reentry_campaign_dir/state/basins/7020000010/current.json"
+    cmp "$test_tmp/reentry-$reentry_tamper-compile-before" \
+        "$reentry_campaign_dir/state/compile.json"
+    [[ ! -e "$reentry_campaign_dir/basin-outputs/7020000010" &&
+        ! -e "$reentry_campaign_dir/reports/7020000010-build-report.json" ]] ||
+        die "named compile $reentry_tamper re-entry wrote compile artifacts"
+done
+pass 'compile-basin refuses live-owner and symlink tampering before compile writes'
+
+cleared_repo=$test_tmp/cleared-reentry-repo
+mkdir -p "$cleared_repo/scripts/hetzner"
+ln -s "$repo_root/adapters" "$cleared_repo/adapters"
+sed 's/^    compile_basin_locked "$basin_id"$/    lock_owned=0\
+    takeover_owned=0\
+&/' "$runner" >"$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+chmod +x "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+cleared_root=$test_tmp/workspaces/reentry-cleared
+mkdir "$cleared_root"
+cp -R "$named_campaign_dir" "$cleared_root/tdx-hydro-subset"
+cleared_campaign_dir=$cleared_root/tdx-hydro-subset
+cp "$cleared_campaign_dir/state/basins/7020000010/current.json" \
+    "$test_tmp/reentry-cleared-current-before"
+cp "$cleared_campaign_dir/state/compile.json" "$test_tmp/reentry-cleared-compile-before"
+cleared_status=0
+"$selected_bash" "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh" compile-basin \
+    --campaign subset --workspace-root "$cleared_root" --basin 7020000010 \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout" 2>"$case_stderr" ||
+    cleared_status=$?
+[[ "$cleared_status" -ne 0 ]] || die 'named compile with cleared ownership unexpectedly succeeded'
+cleared_lock=$cleared_campaign_dir/state/locks/campaign.lock
+cleared_owner=$(<"$cleared_lock/owner.pid")
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: campaign lock is held by live PID $cleared_owner" ]] ||
+    die 'named compile with cleared ownership diagnostic differs'
+cmp "$test_tmp/reentry-cleared-current-before" \
+    "$cleared_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/reentry-cleared-compile-before" "$cleared_campaign_dir/state/compile.json"
+[[ ! -e "$cleared_campaign_dir/basin-outputs/7020000010" &&
+    ! -e "$cleared_campaign_dir/reports/7020000010-build-report.json" ]] ||
+    die 'named compile with cleared ownership wrote compile artifacts'
+pass 'compile-basin refuses second lock acquisition after ownership flags are cleared'
+
 jq '.stages.acquire_basins={
   status:"pending",attempts:0,failure_reason:null,evidence:null
 }' "$named_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/named-pending"
@@ -2020,11 +2123,11 @@ for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/c
 done
 [[ -e "$test_tmp/transfer-state/signal-owner" ]] ||
     die 'repeated drain TERM did not start its signal coordinator'
-# Bash 3.2 resets a parent-set EXIT trap in an & subshell. The rendezvous
-# proves the operational lock survives a child exit; the source-order check
+# The rendezvous waits for a real acquire_basin subshell to exit before checking
+# that the parent still owns the operational lock. The source-order check
 # separately enforces the defense-in-depth ownership resets.
 [[ -s "$test_tmp/transfer-state/lock-owner-stable" ]] ||
-    die 'campaign lock did not remain owned by the parent after a worker child exited'
+    die 'campaign lock did not remain owned by the parent after an acquire_basin child exited'
 drain_campaign_dir=$drain_interrupt_root/tdx-hydro-interrupt-drain
 [[ $(find "$drain_campaign_dir/state/tmp" \
     \( -name '.curl-headers.*' -o -name '.curl-stats.*' \) -type f |
