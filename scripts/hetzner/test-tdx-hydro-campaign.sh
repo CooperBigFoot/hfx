@@ -2424,6 +2424,218 @@ jq -e '
 ' "$compile_validation_state" >/dev/null || die 'validation failure retry did not persist fresh diagnostics'
 pass 'adapter validation failure retains artifacts and refuses overwrite'
 
+reclaim_root=$test_tmp/workspaces/reclaim-base
+mkdir "$reclaim_root"
+run_runner init --campaign reclaim-base --workspace-root "$reclaim_root" \
+    --basin 1020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+reclaim_dir=$reclaim_root/tdx-hydro-reclaim-base
+jq -e '
+  .schema_version == 4 and
+  .retention == {
+    inputs_reclaimed:false,
+    policy:"reclaim-inputs-after-terminal"
+  }
+' "$reclaim_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'reclaim init did not emit the schema-4 retention contract'
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-base --workspace-root "$reclaim_root" \
+    --max-parallel 1 >"$case_stdout"
+for reclaim_product in basins streamnet; do
+    [[ -f "$reclaim_dir/downloads/1020000010-$reclaim_product.gpkg" ]] ||
+        die "nonterminal reclaim acquisition removed $reclaim_product"
+done
+jq -e '
+  .stages.compile.status == "pending" and
+  .stages.compile.attempts == 0 and
+  .retention.inputs_reclaimed == false
+' "$reclaim_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'nonterminal reclaim acquisition state differs'
+pass 'reclaim initialization uses schema 4 and acquisition remains nonterminal'
+
+reclaim_ordinary_root=$test_tmp/workspaces/reclaim-ordinary
+mkdir "$reclaim_ordinary_root"
+cp -R "$reclaim_dir" "$reclaim_ordinary_root/tdx-hydro-reclaim-base"
+reclaim_ordinary_dir=$reclaim_ordinary_root/tdx-hydro-reclaim-base
+cp "$reclaim_ordinary_dir/reports/1020000010-basins-acquisition.json" \
+    "$test_tmp/reclaim-ordinary-basins-report"
+cp "$reclaim_ordinary_dir/reports/1020000010-streamnet-acquisition.json" \
+    "$test_tmp/reclaim-ordinary-streamnet-report"
+run_runner compile --campaign reclaim-base --workspace-root "$reclaim_ordinary_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+for reclaim_product in basins streamnet; do
+    for reclaim_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+        [[ ! -e "$reclaim_ordinary_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" &&
+           ! -L "$reclaim_ordinary_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" ]] ||
+            die "ordinary landed reclaim retained $reclaim_product$reclaim_suffix"
+    done
+done
+jq -e '
+  .schema_version == 4 and
+  .stages.compile.status == "succeeded" and
+  .stages.compile.attempts == 1 and
+  .retention.inputs_reclaimed == true
+' "$reclaim_ordinary_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'ordinary landed reclaim lacks its durable schema-4 marker'
+[[ -f "$reclaim_ordinary_dir/basin-outputs/1020000010/catchments.parquet" &&
+   -f "$reclaim_ordinary_dir/basin-outputs/1020000010/graph.parquet" &&
+   -f "$reclaim_ordinary_dir/basin-outputs/1020000010/aux/snap_stems.parquet" &&
+   -f "$reclaim_ordinary_dir/reports/1020000010-build-report.json" ]] ||
+    die 'ordinary landed reclaim removed assembly or diagnostic evidence'
+diff -u "$test_tmp/reclaim-ordinary-basins-report" \
+    "$reclaim_ordinary_dir/reports/1020000010-basins-acquisition.json"
+diff -u "$test_tmp/reclaim-ordinary-streamnet-report" \
+    "$reclaim_ordinary_dir/reports/1020000010-streamnet-acquisition.json"
+pass 'ordinary landed compile reclaims only the exact source pair'
+
+for reclaim_outcome in success build-failure validation-failure; do
+    for reclaim_boundary in \
+        compile-attempt-complete terminal-state basins-input-reclaimed \
+        streamnet-input-reclaimed reclaimed-state; do
+        reclaim_case_root=$test_tmp/workspaces/reclaim-$reclaim_outcome-$reclaim_boundary
+        mkdir "$reclaim_case_root"
+        cp -R "$reclaim_dir" "$reclaim_case_root/tdx-hydro-reclaim-base"
+        reclaim_case_dir=$reclaim_case_root/tdx-hydro-reclaim-base
+        : >"$HFX_TEST_ADAPTER_LOG"
+        : >"$HFX_TEST_HFX_LOG"
+        reclaim_status=0
+        case $reclaim_outcome in
+            success)
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+            build-failure)
+                HFX_TEST_FAIL_BUILD_ID=1020000010 \
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+            validation-failure)
+                HFX_TEST_FAIL_VALIDATE_ID=1020000010 \
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+        esac
+        [[ "$reclaim_status" -ne 0 ]] ||
+            die "$reclaim_outcome x $reclaim_boundary interruption unexpectedly succeeded"
+        [[ ! -d "$reclaim_case_dir/state/locks/campaign.lock" ]] ||
+            die "$reclaim_outcome x $reclaim_boundary retained the live campaign lock"
+
+        if [[ -d "$reclaim_case_dir/basin-outputs/1020000010" ]]; then
+            cp -R "$reclaim_case_dir/basin-outputs/1020000010" \
+                "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary"
+            cp "$reclaim_case_dir/reports/1020000010-build-report.json" \
+                "$test_tmp/reclaim-report-$reclaim_outcome-$reclaim_boundary"
+        fi
+        cp "$reclaim_case_dir/reports/1020000010-basins-acquisition.json" \
+            "$test_tmp/reclaim-basins-report-$reclaim_outcome-$reclaim_boundary"
+        cp "$reclaim_case_dir/reports/1020000010-streamnet-acquisition.json" \
+            "$test_tmp/reclaim-streamnet-report-$reclaim_outcome-$reclaim_boundary"
+
+        if [[ "$reclaim_boundary" == compile-attempt-complete ]]; then
+            case $reclaim_outcome in
+                success)
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+                build-failure)
+                    HFX_TEST_FAIL_BUILD_ID=1020000010 \
+                        run_runner compile --campaign reclaim-base \
+                            --workspace-root "$reclaim_case_root" \
+                            --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+                validation-failure)
+                    HFX_TEST_FAIL_VALIDATE_ID=1020000010 \
+                        run_runner compile --campaign reclaim-base \
+                            --workspace-root "$reclaim_case_root" \
+                            --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+            esac
+        else
+            run_runner recover --campaign reclaim-base \
+                --workspace-root "$reclaim_case_root" >"$case_stdout"
+        fi
+
+        reclaim_state=$reclaim_case_dir/state/basins/1020000010/current.json
+        if [[ "$reclaim_boundary" == compile-attempt-complete &&
+              "$reclaim_outcome" != build-failure ]]; then
+            jq -e '
+              .stages.compile.status == "failed" and
+              .stages.compile.attempts == 1 and
+              .stages.compile.failure_reason ==
+                "compile artifact path already exists; retained for inspection" and
+              .retention.inputs_reclaimed == false
+            ' "$reclaim_state" >/dev/null ||
+                die "$reclaim_outcome x $reclaim_boundary did not remain an inspection hold"
+            for reclaim_product in basins streamnet; do
+                [[ -f "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg" ]] ||
+                    die "$reclaim_outcome x $reclaim_boundary removed $reclaim_product final"
+                [[ ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg.partial" &&
+                   ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg.partial.json" ]] ||
+                    die "$reclaim_outcome x $reclaim_boundary recreated partial provenance"
+            done
+        else
+            jq -e --arg outcome "$reclaim_outcome" '
+              .retention.inputs_reclaimed == true and
+              .stages.compile.attempts ==
+                (if $outcome == "build-failure" and
+                    .stages.compile.failure_reason == "adapter build failed"
+                 then (if .stages.compile.attempts == 2 then 2 else 1 end)
+                 else 1 end) and
+              (if $outcome == "success"
+               then .stages.compile.status == "succeeded"
+               elif $outcome == "build-failure"
+               then .stages.compile.failure_reason == "adapter build failed"
+               else .stages.compile.failure_reason == "adapter validation failed" end)
+            ' "$reclaim_state" >/dev/null ||
+                die "$reclaim_outcome x $reclaim_boundary did not converge terminal reclaim"
+            for reclaim_product in basins streamnet; do
+                for reclaim_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+                    [[ ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" &&
+                       ! -L "$reclaim_case_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" ]] ||
+                        die "$reclaim_outcome x $reclaim_boundary retained $reclaim_product$reclaim_suffix"
+                done
+            done
+        fi
+        diff -u "$test_tmp/reclaim-basins-report-$reclaim_outcome-$reclaim_boundary" \
+            "$reclaim_case_dir/reports/1020000010-basins-acquisition.json"
+        diff -u "$test_tmp/reclaim-streamnet-report-$reclaim_outcome-$reclaim_boundary" \
+            "$reclaim_case_dir/reports/1020000010-streamnet-acquisition.json"
+        if [[ -d "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary" ]]; then
+            diff -ru "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary" \
+                "$reclaim_case_dir/basin-outputs/1020000010"
+            diff -u "$test_tmp/reclaim-report-$reclaim_outcome-$reclaim_boundary" \
+                "$reclaim_case_dir/reports/1020000010-build-report.json"
+        fi
+        cp "$reclaim_state" "$test_tmp/reclaim-state-replay"
+        : >"$HFX_TEST_ADAPTER_LOG"
+        run_runner recover --campaign reclaim-base \
+            --workspace-root "$reclaim_case_root" >"$case_stdout"
+        diff -u "$test_tmp/reclaim-state-replay" "$reclaim_state"
+        [[ ! -s "$HFX_TEST_ADAPTER_LOG" ]] ||
+            die "$reclaim_outcome x $reclaim_boundary recover replay invoked adapter"
+    done
+    pass "reclaim interruption matrix converges $reclaim_outcome outcomes"
+done
+
 migration_root=$test_tmp/workspaces/migration
 mkdir "$migration_root"
 cp -R "$acquire_dir" "$migration_root/tdx-hydro-acquire"
@@ -2776,6 +2988,69 @@ for reportable_id in 1020000010 1020011530 1020018110 1020021940; do
         die "diagnostic evidence omits $reportable_id"
 done
 pass 'deterministic acquisition, outcome, and diagnostic evidence is complete and byte-stable'
+
+schema4_evidence_root=$test_tmp/workspaces/schema4-evidence
+mkdir "$schema4_evidence_root"
+cp -R "$evidence_dir" "$schema4_evidence_root/tdx-hydro-evidence"
+schema4_evidence_dir=$schema4_evidence_root/tdx-hydro-evidence
+schema4_evidence_state=$schema4_evidence_dir/state/basins/1020000010/current.json
+jq '
+  .schema_version = 4 |
+  .retention = {
+    inputs_reclaimed:true,
+    policy:"reclaim-inputs-after-terminal"
+  }
+' "$schema4_evidence_state" >"$schema4_evidence_state.tmp"
+mv "$schema4_evidence_state.tmp" "$schema4_evidence_state"
+run_runner evidence --campaign evidence --workspace-root "$schema4_evidence_root" >"$case_stdout"
+diff -u "$test_tmp/expected-acquisition.json" \
+    "$schema4_evidence_dir/publication/evidence/acquisition.json"
+diff -u "$test_tmp/expected-outcomes.json" \
+    "$schema4_evidence_dir/publication/evidence/outcomes.json"
+diff -u "$test_tmp/expected-diagnostics.json" \
+    "$schema4_evidence_dir/publication/evidence/diagnostics.json"
+
+schema4_validation_state=$schema4_evidence_dir/state/basins/1020018110/current.json
+jq '
+  .schema_version = 4 |
+  .retention = {
+    inputs_reclaimed:true,
+    policy:"reclaim-inputs-after-terminal"
+  } |
+  .stages.compile.diagnostic_report = null
+' "$schema4_validation_state" >"$schema4_validation_state.tmp"
+mv "$schema4_validation_state.tmp" "$schema4_validation_state"
+run_runner evidence --campaign evidence --workspace-root "$schema4_evidence_root" >"$case_stdout"
+jq -e '
+  .basins[] |
+  select(.processing_basin_id == "1020018110") |
+  .diagnostics == null and .report_path == null and
+  .unavailable_reason == "adapter validation failed"
+' "$schema4_evidence_dir/publication/evidence/diagnostics.json" >/dev/null ||
+    die 'schema-4 validation failure did not emit the explicit unavailable reason'
+
+for legacy_evidence_version in 1 2; do
+    cp "$evidence_dir/state/basins/1020021940/current.json" \
+        "$schema4_evidence_dir/state/basins/1020021940/current.json"
+    jq --argjson version "$legacy_evidence_version" '
+      .schema_version = $version |
+      if $version == 1 then
+        .stages.acquire_basins |= del(.evidence) |
+        .stages.acquire_streamnet |= del(.evidence) |
+        .stages.compile |= del(.diagnostic_report)
+      else
+        .stages.compile |= del(.diagnostic_report)
+      end
+    ' "$schema4_evidence_dir/state/basins/1020021940/current.json" \
+        >"$schema4_evidence_dir/state/basins/1020021940/current.json.tmp"
+    mv "$schema4_evidence_dir/state/basins/1020021940/current.json.tmp" \
+        "$schema4_evidence_dir/state/basins/1020021940/current.json"
+    expect_failure "schema-$legacy_evidence_version evidence gate" evidence \
+        --campaign evidence --workspace-root "$schema4_evidence_root"
+    assert_contains "$case_stderr" \
+        'legacy basin state requires compile rerun before evidence: 1020021940'
+done
+pass 'schema 3 and 4 evidence matches while legacy schemas retain their refusal'
 
 mkdir "$evidence_dir/downloads/conflict" "$evidence_dir/reports/conflict" "$evidence_dir/basin-outputs/conflict"
 printf '%s\n' download >"$evidence_dir/downloads/conflict/value"

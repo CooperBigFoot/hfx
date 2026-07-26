@@ -340,15 +340,50 @@ range diagnostic remains
 `option --max-parallel must be a base-10 integer from 1 through 62`.
 Use `4` as the polite NGA operating value.
 
-Reclaim policy records the intent that future terminal basins surrender both
-source GeoPackages while landed basin outputs and external diagnostic reports
-remain for assembly and evidence. Its acquisition range is `1` through `4` and
-fails closed above four. Across all campaign source pairs present on the volume,
-its future scheduling invariant permits at most five distinct basin pairs at
-once. A basin counts when any in-flight `.partial` product or installed
-`basins` or `streamnet` GeoPackage exists, including fully acquired basins
-waiting for a terminal result and the basin currently compiling. One slot is
-reserved for the serial compile, leaving at most four acquisition workers:
+Reclaim policy removes only the exact basins and streamnet source GeoPackages,
+safe acquisition partials, and their provenance sidecars after both acquisitions
+succeed and compile reaches a durable success or an actual adapter build or
+validation hard failure with a positive attempt count. The runner first
+atomically records acquisition evidence, the compile outcome, available
+diagnostics, and the failure reason. It then reclaims the basins product, reclaims
+the streamnet product, and atomically records inputs_reclaimed=true before
+processing another basin. Recovery completes any interruption between those
+boundaries. Missing terminal source files are treated as an interrupted or
+repeated reclaim; unsafe path types fail closed without traversal.
+
+Landed basin outputs and every external diagnostic and acquisition report remain
+on the campaign volume. Assembly requires every landed
+basin-outputs/<processing-basin-id>/catchments.parquet,
+graph.parquet, and aux/snap_stems.parquet across its merge passes, so those files
+are never reclaim targets. Retain-all behavior is unchanged and keeps all acquired
+source artifacts through publication.
+
+Acquisition status failed remains retryable and is not a reclaim trigger. A safe
+partial and provenance sidecar remain available for If-Range resume, and a
+succeeded sibling product remains installed. These artifacts count as one
+occupied pair against the five-pair invariant. Acquisition exhaustion and reclaim
+are deferred to the occupancy-aware scheduler that owns dispatch and retry
+budgets.
+
+Acquisition artifacts explicitly retained for inspection are not reclaimed. The
+affected reasons are "acquisition report is unsafe or malformed; retained for
+inspection", "existing final file failed integrity verification; retained for
+inspection", "persisted evidence does not match final file; retained for
+inspection", and "installed final failed integrity verification; retained for
+inspection". Each affected basin with source bytes counts as one occupied pair
+until an operator classifies and resolves it.
+
+Compile artifacts classified as "compile artifact path already exists; retained
+for inspection" or "existing compile artifacts failed resume verification;
+retained for inspection" are also not reclaim triggers. Both source products and
+their provenance sidecars remain, inputs_reclaimed stays false, and the basin
+counts as one occupied pair. The M5-S3B occupancy-aware scheduler owns the guard
+that stops dispatch before a sixth pair.
+
+After a compile hard failure has been durably classified and its inputs reclaimed,
+those inputs are not retryable in place. Retrying that basin requires a fresh
+approximately 30-minute acquisition under a separately authorized recovery
+workflow.
 
 ```text
 6,979,305,472 + 1,880,039,424 = 8,859,344,896 bytes per source pair
@@ -357,26 +392,9 @@ max_parallel <= 5 - 1
 max_parallel <= 4
 ```
 
-A later dispatch guard will assert the same `44,296,724,480`-byte quantity
-against actual occupancy and free disk.
-
-**M5-S1 only persists and sizes reclaim mode. It performs no reclaim
-behavior.** M5-S2 owns reclaim after durable terminal evidence, including the
-terminal acquisition-failure path. No provisioning gate occurs before M5-S4,
-and M5-S5 is the only paid execution step. Do not use this intermediate state
-for a paid campaign.
-
-Today `fail_product` retains a failed acquisition's `.partial` or installed
-GeoPackage for inspection, and that basin never reaches compile. This residue
-is outside the reclaim five-pair invariant until M5-S2. Each terminal
-acquisition failure can consume up to an additional `8,859,344,896` bytes
-beyond the `44,296,724,480` reserve. S1 does not add an unbounded failure count
-to the sizing formula or remove that residue.
-
-Acquisition retains an invalid final for inspection. It continues a regular
-partial only when its sidecar's exact identity, URL, strong ETag, byte count,
-remote total, and SHA-256 validate; otherwise it discards a safe ordinary
-incomplete partial before one complete-file retry.
+It continues a regular partial only when its sidecar's exact identity, URL,
+strong ETag, byte count, remote total, and SHA-256 validate; otherwise it
+discards a safe ordinary incomplete partial before one complete-file retry.
 A resumed acquisition re-verifies every installed final's byte count, SHA-256,
 SQLite identity, layer name, and persisted evidence. A resumed compile re-validates
 each succeeded dataset and external report. Existing failed or conflicting compile
@@ -391,8 +409,10 @@ The runner phases are:
    Use `4` as the polite NGA campaign operating policy. The runner safely
    continues only a server-honored HTTP range tied to a validated strong ETag.
 3. `compile --fabric-version <value>` invokes one isolated adapter build per
-   basin after both products succeed. It retains
-   `basin-outputs/<basin>` and `reports/<basin>-build-report.json`.
+   basin after both products succeed. In reclaim mode, durable compile success
+   or an actual adapter build or validation hard failure immediately reclaims
+   only that basin's source pair. Outputs and reports remain. Both compile
+   inspection classifications remain unreclaimed.
 4. `evidence` writes deterministic
    `publication/evidence/acquisition.json`,
    `publication/evidence/outcomes.json`, and
@@ -403,8 +423,10 @@ The runner phases are:
    not invoke assembly or validate dataset semantics.
 
 `status` validates state and prints sizing plus deterministic per-stage counts.
-`recover` changes interrupted `running` stages back to `pending`; `acquire` and
-`compile` also perform the applicable recovery before work. Operational
+Only reclaim mode also prints a deterministic reclaimed-input count.
+`recover` changes interrupted `running` stages back to `pending` and completes
+an interrupted terminal reclaim; `acquire` and `compile` also perform the
+applicable recovery before work. Operational
 recovery always re-runs the same campaign with the same sizing, inventory,
 parallelism, fabric version, paths, attribution inputs, and scratch prefix.
 Do not sweep resources, enumerate by name pattern or label selector, or perform
@@ -477,7 +499,7 @@ parameters. They document usage and do not authorize provisioning:
   --active-compile-scratch-bytes <active-compile-scratch-bytes> \
   --filesystem-overhead-bytes <filesystem-overhead-bytes>
 
-# Sizing only until M5-S2 lands. Do not use for a paid campaign.
+# Reclaim behavior is local and recoverable; paid execution remains gated by the planetary runbook.
 ./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-init -- \
   /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh init \
   --campaign <campaign> \
