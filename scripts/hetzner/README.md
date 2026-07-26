@@ -8,7 +8,7 @@ discipline. Nothing durable survives on the VM. Inputs are re-fetchable,
 outputs are re-creatable, and delivered artifacts live outside the VM before
 teardown.
 
-Completed pilot evidence: [TDX-Hydro processing basin 7020000010](CAMPAIGN-tdx-hydro-7020000010.md).
+Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md) and [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md).
 
 The scripts in this directory compose one lifecycle and remain independently
 runnable. Campaign identifiers use 1-32 lowercase letters, digits, or hyphens
@@ -304,20 +304,24 @@ values and the same 62-basin inventory. Changed parameters require a new
 campaign ID.
 
 The persisted policy is `retain-all-through-publication`. Acquired final
-GeoPackages, per-basin outputs, and external diagnostic reports remain on the
-campaign volume. Acquisition retains an invalid final for inspection and
-removes only its ordinary incomplete `.partial` file before a complete-file
-retry. A resumed acquisition re-verifies each retained final's byte count,
-SHA-256, SQLite identity, layer name, and persisted evidence. A resumed compile
-re-validates each succeeded dataset and external report. Existing failed or
-conflicting compile artifacts are retained for inspection.
+GeoPackages, resumable attributable partials, per-basin outputs, and external
+diagnostic reports remain on the campaign volume. Acquisition retains an invalid
+final for inspection. It continues a regular partial only when its sidecar's exact
+identity, URL, strong ETag, byte count, remote total, and SHA-256 validate; otherwise
+it discards a safe ordinary incomplete partial before one complete-file retry.
+A resumed acquisition re-verifies every installed final's byte count, SHA-256,
+SQLite identity, layer name, and persisted evidence. A resumed compile re-validates
+each succeeded dataset and external report. Existing failed or conflicting compile
+artifacts are retained for inspection.
 
 The runner phases are:
 
 1. `init` creates the fixed campaign layout and records sizing, inventory, and
    retention policy.
 2. `acquire --max-parallel <1-62>` performs bounded parallel work across
-   basins. Each product transfer remains a complete GET.
+   basins, with products serial within each basin. The runner retains the full
+   range; use `4` as the polite NGA campaign operating policy. It safely continues
+   only a server-honored HTTP range tied to a validated strong ETag.
 3. `compile --fabric-version <value>` invokes one isolated adapter build per
    basin after both products succeed. It retains
    `basin-outputs/<basin>` and `reports/<basin>-build-report.json`.
@@ -569,26 +573,38 @@ later default teardown deletes it.
 
 ## NGA acquisition notes
 
-The 2026-07-21 probe from Hetzner `fsn1` found no HTTP range support. A range
-request returned the full body, and the response supplied no `Accept-Ranges`
-header. Each file transfer is all-or-nothing. An interrupted transfer restarts
-the complete file from zero. Segmented per-file downloads and resume are
-unavailable.
+The 2026-07-21 probe from Hetzner `fsn1` found no advertised HTTP range support.
+The 2026-07-25 paid run showed that a range request returned the full body with
+HTTP 200 and no usable `Content-Range`. Segmented per-file downloads remain
+unavailable. The runner may continue an attributable partial only if a later
+request returns HTTP 206 with its validated strong ETag, exact starting offset,
+and consistent remote total. Curl's documented `CURLE_RANGE_ERROR` behavior
+returns code 33 without writing a body when a continuation receives the measured
+HTTP 200 response without `Content-Range`; the runner classifies the captured
+response, discards the safe old partial, and makes one clean full GET. It never
+appends that full response to the partial.
+An ignored-Range call includes `--continue-at -`, so it increments `resume_count`
+while recording mode `range_ignored_restart`; a changed-ETag HTTP 200 is counted
+the same way even though validator mismatch, rather than an ignored Range, caused it.
 
-Per-connection throughput was erratic at roughly `1-6 MB/s`. Parallel requests
-for separate files multiplied aggregate throughput. At 62-basin scale, use
-modest per-file parallelism across separate files. Do not segment a single
-file. Observed basin GeoPackages were `5.9-7.0 GB` each. The observed
-stream-network GeoPackage was `1.68 GB`, with an exact recorded size of
-`1,676,398,592` bytes.
+Per-connection throughput was erratic. During the paid run a laptop sustained
+about 13 MB/s while the campaign VM received about 1.0 MB/s on its own simultaneous
+connection, showing server headroom and a per-connection constraint. Use
+`--max-parallel 4` as the polite operating policy for separate product files; the
+runner retains its `1..62` accepted range. At four connections sustaining the
+measured VM rate, roughly 500 GB needs about 35 transfer-hours; allow 36-40 hours
+for a 62-basin acquisition. Do not segment a single file. Observed basin
+GeoPackages were `5.9-7.0 GB` each. The observed stream-network GeoPackage was
+`1.68 GB`, with an exact recorded size of `1,676,398,592` bytes.
 
 The endpoint was reachable from `fsn1`, returned real payloads, completed the
 full stream-network file, and showed no observed geo-blocking during the probe.
-Plan disk capacity for complete files plus active partials and retained
-downloads. Expect retries to consume a complete-file transfer. Keep downloads
-on the attached volume and use campaign logs to preserve transfer evidence
-across disconnects. The smoke script intentionally removes an incomplete
-partial and begins a complete transfer on rerun because resume is unavailable.
+Plan disk capacity for complete files plus active partials, sidecars, and retained
+downloads. An interrupted transfer is resumable only under the validated 206
+contract above; otherwise budget for one clean complete-file retry. Keep downloads
+and per-product acquisition reports on the attached volume so retries and transfer
+evidence survive disconnects. The smoke script's behavior is separate from the
+campaign runner and remains an all-or-nothing probe.
 
 ## Troubleshooting
 
@@ -600,7 +616,7 @@ partial and begins a complete transfer on rerun because resume is unavailable.
 | Credential metadata or required variable failure | The installed environment file is absent, unsafe, unloadable, or incomplete. | Correct the operator-managed source, rerun provisioning to reinstall `/etc/pourpoint-hfx.env`, then rerun smoke. |
 | Missing bootstrap state | Required directories, packages, or tools are absent. | Rerun the idempotent bootstrap, then retry launch or smoke. |
 | Duplicate workload session | The exact tmux session already exists. | Use `attach`, `status`, or `tail`; start again after the exact session finishes. |
-| NGA transfer interruption | NGA lacks range support. | Expect a complete-file restart. Use parallelism across separate files for a larger acquisition campaign. |
+| NGA transfer interruption | The response may not honor Range, or the saved partial may lack safe provenance. | The campaign runner continues only a validated strong-ETag 206 response; otherwise it discards the safe partial and performs one clean GET. Use `--max-parallel 4` as operating policy across separate files, never segments of one file; the runner accepts `1..62`. |
 | Safe teardown refusal | Exact-name ownership, labels, IDs, or attachment state failed validation. | Inspect only the exact campaign resource names and labels named by the diagnostic, correct ownership or attachment state, and rerun. |
 
 Scope zero-footprint verification to the current campaign's deterministic

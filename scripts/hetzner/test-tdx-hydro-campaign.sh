@@ -92,6 +92,21 @@ init_args() {
         --assembled-artifact-bytes 8
 }
 
+subset_init_args() {
+    printf '%s\n' \
+        init --campaign "$1" --workspace-root "$2" \
+        --basin 7020000010 \
+        --basin 1020000010 \
+        --basin 9020000010 \
+        --available-memory-bytes 11 \
+        --available-disk-bytes 26 \
+        --retained-input-bytes 5 \
+        --retained-basin-output-bytes 6 \
+        --assembly-memory-ceiling-bytes 11 \
+        --assembly-scratch-ceiling-bytes 7 \
+        --assembled-artifact-bytes 8
+}
+
 copy_workspace() {
     local name=$1
     local destination=$test_tmp/workspaces/$name
@@ -100,9 +115,68 @@ copy_workspace() {
     printf '%s\n' "$destination"
 }
 
+mark_compile_succeeded() {
+    local campaign_dir=$1
+    local basin_id=$2
+    local state=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$state.tmp
+    jq '.stages.compile={status:"succeeded",attempts:1,failure_reason:null,diagnostic_report:null}' \
+        "$state" >"$temporary"
+    mv "$temporary" "$state"
+    mkdir -p "$campaign_dir/basin-outputs/$basin_id"
+}
+
+write_expected_assembly_argv() {
+    local campaign_dir=$1
+    HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/expected-assembly-argv
+    export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
+    printf '%s\n' \
+        assemble \
+        --input "$campaign_dir/basin-outputs/1020000010" \
+        --input "$campaign_dir/basin-outputs/7020000010" \
+        --out "$campaign_dir/assembly/dataset" \
+        >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+}
+
+write_assembly_state_fixture() {
+    local campaign_dir=$1
+    local status=$2
+    local attempts=$3
+    local reason=$4
+    jq -n --arg status "$status" --argjson attempts "$attempts" --arg reason "$reason" '{
+      schema_version:1,
+      status:$status,
+      attempts:$attempts,
+      failure_reason:(if $reason == "" then null else $reason end),
+      input_basin_ids:["1020000010","7020000010"],
+      output_path:"assembly/dataset",
+      report_path:"reports/assembly.json"
+    }' >"$campaign_dir/state/assembly.json"
+}
+
+create_assembly_dataset_fixture() {
+    local output=$1
+    mkdir -p "$output/aux"
+    printf '%s\n' fixture >"$output/catchments.parquet"
+    printf '%s\n' fixture >"$output/graph.parquet"
+    printf '%s\n' fixture >"$output/manifest.json"
+    printf '%s\n' fixture >"$output/aux/snap_stems.parquet"
+}
+
+new_assembly_workspace() {
+    local name=$1
+    local destination=$test_tmp/workspaces/$name
+    mkdir "$destination"
+    set -- $(init_args equal "$destination")
+    run_runner "$@" >"$case_stdout"
+    printf '%s\n' "$destination"
+}
+
 SCRIPT_DIR=$(cd -P -- "${BASH_SOURCE[0]%/*}" && pwd)
 repo_root=$(cd -P -- "$SCRIPT_DIR/../.." && pwd)
 runner=$SCRIPT_DIR/tdx-hydro-campaign.sh
+bootstrap=$SCRIPT_DIR/bootstrap.sh
+runbook=$SCRIPT_DIR/RUNBOOK-tdx-hydro-assembly-subset.md
 inventory=$repo_root/adapters/tdx-hydro/data/tdx_header_numbers.json
 
 if [[ -x /bin/bash ]]; then
@@ -125,10 +199,12 @@ if [[ -x /bin/bash && "$selected_bash" != /bin/bash ]]; then
     die 'the harness did not select /bin/bash'
 fi
 
-for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep; do
+for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
+[[ -f "$bootstrap" ]] || die "bootstrap is missing: $bootstrap"
+[[ -f "$runbook" ]] || die "runbook is missing: $runbook"
 [[ -f "$inventory" ]] || die "inventory is missing: $inventory"
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/hfx-tdx-campaign-test.XXXXXX")
@@ -191,8 +267,9 @@ skipped=0
 
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
-assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init'
+assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 pass 'sole help arguments succeed'
@@ -221,8 +298,18 @@ expect_failure 'control fabric version' compile --campaign compile --workspace-r
     --fabric-version $'bad\nversion'
 expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
+for foreign_basin_command in status recover acquire compile assemble evidence publish; do
+    expect_failure "basin on $foreign_basin_command" "$foreign_basin_command" \
+        --campaign foreign --workspace-root "$argument_root" --basin 1020000010
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init' ]] ||
+        die "foreign --basin diagnostic differs for $foreign_basin_command"
+done
 for publication_option in --out --report --notice --citation --scratch-prefix; do
     expect_failure "foreign $publication_option" status --campaign foreign --workspace-root "$argument_root" \
+        "$publication_option" value
+    expect_failure "$publication_option on assemble" assemble --campaign foreign --workspace-root "$argument_root" \
         "$publication_option" value
     expect_failure "repeated $publication_option" publish --campaign repeated --workspace-root "$argument_root" \
         "$publication_option" value "$publication_option" value
@@ -263,9 +350,10 @@ for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
     forbidden_v='\[\[[^]]+[[:space:]]-v[[:space:]]'
     forbidden_nameref='(declare|local)[[:space:]]+-n'
     forbidden_lock='f''lock'
+    forbidden_bashpid='BASH''PID'
     if grep -En -e "$forbidden_assoc" -e "$forbidden_wait" -e "$forbidden_map" -e "$forbidden_read" \
         -e "$forbidden_case_change" -e "$forbidden_glob" -e "$forbidden_negative" -e "$forbidden_v" \
-        -e "$forbidden_nameref" -e "$forbidden_lock" "$script" >"$case_stdout"; then
+        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" "$script" >"$case_stdout"; then
         die "forbidden Bash-4 construct found in $script"
     fi
     if grep -En '"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"' "$script" |
@@ -280,7 +368,144 @@ assert_contains "$runner" 'readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/
 assert_contains "$runner" 'ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")'
 assert_contains "$runner" 'ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}'
 assert_contains "$runner" 'HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")'
+assert_contains "$runner" 'option --max-parallel must be a base-10 integer from 1 through 62'
+assert_contains "$runner" '((max_parallel >= 1 && max_parallel <= 62))'
+assert_contains "$runner" '--continue-at'
+assert_contains "$runner" 'header_status" == 200'
+assert_contains "$runner" '[Ee][Tt][Aa][Gg]:*'
+assert_contains "$runner" '.curl-headers.$basin_id.$product.$$'
+assert_contains "$runner" '.curl-stats.$basin_id.$product.$$'
 pass 'static Bash 3.2 compatibility checks pass'
+
+expected_campaign_commands=$test_tmp/expected-campaign-commands
+runner_campaign_commands=$test_tmp/runner-campaign-commands
+bootstrap_campaign_commands_raw=$test_tmp/bootstrap-campaign-commands-raw
+bootstrap_campaign_commands=$test_tmp/bootstrap-campaign-commands
+bootstrap_apt_packages=$test_tmp/bootstrap-apt-packages
+bootstrap_post_apt_loop=$test_tmp/bootstrap-post-apt-loop
+bootstrap_final_loop=$test_tmp/bootstrap-final-loop
+runbook_convergence=$test_tmp/runbook-convergence
+campaign_array_expansion='"${campaign_command_names[''@]}"'
+sed '' >"$expected_campaign_commands" <<'EXPECTED_CAMPAIGN_COMMANDS'
+aws
+chmod
+curl
+find
+grep
+jq
+mkdir
+mv
+od
+ogrinfo
+ps
+rm
+sha256sum
+sort
+tr
+wc
+EXPECTED_CAMPAIGN_COMMANDS
+sed -n 's/.*resolve_command HFX_TDX_[A-Z0-9_]* \([a-z][a-z0-9-]*\).*/\1/p' "$runner" |
+    LC_ALL=C sort -u >"$runner_campaign_commands"
+if ! diff -u "$expected_campaign_commands" "$runner_campaign_commands"; then
+    die "runner command contract differs; paid-run failure was: hfx: error: required command 'jq' is not available"
+fi
+assert_contains "$runner" 'resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON"'
+assert_contains "$runner" 'resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX"'
+
+sed -n '/^campaign_command_names=($/,/^)$/{
+    /^campaign_command_names=($/d
+    /^)$/d
+    s/^[[:space:]]*//
+    /./p
+}' "$bootstrap" >"$bootstrap_campaign_commands_raw"
+[[ $(wc -l <"$bootstrap_campaign_commands_raw" | tr -d ' ') -eq 16 ]] ||
+    die 'bootstrap campaign_command_names does not contain exactly 16 nonempty command lines'
+LC_ALL=C sort -u "$bootstrap_campaign_commands_raw" >"$bootstrap_campaign_commands"
+if ! diff -u "$expected_campaign_commands" "$bootstrap_campaign_commands"; then
+    die "bootstrap command contract differs; paid-run failure was: hfx: error: required command 'jq' is not available"
+fi
+
+sed -n '/^apt_packages=($/,/^)$/{
+    /^apt_packages=($/d
+    /^)$/d
+    s/^[[:space:]]*//
+    /./p
+}' "$bootstrap" >"$bootstrap_apt_packages"
+[[ $(grep -Fxc -- jq "$bootstrap_apt_packages") -eq 1 ]] ||
+    die 'bootstrap apt_packages does not contain exactly one jq entry'
+[[ $(grep -Fxc -- procps "$bootstrap_apt_packages") -eq 1 ]] ||
+    die 'bootstrap apt_packages does not contain exactly one procps entry'
+
+sed -n '/^for command_name in /{
+    N
+    /is unavailable after package installation/p
+}' "$bootstrap" >"$bootstrap_post_apt_loop"
+assert_contains "$bootstrap_post_apt_loop" "for command_name in $campaign_array_expansion tmux git gdal-config clang pkg-config; do"
+assert_contains "$bootstrap_post_apt_loop" 'command -v -- "$command_name"'
+assert_contains "$bootstrap_post_apt_loop" 'is unavailable after package installation'
+sed -n '/^for command_name in /{
+    N
+    /failed final verification/p
+}' "$bootstrap" >"$bootstrap_final_loop"
+assert_contains "$bootstrap_final_loop" "for command_name in $campaign_array_expansion tmux gdal-config; do"
+assert_contains "$bootstrap_final_loop" 'command -v -- "$command_name"'
+assert_contains "$bootstrap_final_loop" 'failed final verification'
+assert_contains "$bootstrap" '[[ -x "$HFX_GEO_VENV/bin/python" ]] || bootstrap_die '\''geo environment Python failed final executable verification; rerun bootstrap'\'''
+assert_contains "$bootstrap" '[[ -x "$BUILT_CLI" ]] || bootstrap_die '\''release hfx CLI failed final executable verification; rerun bootstrap'\'''
+
+sed -n '/<<REMOTE_REF/,/^REMOTE_REF$/p' "$runbook" >"$runbook_convergence"
+assert_contains "$runbook_convergence" 'for command_name in aws jq mv mkdir rm chmod find wc tr ps curl sha256sum od ogrinfo sort grep; do'
+assert_contains "$runbook_convergence" 'command -v -- "\$command_name" >/dev/null'
+assert_contains "$runbook_convergence" 'test -x /opt/hfx-geo/bin/python'
+assert_contains "$runbook_convergence" 'test -x /root/hfx/target/release/hfx'
+if grep -F -- 'command -v -- "$command_name"' "$runbook_convergence" >/dev/null; then
+    die 'runbook convergence gate expands unescaped command_name in its unquoted heredoc'
+fi
+pass 'runner, bootstrap, apt ownership, and runbook dependency contracts remain synchronized'
+
+subset_root=$test_tmp/workspaces/subset
+mkdir "$subset_root"
+set -- $(subset_init_args subset "$subset_root")
+run_runner "$@" >"$case_stdout"
+subset_campaign_dir=$subset_root/tdx-hydro-subset
+jq -e '
+  keys == ["basin_ids","schema_version"] and
+  .schema_version == 1 and
+  .basin_ids == ["1020000010","7020000010","9020000010"]
+' "$subset_campaign_dir/state/selection.json" >/dev/null ||
+    die 'subset selection was not frozen in sorted canonical form'
+[[ $(jq 'length' "$subset_campaign_dir/state/inventory.json") -eq 62 ]] ||
+    die 'subset init changed the authoritative inventory'
+cp -R "$subset_campaign_dir/state" "$test_tmp/subset-state-before"
+set -- $(init_args subset "$subset_root")
+run_runner "$@" --basin 9020000010 --basin 7020000010 --basin 1020000010 >"$case_stdout"
+diff -ru "$test_tmp/subset-state-before" "$subset_campaign_dir/state"
+for changed_selection in \
+    '--basin 7020000010 --basin 1020000010' \
+    '--basin 7020000010 --basin 1020000010 --basin 9020000010 --basin 1020011530'
+do
+    set -- $(init_args subset "$subset_root")
+    eval "set -- \"\$@\" $changed_selection"
+    expect_failure 'changed basin selection' "$@"
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: basin selection changed; use a new campaign ID' ]] ||
+        die 'changed basin selection diagnostic differs'
+    diff -ru "$test_tmp/subset-state-before" "$subset_campaign_dir/state"
+done
+set -- $(init_args duplicate-subset "$subset_root")
+expect_failure 'duplicate basin selection' "$@" --basin 7020000010 --basin 7020000010
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: basin ID '7020000010' was selected more than once" ]] ||
+    die 'duplicate basin diagnostic differs'
+[[ ! -e "$subset_root/tdx-hydro-duplicate-subset" ]] ||
+    die 'duplicate basin request left an accepted campaign'
+set -- $(init_args unknown-subset "$subset_root")
+expect_failure 'unknown basin selection' "$@" --basin 9999999999
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: unknown basin ID '9999999999'; expected a key in state/inventory.json" ]] ||
+    die 'unknown basin diagnostic differs'
+[[ ! -e "$subset_root/tdx-hydro-unknown-subset" ]] ||
+    die 'unknown basin request left an accepted campaign'
+pass 'selection parsing, freezing, and convergence'
 
 valid_root=$test_tmp/workspaces/valid
 mkdir "$valid_root"
@@ -322,6 +547,8 @@ jq -e '
 jq -S '.' "$inventory" >"$test_tmp/expected-inventory.json"
 jq -S '.' "$campaign_dir/state/inventory.json" >"$test_tmp/actual-inventory.json"
 diff -u "$test_tmp/expected-inventory.json" "$test_tmp/actual-inventory.json"
+[[ ! -e "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]] ||
+    die 'full-inventory init unexpectedly created selection state'
 [[ $(find "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') == 62 ]] ||
     die 'basin directory count differs'
 [[ $(find "$campaign_dir/state/basins" -name current.json -type f | wc -l | tr -d ' ') == 62 ]] ||
@@ -337,6 +564,15 @@ jq -e -s '
       }
     )
 ' "$campaign_dir"/state/basins/*/current.json >/dev/null || die 'initial basin states differ'
+jq -e '. == {
+  schema_version:1,
+  status:"pending",
+  attempts:0,
+  failure_reason:null,
+  input_basin_ids:[],
+  output_path:"assembly/dataset",
+  report_path:"reports/assembly.json"
+}' "$campaign_dir/state/assembly.json" >/dev/null || die 'initial assembly state differs'
 if grep -F '7020000010' "$runner" >/dev/null; then
     die 'runner contains a transcribed processing-basin ID'
 fi
@@ -515,6 +751,24 @@ jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
     >"$compile_state_root/tdx-hydro-equal/state/compile.json"
 expect_failure 'malformed compile contract' status --campaign equal --workspace-root "$compile_state_root"
 
+assembly_state_root=$(copy_workspace bad-assembly-state)
+jq '.input_basin_ids=["7020000010","1020000010"]' \
+    "$assembly_state_root/tdx-hydro-equal/state/assembly.json" >"$assembly_state_root/assembly.tmp"
+mv "$assembly_state_root/assembly.tmp" "$assembly_state_root/tdx-hydro-equal/state/assembly.json"
+expect_failure 'malformed assembly contract' status --campaign equal --workspace-root "$assembly_state_root"
+
+selection_state_root=$(copy_workspace bad-selection-state)
+jq -n '{schema_version:1,basin_ids:[]}' \
+    >"$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'empty selection contract' status --campaign equal --workspace-root "$selection_state_root"
+selection_state_root=$(copy_workspace unsorted-selection-state)
+jq -n '{schema_version:1,basin_ids:["7020000010","1020000010"]}' \
+    >"$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'unsorted selection contract' status --campaign equal --workspace-root "$selection_state_root"
+selection_state_root=$(copy_workspace symlink-selection-state)
+ln -s inventory.json "$selection_state_root/tdx-hydro-equal/state/selection.json"
+expect_failure 'symlink selection contract' status --campaign equal --workspace-root "$selection_state_root"
+
 jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnostic_report","failure_reason","status"])' "$selected_state" >/dev/null ||
     die 'shared status fixture lost the v3 compile diagnostic member'
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
@@ -522,6 +776,10 @@ assert_contains "$case_stdout" 'inventory_count=62'
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=1'
 assert_contains "$case_stdout" 'compile_succeeded=1'
+assert_contains "$case_stdout" 'assemble_pending=1'
+assert_contains "$case_stdout" 'assemble_running=0'
+assert_contains "$case_stdout" 'assemble_succeeded=0'
+assert_contains "$case_stdout" 'assemble_failed=0'
 pass 'status rejects all malformed state and reports deterministic counts'
 
 run_runner --help >"$case_stdout"
@@ -551,6 +809,10 @@ sed >"$test_tmp/fake-curl" <<'FAKE_CURL'
 set -eu
 output=
 url=
+headers=
+write_out=
+continue_at=
+if_range=
 seen_fail=0
 seen_show=0
 seen_location=0
@@ -581,7 +843,23 @@ while [ "$#" -gt 0 ]; do
             shift
             output=${1-}
             ;;
-        --range|-r|--continue-at|-C|--parallel|--head|-I|--retry|--retry-all-errors)
+        --dump-header)
+            shift
+            headers=${1-}
+            ;;
+        --write-out)
+            shift
+            write_out=${1-}
+            ;;
+        --continue-at)
+            shift
+            continue_at=${1-}
+            ;;
+        --header)
+            shift
+            if_range=${1-}
+            ;;
+        --range|-r|-C|--parallel|--head|-I|--retry|--retry-all-errors)
             exit 92
             ;;
         https://earth-info.nga.mil/php/download.php?file=*-basins-gpkg|https://earth-info.nga.mil/php/download.php?file=*-streamnet-gpkg)
@@ -592,9 +870,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ "$seen_fail$seen_show$seen_location$seen_connect$seen_speed_limit$seen_speed_time" = 111111 ]
-[ -n "$output" ] && [ -n "$url" ]
+[ -n "$output" ] && [ -n "$url" ] && [ -n "$headers" ] && [ -n "$write_out" ]
+[ "$write_out" = 'http_status=%{http_code}\nnetwork_bytes=%{size_download}\ntime_total_seconds=%{time_total}\naverage_bytes_per_second=%{speed_download}\n' ] || exit 91
+[ -z "$continue_at" ] || { [ "$continue_at" = - ] && [ "${if_range#If-Range: }" != "$if_range" ]; }
 base=${output##*/}
 key=${base%.gpkg.partial}
+stats_path=${headers/.curl-headers./.curl-stats.}
+printf '%s\t%s\t%s\n' "$key" "$headers" "$stats_path" >>"${HFX_TEST_TRANSFER_STATE:?}/paths"
 mutex=${HFX_TEST_TRANSFER_STATE:?}/mutex
 while ! mkdir "$mutex" 2>/dev/null; do sleep 0.01; done
 active=0
@@ -607,6 +889,10 @@ maximum=0
 printf 'start %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
 if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
+    total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
+    head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
+    printf 'HTTP/1.1 200 OK\r\nETag: \"fixture-v1\"\r\nContent-Length: %s\r\n\r\n' "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
     printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/curl.$$"
     printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/worker.$PPID"
     if mkdir "$HFX_TEST_TRANSFER_STATE/signal-owner" 2>/dev/null; then
@@ -639,11 +925,68 @@ if [ -n "${HFX_TEST_BARRIER_COUNT-}" ]; then
         [ "$barrier_deadline" -lt 1000 ] || exit 94
     done
 fi
-if [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
-    printf 'partial\n' >"$output"
+total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
+if [ "${HFX_TEST_RESUME_MODE-}" = changed ]; then
+    total=$((total + 3))
+fi
+header_etag='"fixture-v1"'
+header_name_etag=ETag
+header_name_length=Content-Length
+header_name_range=Content-Range
+[ "${HFX_TEST_LOWERCASE_HEADERS-}" != 1 ] || {
+    header_name_etag=etag
+    header_name_length=content-length
+    header_name_range=content-range
+}
+if [ -n "$continue_at" ]; then
+    offset=$(wc -c <"$output" | tr -d ' ')
+    [ "$if_range" = "If-Range: $header_etag" ] || exit 91
+    case ${HFX_TEST_RESUME_MODE-honor} in
+        ignored|changed)
+            [ "${HFX_TEST_RESUME_MODE-honor}" != changed ] || header_etag='"fixture-v2"'
+            printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+            printf 'http_status=200\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=33
+            ;;
+        mutate-ignored)
+            printf x >>"$output"
+            printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+            printf 'http_status=200\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=33
+            ;;
+        short)
+            printf 'HTTP/1.1 206 Partial Content\r\n%s: %s\r\n%s: bytes %s-%s/%s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_range" "$offset" "$((total - 1))" "$total" >"$headers"
+            printf 'http_status=206\nnetwork_bytes=0\ntime_total_seconds=1.25\naverage_bytes_per_second=0\n'
+            result=0
+            ;;
+        honor)
+            tail -c +$((offset + 1)) "$HFX_TEST_GPKG_TEMPLATE" >>"$output"
+            printf 'HTTP/1.1 206 Partial Content\r\n%s: %s\r\n%s: bytes %s-%s/%s\r\n\r\n' \
+                "$header_name_etag" "$header_etag" "$header_name_range" "$offset" "$((total - 1))" "$total" >"$headers"
+            printf 'http_status=206\nnetwork_bytes=%s\ntime_total_seconds=1.25\naverage_bytes_per_second=8\n' "$((total - offset))"
+            result=0
+            ;;
+        *) exit 96 ;;
+    esac
+elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
+    head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
+    [ "${HFX_TEST_LEADING_ZERO_LENGTH-}" != 1 ] || total=0$total
+    printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+        "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
     result=22
 else
     cp "${HFX_TEST_GPKG_TEMPLATE:?}" "$output"
+    if [ "${HFX_TEST_RESUME_MODE-}" = changed ]; then
+        printf v2x >>"$output"
+        header_etag='"fixture-v2"'
+    fi
+    printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+        "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    printf 'http_status=200\nnetwork_bytes=%s\ntime_total_seconds=1.25\naverage_bytes_per_second=20\n' "$total"
     result=0
 fi
 while ! mkdir "$mutex" 2>/dev/null; do sleep 0.01; done
@@ -656,11 +999,12 @@ exit "$result"
 FAKE_CURL
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
+checksum=$(cksum <"$1")
+checksum=${checksum%% *}
 if [ "${HFX_TEST_HASH_MODE-}" = changed ]; then
-    printf '%064d  %s\n' 1 "$1"
-else
-    printf '%064d  %s\n' 0 "$1"
+    checksum=$((checksum + 1))
 fi
+printf '%064x  %s\n' "$checksum" "$1"
 FAKE_SHA
 sed >"$test_tmp/fake-ogrinfo" <<'FAKE_OGR'
 #!/bin/sh
@@ -764,12 +1108,43 @@ case $command_name in
         hfx_binary=$4
         printf 'validate\t%s\t--hfx-binary\t%s\n' "$dataset" "$hfx_binary" >>"$log"
         [ -d "$dataset" ] && [ ! -L "$dataset" ] || exit 88
-        if [ "${HFX_TEST_FAIL_VALIDATE_ID-}" = "${dataset##*/}" ]; then
+        if [ "${HFX_TEST_FAIL_VALIDATE_ID-}" = "${dataset##*/}" ] ||
+            { [ "${dataset##*/}" = dataset ] && [ "${HFX_TEST_FAIL_ASSEMBLY_VALIDATE-}" = 1 ]; }; then
             exit 42
         fi
-        "$hfx_binary" "$dataset" --strict --sample-pct 100 --format text
+        hfx_status=0
+        "$hfx_binary" "$dataset" --strict --sample-pct 100 --format text || hfx_status=$?
+        printf '%s\t%s\n' "$dataset" "$hfx_status" >>"${HFX_TEST_HFX_STATUS_LOG:?}"
+        exit "$hfx_status"
         ;;
-    assemble|assembly)
+    assemble)
+        assemble_arguments=("$@")
+        shift
+        input_count=0
+        while [ "$#" -gt 2 ]; do
+            [ "$1" = --input ] || exit 89
+            [ -d "$2" ] && [ ! -L "$2" ] || exit 89
+            input_count=$((input_count + 1))
+            shift 2
+        done
+        [ "$input_count" -gt 0 ] || exit 89
+        [ "$#" -eq 2 ] && [ "$1" = --out ] || exit 89
+        out=$2
+        printf '%s' "${assemble_arguments[0]}" >>"$log"
+        for argument in "${assemble_arguments[@]:1}"; do
+            printf '\t%s' "$argument" >>"$log"
+        done
+        printf '\n' >>"$log"
+        if [ "${HFX_TEST_FAIL_ASSEMBLY-}" = 1 ]; then
+            exit 43
+        fi
+        mkdir -p "$out/aux"
+        printf '%s\n' fixture >"$out/catchments.parquet"
+        printf '%s\n' fixture >"$out/graph.parquet"
+        printf '%s\n' fixture >"$out/manifest.json"
+        printf '%s\n' fixture >"$out/aux/snap_stems.parquet"
+        ;;
+    assembly)
         exit 89
         ;;
     *)
@@ -783,11 +1158,22 @@ set -eu
 [ "$#" -ge 1 ] || exit 91
 [ "$1" = "${HFX_TEST_ADAPTER_SCRIPT:?}" ] || exit 92
 shift
+if [ "${1-}" = assemble ]; then
+    actual=${HFX_TEST_EXPECTED_ASSEMBLY_ARGV:?}.actual
+    : >"$actual"
+    for argument do
+        printf '%s\n' "$argument" >>"$actual"
+    done
+    "${HFX_TEST_DIFF:?}" -u "${HFX_TEST_EXPECTED_ASSEMBLY_ARGV:?}" "$actual" || exit 94
+fi
 exec "${HFX_TEST_ADAPTER_STUB:?}" "$@"
 FAKE_ADAPTER_PYTHON
 sed >"$test_tmp/fake-hfx" <<'FAKE_HFX'
 #!/bin/bash
 set -eu
+case ${1-} in
+    assemble|assembly) exit 74 ;;
+esac
 printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HFX_LOG:?}"
 [ "$#" -eq 6 ] || exit 71
 [ "$1" != validate ] || exit 72
@@ -796,9 +1182,6 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 [ "$4" = 100 ] || exit 73
 [ "$5" = --format ] || exit 73
 [ "$6" = text ] || exit 73
-case "$*" in
-    *assemble*|*assembly*) exit 74 ;;
-esac
 exit 0
 FAKE_HFX
 chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
@@ -816,7 +1199,175 @@ export HFX_TEST_ADAPTER_LOG=$test_tmp/invocations/adapter.log
 export HFX_TEST_ADAPTER_SCRIPT=$repo_root/adapters/tdx-hydro/build_adapter.py
 export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
 export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
+export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
+export HFX_TEST_DIFF=$(command -v diff)
 
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign subset --workspace-root "$subset_root" --max-parallel 62 >"$case_stdout"
+grep '^start ' "$test_tmp/transfer-state/events" | sed 's/^start //' | sort >"$test_tmp/subset-starts"
+printf '%s\n' \
+    1020000010-basins 1020000010-streamnet \
+    7020000010-basins 7020000010-streamnet \
+    9020000010-basins 9020000010-streamnet >"$test_tmp/expected-subset-starts"
+diff -u "$test_tmp/expected-subset-starts" "$test_tmp/subset-starts"
+[[ $(find "$subset_campaign_dir/downloads" -name '*.gpkg' -type f | wc -l | tr -d ' ') -eq 6 ]] ||
+    die 'subset acquisition did not install exactly six files'
+jq -e -s '
+  map(select(.processing_basin_id as $id |
+    ["1020000010","7020000010","9020000010"] | index($id) | not)) |
+  length == 59 and all(
+    .stages.acquire_basins.status == "pending" and
+    .stages.acquire_basins.attempts == 0 and
+    .stages.acquire_streamnet.status == "pending" and
+    .stages.acquire_streamnet.attempts == 0)
+' "$subset_campaign_dir"/state/basins/*/current.json >/dev/null ||
+    die 'subset acquisition modified an unselected basin'
+assert_contains "$case_stdout" 'acquire_basins_succeeded=3'
+assert_contains "$case_stdout" 'acquire_streamnet_succeeded=3'
+pass 'three-basin acquisition schedules only the frozen selection'
+
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner compile --campaign subset --workspace-root "$subset_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+grep '^build' "$HFX_TEST_ADAPTER_LOG" | cut -f11 | sort >"$test_tmp/subset-build-ids"
+printf '%s\n' 1020000010 7020000010 9020000010 >"$test_tmp/expected-subset-build-ids"
+diff -u "$test_tmp/expected-subset-build-ids" "$test_tmp/subset-build-ids"
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 3 ]] ||
+    die 'subset compile did not issue exactly three builds'
+jq '.stages.compile={
+  status:"failed",attempts:1,failure_reason:"adapter validation failed",
+  diagnostic_report:{path:"reports/7020000010-build-report.json",diagnostics:{fixture_metric:702}}
+}' "$subset_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/subset-failed"
+mv "$test_tmp/subset-failed" "$subset_campaign_dir/state/basins/7020000010/current.json"
+mark_compile_succeeded "$subset_campaign_dir" 1020011530
+HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/subset-assembly-argv
+export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
+printf '%s\n' \
+    assemble \
+    --input "$subset_campaign_dir/basin-outputs/1020000010" \
+    --input "$subset_campaign_dir/basin-outputs/9020000010" \
+    --out "$subset_campaign_dir/assembly/dataset" >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+run_runner assemble --campaign subset --workspace-root "$subset_root" >"$case_stdout"
+jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+    "$subset_campaign_dir/state/assembly.json" >/dev/null ||
+    die 'subset assembly state admitted a failed or unselected basin'
+jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+    "$subset_campaign_dir/reports/assembly.json" >/dev/null ||
+    die 'subset assembly report admitted a failed or unselected basin'
+pass 'compile and assemble remain scoped to the frozen selection'
+
+mkdir "$test_tmp/subset-lifecycle-before"
+cp "$subset_campaign_dir/state/selection.json" "$test_tmp/subset-lifecycle-before/selection.json"
+cp "$subset_campaign_dir/state/assembly.json" "$test_tmp/subset-lifecycle-before/assembly.json"
+cp "$subset_campaign_dir/state/compile.json" "$test_tmp/subset-lifecycle-before/compile.json"
+cp "$subset_campaign_dir/reports/assembly.json" "$test_tmp/subset-lifecycle-before/assembly-report.json"
+for preserved_id in 1020000010 7020000010 9020000010 1020011530; do
+    cp "$subset_campaign_dir/state/basins/$preserved_id/current.json" \
+        "$test_tmp/subset-lifecycle-before/$preserved_id.json"
+done
+subset_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+subset_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+subset_transfer_lines=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
+set -- $(init_args subset "$subset_root")
+expect_failure 'mid-lifecycle basin selection drift' "$@" \
+    --basin 1020000010 --basin 9020000010
+[[ $(tail -1 "$case_stderr") == 'hfx: error: basin selection changed; use a new campaign ID' ]] ||
+    die 'mid-lifecycle basin selection diagnostic differs'
+diff -u "$test_tmp/subset-lifecycle-before/assembly-report.json" \
+    "$subset_campaign_dir/reports/assembly.json"
+for preserved_id in 1020000010 7020000010 9020000010 1020011530; do
+    diff -u "$test_tmp/subset-lifecycle-before/$preserved_id.json" \
+        "$subset_campaign_dir/state/basins/$preserved_id/current.json"
+done
+diff -u "$test_tmp/subset-lifecycle-before/selection.json" "$subset_campaign_dir/state/selection.json"
+diff -u "$test_tmp/subset-lifecycle-before/compile.json" "$subset_campaign_dir/state/compile.json"
+diff -u "$test_tmp/subset-lifecycle-before/assembly.json" "$subset_campaign_dir/state/assembly.json"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$subset_adapter_lines" &&
+    $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$subset_hfx_lines" &&
+    $(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ') -eq "$subset_transfer_lines" ]] ||
+    die 'mid-lifecycle selection refusal invoked a service fake'
+pass 'mid-lifecycle basin selection drift refuses without side effects'
+
+subset_evidence_root=$test_tmp/workspaces/subset-evidence
+mkdir "$subset_evidence_root"
+set -- $(init_args subset-evidence "$subset_evidence_root")
+run_runner "$@" --basin 7020000010 --basin 1020000010 >"$case_stdout"
+subset_evidence_dir=$subset_evidence_root/tdx-hydro-subset-evidence
+assert_contains "$case_stdout" 'inventory_count=62'
+assert_contains "$case_stdout" 'selected_basin_count=2'
+assert_contains "$case_stdout" 'unselected_basin_count=60'
+assert_contains "$case_stdout" 'compile_pending=2'
+jq -n --arg id 1020000010 '{
+  schema_version:3,processing_basin_id:$id,stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:21,sha256:("a"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"basins-1020000010"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:22,sha256:("b"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"streamnet-1020000010"}},
+    compile:{status:"succeeded",attempts:1,failure_reason:null,diagnostic_report:{
+      path:"reports/1020000010-build-report.json",diagnostics:{fixture_metric:101}}}
+  }}' >"$subset_evidence_dir/state/basins/1020000010/current.json"
+jq -n --arg id 7020000010 '{
+  schema_version:3,processing_basin_id:$id,stages:{
+    acquire_basins:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:23,sha256:("c"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"basins-7020000010"}},
+    acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{
+      bytes:24,sha256:("d"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+      layer_name:"streamnet-7020000010"}},
+    compile:{status:"failed",attempts:1,failure_reason:"adapter validation failed",diagnostic_report:{
+      path:"reports/7020000010-build-report.json",diagnostics:{fixture_metric:702}}}
+  }}' >"$subset_evidence_dir/state/basins/7020000010/current.json"
+cp "$subset_evidence_dir/state/basins/9020000010/current.json" "$test_tmp/unselected-before-evidence"
+run_runner status --campaign subset-evidence --workspace-root "$subset_evidence_root" >"$case_stdout"
+assert_contains "$case_stdout" 'acquire_basins_succeeded=2'
+assert_contains "$case_stdout" 'acquire_streamnet_succeeded=2'
+assert_contains "$case_stdout" 'compile_succeeded=1'
+assert_contains "$case_stdout" 'compile_failed=1'
+run_runner evidence --campaign subset-evidence --workspace-root "$subset_evidence_root"
+diff -u "$test_tmp/unselected-before-evidence" \
+    "$subset_evidence_dir/state/basins/9020000010/current.json"
+for evidence_name in acquisition outcomes diagnostics; do
+    evidence_file=$subset_evidence_dir/publication/evidence/$evidence_name.json
+    jq -e '
+      .schema_version == 2 and
+      .selected_basin_ids == ["1020000010","7020000010"]
+    ' "$evidence_file" >/dev/null || die "$evidence_name subset classes differ"
+    jq -e --slurpfile inventory "$subset_evidence_dir/state/inventory.json" '
+      .unselected_basin_ids == (($inventory[0] | keys) - ["1020000010","7020000010"]) and
+      (.unselected_basin_ids | index("9020000010")) != null
+    ' "$evidence_file" >/dev/null || die "$evidence_name unselected class differs"
+done
+jq -e '
+  [.basins[].processing_basin_id] == ["1020000010","7020000010"]
+' "$subset_evidence_dir/publication/evidence/acquisition.json" >/dev/null ||
+    die 'subset acquisition evidence omitted a selected basin'
+jq -e '
+  {schema_version,campaign,selected_basin_ids,attempted_basin_ids,excluded_basins,outcomes} == {
+    schema_version:2,
+    campaign:"subset-evidence",
+    selected_basin_ids:["1020000010","7020000010"],
+    attempted_basin_ids:["1020000010","7020000010"],
+    excluded_basins:[{processing_basin_id:"7020000010",
+      failure_reason:"adapter validation failed"}],
+    outcomes:[
+      {processing_basin_id:"1020000010",status:"succeeded",attempts:1,failure_reason:null},
+      {processing_basin_id:"7020000010",status:"failed",attempts:1,
+        failure_reason:"adapter validation failed"}
+    ]
+  }
+' "$subset_evidence_dir/publication/evidence/outcomes.json" >/dev/null ||
+    die 'subset outcome projection differs'
+jq -e '
+  [.basins[].processing_basin_id] == ["1020000010","7020000010"]
+' "$subset_evidence_dir/publication/evidence/diagnostics.json" >/dev/null ||
+    die 'subset diagnostics evidence omitted a selected basin'
+pass 'subset status and evidence preserve selected, attempted, excluded, and unselected classes'
+
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
 rendezvous_status=0
 HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
     "$test_tmp/fake-curl" \
@@ -826,9 +1377,11 @@ HFX_TEST_INTERRUPT_DRAIN=1 HFX_TEST_RENDEZVOUS_LIMIT=3 \
         --connect-timeout 30 \
         --speed-limit 65536 \
         --speed-time 60 \
+        --dump-header "$test_tmp/lone-basins.headers" \
+        --write-out 'http_status=%{http_code}\nnetwork_bytes=%{size_download}\ntime_total_seconds=%{time_total}\naverage_bytes_per_second=%{speed_download}\n' \
         --output "$test_tmp/lone-basins.gpkg.partial" \
         'https://earth-info.nga.mil/php/download.php?file=1020000010-basins-gpkg' \
-        >"$case_stdout" 2>"$case_stderr" || rendezvous_status=$?
+        >"$test_tmp/lone-basins.stats" 2>"$case_stderr" || rendezvous_status=$?
 [[ "$rendezvous_status" -eq 95 ]] ||
     die "single-marker drain rendezvous exited $rendezvous_status instead of 95"
 [[ $(find "$test_tmp/transfer-state" -name 'curl.*' -type f | wc -l | tr -d ' ') == 1 ]] ||
@@ -880,6 +1433,19 @@ for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/c
 done
 [[ -e "$test_tmp/transfer-state/signal-owner" ]] ||
     die 'repeated drain TERM did not start its signal coordinator'
+drain_campaign_dir=$drain_interrupt_root/tdx-hydro-interrupt-drain
+[[ $(find "$drain_campaign_dir/state/tmp" \
+    \( -name '.curl-headers.*' -o -name '.curl-stats.*' \) -type f |
+    wc -l | tr -d ' ') == 0 ]] ||
+    die 'interrupted acquisition retained header or stats temporaries'
+while IFS= read -r interrupted_partial; do
+    [[ -f "$interrupted_partial" && ! -L "$interrupted_partial" ]] ||
+        die "interrupted acquisition retained an unsafe partial: $interrupted_partial"
+    if [[ -e "$interrupted_partial.json" ]]; then
+        [[ -f "$interrupted_partial.json" && ! -L "$interrupted_partial.json" ]] ||
+            die "interrupted acquisition retained an unsafe sidecar: $interrupted_partial.json"
+    fi
+done < <(find "$drain_campaign_dir/downloads" -name '*.gpkg.partial' -type f)
 pass 'repeated INT/TERM during worker drain exits 130, reaps workers, and releases the lock'
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
@@ -888,16 +1454,50 @@ acquire_root=$test_tmp/workspaces/acquire
 mkdir "$acquire_root"
 set -- $(init_args acquire "$acquire_root")
 run_runner "$@" >"$case_stdout"
-export HFX_TEST_BARRIER_COUNT=2
-run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 3 >"$case_stdout"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+export HFX_TEST_BARRIER_COUNT=4
+if ! run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"; then
+    sed 's/^/all-62 acquire: /' "$case_stderr" >&2
+    die 'all-62 acquisition failed'
+fi
 unset HFX_TEST_BARRIER_COUNT
 acquire_dir=$acquire_root/tdx-hydro-acquire
-[[ $(<"$test_tmp/transfer-state/maximum") -ge 2 && $(<"$test_tmp/transfer-state/maximum") -le 3 ]] ||
-    die 'bounded parallel acquisition did not observe deterministic overlap'
+[[ $(<"$test_tmp/transfer-state/maximum") == 4 ]] ||
+    die 'bounded parallel acquisition did not observe exactly four transfers'
 [[ $(find "$acquire_dir/downloads" -name '*.gpkg' -type f | wc -l | tr -d ' ') == 124 ]] ||
     die 'complete acquisition did not install 124 files'
 [[ $(grep -c '^start ' "$test_tmp/transfer-state/events") == 124 ]] ||
     die 'complete acquisition did not invoke 124 transfers'
+[[ $(grep -c '^hfx: acquisition product=.* status=succeeded ' "$case_stderr") == 124 ]] ||
+    die 'complete acquisition did not emit 124 succeeded summaries'
+[[ $(find "$acquire_dir/reports" -name '*-acquisition.json' -type f | wc -l | tr -d ' ') == 124 ]] ||
+    die 'complete acquisition did not install 124 acquisition reports'
+[[ $(cut -f2 "$test_tmp/transfer-state/paths" | sort -u | wc -l | tr -d ' ') == 124 &&
+    $(cut -f3 "$test_tmp/transfer-state/paths" | sort -u | wc -l | tr -d ' ') == 124 ]] ||
+    die 'acquisition header and stats paths are not distinct'
+while IFS=$'\t' read -r captured_key captured_headers captured_stats; do
+    captured_basin=${captured_key%-*}
+    captured_product=${captured_key##*-}
+    case $captured_headers in
+        *".curl-headers.$captured_basin.$captured_product."*) ;;
+        *) die "header path lacks basin/product identity: $captured_headers" ;;
+    esac
+    case $captured_stats in
+        *".curl-stats.$captured_basin.$captured_product."*) ;;
+        *) die "stats path lacks basin/product identity: $captured_stats" ;;
+    esac
+done <"$test_tmp/transfer-state/paths"
+jq -e -s '
+  length == 124 and all(
+    .schema_version == 1 and .retry_count == 0 and .resume_count == 0 and
+    .range_ignored_restart_count == 0 and (.transfers | length) == 1 and
+    .transfers[0].mode == "fresh" and .transfers[0].result == "succeeded" and
+    .transfers[0].http_status == 200 and .transfers[0].time_total_seconds == 1.25
+  )
+' "$acquire_dir"/reports/*-acquisition.json >/dev/null ||
+    die 'fresh acquisition reports differ'
 jq -e -s '
   length == 62 and all(
     .schema_version == 3 and
@@ -914,9 +1514,12 @@ jq -e -s '
   )
 ' "$acquire_dir"/state/basins/*/current.json >/dev/null || die 'successful acquisition evidence differs'
 events_before=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
-run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign acquire --workspace-root "$acquire_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
 events_after=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
 [[ "$events_before" == "$events_after" ]] || die 'verified reuse fetched files again'
+[[ $(grep -c ' status=reused ' "$case_stderr") == 124 ]] ||
+    die 'verified reuse summaries differ'
 pass 'all 62 basins acquire with bounded concurrency and exact reusable evidence'
 
 serial_root=$test_tmp/workspaces/serial
@@ -925,8 +1528,15 @@ set -- $(init_args serial "$serial_root")
 run_runner "$@" >"$case_stdout"
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
-run_runner acquire --campaign serial --workspace-root "$serial_root" --max-parallel 1 >"$case_stdout"
+run_runner acquire --campaign serial --workspace-root "$serial_root" --max-parallel 1 \
+    >"$case_stdout" 2>"$case_stderr"
 [[ $(<"$test_tmp/transfer-state/maximum") == 1 ]] || die 'serial acquisition exceeded one active transfer'
+[[ $(find "$serial_root/tdx-hydro-serial/reports" -name '*-acquisition.json' -type f |
+    wc -l | tr -d ' ') == 124 ]] ||
+    die 'serial acquisition did not atomically install every product report'
+[[ $(find "$serial_root/tdx-hydro-serial/reports" -name '.*.tmp.*' -type f |
+    wc -l | tr -d ' ') == 0 ]] ||
+    die 'serial acquisition left a report writer temporary'
 pass 'maximum parallel one remains strictly serial'
 
 failure_root=$test_tmp/workspaces/failure
@@ -937,8 +1547,16 @@ rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
 failure_id=$(jq -r 'keys[0]' "$inventory")
 export HFX_TEST_FAIL_KEY=$failure_id-basins
-run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 \
+    >"$case_stdout" 2>"$case_stderr"
 failure_state=$failure_root/tdx-hydro-failure/state/basins/$failure_id/current.json
+failure_partial=$failure_root/tdx-hydro-failure/downloads/$failure_id-basins.gpkg.partial
+[[ -f "$failure_partial" && -f "$failure_partial.json" ]] ||
+    die 'interrupted product did not retain attributable provenance'
+[[ $(find "$failure_root/tdx-hydro-failure/state/tmp" \
+    \( -name ".curl-headers.$failure_id.basins.*" -o -name ".curl-stats.$failure_id.basins.*" \) \
+    -type f | wc -l | tr -d ' ') == 0 ]] ||
+    die 'failed transfer retained its header or stats temporary'
 jq -e '
   .stages.acquire_basins.status == "failed" and
   .stages.acquire_basins.attempts == 1 and
@@ -948,12 +1566,41 @@ jq -e '
 ' "$failure_state" >/dev/null || die 'isolated transfer failure state differs'
 unset HFX_TEST_FAIL_KEY
 events_before=$(grep -c '^start ' "$test_tmp/transfer-state/events")
-run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 >"$case_stdout"
+run_runner acquire --campaign failure --workspace-root "$failure_root" --max-parallel 3 \
+    >"$case_stdout" 2>"$case_stderr"
 events_after=$(grep -c '^start ' "$test_tmp/transfer-state/events")
 [[ $((events_after - events_before)) == 1 ]] || die 'retry fetched work other than the failed product'
 jq -e '.stages.acquire_basins.status == "succeeded" and .stages.acquire_basins.attempts == 2' \
     "$failure_state" >/dev/null || die 'failed product did not converge on retry'
-pass 'product failure is isolated and only incomplete work retries'
+jq -e '.retry_count == 1 and .resume_count == 1 and
+  (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "succeeded"' \
+    "$failure_root/tdx-hydro-failure/reports/$failure_id-basins-acquisition.json" >/dev/null ||
+    die 'failed product continuation telemetry differs'
+
+leading_zero_root=$test_tmp/workspaces/leading-zero
+mkdir "$leading_zero_root"
+cp -R "$subset_campaign_dir" "$leading_zero_root/tdx-hydro-subset"
+leading_zero_dir=$leading_zero_root/tdx-hydro-subset
+leading_zero_id=1020000010
+leading_zero_state=$leading_zero_dir/state/basins/$leading_zero_id/current.json
+leading_zero_final=$leading_zero_dir/downloads/$leading_zero_id-basins.gpkg
+rm "$leading_zero_final"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$leading_zero_state" >"$leading_zero_state.tmp"
+mv "$leading_zero_state.tmp" "$leading_zero_state"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_FAIL_KEY=$leading_zero_id-basins HFX_TEST_LEADING_ZERO_LENGTH=1 \
+    run_runner acquire --campaign subset --workspace-root "$leading_zero_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "failed" and
+  .stages.acquire_basins.failure_reason == "transfer failed" and
+  .stages.acquire_streamnet.status == "succeeded"' "$leading_zero_state" >/dev/null ||
+    die 'leading-zero Content-Length was not isolated to its product'
+[[ ! -e "$leading_zero_final.partial" && ! -e "$leading_zero_final.partial.json" ]] ||
+    die 'leading-zero Content-Length retained unattributable provenance'
+pass 'product failures are isolated, resumable, and contain malformed Content-Length'
 
 reuse_root=$test_tmp/workspaces/reuse-corrupt
 mkdir "$reuse_root"
@@ -1024,6 +1671,120 @@ jq -e '.stages.acquire_basins.status == "succeeded" and .stages.acquire_basins.a
 [[ $(grep -c "^start $reuse_id-basins$" "$test_tmp/transfer-state/events") == 1 ]] ||
     die 'partial retry did not issue exactly one complete GET'
 
+prepare_resume_fixture() {
+    local name=$1
+    resume_root=$test_tmp/workspaces/$name
+    mkdir "$resume_root"
+    cp -R "$subset_campaign_dir" "$resume_root/tdx-hydro-subset"
+    resume_dir=$resume_root/tdx-hydro-subset
+    resume_id=1020000010
+    resume_state=$resume_dir/state/basins/$resume_id/current.json
+    resume_final=$resume_dir/downloads/$resume_id-basins.gpkg
+    resume_partial=$resume_final.partial
+    resume_sidecar=$resume_partial.json
+    resume_report=$resume_dir/reports/$resume_id-basins-acquisition.json
+    rm "$resume_final"
+    jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+        "$resume_state" >"$resume_state.tmp"
+    mv "$resume_state.tmp" "$resume_state"
+    rm -r "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    HFX_TEST_FAIL_KEY=$resume_id-basins \
+        run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+        >"$case_stdout" 2>"$case_stderr"
+    [[ -f "$resume_partial" && -f "$resume_sidecar" && ! -e "$resume_final" ]] ||
+        die "$name did not establish an attributable interrupted partial"
+}
+
+prepare_resume_fixture resume-honored
+run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+cmp "$resume_final" "$test_tmp/geopackage-template" >/dev/null ||
+    die 'honored continuation did not install the exact fixture'
+jq -e '.resume_count == 1 and (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "succeeded" and
+  (.transfers | last | .http_status) == 206' \
+    "$resume_report" >/dev/null || die 'honored continuation report differs'
+
+prepare_resume_fixture resume-ignored
+ignored_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+HFX_TEST_RESUME_MODE=ignored \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - ignored_events)) == 2 ]] ||
+    die 'ignored Range did not issue one continuation and one clean GET'
+cmp "$resume_final" "$test_tmp/geopackage-template" >/dev/null ||
+    die 'ignored Range concatenated data'
+jq -e '.transfers as $t | .range_ignored_restart_count == 1 and
+  $t[($t|length)-2].mode == "range_ignored_restart" and
+  $t[($t|length)-2].result == "range_ignored_restart" and
+  ($t | last | .mode) == "fresh"' "$resume_report" >/dev/null ||
+    die 'ignored Range report differs'
+
+prepare_resume_fixture resume-changed
+HFX_TEST_RESUME_MODE=changed \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(wc -c <"$resume_final" | tr -d ' ') == 27 ]] ||
+    die 'changed ETag did not install only the new representation'
+tail -c 3 "$resume_final" | grep -Fx v2x >/dev/null ||
+    die 'changed ETag fixture differs'
+
+prepare_resume_fixture resume-short
+HFX_TEST_RESUME_MODE=short \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "failed"' "$resume_state" >/dev/null ||
+    die 'short continuation unexpectedly succeeded'
+[[ ! -e "$resume_final" ]] || die 'short continuation installed a final'
+
+prepare_resume_fixture resume-stale
+printf 'XXXXXXXXXXXXXXXXXX' >"$resume_partial"
+stale_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - stale_events)) == 1 ]] ||
+    die 'same-length hash-stale partial did not use exactly one clean GET'
+
+prepare_resume_fixture resume-lowercase
+HFX_TEST_LOWERCASE_HEADERS=1 \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '(.transfers | last | .http_status) == 206 and
+  (.transfers | last | .result) == "succeeded"' \
+    "$resume_report" >/dev/null || die 'lowercase continuation headers were not accepted'
+
+prepare_resume_fixture resume-mutated-ignored
+mutated_events=$(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events")
+HFX_TEST_RESUME_MODE=mutate-ignored \
+    run_runner acquire --campaign subset --workspace-root "$resume_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ $(($(grep -c "^start $resume_id-basins$" "$test_tmp/transfer-state/events") - mutated_events)) == 1 ]] ||
+    die 'mutated ignored-Range continuation made a clean GET'
+jq -e '.stages.acquire_basins.status == "failed" and
+  .stages.acquire_basins.failure_reason == "partial changed during ignored-Range continuation"' \
+    "$resume_state" >/dev/null || die 'mutated ignored-Range failure differs'
+jq -e '.range_ignored_restart_count == 0 and
+  (.transfers | last | .mode) == "resume" and
+  (.transfers | last | .result) == "integrity_failed"' "$resume_report" >/dev/null ||
+    die 'mutated ignored-Range telemetry differs'
+
+lowercase_fresh_root=$test_tmp/workspaces/lowercase-fresh
+mkdir "$lowercase_fresh_root"
+cp -R "$subset_campaign_dir" "$lowercase_fresh_root/tdx-hydro-subset"
+lowercase_fresh_dir=$lowercase_fresh_root/tdx-hydro-subset
+rm "$lowercase_fresh_dir/downloads/1020000010-basins.gpkg"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$lowercase_fresh_dir/state/basins/1020000010/current.json" >"$case_stdout"
+mv "$case_stdout" "$lowercase_fresh_dir/state/basins/1020000010/current.json"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_LOWERCASE_HEADERS=1 \
+    run_runner acquire --campaign subset --workspace-root "$lowercase_fresh_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+[[ -f "$lowercase_fresh_dir/downloads/1020000010-basins.gpkg" ]] ||
+    die 'lowercase fresh headers were not accepted'
+
 unsafe_partial_root=$test_tmp/workspaces/unsafe-partial
 mkdir "$unsafe_partial_root"
 cp -R "$acquire_dir" "$unsafe_partial_root/tdx-hydro-acquire"
@@ -1041,7 +1802,7 @@ jq -e '.stages.acquire_basins.status == "failed" and .stages.acquire_basins.atte
     "$unsafe_state" >/dev/null || die 'unsafe partial was not isolated without a new attempt'
 [[ -L "$unsafe_final.partial" ]] || die 'unsafe partial was removed or traversed'
 [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'unsafe partial triggered a fetch'
-pass 'verified finals are adopted and partial paths follow safe all-or-nothing retry rules'
+pass 'verified finals are adopted and partials resume only with safe provenance'
 
 compile_physical_parent=$test_tmp/workspaces/compile-physical-parent
 compile_link_parent=$test_tmp/workspaces/compile-link-parent
@@ -1327,6 +2088,216 @@ fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-after"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-after"
 pass 'no cloud, network, SSH, or publication command ran'
+
+assembly_hfx_start=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+assembly_success_root=$(new_assembly_workspace assembly-success)
+assembly_success_dir=$assembly_success_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_success_dir" 7020000010
+mark_compile_succeeded "$assembly_success_dir" 1020000010
+write_expected_assembly_argv "$assembly_success_dir"
+run_runner assemble --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout" 2>"$case_stderr"
+jq -e '
+  .schema_version == 1 and .status == "succeeded" and .attempts == 1 and
+  .failure_reason == null and .input_basin_ids == ["1020000010","7020000010"] and
+  .output_path == "assembly/dataset" and .report_path == "reports/assembly.json"
+' "$assembly_success_dir/state/assembly.json" >/dev/null
+jq -e --arg campaign equal '
+  . == {
+    schema_version:1,
+    campaign:$campaign,
+    input_basin_ids:["1020000010","7020000010"],
+    input_dataset_paths:["basin-outputs/1020000010","basin-outputs/7020000010"],
+    output_path:"assembly/dataset"
+  }
+' "$assembly_success_dir/reports/assembly.json" >/dev/null
+[[ -d "$assembly_success_dir/assembly/dataset" ]] ||
+    die 'assembly success did not publish the dataset'
+[[ ! -e "$assembly_success_dir/assembly/dataset/assembly.json" ]] ||
+    die 'runner-owned assembly report was placed beneath the dataset'
+pass 'assembly succeeds with exact sorted repeated-input argv and external report'
+
+for rejected_verb in assemble assembly; do
+    literal_status=0
+    "$test_tmp/fake-hfx" "$rejected_verb" --strict --sample-pct 100 --format text \
+        >"$case_stdout" 2>"$case_stderr" || literal_status=$?
+    [[ "$literal_status" -eq 74 ]] ||
+        die "fake-hfx literal $rejected_verb verb exited $literal_status instead of 74"
+done
+
+assembly_empty_root=$(new_assembly_workspace assembly-empty)
+assembly_empty_dir=$assembly_empty_root/tdx-hydro-equal
+cp "$assembly_empty_dir/state/assembly.json" "$test_tmp/assembly-empty-state-before"
+empty_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+empty_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'assembly without compiled basins' assemble --campaign equal --workspace-root "$assembly_empty_root"
+assert_contains "$case_stderr" 'hfx: error: assembly requires at least one basin with compile status succeeded'
+diff -u "$test_tmp/assembly-empty-state-before" "$assembly_empty_dir/state/assembly.json"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$empty_adapter_lines" ]] ||
+    die 'empty assembly invoked the adapter'
+[[ $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$empty_hfx_lines" ]] ||
+    die 'empty assembly invoked HFX'
+[[ ! -e "$assembly_empty_dir/assembly/dataset" &&
+   ! -e "$assembly_empty_dir/reports/assembly.json" ]] ||
+    die 'empty assembly created an artifact'
+[[ $(find "$assembly_empty_dir/assembly" -mindepth 1 -maxdepth 1 ! -name scratch | wc -l | tr -d ' ') -eq 0 ]] ||
+    die 'empty assembly created a staging entry'
+pass 'assembly refuses an empty compiled-basin selection without mutation'
+
+assembly_adopt_root=$(new_assembly_workspace assembly-adopt)
+assembly_adopt_dir=$assembly_adopt_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_adopt_dir" 7020000010
+mark_compile_succeeded "$assembly_adopt_dir" 1020000010
+write_assembly_state_fixture "$assembly_adopt_dir" running 1 ''
+create_assembly_dataset_fixture "$assembly_adopt_dir/assembly/dataset"
+run_runner recover --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+adopt_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+adopt_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$adopt_assemble_before" ]] ||
+    die 'attributable adoption invoked assemble'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((adopt_validate_before + 1)) ]] ||
+    die 'attributable adoption did not validate exactly once'
+jq -e '.status == "succeeded" and .attempts == 1' "$assembly_adopt_dir/state/assembly.json" >/dev/null
+[[ -f "$assembly_adopt_dir/reports/assembly.json" ]] ||
+    die 'attributable adoption did not regenerate the report'
+pass 'recover adopts a verified destination with attributable interrupted provenance'
+
+assembly_refuse_root=$(new_assembly_workspace assembly-refuse)
+assembly_refuse_dir=$assembly_refuse_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_refuse_dir" 7020000010
+mark_compile_succeeded "$assembly_refuse_dir" 1020000010
+mkdir "$assembly_refuse_dir/assembly/dataset"
+printf '%s\n' preserve >"$assembly_refuse_dir/assembly/dataset/canary"
+refuse_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+refuse_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'unverified assembly destination' assemble --campaign equal --workspace-root "$assembly_refuse_root"
+assert_contains "$case_stderr" 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+[[ $(<"$assembly_refuse_dir/assembly/dataset/canary") == preserve ]] ||
+    die 'unverified destination was modified'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$refuse_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$refuse_hfx_lines" ]] ||
+    die 'unverified destination refusal invoked validation'
+[[ ! -e "$assembly_refuse_dir/reports/assembly.json" ]] ||
+    die 'unverified destination refusal created a report'
+jq -e '.attempts == 0' "$assembly_refuse_dir/state/assembly.json" >/dev/null
+pass 'assembly preserves and refuses an unverified existing destination'
+
+assembly_retry_root=$(new_assembly_workspace assembly-retry)
+assembly_retry_dir=$assembly_retry_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_retry_dir" 7020000010
+mark_compile_succeeded "$assembly_retry_dir" 1020000010
+write_expected_assembly_argv "$assembly_retry_dir"
+cp -R "$assembly_retry_dir/state/basins" "$test_tmp/retry-basins-before"
+HFX_TEST_FAIL_ASSEMBLY=1 expect_failure 'injected assembly failure' \
+    assemble --campaign equal --workspace-root "$assembly_retry_root"
+jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "adapter assembly failed"' \
+    "$assembly_retry_dir/state/assembly.json" >/dev/null
+[[ ! -e "$assembly_retry_dir/assembly/dataset" &&
+   ! -e "$assembly_retry_dir/reports/assembly.json" ]] ||
+    die 'adapter assembly failure left a dataset or report'
+diff -ru "$test_tmp/retry-basins-before" "$assembly_retry_dir/state/basins"
+retry_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_retry_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((retry_assemble_before + 1)) ]] ||
+    die 'assembly retry did not issue exactly one fresh assemble vector'
+jq -e '.status == "succeeded" and .attempts == 2' "$assembly_retry_dir/state/assembly.json" >/dev/null
+pass 'adapter assembly failure is isolated and a clean retry converges'
+
+assembly_stage_root=$(new_assembly_workspace assembly-stage)
+assembly_stage_dir=$assembly_stage_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_stage_dir" 7020000010
+mark_compile_succeeded "$assembly_stage_dir" 1020000010
+write_assembly_state_fixture "$assembly_stage_dir" running 1 ''
+mkdir "$assembly_stage_dir/assembly/.dataset.tmp-interrupted"
+printf '%s\n' keep >"$assembly_stage_dir/assembly/unrelated"
+run_runner recover --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
+write_expected_assembly_argv "$assembly_stage_dir"
+run_runner assemble --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
+[[ ! -e "$assembly_stage_dir/assembly/.dataset.tmp-interrupted" ]] ||
+    die 'attributable interrupted staging was not removed'
+[[ $(<"$assembly_stage_dir/assembly/unrelated") == keep ]] ||
+    die 'unrelated assembly entry changed'
+jq -e '.status == "succeeded" and .attempts == 2' "$assembly_stage_dir/state/assembly.json" >/dev/null
+pass 'recover removes only attributable adapter staging before retry'
+
+cp "$assembly_success_dir/reports/assembly.json" "$test_tmp/assembly-success-report-before"
+success_attempts_before=$(jq -r '.attempts' "$assembly_success_dir/state/assembly.json")
+success_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
+success_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
+run_runner assemble --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+[[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$success_assemble_before" ]] ||
+    die 'succeeded assembly resume invoked assemble'
+[[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((success_validate_before + 1)) ]] ||
+    die 'succeeded assembly resume did not validate exactly once'
+[[ $(jq -r '.attempts' "$assembly_success_dir/state/assembly.json") -eq "$success_attempts_before" ]] ||
+    die 'succeeded assembly resume incremented attempts'
+diff -u "$test_tmp/assembly-success-report-before" "$assembly_success_dir/reports/assembly.json"
+run_runner status --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+assert_contains "$case_stdout" 'assemble_pending=0'
+assert_contains "$case_stdout" 'assemble_running=0'
+assert_contains "$case_stdout" 'assemble_succeeded=1'
+assert_contains "$case_stdout" 'assemble_failed=0'
+assembly_changed_root=$test_tmp/workspaces/assembly-changed
+mkdir "$assembly_changed_root"
+cp -R "$assembly_success_dir" "$assembly_changed_root/tdx-hydro-equal"
+assembly_changed_dir=$assembly_changed_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_changed_dir" 1020011530
+changed_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+changed_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'changed succeeded assembly input set' \
+    assemble --campaign equal --workspace-root "$assembly_changed_root"
+assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
+jq -e '
+  .status == "failed" and .attempts == 1 and
+  .failure_reason == "existing succeeded assembly failed resume verification; retained for inspection" and
+  .input_basin_ids == ["1020000010","7020000010"]
+' "$assembly_changed_dir/state/assembly.json" >/dev/null
+[[ -d "$assembly_changed_dir/assembly/dataset" &&
+   -f "$assembly_changed_dir/reports/assembly.json" ]] ||
+    die 'changed succeeded input set did not preserve assembly artifacts'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$changed_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$changed_hfx_lines" ]] ||
+    die 'changed succeeded input set invoked adapter or HFX'
+pass 'succeeded assembly resumes by verification without report or attempt mutation'
+
+assembly_invalid_root=$(new_assembly_workspace assembly-invalid)
+assembly_invalid_dir=$assembly_invalid_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_invalid_dir" 7020000010
+mark_compile_succeeded "$assembly_invalid_dir" 1020000010
+write_expected_assembly_argv "$assembly_invalid_dir"
+cp -R "$assembly_invalid_dir/state/basins" "$test_tmp/invalid-basins-before"
+HFX_TEST_FAIL_ASSEMBLY_VALIDATE=1 expect_failure 'post-assembly validation failure' \
+    assemble --campaign equal --workspace-root "$assembly_invalid_root"
+assert_contains "$case_stderr" 'assembled dataset validation failed; retained for inspection'
+jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "assembled dataset validation failed; retained for inspection"' \
+    "$assembly_invalid_dir/state/assembly.json" >/dev/null
+[[ -d "$assembly_invalid_dir/assembly/dataset" &&
+   ! -e "$assembly_invalid_dir/reports/assembly.json" ]] ||
+    die 'post-validation failure did not retain only the dataset'
+diff -ru "$test_tmp/invalid-basins-before" "$assembly_invalid_dir/state/basins"
+invalid_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+invalid_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+expect_failure 'post-validation artifact rerun' assemble --campaign equal --workspace-root "$assembly_invalid_root"
+assert_contains "$case_stderr" 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$invalid_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$invalid_hfx_lines" ]] ||
+    die 'post-validation artifact rerun invoked adapter or HFX'
+pass 'post-assembly validation failure retains evidence and refuses rerun'
+
+assembly_hfx_end=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+tail -n $((assembly_hfx_end - assembly_hfx_start)) "$HFX_TEST_HFX_LOG" >"$test_tmp/assembly-hfx-delta"
+if grep -Ev $'/assembly/dataset\t--strict\t--sample-pct\t100\t--format\ttext$' \
+    "$test_tmp/assembly-hfx-delta" >"$case_stdout"; then
+    die 'assembly HFX delta contains a non-validation vector'
+fi
+[[ $(wc -l <"$test_tmp/assembly-hfx-delta" | tr -d ' ') -eq 5 ]] ||
+    die 'assembly cases produced an unexpected HFX validation count'
+if grep -Ev '^(build|validate|assemble)[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >"$case_stdout"; then
+    die 'adapter log contains an unknown command after assembly cases'
+fi
+if grep -E '^assembly[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >/dev/null; then
+    die 'adapter log contains the rejected assembly misspelling'
+fi
 
 cp "$HFX_TEST_ADAPTER_LOG" "$test_tmp/adapter-before-new-paths"
 cp "$HFX_TEST_HFX_LOG" "$test_tmp/hfx-before-new-paths"
@@ -2073,15 +3044,10 @@ pass 'initial extra or wrong-size inventory and post-upload size mismatch are re
 
 diff -u "$test_tmp/adapter-before-new-paths" "$HFX_TEST_ADAPTER_LOG"
 diff -u "$test_tmp/hfx-before-new-paths" "$HFX_TEST_HFX_LOG"
-if grep -En '(^|[^[:alnum:]_])assemble_hfx([^[:alnum:]_]|$)' "$runner" ||
-   grep -En '^[[:space:]]*(function[[:space:]]+)?(assemble|assembly)[[:space:]]*(\(\))?[[:space:]]*\{' "$runner" ||
-   grep -En '^[[:space:]]*(assemble|assembly)(\|[^)]*)?\)[[:space:]]' "$runner"; then
-    die 'runner defines or dispatches an assembly entrypoint'
-fi
 if grep -F 'never-publish' "$aws_log" >/dev/null; then
     die 'publication exposed the per-basin canary'
 fi
-pass 'publication never invokes or defines assembly and never consults adapter or HFX'
+pass 'publication never invokes assembly and never consults adapter or HFX'
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||

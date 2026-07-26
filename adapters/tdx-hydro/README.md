@@ -58,6 +58,8 @@ Degenerate reaches do not change unit selection or contraction. A polygon-bearin
 
 Tree topology is enforced, not inferred from the manifest declaration. The adapter rejects native self-links, missing downstream targets, cycles, duplicate `LINKNO` rows, and duplicate rows that imply a bifurcation. It then verifies that every emitted unit has at most one downstream edge and that the contracted emitted relation is acyclic. A violation is a fatal build error.
 
+Catchment and graph bbox columns are identical float32 coverings rounded outward from each catchment's exact float64 geometry bounds. Each per-basin manifest bbox is the component-wise union of the emitted catchment covering columns, with the selected float32 values widened exactly to float64 for JSON. The manifest therefore equals the validator's catchment-column union while enclosing the source geometries.
+
 ## Reach orientation and outlets
 
 For every healthy native reach whose `DSLINKNO` names a successor, the adapter compares both endpoints of the reach with the distinct endpoint coordinates of that immediate native successor. Orientation ambiguity is decided from the reach's own endpoints: if matches use exactly one reach endpoint, that exact source coordinate is the proven downstream endpoint. The successor endpoint need not be unique. TDX-Hydro contains many nonzero reaches shorter than twice the default `0.001`-degree coincidence tolerance, approximately 222 m, so one endpoint of a predecessor can legitimately coincide within tolerance with both endpoints of its short successor. This successor-side multi-match is accepted and reported; it does not make the predecessor's orientation ambiguous.
@@ -100,7 +102,7 @@ The adapter always writes `aux/snap_stems.parquet` and declares it as `hfx.aux.s
 
 Each selected stem preserves its normalized source LineString. Its `unit_id` is the corresponding Global LINKNO. Stems are ordered by centroid Hilbert distance over the fixed EPSG:4326 world domain `[-180, -90, 180, 90]`, with `unit_id` as the deterministic tie-break, and receive sequential `id` values from 1 through N after ordering.
 
-For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer expands a zero-width or zero-height float32 bbox by the existing metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
+Snap bbox columns are float32 coverings rounded outward from exact float64 geometry bounds. For a polygon-bearing degenerate reach, the snap row preserves the original two identical vertices. The writer then expands each dimension that was degenerate in the exact bounds by the existing float32 metadata epsilon so the covering remains ordered; that bbox operation does not alter the WKB geometry and is not a geometry repair.
 
 `weight` is the same empirically normalized inclusive `DSContArea` in km2 used by `up_area_km2`, stored as float32. The manifest records this exact producer definition:
 
@@ -157,6 +159,45 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.streamnet.trusted_orientation_polygon_bearing_isolated_root_count`
 - `diagnostics.streamnet.trusted_orientation_polygon_bearing_isolated_root_native_linknos`
 - `diagnostics.streamnet.orientation_tolerance`
+- `diagnostics.memory.target_bytes`
+- `diagnostics.memory.measurement_available`
+- `diagnostics.memory.unavailable_reason`
+- `diagnostics.memory.observed_peak_rss_bytes`
+- `diagnostics.memory.high_water_rss_bytes`
+- `diagnostics.memory.sample_interval_ms`
+- `diagnostics.memory.measurement_method`
+- `diagnostics.memory.peak_scratch_bytes`
+- `diagnostics.memory.scratch_high_water_bytes`
+- `diagnostics.memory.scratch_measurement_available`
+- `diagnostics.memory.scratch_unavailable_reason`
+- `diagnostics.memory.basins_rows`
+- `diagnostics.memory.streamnet_rows`
+- `diagnostics.memory.basins_geometry_count`
+- `diagnostics.memory.streamnet_geometry_count`
+- `diagnostics.memory.basins_coordinate_count`
+- `diagnostics.memory.streamnet_coordinate_count`
+- `diagnostics.memory.basins_input_bytes`
+- `diagnostics.memory.streamnet_input_bytes`
+- `diagnostics.memory.selected_dtypes.native_id`
+- `diagnostics.memory.selected_dtypes.downstream_native_id`
+- `diagnostics.memory.selected_dtypes.global_id`
+- `diagnostics.memory.selected_dtypes.dscontarea`
+- `diagnostics.memory.selected_dtypes.hilbert`
+- `diagnostics.memory.selected_dtypes.flags`
+
+The phase keys are `basins_load`, `streamnet_load`, `source_validate`,
+`basins_clamp`, `streamnet_clamp`, `source_post_clamp_validate`,
+`dscontarea_infer`, `topology`, `catchment_run_creation`,
+`catchment_graph_merge_write`, `snap_run_creation`, and `snap_merge_write`.
+Every `diagnostics.memory.phases.<phase>` object has exactly
+`start_rss_bytes`, `end_rss_bytes`, `peak_rss_bytes`,
+`allocation_delta_bytes`, `max_intra_phase_increase_bytes`, and
+`sample_count`.
+
+RSS and scratch measurement can be unavailable on non-Linux developer
+platforms. Missing evidence is represented by `null` numeric leaves plus a
+concrete unavailable reason, never by zero. `manifest.json` construction and
+write are outside these phases and the memory block is report-only.
 
 The adapter emits a warning for each nonzero clamp, including the layer, altered vertex count, and native IDs. After compilation it emits separate warnings for nonzero `contracted_edge_count`, `contracted_root_count`, `contracted_link_traversal_count`, and `polygonless_dropped_reach_count`. It emits three dedicated nonzero degenerate-reach warnings, each with a count and sorted native LINKNOs: all degenerate reaches, the polygon-bearing subset, and the polygon-less subset. It emits dedicated warnings with sorted native LINKNOs for nonzero `short_successor_resolved_reach_count` and `reach_side_near_degenerate_resolved_reach_count`; these fields exclude exact M4-S2 degeneracy and do not redefine M4-S3 area diagnostics. It also warns separately for nonzero trusted healthy isolated-root counts, including native LINKNO values, both for all healthy isolated native roots and for the polygon-bearing subset. The empirical area-unit decision, candidate-error ratio, visible raster-versus-vector divergence metrics, and complete streamnet summary are informational logs. Validity outside the exact two-identical-vertex source convention, native-successor non-coincidence, reach-side ambiguity beyond the bounded near-degenerate rule, conflicting definite root predecessor matches, and other contract failures raise errors rather than warnings.
 
@@ -211,10 +252,13 @@ references, and the declared snap auxiliary contract. Attribution files are
 staged byte-identically.
 
 Only the exact set of all 62 processing-basin crosswalk entries omits `region`
-and claims `bbox = [-180, -90, 180, 90]`. Every proper subset receives
+and claims the independently exact planetary declaration
+`bbox = [-180, -90, 180, 90]`. Every proper subset receives
 `tdx-hydro-partial-<digest>`, where the digest is the first 12 hexadecimal
 characters of SHA-256 over the sorted region keys joined by commas, with no
-trailing separator, and its bbox is the float32 covering union. For example,
+trailing separator. Its manifest bbox is the exact union of child
+covering-union manifest bboxes and therefore exactly equals the union of the
+copied float32 catchment columns. For example,
 regions `7020000010,7020014250` produce digest `afd4ffb0b736` and region
 `tdx-hydro-partial-afd4ffb0b736`.
 

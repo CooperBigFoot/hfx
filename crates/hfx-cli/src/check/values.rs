@@ -274,7 +274,7 @@ mod tests {
     use crate::dataset::CatchmentsData;
     use crate::reader::manifest::RawManifest;
 
-    use super::check_up_area_consistency;
+    use super::{check_bbox_enclosure, check_up_area_consistency};
 
     fn manifest(has_up_area: bool) -> RawManifest {
         RawManifest {
@@ -337,5 +337,19 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].check_id, "values.up_area_unexpected");
+    }
+
+    #[test]
+    fn bbox_enclosure_allows_exact_widened_float32_boundary() {
+        let maxx = -11.442605_f32;
+        let mut raw_manifest = manifest(false);
+        raw_manifest.bbox = Some(vec![-20.0, -1.0, f64::from(maxx), 1.0]);
+        let mut data = catchments(1, 1, None);
+        data.bboxes = vec![[-20.0, -1.0, maxx, 1.0]];
+
+        assert_eq!(f64::from(maxx).to_bits(), 0xc026e29d20000000);
+        let diagnostics = check_bbox_enclosure(&raw_manifest, &data);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 }
