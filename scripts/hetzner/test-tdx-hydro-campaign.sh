@@ -259,7 +259,7 @@ if [[ -x /bin/bash && "$selected_bash" != /bin/bash ]]; then
     die 'the harness did not select /bin/bash'
 fi
 
-for command_name in jq grep diff find sort wc mktemp mkdir mkfifo cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
+for command_name in jq grep diff find sort wc mktemp mkdir mkfifo cp rm mv chmod tr sed ln touch git sleep head tail cmp perl; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
@@ -268,11 +268,13 @@ done
 [[ -f "$inventory" ]] || die "inventory is missing: $inventory"
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/hfx-tdx-campaign-test.XXXXXX")
+mutation_runner=
 case $test_tmp in
     "${TMPDIR:-/tmp}"/hfx-tdx-campaign-test.*) ;;
     *) die "mktemp returned an unsafe path: $test_tmp" ;;
 esac
 cleanup() {
+    [[ -z "${mutation_runner-}" || ! -e "$mutation_runner" ]] || rm -f -- "$mutation_runner"
     case ${test_tmp-} in
         "${TMPDIR:-/tmp}"/hfx-tdx-campaign-test.*)
             [[ -d "$test_tmp" && ! -L "$test_tmp" ]] && rm -rf -- "$test_tmp"
@@ -282,6 +284,17 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir "$test_tmp/fake-bin" "$test_tmp/invocations" "$test_tmp/workspaces"
+if [[ -n "${HFX_TEST_MUTATION_FROM-}" ]]; then
+    [[ $(grep -Fxc -- "$HFX_TEST_MUTATION_FROM" "$runner") -eq 1 ]] ||
+        die 'mutation anchor must occur exactly once'
+    mutation_runner=$SCRIPT_DIR/.tdx-hydro-campaign.mutated.$$
+    cp "$runner" "$mutation_runner"
+    HFX_TEST_MUTATION_FROM=$HFX_TEST_MUTATION_FROM HFX_TEST_MUTATION_TO=${HFX_TEST_MUTATION_TO-} \
+        perl -0pi -e 's/^\Q$ENV{HFX_TEST_MUTATION_FROM}\E$/$ENV{HFX_TEST_MUTATION_TO}/m' \
+        "$mutation_runner"
+    runner=$mutation_runner
+    unset HFX_TEST_MUTATION_FROM HFX_TEST_MUTATION_TO
+fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-before"
 case_stdout=$test_tmp/stdout
 case_stderr=$test_tmp/stderr
@@ -326,11 +339,15 @@ passed=0
 skipped=0
 
 calibration_fake_setup() {
-    [[ -x "$test_tmp/fake-curl" ]] && return
-    sed -n "/^printf 'SQLite format 3/,/^export HFX_TEST_DIFF=/p" "$0" >"$test_tmp/calibration-fake-setup"
-    [[ -s "$test_tmp/calibration-fake-setup" ]] || die 'calibration fake setup extraction was empty'
-    source "$test_tmp/calibration-fake-setup"
+    if [[ ! -x "$test_tmp/fake-curl" ]]; then
+        sed -n "/^printf 'SQLite format 3/,/^export HFX_TEST_DIFF=/p" "$0" >"$test_tmp/calibration-fake-setup"
+        [[ -s "$test_tmp/calibration-fake-setup" ]] || die 'calibration fake setup extraction was empty'
+        source "$test_tmp/calibration-fake-setup"
+    fi
     [[ -n "${HFX_TDX_ADAPTER_PYTHON-}" ]] || die 'calibration fake adapter was not installed'
+    if [[ $(wc -c <"$HFX_TEST_GPKG_TEMPLATE" | tr -d ' ') -eq 24 ]]; then
+        printf '123456789012345678901234' >>"$HFX_TEST_GPKG_TEMPLATE"
+    fi
 }
 
 calibration_new_campaign() {
@@ -359,7 +376,7 @@ calibration_measurement_json() {
       raw:{start_timestamp_seconds:100,end_timestamp_seconds:110,bytes:10000000,
         elapsed_seconds:10,retries:0,throughput_bytes_per_second:1000000},
       steady_state:{start_timestamp_seconds:100,end_timestamp_seconds:101,start_bytes:0,
-        end_bytes:$throughput,bytes:$throughput,elapsed_seconds:1,
+        attempts:[1],end_bytes:$throughput,bytes:$throughput,elapsed_seconds:1,
         throughput_bytes_per_second:$throughput,compile_completions:$completions,
         compile_wall_seconds:(if $completions == 0 then 0 else 1 end)},
       excluded_drain_tail:{start_timestamp_seconds:101,end_timestamp_seconds:110,
@@ -380,6 +397,7 @@ calibration_write_state() {
        attempts:(if $status == "pending" then 0 else 1 end),
        measurement:(if $status == "measured" then $measurement else null end)};
       {schema_version:1,fabric_version:"fixture-v1",selected_max_parallel:$selected,
+       selected_throughput_validity:(if $selected == null then null else "compile-observed" end),
        cohorts:{"parallel-2":cohort(2;"1020011530 3020003790 6020006540 8020008900";$p2),
                 "parallel-4":cohort(4;"2020003440 4020006940 7020014250 9020000010";$p4)}}' \
         >"$dir/state/calibration.json"
@@ -432,7 +450,7 @@ calibration_prepare_workers() {
 calibration_complete() {
     local name=$1
     local parallel=$2
-    calibration_prepare_workers
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
     calibration_run "$name" "$parallel" >"$case_stdout" 2>"$case_stderr" || {
         sed 's/^/calibration stdout: /' "$case_stdout" >&2
         sed 's/^/calibration complete: /' "$case_stderr" >&2
@@ -460,13 +478,16 @@ calibration_cohort_case() {
             calibration_run calibration-matrix "$parallel" >"$case_stdout"
             assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
         else
-            HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 \
-                expect_failure "calibration matrix $p2/$p4" calibrate \
-                --campaign calibration-matrix --workspace-root "$calibration_root" \
-                --max-parallel "$parallel" --fabric-version fixture-v1
             if [[ "$expected" == disk ]]; then
+                HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 \
+                    expect_failure "calibration matrix $p2/$p4" calibrate \
+                    --campaign calibration-matrix --workspace-root "$calibration_root" \
+                    --max-parallel "$parallel" --fabric-version fixture-v1
                 assert_contains "$case_stderr" 'insufficient calibration disk'
             else
+                expect_failure "calibration matrix $p2/$p4" calibrate \
+                    --campaign calibration-matrix --workspace-root "$calibration_root" \
+                    --max-parallel "$parallel" --fabric-version fixture-v1
                 assert_contains "$case_stderr" 'calibration cohort status ordering is malformed'
             fi
             cmp "$test_tmp/matrix-before" "$calibration_dir/state/calibration.json"
@@ -495,6 +516,16 @@ calibration_cohort_case() {
         jq -cS '.cohorts["parallel-4"]' "$calibration_dir/state/calibration.json" >"$test_tmp/p4-after"
         cmp "$test_tmp/p4-before" "$test_tmp/p4-after"
     done
+    calibration_write_state "$calibration_dir" measured measured 2
+    jq '.cohorts["parallel-2"].measurement.raw.bytes=40000000000 |
+        .cohorts["parallel-2"].measurement.raw.throughput_bytes_per_second=4000000000 |
+        .cohorts["parallel-2"].measurement.excluded_drain_tail.end_bytes=40000000000 |
+        .cohorts["parallel-2"].measurement.excluded_drain_tail.bytes=
+          (40000000000-.cohorts["parallel-2"].measurement.excluded_drain_tail.start_bytes)' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/large"
+    mv "$calibration_dir/state/tmp/large" "$calibration_dir/state/calibration.json"
+    calibration_run calibration-matrix 2 >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
     calibration_new_campaign calibration-admission
     cp -R "$calibration_dir/state/basins" "$test_tmp/admission-basins"
     HFX_TEST_PIPELINE_AVAILABLE_BYTES=61989017472 \
@@ -523,11 +554,11 @@ calibration_measurement_case() {
     calibration_new_campaign calibration-measurement
     calibration_complete calibration-measurement 2
     jq -e '.cohorts["parallel-2"] |
-      .status == "measured" and .measurement.raw.bytes > 0 and
-      .measurement.steady_state.bytes > 0 and
+      .status == "measured" and .measurement.raw.bytes == 384 and
+      .measurement.steady_state.end_bytes > .measurement.steady_state.start_bytes and
       .measurement.steady_state.compile_completions > 0' \
         "$calibration_dir/state/calibration.json" >/dev/null ||
-        die 'real parallel-2 calibration measurement differs'
+        die "real parallel-2 calibration measurement differs: $(jq -c '.cohorts["parallel-2"].measurement' "$calibration_dir/state/calibration.json")"
     attempts=$(jq -r '.cohorts["parallel-2"].attempts' "$calibration_dir/state/calibration.json")
     [[ "$attempts" -eq 1 ]] || die 'first calibration did not create attempt one'
     trace=$calibration_dir/state/calibration/parallel-2-attempt-1.samples.tsv
@@ -538,7 +569,7 @@ calibration_measurement_case() {
     mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
     mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
     HFX_TEST_CLOCK_START=140
-    calibration_prepare_workers
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
     unset HFX_TEST_CLOCK_START
     calibration_run calibration-measurement 2 >"$case_stdout"
     jq -e '.cohorts["parallel-2"] |
@@ -552,17 +583,66 @@ calibration_measurement_case() {
         die 'terminal replay did not clamp the corrected-end byte regression'
     [[ ! -e "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ]] ||
         die 'terminal replay scheduled a new attempt'
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n112\t144\t1\t2\t2\n113\t144\t0\t2\t2\n' >"$trace"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    [[ $(jq -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' \
+        "$calibration_dir/state/calibration.json") -eq 13 ]] ||
+        die 'single-attempt corrected throughput differs from 144 bytes over 11 seconds'
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n' >"$trace"
+    printf '110\t0\t2\t0\t0\n121\t144\t1\t2\t2\n122\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=2 |
+        .cohorts["parallel-2"].measurement=null' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"].measurement.steady_state |
+      .bytes == 144 and .elapsed_seconds == 11 and .throughput_bytes_per_second == 13 and
+      .attempts == [1,2]' "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'inter-attempt idle time diluted corrected throughput'
+    printf '110\t0\t1\t0\t0\n121\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"].measurement.steady_state |
+      .elapsed_seconds > 0 and .bytes > 0 and .compile_completions == 0' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'narrow resume did not retain an explicitly invalid nonzero fallback interval'
+    printf '140\t384\t0\t2\t2\n' >>"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    before=$(wc -l <"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" | tr -d ' ')
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    [[ $(wc -l <"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" | tr -d ' ') -eq "$before" ]] ||
+        die 'terminal sample de-duplication appended an identical record'
     calibration_write_state "$calibration_dir" measured measured null
-    jq --argjson p2 "$(calibration_measurement_json 1050000 2)" \
+    jq --argjson p2 "$(calibration_measurement_json 1000000 2)" \
         --argjson p4 "$(calibration_measurement_json 1100000 0)" \
         '.cohorts["parallel-2"].measurement=$p2 | .cohorts["parallel-4"].measurement=$p4 |
-         .selected_max_parallel=2' "$calibration_dir/state/calibration.json" \
+         .selected_max_parallel=2 | .selected_throughput_validity="compile-observed"' "$calibration_dir/state/calibration.json" \
         >"$calibration_dir/state/tmp/ranking"
     mv "$calibration_dir/state/tmp/ranking" "$calibration_dir/state/calibration.json"
     calibration_run calibration-measurement 2 >"$case_stdout"
     assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
     jq --argjson p2 "$(calibration_measurement_json 1044999 2)" \
-        '.cohorts["parallel-2"].measurement=$p2 | .selected_max_parallel=4' \
+        '.cohorts["parallel-2"].measurement=$p2 |
+         .cohorts["parallel-4"].measurement.steady_state.compile_completions=2 |
+         .cohorts["parallel-4"].measurement.steady_state.compile_wall_seconds=1 |
+         .selected_max_parallel=4 | .selected_throughput_validity="compile-observed"' \
         "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/ranking"
     mv "$calibration_dir/state/tmp/ranking" "$calibration_dir/state/calibration.json"
     calibration_run calibration-measurement 4 >"$case_stdout"
@@ -582,6 +662,7 @@ calibration_replay_case() {
         >"$calibration_dir/state/calibration/parallel-2.json"
     printf '100\t0\t2\t0\t0\n101\t1\t1\t0\t0\n' \
         >"$calibration_dir/state/calibration/parallel-2-attempt-1.samples.tsv"
+    printf 'orphan\n' >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
     build_before=$(grep -c '^build' "$test_tmp/invocations/adapter.log" || :)
     HFX_TEST_CLOCK_START=110
     calibration_complete calibration-replay 2
@@ -592,8 +673,10 @@ calibration_replay_case() {
         die 'running calibration did not resume in attempt two over the ordered concatenation'
     [[ -s "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ]] ||
         die 'resumed calibration did not retain attempt two'
+    ! grep -q orphan "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ||
+        die 'orphan attempt trace was not adopted and truncated'
     calibration_complete calibration-replay 4
-    jq -e '(.selected_max_parallel == 2 or .selected_max_parallel == 4) and
+    jq -e '.selected_max_parallel == 2 and .selected_throughput_validity == "compile-observed" and
       ([.cohorts[].status] | all(. == "measured"))' \
         "$calibration_dir/state/calibration.json" >/dev/null ||
         die 'both cohorts did not freeze the five-percent selection'
@@ -608,6 +691,18 @@ calibration_replay_case() {
     calibration_run calibration-replay 4 >"$case_stdout"
     [[ $(wc -l <"$test_tmp/invocations/adapter.log" | tr -d ' ') -eq "$before" ]] ||
         die 'measured replay rescheduled paid work'
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    jq '.basins["2020003440"]=.basins["1020011530"] |
+        .basin_ids=(.basins|keys)' "$calibration_dir/state/pipeline.json" \
+        >"$calibration_dir/state/tmp/production-pipeline"
+    mv "$calibration_dir/state/tmp/production-pipeline" "$calibration_dir/state/pipeline.json"
+    calibration_run calibration-replay 2 >"$case_stdout" 2>"$case_stderr" || {
+        sed 's/^/unrelated pipeline: /' "$case_stderr" >&2
+        die 'measured replay with unrelated pipeline failed'
+    }
+    [[ -f "$calibration_dir/state/pipeline.json" &&
+        ! -e "$calibration_dir/state/calibration/parallel-2-pipeline.json" ]] ||
+        die 'calibration finalization relocated unrelated production pipeline state'
     calibration_selected=$(jq -r '.selected_max_parallel' "$calibration_dir/state/calibration.json")
     [[ "$calibration_selected" -eq 2 ]] && calibration_wrong=4 || calibration_wrong=2
     expect_failure 'pipeline parallelism differs from calibration' pipeline \
@@ -622,6 +717,7 @@ calibration_disclosure_case() {
     sed >"$expected" <<'DISCLOSURE'
 calibration_fabric_version=fixture-v1
 calibration_selected_max_parallel=2
+calibration_selected_throughput_validity=compile-observed
 calibration_parallel_2_status=measured
 calibration_parallel_2_raw_start_timestamp_seconds=100
 calibration_parallel_2_raw_end_timestamp_seconds=110
@@ -631,6 +727,7 @@ calibration_parallel_2_raw_retries=0
 calibration_parallel_2_raw_throughput_bytes_per_second=1000000
 calibration_parallel_2_steady_start_timestamp_seconds=100
 calibration_parallel_2_steady_end_timestamp_seconds=101
+calibration_parallel_2_steady_attempts=1
 calibration_parallel_2_steady_start_bytes=0
 calibration_parallel_2_steady_end_bytes=1000000
 calibration_parallel_2_steady_bytes=1000000
@@ -653,6 +750,7 @@ calibration_parallel_4_raw_retries=0
 calibration_parallel_4_raw_throughput_bytes_per_second=1000000
 calibration_parallel_4_steady_start_timestamp_seconds=100
 calibration_parallel_4_steady_end_timestamp_seconds=101
+calibration_parallel_4_steady_attempts=1
 calibration_parallel_4_steady_start_bytes=0
 calibration_parallel_4_steady_end_bytes=1000000
 calibration_parallel_4_steady_bytes=1000000
@@ -667,7 +765,7 @@ calibration_parallel_4_drain_end_bytes=10000000
 calibration_parallel_4_drain_bytes=9000000
 calibration_parallel_4_drain_elapsed_seconds=9
 DISCLOSURE
-    [[ $(wc -l <"$expected" | tr -d ' ') -eq 46 ]] || die 'calibration disclosure fixture does not contain 46 lines'
+    [[ $(wc -l <"$expected" | tr -d ' ') -eq 49 ]] || die 'calibration disclosure fixture does not contain 49 lines'
     calibration_fake_setup
     calibration_new_campaign calibration-disclosure
     calibration_write_state "$calibration_dir" measured measured 2
@@ -688,13 +786,18 @@ DISCLOSURE
     mv "$calibration_dir/state/tmp/calibration.saved" "$calibration_dir/state/calibration.json"
     cmp "$test_tmp/status-with-calibration" "$test_tmp/status-without-calibration"
     cmp "$test_tmp/progress-with-calibration" "$test_tmp/progress-without-calibration"
+    cp "$calibration_dir/state/calibration.json" "$calibration_dir/state/tmp/calibration.saved"
+    printf '{\n' >"$calibration_dir/state/calibration.json"
+    run_runner status --campaign calibration-disclosure --workspace-root "$calibration_root" >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_state=malformed'
+    mv "$calibration_dir/state/tmp/calibration.saved" "$calibration_dir/state/calibration.json"
     calibration_run calibration-disclosure 2 >"$case_stdout"
-    tail -n 46 "$case_stdout" >"$test_tmp/disclosure.actual"
+    tail -n 49 "$case_stdout" >"$test_tmp/disclosure.actual"
     cmp "$expected" "$test_tmp/disclosure.actual"
     cp "$case_stdout" "$test_tmp/disclosure.first"
     calibration_run calibration-disclosure 2 >"$case_stdout"
     cmp "$test_tmp/disclosure.first" "$case_stdout"
-    [[ $(tail -n 46 "$case_stdout" | wc -l | tr -d ' ') -eq 46 ]] ||
+    [[ $(tail -n 49 "$case_stdout" | wc -l | tr -d ' ') -eq 49 ]] ||
         die 'calibration disclosure was not the final complete block'
     calibration_new_campaign calibration-disclosure-scheduled
     calibration_complete calibration-disclosure-scheduled 2
@@ -765,6 +868,10 @@ expect_failure 'calibrate parallel three' calibrate --campaign parallel-three --
 expect_failure 'calibrate parallel five' calibrate --campaign parallel-five --workspace-root "$argument_root" --max-parallel 5 --fabric-version fixture-v1
 expect_failure 'calibrate foreign option' calibrate --campaign foreign --workspace-root "$argument_root" --max-parallel 2 --fabric-version fixture-v1 --out nope
 expect_failure 'calibrate malformed fabric' calibrate --campaign fabric --workspace-root "$argument_root" --max-parallel 2 --fabric-version $'bad\nvalue'
+expect_failure 'max parallel usage scope' status --campaign scope --max-parallel 2
+assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire, pipeline, or calibrate'
+expect_failure 'fabric version usage scope' status --campaign scope --fabric-version v1
+assert_contains "$case_stderr" 'option --fabric-version is valid only for compile, compile-basin, pipeline, or calibrate'
 mkdir "$test_tmp/workspaces/symlink-target"
 ln -s "$test_tmp/workspaces/symlink-target" "$test_tmp/workspaces/symlink-root"
 expect_failure 'symlink workspace root' status --campaign symlink --workspace-root "$test_tmp/workspaces/symlink-root"
@@ -4702,11 +4809,11 @@ expect_failure 'pipeline control fabric version' pipeline --campaign pipeline \
     --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version $'bad\nversion'
 expect_failure 'pipeline option ownership max' status --campaign pipeline \
     --workspace-root "$pipeline_root" --max-parallel 2
-assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire or pipeline'
+assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire, pipeline, or calibrate'
 expect_failure 'pipeline option ownership fabric' status --campaign pipeline \
     --workspace-root "$pipeline_root" --fabric-version fixture-v1
 assert_contains "$case_stderr" \
-    'option --fabric-version is valid only for compile, compile-basin, or pipeline'
+    'option --fabric-version is valid only for compile, compile-basin, pipeline, or calibrate'
 retain_pipeline_root=$test_tmp/workspaces/pipeline-retain
 mkdir "$retain_pipeline_root"
 set -- $(subset_init_args retainpipe "$retain_pipeline_root")
