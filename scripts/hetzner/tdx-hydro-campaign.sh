@@ -932,12 +932,16 @@ pipeline_read_timed_out() {
 pipeline_sweep_vanished_workers() {
     local worker_index=0
     local vanished_basin_id
+    local vanished_selected_index
     while ((worker_index < ${#pipeline_worker_pids[@]})); do
         if kill -0 "${pipeline_worker_pids[$worker_index]}" 2>/dev/null; then
             worker_index=$((worker_index + 1))
         else
             pipeline_wait_remove_worker "$worker_index"
             vanished_basin_id=$pipeline_removed_basin_id
+            pipeline_selected_index "$vanished_basin_id"
+            vanished_selected_index=$pipeline_found_index
+            pipeline_swept_completion_statuses[$vanished_selected_index]=$pipeline_wait_status
             pipeline_round_reaped=1
             pipeline_recover_reconstruct_basin "$vanished_basin_id"
         fi
@@ -1063,6 +1067,7 @@ pipeline_campaign() {
     local pipeline_completion_record
     local completion_id
     local completion_status
+    local swept_completion_status
     local pipeline_consumer_basin_id
     local pipeline_round_before
     local pipeline_round_after
@@ -1071,8 +1076,7 @@ pipeline_campaign() {
     pipeline_selected_basin_ids=()
     pipeline_dispatch_attempts=()
     pipeline_consume_attempts=()
-    pipeline_round_snapshot_files=()
-    pipeline_attempt_exhausted=0
+    pipeline_swept_completion_statuses=()
     pipeline_completion_open=0
     pipeline_scheduler_active=1
     trap pipeline_scheduler_signal INT TERM
@@ -1093,16 +1097,13 @@ pipeline_campaign() {
         pipeline_selected_basin_ids[${#pipeline_selected_basin_ids[@]}]=$basin_id
         pipeline_dispatch_attempts[${#pipeline_dispatch_attempts[@]}]=0
         pipeline_consume_attempts[${#pipeline_consume_attempts[@]}]=0
+        pipeline_swept_completion_statuses[${#pipeline_swept_completion_statuses[@]}]=
         pipeline_initial_sweep_count=$((pipeline_initial_sweep_count + 1))
     done < <(effective_basin_ids)
     "$JQ" -e --argjson observed "$pipeline_initial_sweep_count" \
         '(.basin_ids | length) == $observed' \
         "$campaign_dir/state/pipeline.json" >/dev/null ||
         hfx_die "pipeline ordered sweep count differs: observed $pipeline_initial_sweep_count"
-    pipeline_round_snapshot_files[0]=$campaign_dir/state/pipeline.json
-    for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
-        pipeline_round_snapshot_files[${#pipeline_round_snapshot_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
-    done
     pipeline_completion_create_open
     pipeline_completion_open=1
     while :; do
@@ -1110,10 +1111,7 @@ pipeline_campaign() {
         pipeline_round_dispatched=0
         pipeline_round_reaped=0
         pipeline_round_compiled=0
-        pipeline_projected_refused=0
-        pipeline_disk_refused=0
-        pipeline_round_before=$("$JQ" -cS . \
-            ${pipeline_round_snapshot_files[@]+"${pipeline_round_snapshot_files[@]}"})
+        pipeline_round_before=$("$JQ" -cS . "$campaign_dir/state/pipeline.json")
         pipeline_ordered_sweep
         for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
             pipeline_parallel_limit_reached && break
@@ -1124,15 +1122,12 @@ pipeline_campaign() {
             pipeline_selected_index "$basin_id"
             selected_index=$pipeline_found_index
             if ((pipeline_dispatch_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS)); then
-                pipeline_attempt_exhausted=1
                 continue
             fi
             if ! pipeline_projected_occupancy_allows "$basin_id"; then
-                pipeline_projected_refused=1
                 break
             fi
             if ! pipeline_dispatch_disk_guard; then
-                pipeline_disk_refused=1
                 break
             fi
             pipeline_dispatch_attempts[$selected_index]=$((pipeline_dispatch_attempts[$selected_index] + 1))
@@ -1150,7 +1145,6 @@ pipeline_campaign() {
             pipeline_selected_index "$basin_id"
             selected_index=$pipeline_found_index
             if ((pipeline_consume_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS)); then
-                pipeline_attempt_exhausted=1
                 continue
             fi
             pipeline_consumer_basin_id=$basin_id
@@ -1179,9 +1173,19 @@ pipeline_campaign() {
                       ! "$completion_id" =~ ^[0-9]{10}$ ||
                       ! "$completion_status" =~ ^[0-9]+$ ]] ||
                     ((completion_status > 255)) ||
-                    ! pipeline_selected_index "$completion_id" ||
-                    ! pipeline_worker_index "$completion_id"; then
+                    ! pipeline_selected_index "$completion_id"; then
                     hfx_die "malformed pipeline completion record: expected selected basin ID and exit status"
+                fi
+                selected_index=$pipeline_found_index
+                swept_completion_status=${pipeline_swept_completion_statuses[$selected_index]-}
+                if [[ -n "$swept_completion_status" ]]; then
+                    pipeline_swept_completion_statuses[$selected_index]=
+                    if ((swept_completion_status == completion_status)); then
+                        continue
+                    fi
+                fi
+                if ! pipeline_worker_index "$completion_id"; then
+                    continue
                 fi
                 selected_index=$pipeline_found_index
                 pipeline_wait_remove_worker "$selected_index"
@@ -1192,16 +1196,14 @@ pipeline_campaign() {
             fi
             continue
         fi
-        pipeline_round_after=$("$JQ" -cS . \
-            ${pipeline_round_snapshot_files[@]+"${pipeline_round_snapshot_files[@]}"})
+        pipeline_round_after=$("$JQ" -cS . "$campaign_dir/state/pipeline.json")
         [[ "$pipeline_round_before" == "$pipeline_round_after" ]] ||
             pipeline_round_durable_changed=1
         if ((pipeline_round_durable_changed == 0 && pipeline_round_dispatched == 0 &&
              pipeline_round_reaped == 0 && pipeline_round_compiled == 0)); then
-            :
+            pipeline_finish_scheduler
+            break
         fi
-        pipeline_finish_scheduler
-        break
     done
     pipeline_scheduler_cleanup
     trap 'release_takeover_guard; release_lock' EXIT

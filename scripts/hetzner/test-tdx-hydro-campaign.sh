@@ -1313,6 +1313,15 @@ maximum=0
 [ "$active" -le "$maximum" ] || printf '%s\n' "$active" >"$HFX_TEST_TRANSFER_STATE/maximum"
 printf 'start %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
+if [ "${HFX_TEST_REDISPATCH_HOLD_KEY-}" = "$key" ] &&
+   [ -d "$HFX_TEST_TRANSFER_STATE/fail-once-$key" ]; then
+    redispatch_wait=0
+    while [ ! -f "${HFX_TEST_REDISPATCH_RELEASE_MARKER:?}" ]; do
+        redispatch_wait=$((redispatch_wait + 1))
+        [ "$redispatch_wait" -lt 1000 ] || exit 97
+        sleep 0.01
+    done
+fi
 if [ -n "${HFX_TEST_PIPELINE_KILL_KEY-}" ] &&
    [ "$key" = "$HFX_TEST_PIPELINE_KILL_KEY" ] &&
    mkdir "$HFX_TEST_TRANSFER_STATE/kill-once-$key" 2>/dev/null; then
@@ -1444,7 +1453,9 @@ if [ -n "$continue_at" ]; then
             ;;
         *) exit 96 ;;
     esac
-elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
+elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ] ||
+     { [ "${HFX_TEST_FAIL_ONCE_KEY-}" = "$key" ] &&
+       mkdir "$HFX_TEST_TRANSFER_STATE/fail-once-$key" 2>/dev/null; }; then
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
     [ "${HFX_TEST_LEADING_ZERO_LENGTH-}" != 1 ] || total=0$total
     printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
@@ -1567,6 +1578,9 @@ log=${HFX_TEST_ADAPTER_LOG:?}
 command_name=${1-}
 case $command_name in
     build)
+        if [ -n "${HFX_TEST_REDISPATCH_RELEASE_MARKER-}" ]; then
+            : >"$HFX_TEST_REDISPATCH_RELEASE_MARKER"
+        fi
         [ "$#" -eq 13 ] || exit 81
         [ "$2" = --basins ] || exit 82
         basins=$3
@@ -1771,6 +1785,26 @@ if [ "$#" -eq 2 ] &&
           .failure_reason == "interrupted before terminal state; reset by recover"))
    ' "$source_path" >/dev/null 2>&1; then
     : >"${HFX_TEST_KILLED_PENDING_MARKER:?}"
+    if [ -n "${HFX_TEST_STALE_READY_MARKER-}" ]; then
+        stale_wait=0
+        while [ ! -f "$HFX_TEST_STALE_READY_MARKER" ]; do
+            stale_wait=$((stale_wait + 1))
+            [ "$stale_wait" -lt 1000 ] || exit 97
+            sleep 0.01
+        done
+        sleep 6
+    fi
+fi
+if [ "$#" -eq 2 ] &&
+   [ -n "${HFX_TEST_STALE_CURRENT_PATH-}" ] &&
+   [ "$destination_path" = "$HFX_TEST_STALE_CURRENT_PATH" ] &&
+   "${HFX_TEST_REAL_JQ:?}" -e '
+     [.stages.acquire_basins,.stages.acquire_streamnet] |
+     any(.status == "failed")
+   ' "$source_path" >/dev/null 2>&1 &&
+   mkdir "${HFX_TEST_STALE_READY_MARKER:?}.once" 2>/dev/null; then
+    : >"$HFX_TEST_STALE_READY_MARKER"
+    sleep 4
 fi
 exec "${HFX_TEST_REAL_MV:?}" "$@"
 PIPELINE_MV
@@ -5098,7 +5132,29 @@ jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler89/state/pipeline.jso
     die 'case 89 disk refusal final statuses differ'
 pass 'case 89 disk refusal'
 
-scheduler_init "$test_tmp/workspaces/scheduler90" scheduler90 1020000010 2020000010 3020000010
+scheduler_init "$test_tmp/workspaces/scheduler-no-progress" scheduler-no-progress 1020000010
+scheduler_no_progress=$test_tmp/workspaces/scheduler-no-progress/tdx-hydro-scheduler-no-progress
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler_no_progress
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler_no_progress/state/tmp/pipeline-completions.fifo
+no_progress_sequence=$test_tmp/scheduler-no-progress-sequence
+printf '%s\n' 0 >"$no_progress_sequence"
+export HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE=$no_progress_sequence
+pipeline_status=0
+run_runner pipeline --campaign scheduler-no-progress \
+    --workspace-root "$test_tmp/workspaces/scheduler-no-progress" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    pipeline_status=$?
+unset HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+[[ "$pipeline_status" -ne 0 && ! -s "$no_progress_sequence" ]] ||
+    die 'no-progress round did not terminate after one refused dispatch'
+assert_contains "$case_stderr" \
+    'pipeline incomplete: pending=1 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+jq -e '.basins["1020000010"] == {status:"pending",blocked_reason:null}' \
+    "$scheduler_no_progress/state/pipeline.json" >/dev/null ||
+    die 'no-progress termination changed the recoverable pending state'
+pass 'pipeline no-progress round terminates through the bounded final-state check'
+
+scheduler_init "$test_tmp/workspaces/scheduler90" scheduler90 1020000010 2020000010
 scheduler90=$test_tmp/workspaces/scheduler90/tdx-hydro-scheduler90
 export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler90
 export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler90/state/tmp/pipeline-completions.fifo
@@ -5106,18 +5162,27 @@ export HFX_TEST_PIPELINE_KILL_KEY=1020000010-basins
 export HFX_TEST_KILLED_BASIN_ID=1020000010
 export HFX_TEST_KILLED_CURRENT_PATH=$scheduler90/state/basins/1020000010/current.json
 export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-pending
+export HFX_TEST_STALE_CURRENT_PATH=$scheduler90/state/basins/2020000010/current.json
+export HFX_TEST_STALE_READY_MARKER=$test_tmp/scheduler90-stale-ready
 export HFX_TEST_REAL_MV=$(command -v mv)
 export HFX_TDX_MV=$test_tmp/pipeline-mv
 rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+export HFX_TEST_FAIL_ONCE_KEY=2020000010-basins
+export HFX_TEST_REDISPATCH_HOLD_KEY=2020000010-basins
+export HFX_TEST_REDISPATCH_RELEASE_MARKER=$test_tmp/scheduler90-redispatch-release
 run_runner pipeline --campaign scheduler90 --workspace-root "$test_tmp/workspaces/scheduler90" \
-    --max-parallel 3 --fabric-version fixture-v1 >"$case_stdout" ||
-    die 'case 90 vanished SIGKILL pipeline failed'
-unset HFX_TEST_PIPELINE_KILL_KEY HFX_TDX_MV
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 90 vanished worker and queued completion pipeline failed'
+unset HFX_TEST_PIPELINE_KILL_KEY HFX_TDX_MV HFX_TEST_STALE_CURRENT_PATH \
+    HFX_TEST_STALE_READY_MARKER HFX_TEST_FAIL_ONCE_KEY HFX_TEST_REDISPATCH_HOLD_KEY \
+    HFX_TEST_REDISPATCH_RELEASE_MARKER
 [[ -f "$HFX_TEST_KILLED_PENDING_MARKER" &&
-   $(grep -c '^start 1020000010-basins' "$test_tmp/transfer-state/events") -eq 2 ]] ||
-    die 'case 90 vanished SIGKILL recovery or retry differs'
+   -f "$test_tmp/scheduler90-stale-ready" &&
+   $(grep -c '^start 1020000010-basins' "$test_tmp/transfer-state/events") -eq 2 &&
+   $(grep -c '^start 2020000010-basins' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+    die 'case 90 vanished worker, queued completion, or retry differs'
 jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler90/state/pipeline.json" >/dev/null ||
-    die 'case 90 vanished SIGKILL final statuses differ'
+    die 'case 90 vanished worker queued-completion final statuses differ'
 helper_state=$scheduler90/state/basins/1020000010/current.json
 jq '.retention.inputs_reclaimed=false |
   .stages.acquire_basins={status:"running",attempts:1,failure_reason:null,evidence:null} |
@@ -5138,6 +5203,8 @@ export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-helper-pending
     campaign_dir=$scheduler90
     lock_path=$scheduler90/state/locks/campaign.lock
     mkdir "$lock_path"; printf '%s\n' "$$" >"$lock_path/owner.pid"; lock_owned=1
+    pipeline_selected_basin_ids=(1020000010)
+    pipeline_swept_completion_statuses=("")
     pipeline_worker_pids=("$helper_pid")
     pipeline_worker_basin_ids=(1020000010)
     pipeline_round_reaped=0
@@ -5152,7 +5219,7 @@ rm -r "$scheduler90/state/locks/campaign.lock"
     pipeline_read_timed_out 1 && pipeline_read_timed_out 142 &&
         pipeline_read_timed_out 37 && ! pipeline_read_timed_out 0
 ) || die 'case 90 vanished SIGKILL timeout classification differs'
-pass 'case 90 vanished SIGKILL'
+pass 'case 90 sweep tolerates an already-accounted queued completion'
 
 scheduler_init "$test_tmp/workspaces/scheduler91" scheduler91 1020000010 2020000010
 scheduler91=$test_tmp/workspaces/scheduler91/tdx-hydro-scheduler91

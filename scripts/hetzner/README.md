@@ -580,12 +580,14 @@ zombie for one additional bounded round. Both `read` and `wait` nonzero statuses
 are captured under strict mode, and each tracked PID is waited exactly once.
 
 Each basin receives at most two scheduler dispatch attempts and two serial
-consumer attempts per invocation. A complete durable snapshot and round action
-flags provide bounded no-progress termination. Success requires every selected
-basin to be `reclaimed`. Bounded incomplete reporting preserves `pending`,
-`ready`, and `blocked` states for recovery or operator action. Fatal and signal
-cleanup sends TERM to tracked children, reaps each child, and removes the FIFO
-before releasing the campaign lock.
+consumer attempts per invocation. A scheduler-state snapshot and round dispatch,
+reap, and compile flags terminate a round with no durable change or action
+through the bounded final-state check. A completion already accounted for by
+the liveness sweep is discarded, including after that basin is redispatched.
+Success requires every selected basin to be `reclaimed`. Bounded incomplete
+reporting preserves `pending`, `ready`, and `blocked` states for recovery or
+operator action. Fatal and signal cleanup sends TERM to tracked children, reaps
+each child, and removes the FIFO before releasing the campaign lock.
 
 The planning timing model remains 33-37 hours for acquisition, 16-18 hours for
 serial compilation, and approximately 34-42 hours for the overlapped pipeline.
