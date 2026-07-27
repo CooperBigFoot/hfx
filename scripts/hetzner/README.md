@@ -527,10 +527,54 @@ Blocked-basin remediation is explicit:
 
 The supervised commands are operator overrides. Automatic pipeline recovery
 never reacquires retained-for-inspection input and never performs a second
-build. This step has no dispatch loop, worker fork, FIFO, occupancy guard, disk
-guard, or calibration. Phase-separated `acquire`, `compile`, `compile-basin`,
-`status`, and `progress`, retain-all behavior, and measured timing ranges
-remain unchanged.
+build. The current slice adds callable pipeline guards and completion transport,
+while `pipeline` execution remains recovery-only. Phase-separated `acquire`,
+`compile`, `compile-basin`, `status`, and `progress`, retain-all behavior, and
+measured timing ranges remain unchanged.
+
+The occupancy guard counts distinct effective basin IDs. A basin occupies one
+pair when any final, partial, or partial sidecar source path exists, including a
+dangling symlink, or when its scheduler status is `acquiring`, `ready`,
+`compiling`, or `terminal`. Physical presence wins for every status, including
+`blocked`. A current count above five is corrupt state and fails with
+`hfx: error: pipeline occupancy invariant exceeded: observed <actual> pairs;
+maximum 5`. Projecting a proposed ID returns status 0 at five or fewer and
+status 1 without output when the projection would exceed five. Status 1 is a
+temporary capacity answer, not a campaign failure.
+
+Disk credit is deliberately narrower: one full pair is credited only when both
+installed finals exist. Partial-only and one-final basins receive no credit.
+The guard computes
+`44,296,724,480 - present_pairs * 8,859,344,896` and accepts available bytes
+equal to the result. A one-byte shortfall returns status 1 and emits
+`insufficient pipeline dispatch disk: available <actual> bytes; required
+<required> bytes`. The sizing identities are:
+
+```text
+6,979,305,472 + 1,880,039,424 = 8,859,344,896 bytes per source pair
+5 * 8,859,344,896 = 44,296,724,480 peak input bytes
+max_parallel <= 5 - 1
+max_parallel <= 4
+```
+
+The ephemeral completion transport is
+`state/tmp/pipeline-completions.fifo`, a mode-0600 non-symlink named pipe held
+read-write by the parent on literal descriptor 9. Records are
+`<10-digit-basin-id><TAB><numeric-exit-status><NEWLINE>`. Durable JSON remains
+the source of truth. Bash 3.2 drops a function-installed EXIT trap for a bare
+`function &` invocation, so a future worker launch must use
+`( pipeline_acquisition_worker "$basin_id" ) &`. Variables named by the EXIT
+trap must be non-local because function locals are gone when that trap runs.
+The trap makes exactly one record-write attempt and ignores write failure after
+capturing the true worker status.
+
+M5-S3B-2b must treat every nonzero timed-read result as timeout because Bash
+3.2 returns 1 and Bash 5 returns 142; descriptor 9 being read-write makes EOF
+unreachable. Both `read` and `wait` nonzero statuses require explicit capture
+under strict mode. Each PID may be waited only once; a second wait returns 127.
+`kill -0` can recognize an unreaped zombie for one additional bounded round.
+No scheduling loop, worker fork from a loop, producer, serial consumer,
+liveness sweep, termination logic, or calibration is included in this slice.
 `recover` changes interrupted `running` stages back to `pending` and completes
 an interrupted terminal reclaim; `acquire` and `compile` also perform the
 applicable recovery before work. Operational
