@@ -30,6 +30,9 @@ readonly HFX_TDX_RECLAIM_PAIR_BYTES=8859344896
 readonly HFX_TDX_RECLAIM_PEAK_BYTES=44296724480
 readonly HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS=2
 readonly HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS=2
+readonly HFX_TDX_CALIBRATION_MARGIN_PERCENT=5
+readonly HFX_TDX_CALIBRATION_PARALLEL_2_IDS="1020011530 3020003790 6020006540 8020008900"
+readonly HFX_TDX_CALIBRATION_PARALLEL_4_IDS="2020003440 4020006940 7020014250 9020000010"
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -63,6 +66,7 @@ usage() {
         '       tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -160,6 +164,12 @@ validate_selection_file() {
 }
 
 effective_basin_ids() {
+    if [[ -n "${effective_basin_ids_file-}" ]]; then
+        [[ -f "$effective_basin_ids_file" && ! -L "$effective_basin_ids_file" ]] ||
+            hfx_die "active calibration cohort is not a regular file: $effective_basin_ids_file"
+        "$JQ" -r '.basin_ids[]' "$effective_basin_ids_file"
+        return
+    fi
     if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
         "$JQ" -r '.basin_ids[]' "$campaign_dir/state/selection.json"
     else
@@ -719,6 +729,507 @@ print_sizing() {
     ' "$campaign_dir/state/campaign.json"
 }
 
+validate_calibration_cohort() {
+    local file=$1
+    local expected_name=$2
+    local expected_parallel=$3
+    local expected_ids=$4
+    local ids_json
+    ids_json=$("$JQ" -cn --arg ids "$expected_ids" '$ids | split(" ")')
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "calibration cohort is not a regular file: $file"
+    "$JQ" -e --arg name "$expected_name" --argjson parallel "$expected_parallel" \
+        --argjson ids "$ids_json" --slurpfile inventory "$campaign_dir/state/inventory.json" '
+        type == "object" and keys == ["basin_ids","max_parallel","name","schema_version"] and
+        .schema_version == 1 and .name == $name and .max_parallel == $parallel and
+        .basin_ids == $ids and (.basin_ids | length == 4 and . == (sort | unique) and
+            all(.[]; type == "string" and $inventory[0][.] != null))
+    ' "$file" >/dev/null 2>&1 || hfx_die "calibration cohort is malformed: $file"
+}
+
+# A corrected throughput whose steady_state.compile_completions == 0 is NOT a valid input to the M5-S4 spend-abort threshold.
+# M5-S4 must apply the 4,167,474 bytes/second abort test to a cohort whose corrected window contains at least one compile completion.
+# When only a zero-compile corrected window is available, M5-S4 must treat the threshold as UNMET rather than met.
+# When the cohorts are within the five-percent margin and parallel-4 compile_completions is 0, the disclosed asymmetry decides: select parallel-2.
+# In the pinned scheduler, parallel-4 dispatches all four in its first round; its first reap begins permanent drain,
+# so its corrected window contains zero compile completions and zero compile wall seconds by construction.
+# Production overlaps compile with acquisition at both settings, making parallel-4 systematically optimistic; it may flip
+# a five-percent choice and elevate the value later consumed by the 4,167,474 bytes/second spend threshold.
+calibration_select() {
+    local small=$1
+    local large=$2
+    local selected_value
+    if ((small >= large)); then
+        selected_value=2
+    elif ((100 * small >= (100 - HFX_TDX_CALIBRATION_MARGIN_PERCENT) * large)); then
+        selected_value=2
+    else
+        selected_value=4
+    fi
+    calibration_selection=$selected_value
+}
+
+validate_calibration_json() {
+    local file=$1
+    local small
+    local large
+    local retained
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "calibration state is not a regular file: $file"
+    "$JQ" -e --arg p2 "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" \
+        --arg p4 "$HFX_TDX_CALIBRATION_PARALLEL_4_IDS" --argjson max_i64 "$HFX_TDX_MAX_I64" '
+        def i64: type == "number" and floor == . and . >= 0 and . <= 9223372036854775807;
+        def pos: i64 and . > 0;
+        def expected($s): $s | split(" ");
+        def measure:
+            type == "object" and keys == ["excluded_drain_tail","raw","steady_state"] and
+            (.raw | type == "object" and
+                keys == ["bytes","elapsed_seconds","end_timestamp_seconds","retries","start_timestamp_seconds","throughput_bytes_per_second"] and
+                (to_entries | all(.[]; .value | i64)) and
+                (.bytes | pos and . <= 35437379584) and (.elapsed_seconds | pos) and (.throughput_bytes_per_second | pos) and
+                .end_timestamp_seconds == .start_timestamp_seconds + .elapsed_seconds and
+                .throughput_bytes_per_second == (.bytes / .elapsed_seconds | floor)) and
+            (.steady_state | type == "object" and
+                keys == ["bytes","compile_completions","compile_wall_seconds","elapsed_seconds","end_bytes","end_timestamp_seconds","start_bytes","start_timestamp_seconds","throughput_bytes_per_second"] and
+                (to_entries | all(.[]; .value | i64)) and
+                (.bytes | pos and . <= 35437379584) and (.elapsed_seconds | pos) and (.throughput_bytes_per_second | pos) and
+                .end_timestamp_seconds == .start_timestamp_seconds + .elapsed_seconds and
+                .bytes == .end_bytes - .start_bytes and
+                .throughput_bytes_per_second == (.bytes / .elapsed_seconds | floor) and
+                .compile_completions <= 4 and .elapsed_seconds <= ($max_i64 / 4 | floor) and
+                .compile_wall_seconds <= .elapsed_seconds * 4) and
+            (.excluded_drain_tail | type == "object" and
+                keys == ["bytes","elapsed_seconds","end_bytes","end_timestamp_seconds","start_bytes","start_timestamp_seconds"] and
+                (to_entries | all(.[]; .value | i64)) and
+                .elapsed_seconds == .end_timestamp_seconds - .start_timestamp_seconds and
+                .bytes == .end_bytes - .start_bytes) and
+            (.raw as $r | .steady_state as $s | .excluded_drain_tail as $d |
+                $s.start_timestamp_seconds >= $r.start_timestamp_seconds and
+                $s.end_timestamp_seconds <= $r.end_timestamp_seconds and
+                $d.start_timestamp_seconds == $s.end_timestamp_seconds and
+                $d.start_bytes == $s.end_bytes and $d.end_timestamp_seconds == $r.end_timestamp_seconds and
+                $d.end_bytes == $r.bytes);
+        def cohort($parallel; $ids):
+            type == "object" and keys == ["attempts","basin_ids","max_parallel","measurement","status"] and
+            .max_parallel == $parallel and .basin_ids == expected($ids) and
+            (.attempts | i64) and
+            if .status == "pending" then .attempts == 0 and .measurement == null
+            elif .status == "running" then .attempts > 0 and .measurement == null
+            elif .status == "measured" then .attempts > 0 and (.measurement | measure)
+            else false end;
+        type == "object" and keys == ["cohorts","fabric_version","schema_version","selected_max_parallel"] and
+        .schema_version == 1 and (.fabric_version | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+        (.selected_max_parallel == null or .selected_max_parallel == 2 or .selected_max_parallel == 4) and
+        (.cohorts | type == "object" and keys == ["parallel-2","parallel-4"] and
+            (.["parallel-2"] | cohort(2; $p2)) and
+            (.["parallel-4"] | cohort(4; $p4))) and
+        ((expected($p2) + expected($p4)) | length == 8 and length == (unique | length)) and
+        (if .selected_max_parallel == null then
+            ([.cohorts[].status] | any(. != "measured"))
+         else ([.cohorts[].status] | all(. == "measured")) end)
+    ' "$file" >/dev/null 2>&1 || hfx_die "calibration state is malformed: $file"
+    retained=$("$JQ" -r '.selected_max_parallel // "null"' "$file")
+    if [[ "$retained" != null ]]; then
+        small=$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$file")
+        large=$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.throughput_bytes_per_second' "$file")
+        calibration_select "$small" "$large"
+        [[ "$retained" == "$calibration_selection" ]] || hfx_die "calibration state is malformed: $file"
+    fi
+    calibration_measurement_validated=1
+    ((calibration_measurement_validated == 1)) || hfx_die "calibration measurement validation did not complete: $file"
+}
+
+materialize_calibration_state() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_calibration_json "$state"
+        return
+    fi
+    "$JQ" -n --arg fabric "$fabric_version" \
+        --arg p2 "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" --arg p4 "$HFX_TDX_CALIBRATION_PARALLEL_4_IDS" '{
+          schema_version:1, fabric_version:$fabric, selected_max_parallel:null,
+          cohorts:{
+            "parallel-2":{max_parallel:2,basin_ids:($p2|split(" ")),status:"pending",attempts:0,measurement:null},
+            "parallel-4":{max_parallel:4,basin_ids:($p4|split(" ")),status:"pending",attempts:0,measurement:null}
+          }
+        }' >"$temporary"
+    atomic_install "$temporary" "$state" validate_calibration_json
+}
+
+calibration_install_cohort() {
+    local name=$1
+    local parallel=$2
+    local ids=$3
+    local destination=$campaign_dir/state/calibration/$name.json
+    local temporary=$campaign_dir/state/tmp/$name.json.tmp.$$
+    "$MKDIR" -p "$campaign_dir/state/calibration"
+    if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        "$JQ" -n --arg name "$name" --argjson parallel "$parallel" --arg ids "$ids" \
+            '{schema_version:1,name:$name,max_parallel:$parallel,basin_ids:($ids|split(" "))}' >"$temporary"
+        validate_calibration_cohort "$temporary" "$name" "$parallel" "$ids"
+        "$CHMOD" 0644 "$temporary"
+        "$MV" "$temporary" "$destination"
+    fi
+    validate_calibration_cohort "$destination" "$name" "$parallel" "$ids"
+    effective_basin_ids_file=$destination
+}
+
+calibration_first_start_valid() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        "$JQ" -e '
+          .schema_version == 4 and .retention.inputs_reclaimed == false and
+          (.stages.acquire_basins == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.acquire_streamnet == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null})
+        ' "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
+    done < <(effective_basin_ids)
+}
+
+calibration_first_start_ids_valid() {
+    local basin_id
+    for basin_id in $(printf '%s\n' "$1" | "$TR" ' ' '\n'); do
+        "$JQ" -e '
+          .schema_version == 4 and .retention.inputs_reclaimed == false and
+          (.stages.acquire_basins == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.acquire_streamnet == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null})
+        ' "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
+    done
+}
+
+calibration_admit() {
+    calibration_admission_bytes=$((HFX_TDX_RECLAIM_PEAK_BYTES + max_parallel * HFX_TDX_RECLAIM_PAIR_BYTES))
+    ((calibration_admission_bytes >= HFX_TDX_RECLAIM_PEAK_BYTES)) || hfx_die 'calibration admission arithmetic overflowed'
+    pipeline_available_bytes
+    ((pipeline_available_byte_count >= calibration_admission_bytes)) ||
+        hfx_die "insufficient calibration disk: available $pipeline_available_byte_count bytes; required $calibration_admission_bytes bytes"
+}
+
+calibration_now() {
+    local value
+    if [[ -n "${HFX_TDX_CALIBRATION_NOW_FILE-}" ]]; then
+        [[ -f "$HFX_TDX_CALIBRATION_NOW_FILE" && ! -L "$HFX_TDX_CALIBRATION_NOW_FILE" ]] ||
+            hfx_die 'calibration timestamp fixture is unsafe'
+        IFS= read -r value <"$HFX_TDX_CALIBRATION_NOW_FILE" || hfx_die 'calibration timestamp fixture is exhausted'
+        calibration_clock_first=1
+        while IFS= read -r calibration_clock_line; do
+            if ((calibration_clock_first == 1)); then
+                calibration_clock_first=0
+            else
+                printf '%s\n' "$calibration_clock_line"
+            fi
+        done <"$HFX_TDX_CALIBRATION_NOW_FILE" >"$HFX_TDX_CALIBRATION_NOW_FILE.tmp"
+        "$MV" "$HFX_TDX_CALIBRATION_NOW_FILE.tmp" "$HFX_TDX_CALIBRATION_NOW_FILE"
+    else
+        value=$(/bin/date +%s)
+    fi
+    calibration_timestamp=$(normalize_nonnegative_i64 "$value") || hfx_die 'calibration timestamp is malformed'
+}
+
+calibration_product_bytes() {
+    local basin_id
+    local product
+    local path
+    local observed
+    calibration_byte_count=0
+    while IFS= read -r basin_id; do
+        for product in basins streamnet; do
+            path=$campaign_dir/downloads/$basin_id-$product.gpkg
+            if [[ ! -f "$path" || -L "$path" ]]; then
+                path=$path.partial
+            fi
+            if [[ -f "$path" && ! -L "$path" ]]; then
+                observed=$("$WC" -c <"$path" | "$TR" -d ' ')
+                observed=$(normalize_nonnegative_i64 "$observed") || hfx_die 'calibration product length is malformed'
+                calibration_byte_count=$(checked_add "$calibration_byte_count" "$observed")
+            fi
+        done
+    done < <(effective_basin_ids)
+}
+
+calibration_append_sample() {
+    local timestamp=$1
+    local bytes=$2
+    local occupancy=$3
+    local completions=$4
+    local wall=$5
+    printf '%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$bytes" "$occupancy" "$completions" "$wall" >>"$calibration_trace_file"
+}
+
+calibration_observe() {
+    local event=$1
+    local occupancy=0
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    case $event in
+        dispatch|ordinary-reap|vanished-sweep) ;;
+        *) hfx_die "unknown calibration observation: $event" ;;
+    esac
+    calibration_now
+    calibration_product_bytes
+    occupancy=${#pipeline_worker_pids[@]}
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" "$occupancy" \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+}
+
+calibration_compile_started() {
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    [[ -z "$calibration_compile_basin" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_now
+    calibration_compile_basin=$pipeline_consumer_basin_id
+    calibration_compile_start=$calibration_timestamp
+}
+
+calibration_compile_finished() {
+    local elapsed
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    [[ "$calibration_compile_basin" == "$pipeline_consumer_basin_id" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_now
+    ((calibration_timestamp >= calibration_compile_start)) || hfx_die 'calibration compile timestamp regressed'
+    elapsed=$((calibration_timestamp - calibration_compile_start))
+    calibration_compile_completions=$((calibration_compile_completions + 1))
+    calibration_compile_wall_seconds=$(checked_add "$calibration_compile_wall_seconds" "$elapsed")
+    calibration_compile_basin=
+    calibration_product_bytes
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" "${#pipeline_worker_pids[@]}" \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+}
+
+calibration_scan_traces() {
+    local attempt
+    local line
+    local timestamp
+    local observed
+    local occupancy
+    local completions
+    local wall
+    local previous_timestamp=-1
+    local index=0
+    local trace
+    local extra_count
+    local require_complete=${calibration_scan_require_complete-1}
+    calibration_timestamps=()
+    calibration_bytes=()
+    calibration_occupancies=()
+    calibration_completions=()
+    calibration_walls=()
+    calibration_running_max_bytes=0
+    calibration_first_full_index=-1
+    calibration_last_full_index=-1
+    for ((attempt = 1; attempt <= calibration_attempts; attempt++)); do
+        trace=$campaign_dir/state/calibration/$calibration_name-attempt-$attempt.samples.tsv
+        [[ -f "$trace" && ! -L "$trace" ]] || hfx_die "calibration attempt trace is missing or unsafe: $trace"
+        while IFS=$'\t' read -r timestamp observed occupancy completions wall; do
+            [[ -n "$timestamp" && -n "$observed" && -n "$occupancy" && -n "$completions" && -n "$wall" ]] ||
+                hfx_die "calibration attempt trace is malformed: $trace"
+            timestamp=$(normalize_nonnegative_i64 "$timestamp") || hfx_die "calibration attempt trace is malformed: $trace"
+            calibration_observed_bytes=$(normalize_nonnegative_i64 "$observed") || hfx_die "calibration attempt trace is malformed: $trace"
+            occupancy=$(normalize_nonnegative_i64 "$occupancy") || hfx_die "calibration attempt trace is malformed: $trace"
+            completions=$(normalize_nonnegative_i64 "$completions") || hfx_die "calibration attempt trace is malformed: $trace"
+            wall=$(normalize_nonnegative_i64 "$wall") || hfx_die "calibration attempt trace is malformed: $trace"
+            ((timestamp >= previous_timestamp && occupancy <= max_parallel && completions <= 4)) ||
+                hfx_die "calibration attempt trace is malformed: $trace"
+            if ((index > 0)); then
+                ((completions >= calibration_completions[$((index - 1))] && wall >= calibration_walls[$((index - 1))])) ||
+                    hfx_die "calibration attempt trace counters regressed: $trace"
+            fi
+            if ((calibration_observed_bytes > calibration_running_max_bytes)); then
+                calibration_running_max_bytes=$calibration_observed_bytes
+            fi
+    calibration_observed_bytes=$calibration_running_max_bytes
+            calibration_timestamps[$index]=$timestamp
+            calibration_bytes[$index]=$calibration_observed_bytes
+            calibration_occupancies[$index]=$occupancy
+            calibration_completions[$index]=$completions
+            calibration_walls[$index]=$wall
+            if ((occupancy == max_parallel)); then
+                ((calibration_first_full_index < 0)) && calibration_first_full_index=$index
+                calibration_last_full_index=$index
+            fi
+            previous_timestamp=$timestamp
+            index=$((index + 1))
+        done <"$trace"
+    done
+    extra_count=$("$FIND" "$campaign_dir/state/calibration" -maxdepth 1 -type f -name "$calibration_name-attempt-*.samples.tsv" | "$WC" -l | "$TR" -d ' ')
+    [[ "$extra_count" == "$calibration_attempts" ]] || hfx_die 'calibration attempt traces are not contiguous'
+    ((index > 0)) || hfx_die 'calibration attempt traces are empty'
+    calibration_last_index=$((index - 1))
+    if ((require_complete == 0)); then
+        return
+    fi
+    ((calibration_first_full_index >= 0 && calibration_last_full_index + 1 < index)) ||
+        hfx_die 'calibration trace lacks a full-occupancy record and lower successor'
+    calibration_steady_end_index=$((calibration_last_full_index + 1))
+    ((calibration_occupancies[$calibration_steady_end_index] < max_parallel)) ||
+        hfx_die 'calibration corrected interval lacks a lower successor'
+    for ((attempt = calibration_steady_end_index + 1; attempt < index; attempt++)); do
+        ((calibration_occupancies[$attempt] < max_parallel)) || hfx_die 'calibration occupancy returned to full after drain began'
+    done
+}
+
+calibration_count_retries() {
+    local basin_id
+    local attempts
+    calibration_retries=0
+    while IFS= read -r basin_id; do
+        attempts=$("$JQ" -r '[.stages.acquire_basins.attempts,.stages.acquire_streamnet.attempts] | add' \
+            "$campaign_dir/state/basins/$basin_id/current.json")
+        ((attempts >= 2)) || hfx_die 'calibration acquisition attempts are inconsistent'
+        calibration_retries=$(checked_add "$calibration_retries" "$((attempts - 2))")
+    done < <(effective_basin_ids)
+}
+
+calibration_compute_measurement() {
+    local raw_start=${calibration_timestamps[0]}
+    local raw_end=${calibration_timestamps[$calibration_last_index]}
+    local raw_bytes=${calibration_bytes[$calibration_last_index]}
+    local steady_start=${calibration_timestamps[$calibration_first_full_index]}
+    local steady_end=${calibration_timestamps[$calibration_steady_end_index]}
+    local steady_start_bytes=${calibration_bytes[$calibration_first_full_index]}
+    local steady_end_bytes=${calibration_bytes[$calibration_steady_end_index]}
+    local raw_elapsed=$((raw_end - raw_start))
+    local steady_elapsed=$((steady_end - steady_start))
+    local steady_completions=$((calibration_completions[$calibration_steady_end_index] - calibration_completions[$calibration_first_full_index]))
+    local steady_wall=$((calibration_walls[$calibration_steady_end_index] - calibration_walls[$calibration_first_full_index]))
+    calibration_raw_bytes=$raw_bytes
+    calibration_corrected_bytes=$((steady_end_bytes - steady_start_bytes))
+    calibration_corrected_elapsed=$steady_elapsed
+    ((raw_elapsed > 0 && raw_bytes > 0 && steady_elapsed > 0 && calibration_corrected_bytes > 0)) ||
+        hfx_die 'calibration measurement requires positive raw and corrected intervals and bytes'
+    calibration_raw_throughput=$((calibration_raw_bytes / raw_elapsed))
+    calibration_corrected_throughput=$((calibration_corrected_bytes / calibration_corrected_elapsed))
+    ((calibration_raw_throughput > 0 && calibration_corrected_throughput > 0)) ||
+        hfx_die 'calibration throughput rounded to zero'
+    calibration_count_retries
+    calibration_measurement_json=$("$JQ" -cn \
+        --argjson rs "$raw_start" --argjson re "$raw_end" --argjson rb "$raw_bytes" --argjson rel "$raw_elapsed" \
+        --argjson rr "$calibration_retries" --argjson rt "$calibration_raw_throughput" \
+        --argjson ss "$steady_start" --argjson se "$steady_end" --argjson sb "$steady_start_bytes" \
+        --argjson eb "$steady_end_bytes" --argjson b "$calibration_corrected_bytes" --argjson el "$steady_elapsed" \
+        --argjson t "$calibration_corrected_throughput" --argjson cc "$steady_completions" --argjson cw "$steady_wall" '{
+          raw:{start_timestamp_seconds:$rs,end_timestamp_seconds:$re,bytes:$rb,elapsed_seconds:$rel,retries:$rr,throughput_bytes_per_second:$rt},
+          steady_state:{start_timestamp_seconds:$ss,end_timestamp_seconds:$se,start_bytes:$sb,end_bytes:$eb,bytes:$b,elapsed_seconds:$el,throughput_bytes_per_second:$t,compile_completions:$cc,compile_wall_seconds:$cw},
+          excluded_drain_tail:{start_timestamp_seconds:$se,end_timestamp_seconds:$re,start_bytes:$eb,end_bytes:$rb,bytes:($rb-$eb),elapsed_seconds:($re-$se)}
+        }')
+}
+
+calibration_terminal_reclaimed() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        "$JQ" -e '.schema_version == 4 and .retention.inputs_reclaimed == true and
+            (.stages.compile.status == "succeeded" or .stages.compile.status == "failed")' \
+            "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
+    done < <(effective_basin_ids)
+}
+
+calibration_append_terminal_sample() {
+    local last_record
+    local retained_record=
+    calibration_now
+    calibration_product_bytes
+    last_record="$calibration_timestamp\t$calibration_byte_count\t0\t$calibration_compile_completions\t$calibration_compile_wall_seconds"
+    while IFS= read -r calibration_terminal_line; do retained_record=$calibration_terminal_line; done <"$calibration_trace_file"
+    if [[ ! -s "$calibration_trace_file" ]] || [[ "$retained_record" != "$last_record" ]]; then
+        calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" 0 \
+            "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+    fi
+}
+
+calibration_finalize() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local archive=$campaign_dir/state/calibration/$calibration_name-pipeline.json
+    local archive_hash
+    local live_hash
+    calibration_scan_traces
+    calibration_compute_measurement
+    if [[ "$calibration_name" == parallel-4 ]]; then
+        calibration_select \
+            "$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$state")" \
+            "$("$JQ" -r '.steady_state.throughput_bytes_per_second' <<<"$calibration_measurement_json")"
+        "$JQ" --arg name "$calibration_name" --argjson measurement "$calibration_measurement_json" \
+            --argjson selected "$calibration_selection" '
+            .cohorts[$name].status="measured" | .cohorts[$name].measurement=$measurement |
+            .selected_max_parallel=$selected
+        ' "$state" >"$temporary"
+    else
+        "$JQ" --arg name "$calibration_name" --argjson measurement "$calibration_measurement_json" '
+            .cohorts[$name].status="measured" | .cohorts[$name].measurement=$measurement
+        ' "$state" >"$temporary"
+    fi
+    atomic_install "$temporary" "$state" validate_calibration_json
+    if [[ -e "$archive" || -L "$archive" ]]; then
+        [[ -f "$archive" && ! -L "$archive" ]] || hfx_die "calibration pipeline archive is unsafe: $archive"
+        archive_hash=$("$SHA256SUM" "$archive")
+        archive_hash=${archive_hash%% *}
+        live_hash=$("$SHA256SUM" "$campaign_dir/state/pipeline.json")
+        live_hash=${live_hash%% *}
+        [[ "$archive_hash" == "$live_hash" ]] || hfx_die 'calibration pipeline archive differs from live state'
+    else
+        "$CHMOD" 0644 "$campaign_dir/state/pipeline.json"
+        "$MV" "$campaign_dir/state/pipeline.json" "$archive"
+    fi
+    [[ -f "$archive" && ! -L "$archive" ]] || hfx_die 'calibration pipeline archive is missing'
+    [[ ! -e "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]] ||
+        "$RM" -- "$campaign_dir/state/pipeline.json"
+}
+
+calibration_freeze_selection() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local small
+    local large
+    local retained
+    validate_calibration_json "$state"
+    [[ $("$JQ" -r '[.cohorts[].status] | all(. == "measured")' "$state") == true ]] || return 0
+    small=$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$state")
+    large=$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.throughput_bytes_per_second' "$state")
+    calibration_select "$small" "$large"
+    retained=$("$JQ" -r '.selected_max_parallel // "null"' "$state")
+    if [[ "$retained" == null ]]; then
+        "$JQ" --argjson selected "$calibration_selection" '.selected_max_parallel=$selected' "$state" >"$temporary"
+        atomic_install "$temporary" "$state" validate_calibration_json
+    else
+        [[ "$retained" == "$calibration_selection" ]] || hfx_die 'calibration selection cannot be overwritten'
+    fi
+}
+
+print_calibration_disclosure() {
+    validate_calibration_json "$campaign_dir/state/calibration.json"
+    "$JQ" -r '
+      "calibration_fabric_version=\(.fabric_version)",
+      "calibration_selected_max_parallel=\(.selected_max_parallel // "pending")",
+      (.cohorts | to_entries[] | .key as $name | .value as $c |
+        "calibration_\($name|gsub("-";"_"))_status=\($c.status)",
+        if $c.status == "measured" then
+          "calibration_\($name|gsub("-";"_"))_raw_start_timestamp_seconds=\($c.measurement.raw.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_end_timestamp_seconds=\($c.measurement.raw.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_bytes=\($c.measurement.raw.bytes)",
+          "calibration_\($name|gsub("-";"_"))_raw_elapsed_seconds=\($c.measurement.raw.elapsed_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_retries=\($c.measurement.raw.retries)",
+          "calibration_\($name|gsub("-";"_"))_raw_throughput_bytes_per_second=\($c.measurement.raw.throughput_bytes_per_second)",
+          "calibration_\($name|gsub("-";"_"))_steady_start_timestamp_seconds=\($c.measurement.steady_state.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_end_timestamp_seconds=\($c.measurement.steady_state.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_start_bytes=\($c.measurement.steady_state.start_bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_end_bytes=\($c.measurement.steady_state.end_bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_bytes=\($c.measurement.steady_state.bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_elapsed_seconds=\($c.measurement.steady_state.elapsed_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_throughput_bytes_per_second=\($c.measurement.steady_state.throughput_bytes_per_second)",
+          "calibration_\($name|gsub("-";"_"))_steady_compile_completions=\($c.measurement.steady_state.compile_completions)",
+          "calibration_\($name|gsub("-";"_"))_steady_compile_wall_seconds=\($c.measurement.steady_state.compile_wall_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_start_timestamp_seconds=\($c.measurement.excluded_drain_tail.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_end_timestamp_seconds=\($c.measurement.excluded_drain_tail.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_start_bytes=\($c.measurement.excluded_drain_tail.start_bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_end_bytes=\($c.measurement.excluded_drain_tail.end_bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_bytes=\($c.measurement.excluded_drain_tail.bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_elapsed_seconds=\($c.measurement.excluded_drain_tail.elapsed_seconds)"
+        else empty end)
+    ' "$campaign_dir/state/calibration.json"
+}
+
+calibration_require_pipeline_freeze() {
+    [[ "$max_parallel" == "$calibration_selection" ]] || hfx_die 'pipeline max-parallel differs from frozen calibration selection'
+}
+
 print_status() {
     local stage
     local status
@@ -1137,6 +1648,7 @@ pipeline_campaign() {
             pipeline_worker_basin_ids[${#pipeline_worker_basin_ids[@]}]=$basin_id
             pipeline_round_dispatched=1
         done
+        calibration_observe dispatch
         pipeline_consumer_basin_id=
         for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
             status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
@@ -1155,7 +1667,9 @@ pipeline_campaign() {
             selected_index=$pipeline_found_index
             pipeline_consume_attempts[$selected_index]=$((pipeline_consume_attempts[$selected_index] + 1))
             transition_pipeline_basin "$pipeline_consumer_basin_id" compiling
+            calibration_compile_started
         compile_basin_locked "$pipeline_consumer_basin_id" true
+            calibration_compile_finished
             pipeline_recover_reconstruct_basin "$pipeline_consumer_basin_id"
             pipeline_round_compiled=1
             continue
@@ -1165,6 +1679,7 @@ pipeline_campaign() {
             IFS= read -r -u 9 -t 1 pipeline_completion_record || read_status=$?
             if pipeline_read_timed_out "$read_status"; then
                 pipeline_sweep_vanished_workers
+                calibration_observe vanished-sweep
             else
                 completion_id=${pipeline_completion_record%%$'\t'*}
                 completion_status=${pipeline_completion_record#*$'\t'}
@@ -1189,6 +1704,7 @@ pipeline_campaign() {
                 fi
                 selected_index=$pipeline_found_index
                 pipeline_wait_remove_worker "$selected_index"
+                calibration_observe ordinary-reap
                 ((pipeline_wait_status == completion_status)) ||
                     hfx_die "pipeline completion status mismatch for $completion_id: record $completion_status; wait $pipeline_wait_status"
                 pipeline_round_reaped=1
@@ -3690,6 +4206,115 @@ acquire_campaign() {
     print_status
 }
 
+calibrate_campaign() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local status
+    local other_status
+    local ids
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_campaign_json "$campaign_dir/state/campaign.json"
+    acquire_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
+        hfx_die 'calibrate requires retention policy reclaim-inputs-after-terminal'
+    CURL=$(resolve_command HFX_TDX_CURL curl)
+    SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+    OD=$(resolve_command HFX_TDX_OD od)
+    OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+    acquire_campaign_lock
+    validate_workspace_state
+    if [[ ! -e "$state" && ! -L "$state" ]]; then
+        if [[ "$max_parallel" == 2 ]]; then
+            calibration_first_start_ids_valid "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" ||
+                hfx_die 'calibration cohort has prior durable work; recover it before calibration'
+        else
+            hfx_die 'parallel-2 calibration must be measured before parallel-4 starts'
+        fi
+    fi
+    materialize_calibration_state
+    [[ $("$JQ" -r '.fabric_version' "$state") == "$fabric_version" ]] ||
+        hfx_die 'calibration fabric version is immutable'
+    status=$("$JQ" -r --arg name "parallel-$max_parallel" '.cohorts[$name].status' "$state")
+    if [[ "$max_parallel" == 2 ]]; then
+        calibration_name=parallel-2
+        ids=$HFX_TDX_CALIBRATION_PARALLEL_2_IDS
+        other_status=$("$JQ" -r '.cohorts["parallel-4"].status' "$state")
+        [[ "$other_status" == pending || ("$status" == measured && "$other_status" == measured) ]] ||
+            hfx_die 'calibration cohort status ordering is malformed'
+    else
+        calibration_name=parallel-4
+        ids=$HFX_TDX_CALIBRATION_PARALLEL_4_IDS
+        other_status=$("$JQ" -r '.cohorts["parallel-2"].status' "$state")
+        [[ "$other_status" == measured ]] || hfx_die 'parallel-2 calibration must be measured before parallel-4 starts'
+    fi
+    calibration_install_cohort "$calibration_name" "$max_parallel" "$ids"
+    if [[ "$status" == measured ]]; then
+        if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]]; then
+            calibration_attempts=$("$JQ" -r --arg name "$calibration_name" '.cohorts[$name].attempts' "$state")
+            calibration_terminal_reclaimed || hfx_die 'measured calibration retained a nonterminal pipeline snapshot'
+            calibration_finalize
+        fi
+        calibration_freeze_selection
+    print_calibration_disclosure
+        return
+    fi
+    calibration_attempts=$("$JQ" -r --arg name "$calibration_name" '.cohorts[$name].attempts' "$state")
+    if [[ "$status" == pending ]]; then
+        calibration_first_start_valid || hfx_die 'calibration cohort has prior durable work; recover it before calibration'
+    fi
+    if calibration_terminal_reclaimed; then
+        ((calibration_attempts > 0)) || hfx_die 'terminal calibration cohort has no retained attempt'
+        calibration_trace_file=$campaign_dir/state/calibration/$calibration_name-attempt-$calibration_attempts.samples.tsv
+        calibration_scan_traces
+        calibration_compile_completions=${calibration_completions[$calibration_last_index]}
+        calibration_compile_wall_seconds=${calibration_walls[$calibration_last_index]}
+        calibration_append_terminal_sample
+        calibration_finalize
+        calibration_freeze_selection
+    print_calibration_disclosure
+        return
+    fi
+    resolve_pipeline_compile_tools
+    calibration_admit
+    calibration_attempt=$((calibration_attempts + 1))
+    calibration_trace_file=$campaign_dir/state/calibration/$calibration_name-attempt-$calibration_attempt.samples.tsv
+    [[ ! -e "$calibration_trace_file" && ! -L "$calibration_trace_file" ]] ||
+        hfx_die "calibration attempt trace already exists: $calibration_trace_file"
+    if ((calibration_attempts > 0)); then
+        calibration_scan_require_complete=0
+        calibration_scan_traces
+        calibration_scan_require_complete=1
+        calibration_compile_completions=${calibration_completions[$calibration_last_index]}
+        calibration_compile_wall_seconds=${calibration_walls[$calibration_last_index]}
+    else
+        calibration_compile_completions=0
+        calibration_compile_wall_seconds=0
+    fi
+    (umask 022; : >"$calibration_trace_file")
+    [[ -f "$calibration_trace_file" && ! -L "$calibration_trace_file" ]] || hfx_die 'could not create calibration attempt trace'
+    calibration_compile_basin=
+    calibration_active=1
+    calibration_now
+    calibration_product_bytes
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" 0 \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+    "$JQ" --arg name "$calibration_name" --argjson attempt "$calibration_attempt" '
+        .cohorts[$name].status="running" | .cohorts[$name].attempts=$attempt
+    ' "$state" >"$temporary"
+    atomic_install "$temporary" "$state" validate_calibration_json
+    release_takeover_guard
+    release_lock
+    pipeline_campaign
+    [[ -z "$calibration_compile_basin" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_append_terminal_sample
+    calibration_active=0
+    calibration_attempts=$calibration_attempt
+    calibration_finalize
+    calibration_freeze_selection
+    effective_basin_ids_file=
+        print_calibration_disclosure
+}
+
 if (($# == 1)) && [[ "$1" == -h || "$1" == --help ]]; then
     usage
     exit 0
@@ -3698,7 +4323,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|compile-basin|progress|pipeline|assemble|evidence|publish) ;;
+    init|status|recover|acquire|compile|compile-basin|progress|pipeline|calibrate|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -3719,6 +4344,9 @@ filesystem_overhead_bytes=
 sizing_seen=' '
 retention_policy=retain-all-through-publication
 retention_policy_seen=0
+effective_basin_ids_file=
+calibration_active=0
+calibration_compile_basin=
 max_parallel=
 max_parallel_seen=0
 fabric_version=
@@ -3773,14 +4401,14 @@ while (($# > 0)); do
             retention_policy=$value
             ;;
         --max-parallel)
-            [[ "$subcommand" == acquire || "$subcommand" == pipeline ]] ||
+            [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" == calibrate ]] ||
                 usage_error 'option --max-parallel is valid only for acquire or pipeline'
             ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
             max_parallel_seen=1
             max_parallel=$value
             ;;
         --fabric-version)
-            [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline ]] ||
+            [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline || "$subcommand" == calibrate ]] ||
                 usage_error 'option --fabric-version is valid only for compile, compile-basin, or pipeline'
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
@@ -3856,7 +4484,7 @@ if [[ "$subcommand" == compile-basin ]]; then
     [[ "${basin_ids[0]}" =~ ^[0-9]{10}$ ]] ||
         hfx_die "invalid processing basin ID '${basin_ids[0]}'; expected an authoritative 10-digit ID"
 fi
-if [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline ]]; then
+if [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline || "$subcommand" == calibrate ]]; then
     ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
     [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
         usage_error 'option --fabric-version requires a non-empty non-option value'
@@ -3912,6 +4540,9 @@ elif [[ "$subcommand" == status ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     acquire_campaign_lock
     validate_workspace_state
+    if [[ -e "$campaign_dir/state/calibration.json" || -L "$campaign_dir/state/calibration.json" ]]; then
+        validate_calibration_json "$campaign_dir/state/calibration.json"
+    fi
     print_status
 elif [[ "$subcommand" == progress ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
@@ -3920,8 +4551,14 @@ elif [[ "$subcommand" == progress ]]; then
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
-elif [[ "$subcommand" == acquire || "$subcommand" == pipeline ]]; then
+elif [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" == calibrate ]]; then
     ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
+    if [[ "$subcommand" == calibrate ]]; then
+        [[ "$max_parallel" == 2 || "$max_parallel" == 4 ]] ||
+            usage_error 'option --max-parallel must be 2 or 4 for calibrate'
+        calibrate_campaign
+        exit 0
+    fi
     [[ "$max_parallel" =~ ^[0-9]+$ ]] || usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     ((max_parallel >= 1 && max_parallel <= 62)) ||
         usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
@@ -3941,6 +4578,13 @@ elif [[ "$subcommand" == acquire || "$subcommand" == pipeline ]]; then
     else
         [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
             hfx_die 'pipeline requires retention policy reclaim-inputs-after-terminal'
+        if [[ -e "$campaign_dir/state/calibration.json" || -L "$campaign_dir/state/calibration.json" ]]; then
+            validate_calibration_json "$campaign_dir/state/calibration.json"
+            [[ $("$JQ" -r '.fabric_version' "$campaign_dir/state/calibration.json") == "$fabric_version" ]] ||
+                hfx_die 'pipeline fabric version differs from frozen calibration fabric version'
+            calibration_selection=$("$JQ" -r '.selected_max_parallel // "pending"' "$campaign_dir/state/calibration.json")
+            calibration_require_pipeline_freeze
+        fi
         CURL=$(resolve_command HFX_TDX_CURL curl)
         SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
         OD=$(resolve_command HFX_TDX_OD od)
