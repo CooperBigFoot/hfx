@@ -221,7 +221,7 @@ if [[ -x /bin/bash && "$selected_bash" != /bin/bash ]]; then
     die 'the harness did not select /bin/bash'
 fi
 
-for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
+for command_name in jq grep diff find sort wc mktemp mkdir mkfifo cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
@@ -518,10 +518,28 @@ assert_contains "$runner" '.curl-stats.$basin_id.$product.$$'
 [[ $(grep -Fc '"$JQ" -r '\''keys[]'\'' "$campaign_dir/state/inventory.json"' "$runner") -eq 3 ]] ||
     die 'runner does not contain exactly three textual three-argument keys[] reads'
 sed -n '/^acquire_basin() {$/,/^}$/p' "$runner" >"$case_stdout"
-reset_lock_line=$(grep -n '^    lock_owned=0$' "$case_stdout" | cut -d: -f1)
-reset_takeover_line=$(grep -n '^    takeover_owned=0$' "$case_stdout" | cut -d: -f1)
-[[ "$reset_takeover_line" -eq "$((reset_lock_line + 1))" ]] ||
-    die 'acquisition child ownership resets are not adjacent and ordered'
+[[ $(sed -n '2p' "$case_stdout") == '    lock_owned=0' &&
+   $(sed -n '3p' "$case_stdout") == '    takeover_owned=0' ]] ||
+    die 'acquisition child ownership resets are not the first two statements'
+sed -n '/^pipeline_acquisition_worker() {$/,/^}$/p' "$runner" >"$case_stdout"
+[[ $(sed -n '2p' "$case_stdout") == '    lock_owned=0' &&
+   $(sed -n '3p' "$case_stdout") == '    takeover_owned=0' ]] ||
+    die 'pipeline worker ownership resets are not the first two statements'
+[[ $(grep -c '^pipeline_acquisition_worker() {$' "$runner") -eq 1 ]] ||
+    die 'pipeline worker definition count differs'
+[[ $(grep -c 'pipeline_acquisition_worker' "$runner") -eq 1 ]] ||
+    die 'pipeline worker has a production call site'
+trap_body=$(grep '^    trap ' "$case_stdout")
+[[ "$trap_body" != *'$1'* && "$trap_body" != *'$2'* &&
+   "$trap_body" != *'$@'* && "$trap_body" != *'$*'* ]] ||
+    die 'pipeline worker trap uses positional parameters'
+for trap_name in $(printf '%s\n' "$trap_body" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | tr -d '$' | sort -u); do
+    ! grep -Eq "^[[:space:]]*local([[:space:]].*)?[[:space:]]$trap_name(=|[[:space:]]|$)" "$case_stdout" ||
+        die "pipeline worker trap variable is local: $trap_name"
+done
+if grep -En 'pipeline_acquisition_worker[[:space:]]+[^&]*&' "$runner" >"$case_stdout"; then
+    die 'pipeline worker has a bare background invocation'
+fi
 pass 'static Bash 3.2 compatibility checks pass'
 
 expected_campaign_commands=$test_tmp/expected-campaign-commands
@@ -1598,6 +1616,31 @@ sed >"$test_tmp/fake-adapter-python" <<'FAKE_ADAPTER_PYTHON'
 #!/bin/bash
 set -eu
 [ "$#" -ge 1 ] || exit 91
+mkfifo_program='import os, sys
+path = sys.argv[1]
+old_umask = os.umask(0)
+try:
+    os.mkfifo(path, 0o600)
+finally:
+    os.umask(old_umask)'
+statvfs_program='import os, sys
+path = sys.argv[1]
+s = os.statvfs(path)
+print(s.f_bavail * s.f_frsize)'
+if [ "$1" = -c ]; then
+    [ "$#" -eq 3 ] || exit 93
+    if [ "$2" = "$mkfifo_program" ]; then
+        [ "$3" = "${HFX_TEST_PIPELINE_COMPLETION_PATH:?}" ] || exit 93
+        mkfifo -m 600 "$3"
+        exit
+    fi
+    if [ "$2" = "$statvfs_program" ]; then
+        [ "$3" = "${HFX_TEST_PIPELINE_CAMPAIGN_DIR:?}" ] || exit 93
+        printf '%s\n' "${HFX_TEST_PIPELINE_AVAILABLE_BYTES-44296724480}"
+        exit
+    fi
+    exit 93
+fi
 [ "$1" = "${HFX_TEST_ADAPTER_SCRIPT:?}" ] || exit 92
 shift
 if [ "${1-}" = assemble ]; then
@@ -4099,7 +4142,7 @@ assert_contains "$case_stderr" \
 [[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
     die 'pipeline left the campaign lock behind'
 sed -n '/^pipeline_campaign() {$/,/^}$/p' "$runner" >"$test_tmp/pipeline-coordinator"
-if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|acquire_basin|compile_campaign|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
+if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|fifo|acquire_basin|compile_campaign|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
     "$test_tmp/pipeline-coordinator" >"$case_stdout"; then
     die 'pipeline coordinator contains execution machinery'
 fi
@@ -4420,6 +4463,321 @@ diff -ru "$test_tmp/recovery-replay-before" "$pipeline_dir"
 git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-after"
 diff -u "$test_tmp/recovery-status-before" "$test_tmp/recovery-status-after"
 recovery_case_84_passed=1
+
+guard_dir=$test_tmp/pipeline-guards
+mkdir -p "$guard_dir/downloads" "$guard_dir/state/tmp"
+for readme_contract in \
+    'pipeline occupancy invariant exceeded: observed <actual> pairs;' \
+    'insufficient pipeline dispatch disk: available <actual> bytes; required' \
+    'state/tmp/pipeline-completions.fifo' \
+    '( pipeline_acquisition_worker "$basin_id" ) &' \
+    '5 * 8,859,344,896 = 44,296,724,480 peak input bytes'; do
+    assert_contains "$SCRIPT_DIR/README.md" "$readme_contract"
+done
+sed -n '/^The authored 600 GB reclaim model is:$/,/^| `560,000,000,000` usable bytes/p' \
+    "$SCRIPT_DIR/README.md" >"$test_tmp/current-authored-model"
+current_authored_hash=$(shasum -a 256 "$test_tmp/current-authored-model" | awk '{print $1}')
+[[ "$current_authored_hash" == 1dc7d7e7574f6e56b980d8f888865b991dbafbb39c1c0a6266187b71c508813b ]] ||
+    die 'authored 600 GB reclaim model changed'
+cp "$repo_root/adapters/tdx-hydro/data/tdx_header_numbers.json" "$guard_dir/state/inventory.json"
+guard_ids=()
+while IFS= read -r guard_id; do
+    guard_ids[${#guard_ids[@]}]=$guard_id
+done < <(jq -r 'keys[0:6][]' "$guard_dir/state/inventory.json")
+[[ ${#guard_ids[@]} -eq 6 ]] || die 'guard fixture does not contain six authoritative IDs'
+jq -n --args '{schema_version:1,basin_ids:$ARGS.positional,
+  basins:($ARGS.positional|map({key:.,value:{status:"pending",blocked_reason:null}})|from_entries),
+  fabric_version:"fixture-v1",max_parallel:4}' -- \
+  ${guard_ids[@]+"${guard_ids[@]}"} >"$guard_dir/state/pipeline.json"
+jq -n --args '{schema_version:1,basin_ids:$ARGS.positional}' -- \
+  ${guard_ids[@]+"${guard_ids[@]}"} >"$guard_dir/state/selection.json"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    RM=$(command -v rm)
+    ADAPTER_PYTHON=$test_tmp/fake-adapter-python
+    campaign_dir=$guard_dir
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$campaign_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$campaign_dir/state/tmp/pipeline-completions.fifo
+    set_pipeline_status() {
+        "$JQ" --arg id "$1" --arg status "$2" '.basins[$id].status=$status' \
+            "$campaign_dir/state/pipeline.json" >"$campaign_dir/state/tmp/p.json"
+        mv "$campaign_dir/state/tmp/p.json" "$campaign_dir/state/pipeline.json"
+    }
+    clear_guard_sources() {
+        rm -f "$campaign_dir"/downloads/*
+    }
+    suffixes=(basins.gpkg basins.gpkg.partial basins.gpkg.partial.json
+        streamnet.gpkg streamnet.gpkg.partial streamnet.gpkg.partial.json)
+    for suffix in ${suffixes[@]+"${suffixes[@]}"}; do
+        clear_guard_sources
+        path=$campaign_dir/downloads/${guard_ids[0]}-$suffix
+        if [[ "$suffix" == streamnet.gpkg.partial.json ]]; then
+            ln -s "$campaign_dir/missing-target" "$path"
+        else
+            : >"$path"
+        fi
+        pipeline_has_physical_pair "${guard_ids[0]}" ||
+            die "physical predicate missed $suffix"
+        pipeline_count_occupancy
+        [[ "$pipeline_occupancy_count" -eq 1 ]] ||
+            die "physical path counted incorrectly: $suffix"
+    done
+    clear_guard_sources
+    for status in pending acquiring ready compiling terminal reclaimed blocked; do
+        set_pipeline_status "${guard_ids[0]}" "$status"
+        if [[ "$status" == acquiring || "$status" == ready ||
+              "$status" == compiling || "$status" == terminal ]]; then
+            pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+                die "reserving status omitted: $status"
+        elif pipeline_basin_occupies_pair "${guard_ids[0]}"; then
+            die "nonreserving status included: $status"
+        fi
+    done
+    set_pipeline_status "${guard_ids[0]}" blocked
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg.partial"
+    pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+        die 'source-retaining blocked basin was omitted'
+    clear_guard_sources
+    ! pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+        die 'path-free blocked basin was included'
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg"
+    : >"$campaign_dir/downloads/${guard_ids[0]}-streamnet.gpkg.partial"
+    set_pipeline_status "${guard_ids[0]}" ready
+    pipeline_count_occupancy
+    [[ "$pipeline_occupancy_count" -eq 1 ]] ||
+        die 'multiple paths and reserving status counted one ID more than once'
+    clear_guard_sources
+    for index in 0 1 2 3 4 5; do
+        set_pipeline_status "${guard_ids[$index]}" pending
+    done
+    for index in 0 1 2 3 4; do
+        set_pipeline_status "${guard_ids[$index]}" acquiring
+    done
+    pipeline_count_occupancy
+    [[ "$pipeline_occupancy_count" -eq 5 ]] || die 'current occupancy five differs'
+    union_status=0
+    ( set_pipeline_status "${guard_ids[5]}" ready; pipeline_count_occupancy ) \
+        >"$case_stdout" 2>"$case_stderr" || union_status=$?
+    [[ "$union_status" -eq 1 ]] || die 'current occupancy six was not fatal'
+    [[ $(<"$case_stderr") == 'hfx: error: pipeline occupancy invariant exceeded: observed 6 pairs; maximum 5' ]] ||
+        die 'current occupancy-six diagnostic differs'
+    set_pipeline_status "${guard_ids[5]}" pending
+    set_pipeline_status "${guard_ids[4]}" pending
+    pipeline_projected_occupancy_allows "${guard_ids[5]}" ||
+        die 'projected occupancy five was rejected'
+    set_pipeline_status "${guard_ids[4]}" acquiring
+    projected_status=0
+    pipeline_projected_occupancy_allows "${guard_ids[5]}" \
+        >"$case_stdout" 2>"$case_stderr" || projected_status=$?
+    projected_survived=1
+    [[ "$projected_status" -eq 1 && ! -s "$case_stdout" && ! -s "$case_stderr" &&
+       "$projected_survived" -eq 1 ]] || die 'projected occupancy six contract differs'
+    pipeline_projected_occupancy_allows "${guard_ids[0]}" ||
+        die 'already-occupied proposal added another pair'
+    for index in 0 1 2 3 4; do
+        set_pipeline_status "${guard_ids[$index]}" pending
+    done
+    for pair_count in 0 1 2 3 4 5; do
+        clear_guard_sources
+        for ((index = 0; index < pair_count; index++)); do
+            : >"$campaign_dir/downloads/${guard_ids[$index]}-basins.gpkg"
+            : >"$campaign_dir/downloads/${guard_ids[$index]}-streamnet.gpkg"
+        done
+        required=$((44296724480 - pair_count * 8859344896))
+        HFX_TEST_PIPELINE_AVAILABLE_BYTES=$required pipeline_dispatch_disk_guard ||
+            die "disk equality rejected for $pair_count pairs"
+        if ((pair_count < 5)); then
+            disk_status=0
+            HFX_TEST_PIPELINE_AVAILABLE_BYTES=$((required - 1)) \
+                pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+                disk_status=$?
+            disk_survived=1
+            [[ "$disk_status" -eq 1 && ! -s "$case_stdout" &&
+               "$disk_survived" -eq 1 ]] || die 'disk shortfall contract differs'
+            [[ $(<"$case_stderr") == "insufficient pipeline dispatch disk: available $((required - 1)) bytes; required $required bytes" ]] ||
+                die 'disk shortfall diagnostic differs'
+        fi
+    done
+    clear_guard_sources
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg.partial"
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=44296724479 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'partial-only basin received disk credit'
+    clear_guard_sources
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg"
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=44296724479 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'one-final basin received disk credit'
+    for bad_probe in command-failure empty negative nonnumeric multiline overflow; do
+        probe_status=0
+        if [[ "$bad_probe" == command-failure ]]; then
+            ( ADAPTER_PYTHON=false; pipeline_available_bytes ) \
+                >"$case_stdout" 2>"$case_stderr" || probe_status=$?
+        else
+            case $bad_probe in
+                empty) probe_value= ;;
+                negative) probe_value=-1 ;;
+                nonnumeric) probe_value=x ;;
+                multiline) probe_value=$'1\n2' ;;
+                overflow) probe_value=9223372036854775808 ;;
+            esac
+            ( HFX_TEST_PIPELINE_AVAILABLE_BYTES=$probe_value; export HFX_TEST_PIPELINE_AVAILABLE_BYTES
+              pipeline_available_bytes ) >"$case_stdout" 2>"$case_stderr" ||
+                probe_status=$?
+        fi
+        [[ "$probe_status" -eq 1 && ! -s "$case_stdout" ]] ||
+            die "statvfs $bad_probe was not fatal"
+        [[ $(<"$case_stderr") == 'hfx: error: pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count' ]] ||
+            die "statvfs $bad_probe diagnostic differs"
+    done
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=00000000000000000001 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'leading-zero probe unexpectedly sufficed'
+    assert_contains "$case_stderr" 'available 1 bytes'
+)
+pass 'pipeline guard counts conservative pairs and exact disk headroom'
+
+completion_dir=$test_tmp/pipeline-completion
+mkdir -p "$completion_dir/state/tmp"
+completion_path=$completion_dir/state/tmp/pipeline-completions.fifo
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    RM=$(command -v rm)
+    ADAPTER_PYTHON=$test_tmp/fake-adapter-python
+    campaign_dir=$completion_dir
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$campaign_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$completion_path
+    pipeline_completion_create_open
+    [[ -p "$completion_path" && ! -L "$completion_path" ]] ||
+        die 'completion path is not a safe named pipe'
+    [[ $(stat -f '%Lp' "$completion_path") == 600 ]] ||
+        die 'completion path mode differs'
+    printf '1020000010\t0\n' >&9
+    read_status=0
+    IFS=$'\t' read -r -u 9 -t 1 completion_id completion_status ||
+        read_status=$?
+    [[ "$read_status" -eq 0 && "$completion_id" == 1020000010 &&
+       "$completion_status" == 0 ]] || die 'bounded completion record differs'
+    pipeline_completion_close_remove
+    [[ ! -e "$completion_path" && ! -L "$completion_path" ]] ||
+        die 'completion path was not removed'
+    mkfifo "$completion_path"
+    pipeline_completion_create_open
+    pipeline_completion_close_remove
+    for unsafe_type in file directory symlink; do
+        target=$completion_dir/state/tmp/target
+        printf preserved >"$target"
+        case $unsafe_type in
+            file) printf preserved >"$completion_path" ;;
+            directory) mkdir "$completion_path" ;;
+            symlink) ln -s "$target" "$completion_path" ;;
+        esac
+        unsafe_status=0
+        ( pipeline_completion_create_open ) >"$case_stdout" 2>"$case_stderr" ||
+            unsafe_status=$?
+        [[ "$unsafe_status" -eq 1 ]] || die "unsafe $unsafe_type path was accepted"
+        [[ $(<"$case_stderr") == "hfx: error: unsafe pipeline completion path: $completion_path; expected a non-symlink named pipe" ]] ||
+            die "unsafe $unsafe_type diagnostic differs"
+        [[ $(<"$target") == preserved ]] || die "unsafe $unsafe_type traversed"
+        case $unsafe_type in
+            file) [[ -f "$completion_path" && $(<"$completion_path") == preserved ]] ||
+                die 'unsafe file changed' ;;
+            directory) [[ -d "$completion_path" ]] || die 'unsafe directory changed' ;;
+            symlink) [[ -L "$completion_path" ]] || die 'unsafe symlink changed' ;;
+        esac
+        case $unsafe_type in
+            directory) rmdir "$completion_path" ;;
+            *) rm "$completion_path" ;;
+        esac
+        rm "$target"
+    done
+)
+pass 'pipeline completion path is safe, mode 0600, and bounded'
+
+run_trap_matrix() {
+    local interpreter=$1
+    local expected_version=$2
+    local observed
+    local matrix_dir=$3
+    observed=$("$interpreter" -c 'printf %s "$BASH_VERSION"')
+    if [[ "$expected_version" == 5.x ]]; then
+        [[ "$observed" == 5.* ]] ||
+            die "Bash-5 trap interpreter mismatch: observed $observed"
+    else
+        [[ "$observed" == "$expected_version" ]] ||
+            die "Bash-3.2 trap interpreter mismatch: observed $observed"
+    fi
+    mkdir -p "$matrix_dir"
+    matrix_status=0
+    "$interpreter" -c 'f(){ trap '\''printf fired >"$1"'\'' EXIT; :; }; f "$1" & p=$!; s=0; wait "$p" || s=$?; exit "$s"' \
+        matrix "$matrix_dir/bare" || matrix_status=$?
+    [[ "$matrix_status" -eq 0 ]] || die "$observed bare background wait failed"
+    if [[ "$expected_version" == 5.x ]]; then
+        [[ $(<"$matrix_dir/bare") == fired ]] ||
+            die "$observed bare background did not fire EXIT"
+    else
+        [[ ! -e "$matrix_dir/bare" ]] ||
+            die "$observed bare background unexpectedly fired EXIT"
+    fi
+    matrix_status=0
+    "$interpreter" -c 'f(){ trap '\''printf fired >"$1"'\'' EXIT; :; }; ( f "$1" ) & p=$!; s=0; wait "$p" || s=$?; exit "$s"' \
+        matrix "$matrix_dir/subshell" || matrix_status=$?
+    [[ "$matrix_status" -eq 0 && $(<"$matrix_dir/subshell") == fired ]] ||
+        die "$observed explicit subshell did not fire EXIT"
+    local_status=0
+    "$interpreter" -c 'set -eu; f(){ local record=$1; trap '\''printf fired >"$record"'\'' EXIT; :; }; f "$1"' \
+        matrix "$matrix_dir/local" >/dev/null 2>&1 || local_status=$?
+    [[ "$local_status" -eq 1 && ! -e "$matrix_dir/local" ]] ||
+        die "$observed local trap contract differs"
+}
+
+run_trap_matrix /bin/bash '3.2.57(1)-release' "$test_tmp/trap-32"
+if [[ -x /opt/homebrew/bin/bash ]]; then
+    run_trap_matrix /opt/homebrew/bin/bash 5.x "$test_tmp/trap-5"
+else
+    printf '%s\n' 'test-tdx-hydro-campaign: SKIP: case 87 Bash-5 empirical arm unavailable' >&2
+fi
+worker_dir=$test_tmp/pipeline-worker
+mkdir -p "$worker_dir/state/tmp"
+for stub_status in 0 7; do
+    worker_shell_status=0
+    HFX_TEST_DEFINITIONS=$definitions \
+    HFX_TEST_PIPELINE_CAMPAIGN_DIR=$worker_dir \
+    HFX_TEST_PIPELINE_COMPLETION_PATH=$worker_dir/state/tmp/pipeline-completions.fifo \
+    HFX_TEST_WORKER_ID=${guard_ids[0]} HFX_TEST_WORKER_STATUS=$stub_status \
+    HFX_TEST_FAKE_PYTHON=$test_tmp/fake-adapter-python \
+    /bin/bash -c '
+      set -Eeuo pipefail
+      IFS=$'\''\n\t'\''
+      source "$HFX_TEST_DEFINITIONS"
+      RM=$(command -v rm)
+      ADAPTER_PYTHON=$HFX_TEST_FAKE_PYTHON
+      campaign_dir=$HFX_TEST_PIPELINE_CAMPAIGN_DIR
+      acquire_basin(){ return "$HFX_TEST_WORKER_STATUS"; }
+      pipeline_completion_create_open
+      worker_status=0
+      ( pipeline_acquisition_worker "$HFX_TEST_WORKER_ID" ) || worker_status=$?
+      read_status=0
+      IFS=$'\''\t'\'' read -r -u 9 -t 1 record_id record_status || read_status=$?
+      printf "%s\t%s\t%s\t%s\n" "$record_id" "$record_status" "$worker_status" "$read_status"
+      pipeline_completion_close_remove
+      exit "$worker_status"
+    ' >"$case_stdout" 2>"$case_stderr" || worker_shell_status=$?
+    [[ "$worker_shell_status" -eq "$stub_status" ]] ||
+        die "worker shell status differs for stub $stub_status"
+    [[ $(<"$case_stdout") == "${guard_ids[0]}"$'\t'"$stub_status"$'\t'"$stub_status"$'\t0' ]] ||
+        die "worker record differs for stub $stub_status"
+done
+pass 'pipeline worker notification obeys Bash 3.2 trap contracts'
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||

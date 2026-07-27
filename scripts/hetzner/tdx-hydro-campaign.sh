@@ -108,6 +108,20 @@ normalize_positive_i64() {
     printf '%s\n' "$normalized"
 }
 
+normalize_nonnegative_i64() {
+    local value=$1
+    local normalized=$value
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    while [[ ${#normalized} -gt 1 && ${normalized#0} != "$normalized" ]]; do
+        normalized=${normalized#0}
+    done
+    if [[ ${#normalized} -gt 19 ]] ||
+        [[ ${#normalized} -eq 19 && "$normalized" > "$HFX_TDX_MAX_I64" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$normalized"
+}
+
 checked_add() {
     local total=$1
     local addend=$2
@@ -603,20 +617,28 @@ validate_campaign_structure() {
     fi
 }
 
+for_each_pipeline_source_path() {
+    local basin_id=$1
+    local callback=$2
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg"
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg.partial"
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"
+}
+
+reclaimed_source_must_be_absent() {
+    local candidate_path=$1
+    [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]] ||
+        hfx_die "reclaimed basin source artifact remains for $pipeline_source_basin_id: $candidate_path; move that exact path out of downloads, then rerun recover"
+}
+
 validate_reclaimed_sources_absent() {
     local basin_id=$1
-    local candidate_path
     if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed' "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
-        for candidate_path in \
-            "$campaign_dir/downloads/$basin_id-basins.gpkg" \
-            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial" \
-            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json" \
-            "$campaign_dir/downloads/$basin_id-streamnet.gpkg" \
-            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial" \
-            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"; do
-            [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]] ||
-                hfx_die "reclaimed basin source artifact remains for $basin_id: $candidate_path; move that exact path out of downloads, then rerun recover"
-        done
+        pipeline_source_basin_id=$basin_id
+        for_each_pipeline_source_path "$basin_id" reclaimed_source_must_be_absent
     fi
 }
 
@@ -973,6 +995,160 @@ resolve_pipeline_compile_tools() {
         ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
         HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
     fi
+}
+
+pipeline_source_path_present() {
+    local candidate_path=$1
+    if [[ -e "$candidate_path" || -L "$candidate_path" ]]; then
+        pipeline_source_present=1
+    fi
+}
+
+pipeline_has_physical_pair() {
+    local basin_id=$1
+    pipeline_source_present=0
+    for_each_pipeline_source_path "$basin_id" pipeline_source_path_present
+    ((pipeline_source_present == 1))
+}
+
+pipeline_has_complete_pair() {
+    local basin_id=$1
+    [[ ( -e "$campaign_dir/downloads/$basin_id-basins.gpkg" ||
+          -L "$campaign_dir/downloads/$basin_id-basins.gpkg" ) &&
+       ( -e "$campaign_dir/downloads/$basin_id-streamnet.gpkg" ||
+          -L "$campaign_dir/downloads/$basin_id-streamnet.gpkg" ) ]]
+}
+
+pipeline_basin_occupies_pair() {
+    local basin_id=$1
+    local status
+    if pipeline_has_physical_pair "$basin_id"; then
+        return 0
+    fi
+    status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+        "$campaign_dir/state/pipeline.json")
+    case $status in
+        acquiring|ready|compiling|terminal) return 0 ;;
+        pending|reclaimed|blocked) return 1 ;;
+        *) hfx_die "invalid pipeline status: $status" ;;
+    esac
+}
+
+pipeline_count_occupancy() {
+    local basin_id
+    local actual=0
+    # M5-S3B-2b must run ordered recovery, including blocked-retention reclaim,
+    # before this counter on a dispatch path or operator-resolvable state can
+    # abort a paid run through the disk guard.
+    while IFS= read -r basin_id; do
+        if pipeline_basin_occupies_pair "$basin_id"; then
+            actual=$((actual + 1))
+        fi
+    done < <(effective_basin_ids)
+    ((actual <= HFX_TDX_RECLAIM_PAIR_COUNT)) ||
+        hfx_die "pipeline occupancy invariant exceeded: observed $actual pairs; maximum 5"
+    pipeline_occupancy_count=$actual
+}
+
+pipeline_projected_occupancy_allows() {
+    local basin_id=$1
+    local projected
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] &&
+        "$JQ" -e --arg id "$basin_id" \
+            '(.basin_ids | index($id) != null) and (.basins | has($id))' \
+            "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline basin is not selected: $basin_id"
+    pipeline_count_occupancy
+    projected=$pipeline_occupancy_count
+    if ! pipeline_basin_occupies_pair "$basin_id"; then
+        projected=$((projected + 1))
+    fi
+    ((projected <= HFX_TDX_RECLAIM_PAIR_COUNT))
+}
+
+pipeline_available_bytes() {
+    local output
+    local normalized
+    local program='import os, sys
+path = sys.argv[1]
+s = os.statvfs(path)
+print(s.f_bavail * s.f_frsize)'
+    if ! output=$("$ADAPTER_PYTHON" -c "$program" "$campaign_dir"); then
+        hfx_die 'pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count'
+    fi
+    if ! normalized=$(normalize_nonnegative_i64 "$output"); then
+        hfx_die 'pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count'
+    fi
+    pipeline_available_byte_count=$normalized
+}
+
+pipeline_dispatch_disk_guard() {
+    local basin_id
+    local present_pairs=0
+    local required_bytes
+    pipeline_count_occupancy
+    while IFS= read -r basin_id; do
+        if pipeline_has_complete_pair "$basin_id"; then
+            present_pairs=$((present_pairs + 1))
+        fi
+    done < <(effective_basin_ids)
+    pipeline_available_bytes
+    required_bytes=$((HFX_TDX_RECLAIM_PEAK_BYTES -
+        present_pairs * HFX_TDX_RECLAIM_PAIR_BYTES))
+    if ((pipeline_available_byte_count < required_bytes)); then
+        printf 'insufficient pipeline dispatch disk: available %s bytes; required %s bytes\n' \
+            "$pipeline_available_byte_count" "$required_bytes" >&2
+        return 1
+    fi
+}
+
+pipeline_completion_path_is_safe() {
+    [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]] ||
+        hfx_die "unsafe pipeline completion path: $pipeline_completion_path; expected a non-symlink named pipe"
+}
+
+pipeline_completion_create_open() {
+    local program='import os, sys
+path = sys.argv[1]
+old_umask = os.umask(0)
+try:
+    os.mkfifo(path, 0o600)
+finally:
+    os.umask(old_umask)'
+    pipeline_completion_path=$campaign_dir/state/tmp/pipeline-completions.fifo
+    if [[ -e "$pipeline_completion_path" || -L "$pipeline_completion_path" ]]; then
+        if [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]]; then
+            "$RM" -- "$pipeline_completion_path"
+        else
+            hfx_die "unsafe pipeline completion path: $pipeline_completion_path; expected a non-symlink named pipe"
+        fi
+    fi
+    "$ADAPTER_PYTHON" -c "$program" "$pipeline_completion_path" ||
+        hfx_die "could not create pipeline completion path: $pipeline_completion_path"
+    pipeline_completion_path_is_safe
+    exec 9<>"$pipeline_completion_path"
+}
+
+pipeline_completion_close_remove() {
+    pipeline_completion_path=$campaign_dir/state/tmp/pipeline-completions.fifo
+    exec 9>&-
+    pipeline_completion_path_is_safe
+    "$RM" -- "$pipeline_completion_path"
+}
+
+# M5-S3B-2b must capture nonzero read and wait statuses with || status=$?,
+# wait once per PID, and treat any nonzero read as timeout because descriptor 9
+# prevents EOF. A zombie can satisfy kill -0 for one additional bounded round.
+pipeline_acquisition_worker() {
+    lock_owned=0
+    takeover_owned=0
+    local basin_id=$1
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '$basin_id'; expected an authoritative 10-digit ID"
+    pipeline_worker_basin_id=$basin_id
+    pipeline_worker_status=0
+    trap 'pipeline_worker_status=$?; printf "%s\t%s\n" "$pipeline_worker_basin_id" "$pipeline_worker_status" >&9 || :; exit "$pipeline_worker_status"' EXIT
+    acquire_basin "$basin_id"
 }
 
 pipeline_finish_terminal() {
@@ -3123,11 +3299,11 @@ acquire_product() {
 }
 
 acquire_basin() {
+    lock_owned=0
+    takeover_owned=0
     local basin_id=$1
     # Bash clears a parent-set EXIT trap in an & subshell. These resets remain
     # defense in depth so a worker can never satisfy campaign-lock re-entry.
-    lock_owned=0
-    takeover_owned=0
     if reconcile_reclaim_basin "$basin_id" false; then
         return
     fi
