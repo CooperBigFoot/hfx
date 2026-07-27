@@ -527,10 +527,12 @@ Blocked-basin remediation is explicit:
 
 The supervised commands are operator overrides. Automatic pipeline recovery
 never reacquires retained-for-inspection input and never performs a second
-build. The current slice adds callable pipeline guards and completion transport,
-while `pipeline` execution remains recovery-only. Phase-separated `acquire`,
-`compile`, `compile-basin`, `status`, and `progress`, retain-all behavior, and
-measured timing ranges remain unchanged.
+build. `pipeline` runs an acquisition producer at the requested
+`max_parallel`, capped at four by reclaim policy. Workers launch as explicit
+subshells with `( pipeline_acquisition_worker "$basin_id" ) &`. One synchronous
+serial compiler runs in the parent while acquisition workers remain live.
+Phase-separated `acquire`, `compile`, `compile-basin`, `status`, and `progress`
+and retain-all behavior remain unchanged.
 
 The occupancy guard counts distinct effective basin IDs. A basin occupies one
 pair when any final, partial, or partial sidecar source path exists, including a
@@ -568,16 +570,29 @@ trap must be non-local because function locals are gone when that trap runs.
 The trap makes exactly one record-write attempt and ignores write failure after
 capturing the true worker status.
 
-M5-S3B-2b must treat every nonzero timed-read result as timeout because Bash
-3.2 returns 1 and Bash 5 returns 142; descriptor 9 being read-write makes EOF
-unreachable. Both `read` and `wait` nonzero statuses require explicit capture
-under strict mode. Each PID may be waited only once; a second wait returns 127.
-`kill -0` can recognize an unreaped zombie for one additional bounded round.
-No scheduling loop, worker fork from a loop, producer, serial consumer,
-liveness sweep, termination logic, or calibration is included in this slice.
-`recover` changes interrupted `running` stages back to `pending` and completes
-an interrupted terminal reclaim; `acquire` and `compile` also perform the
-applicable recovery before work. Operational
+The scheduler performs ordered recovery before reconstruction and before every
+occupancy guard. Projected-count and disk-headroom refusals are nonfatal; a
+ready pair can compile and reclaim capacity before the producer retries.
+Descriptor 9 uses one-second timed reads. Every nonzero read result enters the
+liveness sweep because Bash 3.2 returns 1 and Bash 5 returns 142; descriptor 9
+being read-write makes EOF unreachable. `kill -0` can recognize an unreaped
+zombie for one additional bounded round. Both `read` and `wait` nonzero statuses
+are captured under strict mode, and each tracked PID is waited exactly once.
+
+Each basin receives at most two scheduler dispatch attempts and two serial
+consumer attempts per invocation. A scheduler-state snapshot and round dispatch,
+reap, and compile flags terminate a round with no durable change or action
+through the bounded final-state check. A completion already accounted for by
+the liveness sweep is discarded, including after that basin is redispatched.
+Success requires every selected basin to be `reclaimed`. Bounded incomplete
+reporting preserves `pending`, `ready`, and `blocked` states for recovery or
+operator action. Fatal and signal cleanup sends TERM to tracked children, reaps
+each child, and removes the FIFO before releasing the campaign lock.
+
+The planning timing model remains 33-37 hours for acquisition, 16-18 hours for
+serial compilation, and approximately 34-42 hours for the overlapped pipeline.
+These values are planning estimates, not a measured planetary result.
+Operational
 recovery always re-runs the same campaign with the same sizing, inventory,
 parallelism, fabric version, paths, attribution inputs, and scratch prefix.
 Do not sweep resources, enumerate by name pattern or label selector, or perform
