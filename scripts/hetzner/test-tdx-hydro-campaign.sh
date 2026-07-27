@@ -4099,7 +4099,7 @@ assert_contains "$case_stderr" \
 [[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
     die 'pipeline left the campaign lock behind'
 sed -n '/^pipeline_campaign() {$/,/^}$/p' "$runner" >"$test_tmp/pipeline-coordinator"
-if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|acquire_basin|compile_campaign|recover_|reconcile_|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
+if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|acquire_basin|compile_campaign|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
     "$test_tmp/pipeline-coordinator" >"$case_stdout"; then
     die 'pipeline coordinator contains execution machinery'
 fi
@@ -4194,12 +4194,232 @@ for basin_id in 1020000010 7020000010 9020000010; do
     ' "$basin_state" >"$basin_state.tmp"
     mv "$basin_state.tmp" "$basin_state"
 done
-cp "$pipeline_state" "$test_tmp/pipeline-authoritative-stable"
 run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
     --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
 assert_contains "$case_stdout" 'pipeline_durable_unreclaimed=0'
+jq -e '[.basins[].status == "reclaimed"] | all' "$pipeline_state" >/dev/null ||
+    die 'durable reclaimed state did not replace stale scheduler records'
+cp "$pipeline_state" "$test_tmp/pipeline-authoritative-stable"
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
 cmp "$test_tmp/pipeline-authoritative-stable" "$pipeline_state"
 pass 'pipeline progress is lock-free and durable basin state stays authoritative'
+
+recovery_state_fixture() {
+    recovery_id=$1
+    recovery_acquire_status=$2
+    recovery_acquire_reason=$3
+    recovery_compile_status=$4
+    recovery_compile_attempts=$5
+    recovery_compile_reason=$6
+    recovery_reclaimed=$7
+    recovery_state=$pipeline_dir/state/basins/$recovery_id/current.json
+    jq --arg id "$recovery_id" --arg acquire_status "$recovery_acquire_status" \
+        --arg acquire_reason "$recovery_acquire_reason" \
+        --arg compile_status "$recovery_compile_status" \
+        --argjson compile_attempts "$recovery_compile_attempts" \
+        --arg compile_reason "$recovery_compile_reason" --argjson reclaimed "$recovery_reclaimed" '
+      def evidence($product): {
+        bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+        layer_name:($id+"_"+$product)
+      };
+      .schema_version=4 |
+      .retention={policy:"reclaim-inputs-after-terminal",inputs_reclaimed:$reclaimed} |
+      .stages.acquire_basins={
+        status:$acquire_status,attempts:1,
+        failure_reason:(if $acquire_reason == "" then null else $acquire_reason end),
+        evidence:(if $acquire_status == "succeeded" then evidence("basins") else null end)
+      } |
+      .stages.acquire_streamnet={
+        status:"succeeded",attempts:1,failure_reason:null,evidence:evidence("streamnet")
+      } |
+      .stages.compile={
+        status:$compile_status,attempts:$compile_attempts,
+        failure_reason:(if $compile_reason == "" then null else $compile_reason end),
+        diagnostic_report:null
+      }
+    ' "$recovery_state" >"$recovery_state.tmp"
+    mv "$recovery_state.tmp" "$recovery_state"
+}
+
+for recovery_id in 1020000010 7020000010 9020000010; do
+    jq --arg id "$recovery_id" '.basins[$id]={status:"pending",blocked_reason:null}' \
+        "$pipeline_state" >"$pipeline_state.tmp"
+    mv "$pipeline_state.tmp" "$pipeline_state"
+done
+jq '.basins["9020000010"].status="compiling"' "$pipeline_state" >"$pipeline_state.tmp"
+mv "$pipeline_state.tmp" "$pipeline_state"
+recovery_state_fixture 1020000010 succeeded '' failed 1 'adapter build failed' true
+recovery_state_fixture 7020000010 succeeded '' failed 1 'adapter build failed' false
+recovery_state_fixture 9020000010 succeeded '' failed 0 \
+    'acquisition prerequisites are not both succeeded' false
+for recovery_product in basins streamnet; do
+    touch "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg" \
+        "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg.partial" \
+        "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg.partial.json"
+done
+sed >"$test_tmp/recovery-rm" <<'RECOVERY_RM'
+#!/bin/sh
+set -eu
+for recovery_path do
+    case $recovery_path in
+        */downloads/7020000010-*)
+            "${HFX_TEST_REAL_JQ:?}" -e '
+              .basins["7020000010"].status == "terminal"
+            ' "${HFX_TEST_RECOVERY_DIR:?}/state/pipeline.json" >/dev/null
+            "${HFX_TEST_REAL_JQ:?}" -e '
+              .retention.inputs_reclaimed == false
+            ' "${HFX_TEST_RECOVERY_DIR:?}/state/basins/7020000010/current.json" >/dev/null
+            printf '%s\n' "$recovery_path" >>"${HFX_TEST_RECOVERY_RM_LOG:?}"
+            ;;
+    esac
+done
+exec "${HFX_TEST_REAL_RM:?}" "$@"
+RECOVERY_RM
+chmod +x "$test_tmp/recovery-rm"
+export HFX_TEST_RECOVERY_DIR=$pipeline_dir
+export HFX_TEST_RECOVERY_RM_LOG=$test_tmp/recovery-rm.log
+HFX_TEST_REAL_RM=$(command -v rm)
+export HFX_TEST_REAL_RM
+export HFX_TDX_RM=$test_tmp/recovery-rm
+: >"$HFX_TEST_ADAPTER_LOG"
+expect_failure 'mixed recovery remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+unset HFX_TDX_RM
+jq -e '
+  .basins["1020000010"].status == "reclaimed" and
+  .basins["7020000010"].status == "reclaimed" and
+  .basins["9020000010"].status == "ready"
+' "$pipeline_state" >/dev/null || die 'ordered rule 1, rule 2, and rule 5 results differ'
+[[ ! -s "$HFX_TEST_ADAPTER_LOG" ]] || die 'eligible recovery invoked the adapter'
+[[ $(wc -l <"$HFX_TEST_RECOVERY_RM_LOG" | tr -d ' ') -eq 6 ]] ||
+    die 'source removal was not observed after the terminal transition'
+for recovery_product in basins streamnet; do
+    for recovery_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+        [[ ! -e "$pipeline_dir/downloads/7020000010-$recovery_product$recovery_suffix" ]] ||
+            die 'rule 2 left a source path'
+    done
+done
+definitions=$test_tmp/pipeline-recovery-definitions.sh
+sed '/^if (($# == 1))/,$d' "$runner" >"$definitions"
+cp "$pipeline_dir/state/basins/7020000010/current.json" "$test_tmp/recovery-helper-state"
+for recovery_reason in \
+    'acquisition report is unsafe or malformed; retained for inspection' \
+    'existing final file failed integrity verification; retained for inspection' \
+    'persisted evidence does not match final file; retained for inspection' \
+    'installed final failed integrity verification; retained for inspection'; do
+    jq --arg reason "$recovery_reason" \
+        '.stages.acquire_basins.failure_reason=$reason' \
+        "$test_tmp/recovery-helper-state" >"$pipeline_dir/state/basins/7020000010/current.json"
+    (
+        # shellcheck source=/dev/null
+        source "$definitions"
+        JQ=$(command -v jq)
+        campaign_dir=$pipeline_dir
+        [[ $(reclaim_eligibility 7020000010) == ineligible ]]
+    ) || die "shared eligibility accepted excluded reason: $recovery_reason"
+done
+cp "$test_tmp/recovery-helper-state" "$pipeline_dir/state/basins/7020000010/current.json"
+while IFS='|' read -r recovery_class recovery_reason; do
+    [[ -n "$recovery_class" ]] || continue
+    if [[ "$recovery_reason" == 'interrupted before terminal state; reset by recover' ]]; then
+        recovery_state_fixture 1020000010 pending "$recovery_reason" pending 0 '' false
+    else
+        recovery_state_fixture 1020000010 failed "$recovery_reason" pending 0 '' false
+    fi
+    expect_failure "acquisition classification $recovery_reason" pipeline \
+        --campaign pipeline --workspace-root "$pipeline_root" \
+        --max-parallel 1 --fabric-version fixture-v1
+    recovery_actual=$(jq -r '.basins["1020000010"].status' "$pipeline_state")
+    [[ "$recovery_actual" == "$recovery_class" ]] ||
+        die "acquisition reason classified $recovery_actual instead of $recovery_class: $recovery_reason"
+    if [[ "$recovery_class" == blocked ]]; then
+        [[ $(jq -r '.basins["1020000010"].blocked_reason' "$pipeline_state") == "$recovery_reason" ]] ||
+            die "blocked acquisition reason changed: $recovery_reason"
+    fi
+done <<'RECOVERY_ACQUISITION_TABLE'
+pending|interrupted before terminal state; reset by recover
+pending|partial changed during ignored-Range continuation
+pending|continuation response failed provenance verification
+pending|transfer failed
+pending|download provenance or size verification failed
+pending|download failed integrity verification
+blocked|acquisition report is unsafe or malformed; retained for inspection
+blocked|existing final file failed integrity verification; retained for inspection
+blocked|persisted evidence does not match final file; retained for inspection
+blocked|partial provenance path is unsafe; retained without traversal
+blocked|installed final failed integrity verification; retained for inspection
+RECOVERY_ACQUISITION_TABLE
+recovery_state_fixture 1020000010 failed 'unknown acquisition failure' pending 0 '' false
+expect_failure 'unknown acquisition reason' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+assert_contains "$case_stderr" 'pipeline acquisition classifier rejected failure reason'
+recovery_state_fixture 1020000010 running '' pending 0 '' false
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    campaign_dir=$pipeline_dir
+    classify_pipeline_acquisition_stage 1020000010 acquire_basins
+) >"$case_stdout" 2>"$case_stderr" &&
+    die 'residual running acquisition reached rule 8'
+assert_contains "$case_stderr" 'pipeline acquisition classifier found residual running stage'
+recovery_state_fixture 1020000010 succeeded '' failed 1 'adapter build failed' true
+sed -n '/^compile_basin_core() {$/,/^}$/p' "$runner" >"$test_tmp/recovery-core"
+sed -n '/^compile_basin_locked() {$/,/^}$/p' "$runner" >"$test_tmp/recovery-locked"
+[[ $(grep -Fc '[[ "$defer_reclaim" == false ]]' "$test_tmp/recovery-core") -eq 5 ]] ||
+    die 'deferred reclaim does not gate exactly five core sites'
+assert_contains "$test_tmp/recovery-locked" 'compile_basin_core "$basin_id" "$defer_reclaim"'
+assert_contains "$test_tmp/recovery-core" 'if reconcile_reclaim_basin "$basin_id" true; then'
+assert_contains "$test_tmp/recovery-locked" 'if reconcile_reclaim_basin "$basin_id" true; then'
+recovery_case_83_passed=1
+
+recovery_state_fixture 1020000010 failed 'transfer failed' pending 0 '' false
+recovery_state_fixture 7020000010 failed \
+    'acquisition report is unsafe or malformed; retained for inspection' pending 0 '' false
+recovery_state_fixture 9020000010 succeeded '' pending 1 '' false
+for recovery_id in 1020000010 7020000010; do
+    for recovery_product in basins streamnet; do
+        touch "$pipeline_dir/downloads/$recovery_id-$recovery_product.gpkg"
+    done
+done
+: >"$HFX_TEST_ADAPTER_LOG"
+git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-before"
+expect_failure 'inspection recovery remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+jq -e '
+  .basins["1020000010"].status == "pending" and
+  .basins["7020000010"] == {
+    status:"blocked",
+    blocked_reason:"acquisition report is unsafe or malformed; retained for inspection"
+  } and
+  .basins["9020000010"] == {
+    status:"blocked",
+    blocked_reason:"interrupted compile attempt cannot be safely repeated; retained for inspection"
+  }
+' "$pipeline_state" >/dev/null || die 'nonterminal and positive-attempt recovery results differ'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) -eq 0 ]] ||
+    die 'positive-attempt recovery repeated a build'
+for recovery_id in 1020000010 7020000010; do
+    for recovery_product in basins streamnet; do
+        [[ -f "$pipeline_dir/downloads/$recovery_id-$recovery_product.gpkg" ]] ||
+            die 'acquisition recovery removed a retained final'
+    done
+done
+for recovery_id in 1020000010 7020000010 9020000010; do
+    recovery_state_fixture "$recovery_id" succeeded '' failed 1 'adapter build failed' true
+    rm -f "$pipeline_dir/downloads/$recovery_id-basins.gpkg" \
+        "$pipeline_dir/downloads/$recovery_id-streamnet.gpkg"
+done
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+cp -R "$pipeline_dir" "$test_tmp/recovery-replay-before"
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+diff -ru "$test_tmp/recovery-replay-before" "$pipeline_dir"
+git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-after"
+diff -u "$test_tmp/recovery-status-before" "$test_tmp/recovery-status-after"
+recovery_case_84_passed=1
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||
@@ -4292,6 +4512,13 @@ done
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-final"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-final"
 pass 'poison commands remain uninvoked and repository status preserves only the allowed PR body'
+
+[[ "${recovery_case_83_passed-}" == 1 ]] ||
+    die 'pipeline recovery classification case did not complete'
+pass 'pipeline recovery evaluates eight rules and preserves acquisition terminality'
+[[ "${recovery_case_84_passed-}" == 1 ]] ||
+    die 'pipeline recovery replay case did not complete'
+pass 'pipeline recovery never reacquires or repeats a basin build and replay is stable'
 
 printf '1..%d\n' "$passed"
 if [[ "$skipped" -eq 0 ]]; then

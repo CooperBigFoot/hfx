@@ -362,27 +362,45 @@ graph.parquet, and aux/snap_stems.parquet across its merge passes, so those file
 are never reclaim targets. Retain-all behavior is unchanged and keeps all acquired
 source artifacts through publication.
 
-Acquisition status failed remains retryable and is not a reclaim trigger. A safe
-partial and provenance sidecar remain available for If-Range resume, and a
-succeeded sibling product remains installed. These artifacts count as one
-occupied pair against the five-pair invariant. Acquisition exhaustion and reclaim
-are deferred to the occupancy-aware scheduler that owns dispatch and retry
-budgets.
+Pipeline recovery classifies each acquisition stage from durable state.
+`succeeded` is terminal. `pending`, including the interrupted-stage diagnostic,
+and these five failed reasons are retryable and map to pipeline `pending`:
 
-Acquisition artifacts explicitly retained for inspection are not reclaimed. The
-affected reasons are "acquisition report is unsafe or malformed; retained for
-inspection", "existing final file failed integrity verification; retained for
-inspection", "persisted evidence does not match final file; retained for
-inspection", and "installed final failed integrity verification; retained for
-inspection". Each affected basin with source bytes counts as one occupied pair
-until an operator classifies and resolves it.
+- `partial changed during ignored-Range continuation`
+- `continuation response failed provenance verification`
+- `transfer failed`
+- `download provenance or size verification failed`
+- `download failed integrity verification`
 
-Compile artifacts classified as "compile artifact path already exists; retained
-for inspection" or "existing compile artifacts failed resume verification;
-retained for inspection" are also not reclaim triggers. Both source products and
-their provenance sidecars remain, inputs_reclaimed stays false, and the basin
-counts as one occupied pair. The M5-S3B occupancy-aware scheduler owns the guard
-that stops dispatch before a sixth pair.
+These five failed reasons map to pipeline `blocked` and retain the exact reason:
+
+- `acquisition report is unsafe or malformed; retained for inspection`
+- `existing final file failed integrity verification; retained for inspection`
+- `persisted evidence does not match final file; retained for inspection`
+- `partial provenance path is unsafe; retained without traversal`
+- `installed final failed integrity verification; retained for inspection`
+
+Recovery preserves a succeeded sibling, safe partial, sidecar, final,
+acquisition report, attempt count, and evidence. It performs no acquisition.
+Unknown failed reasons and residual `running` acquisition stages fail closed
+with an acquisition-specific diagnostic.
+
+The five durable compile failure reasons are `adapter build failed`, `adapter
+validation failed`, `existing compile artifacts failed resume verification;
+retained for inspection`, `compile artifact path already exists; retained for
+inspection`, and `acquisition prerequisites are not both succeeded`. The two
+adapter hard failures are reclaimable after a positive attempt. Both compile
+inspection reasons are blocked. The prerequisite reason at zero attempts
+automatically becomes `ready` once both acquisitions succeed and neither
+managed output nor build-report path exists. Its artifact-present variant is
+blocked with the prerequisite reason unchanged.
+
+A blocked basin retains its source pair and permanently occupies a future pair
+slot until operator remediation. Pipeline completion requires every selected
+basin to become `reclaimed`, so every invocation remains nonzero while a
+selected basin is blocked. Five blocked basins wedge the campaign because no
+remaining pair slot is available while completion still requires every
+selected basin to be reclaimed.
 
 After a compile hard failure has been durably classified and its inputs reclaimed,
 those inputs are not retryable in place. Retrying that basin requires a fresh
@@ -451,18 +469,23 @@ The runner phases are:
 
 `pipeline` is available only for campaigns using
 `reclaim-inputs-after-terminal`. It validates `--max-parallel` from `1..4`
-and persists that JSON number with the nonempty `--fabric-version` and the
-sorted effective basin IDs in optional schema-1 `state/pipeline.json`. Fabric
-version and selected basin IDs are immutable on replay. Max parallel may
-change within `1..4`, including a safe reduction, when the resulting document
-remains valid.
+and persists that JSON number with the nonempty `--fabric-version` and sorted
+effective basin IDs in schema-1 `state/pipeline.json`. Fabric version and
+selected basin IDs are immutable on replay. Max parallel may change within
+`1..4`.
 
-Pipeline records contain `status` and `blocked_reason`. The seven statuses
-reserve this future transition vocabulary:
-`pending -> acquiring -> ready -> compiling -> terminal -> reclaimed`, plus
-`blocked`. Only the lock-owning parent atomically writes the document. This
-step materializes records as `pending` and performs no transition. Do not
-hand-edit `state/pipeline.json`.
+Pipeline records contain `status` and `blocked_reason` with statuses `pending`,
+`acquiring`, `ready`, `compiling`, `terminal`, `reclaimed`, and `blocked`.
+Only the lock-owning parent writes the document. The document is advisory:
+each pass reconstructs every selected record from authoritative durable basin
+state using ordered, first-match recovery rules. Already-reclaimed basins stay
+reclaimed. Eligible terminal outcomes transition to `terminal` before source
+removal and to `reclaimed` afterward. A succeeded compile missing only its
+diagnostic is verification-only. Positive compile attempts are never rebuilt:
+inspection artifacts are blocked, and an attempt without artifacts is blocked
+as an interrupted attempt. Zero-attempt ready work remains `ready`. Incomplete
+acquisition maps to `pending` or `blocked` as listed above. Remaining compile
+contradictions fail closed. Do not hand-edit `state/pipeline.json`.
 
 `status` retains its lock-taking validation semantics and prints sizing plus
 deterministic per-stage counts. Only reclaim mode also prints a deterministic
@@ -473,15 +496,41 @@ print `pipeline_max_parallel`, `pipeline_fabric_version`, and the seven
 installed pipeline snapshot without locking, migration, recovery,
 reconciliation, or writes.
 
-Pipeline state is advisory; durable per-basin state is authoritative. A stale
-all-pending document is harmless because M5-S3B-1b re-derives scheduler state
-before later dispatch. This step exits zero only when every selected durable
-basin has schema 4 and `retention.inputs_reclaimed == true`. Otherwise it
-prints durable and scheduler counts and exits nonzero immediately.
+Pipeline completion requires every selected advisory record and durable basin
+to be reclaimed. Otherwise the command prints durable and scheduler counts and
+returns nonzero after one bounded pass.
 
-This step modifies no compile function, performs no recovery reconstruction,
-and has no `defer_reclaim`, dispatch loop, worker, fork, FIFO, occupancy guard,
-capacity probe, or disk guard.
+Blocked-basin remediation is explicit:
+
+1. Stop campaign commands and confirm the exact campaign lock is absent.
+2. Copy the basin `current.json`, acquisition reports, source files and
+   sidecars, output directory, and build report to external inspection storage.
+3. Determine whether acquisition evidence or a prior adapter invocation can be
+   made canonical without repeating paid work.
+4. For a valid prior compile, restore canonical output and report at the exact
+   managed paths and rerun `pipeline` with the same fabric version and selected
+   set. If the basin is already blocked with a compile reason, use step 6
+   instead.
+5. For acquisition inspection, preserve evidence and move the reason-specific
+   path out before explicitly running `acquire`, then rerun `pipeline`. Move
+   `reports/<id>-<product>-acquisition.json` for an unsafe report; move
+   `downloads/<id>-<product>.gpkg` for existing-final, installed-final, or
+   evidence-mismatch failures; move the exact `.gpkg.partial` or
+   `.gpkg.partial.json` unsafe path for unsafe partial provenance. For evidence
+   mismatch, the final must be moved first because leaving it permits
+   `acquire` to promote a file that disagreed with persisted evidence.
+6. If a second build is consciously authorized, move conflicting output and
+   report paths outside managed campaign paths, run `compile-basin` with the
+   same fabric version as a supervised override, then rerun `pipeline`.
+7. If neither recovery is defensible, abandon the basin in this campaign and
+   use a new campaign ID.
+
+The supervised commands are operator overrides. Automatic pipeline recovery
+never reacquires retained-for-inspection input and never performs a second
+build. This step has no dispatch loop, worker fork, FIFO, occupancy guard, disk
+guard, or calibration. Phase-separated `acquire`, `compile`, `compile-basin`,
+`status`, and `progress`, retain-all behavior, and measured timing ranges
+remain unchanged.
 `recover` changes interrupted `running` stages back to `pending` and completes
 an interrupted terminal reclaim; `acquire` and `compile` also perform the
 applicable recovery before work. Operational

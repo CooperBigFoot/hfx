@@ -840,7 +840,6 @@ materialize_pipeline_state() {
 
 pipeline_campaign() {
     local locked_policy
-    local basin_id
     local durable_unreclaimed=0
     local scheduler_counts
     acquire_campaign_lock
@@ -849,12 +848,13 @@ pipeline_campaign() {
     [[ "$locked_policy" == "$acquire_retention_policy" ]] ||
         hfx_die 'campaign retention policy changed while acquiring the campaign lock'
     materialize_pipeline_state
-    while IFS= read -r basin_id; do
-        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
-            "$campaign_dir/state/basins/$basin_id/current.json") != true ]]; then
-            durable_unreclaimed=$((durable_unreclaimed + 1))
-        fi
-    done < <(effective_basin_ids)
+    require_pipeline_selection
+    prepare_pipeline_durable_state
+    validate_workspace_state
+    establish_compile_contract
+    reconstruct_pipeline_records
+    validate_workspace_state
+    durable_unreclaimed=$(pipeline_unreclaimed_count)
     scheduler_counts=$("$JQ" -r '
         . as $root |
         ["pending","acquiring","ready","compiling","terminal","reclaimed","blocked"] |
@@ -868,6 +868,310 @@ pipeline_campaign() {
         set -- $scheduler_counts
         hfx_die "pipeline incomplete: pending=$1 acquiring=$2 ready=$3 compiling=$4 terminal=$5 reclaimed=$6 blocked=$7"
     fi
+}
+
+require_pipeline_selection() {
+    local selected_ids_json
+    local basin_id
+    local selected_ids=()
+    while IFS= read -r basin_id; do
+        selected_ids[${#selected_ids[@]}]=$basin_id
+    done < <(effective_basin_ids)
+    selected_ids_json=$("$JQ" -cn --args '$ARGS.positional' -- \
+        ${selected_ids[@]+"${selected_ids[@]}"})
+    "$JQ" -e --argjson selected "$selected_ids_json" '
+        .basin_ids == $selected and (.basins | keys) == $selected
+    ' "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die 'pipeline selection differs from durable campaign selection'
+}
+
+prepare_pipeline_durable_state() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
+    done < <(effective_basin_ids)
+    while IFS= read -r basin_id; do
+        recover_running_stages_for_basin "$basin_id" false
+    done < <(effective_basin_ids)
+}
+
+pipeline_unreclaimed_count() {
+    local basin_id
+    local count=0
+    while IFS= read -r basin_id; do
+        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+            "$campaign_dir/state/basins/$basin_id/current.json") != true ]]; then
+            count=$((count + 1))
+        fi
+    done < <(effective_basin_ids)
+    printf '%s\n' "$count"
+}
+
+reclaim_eligibility() {
+    local basin_id=$1
+    "$JQ" -r '
+      def eligible:
+        .stages.acquire_basins.status == "succeeded" and
+        .stages.acquire_streamnet.status == "succeeded" and
+        ([.stages.acquire_basins.failure_reason,.stages.acquire_streamnet.failure_reason] |
+         all(. != "acquisition report is unsafe or malformed; retained for inspection" and
+             . != "existing final file failed integrity verification; retained for inspection" and
+             . != "persisted evidence does not match final file; retained for inspection" and
+             . != "installed final failed integrity verification; retained for inspection")) and
+        .stages.compile.attempts > 0 and
+        ((.stages.compile.status == "succeeded" and
+          .stages.compile.failure_reason == null and
+          .stages.compile.diagnostic_report != null) or
+         (.stages.compile.status == "failed" and
+          (.stages.compile.failure_reason == "adapter build failed" or
+           .stages.compile.failure_reason == "adapter validation failed")));
+      if eligible then "eligible"
+      elif (.stages.compile.diagnostic_report = {} | eligible) then "missing-diagnostic"
+      else "ineligible"
+      end
+    ' "$campaign_dir/state/basins/$basin_id/current.json"
+}
+
+classify_pipeline_acquisition_stage() {
+    local basin_id=$1
+    local stage=$2
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local status
+    local reason
+    status=$("$JQ" -r --arg stage "$stage" '.stages[$stage].status' "$current")
+    reason=$("$JQ" -r --arg stage "$stage" '.stages[$stage].failure_reason // ""' "$current")
+    case $status in
+        succeeded) printf '%s\n' terminal ;;
+        pending) printf '%s\n' retryable ;;
+        failed)
+            case $reason in
+                'partial changed during ignored-Range continuation'|\
+                'continuation response failed provenance verification'|\
+                'transfer failed'|\
+                'download provenance or size verification failed'|\
+                'download failed integrity verification')
+                    printf '%s\n' retryable
+                    ;;
+                'acquisition report is unsafe or malformed; retained for inspection'|\
+                'existing final file failed integrity verification; retained for inspection'|\
+                'persisted evidence does not match final file; retained for inspection'|\
+                'partial provenance path is unsafe; retained without traversal'|\
+                'installed final failed integrity verification; retained for inspection')
+                    printf '%s\n' inspection
+                    ;;
+                *) hfx_die "pipeline acquisition classifier rejected failure reason for $basin_id $stage: $reason" ;;
+            esac
+            ;;
+        running) hfx_die "pipeline acquisition classifier found residual running stage for $basin_id $stage" ;;
+        *) hfx_die "pipeline acquisition classifier rejected status for $basin_id $stage: $status" ;;
+    esac
+}
+
+resolve_pipeline_compile_tools() {
+    if [[ -z "${ADAPTER_PYTHON-}" ]]; then
+        ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
+        ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
+        HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
+    fi
+}
+
+pipeline_finish_terminal() {
+    local basin_id=$1
+    if [[ $("$JQ" -r '.stages.compile.status' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == succeeded ]]; then
+        resolve_pipeline_compile_tools
+    fi
+    transition_pipeline_basin "$basin_id" terminal
+    reconcile_reclaim_basin "$basin_id" true ||
+        hfx_die "pipeline terminal basin was not reclaimable: $basin_id"
+    [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]] ||
+        hfx_die "pipeline reclaim did not persist terminal state: $basin_id"
+    validate_reclaimed_sources_absent "$basin_id"
+    transition_pipeline_basin "$basin_id" reclaimed
+}
+
+pipeline_rule_1() {
+    local basin_id=$1
+    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
+        validate_reclaimed_sources_absent "$basin_id"
+        transition_pipeline_basin "$basin_id" reclaimed
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_2() {
+    local basin_id=$1
+    [[ $(reclaim_eligibility "$basin_id") == eligible ]] || return 1
+    [[ $("$JQ" -r '.retention.inputs_reclaimed == false' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]] || return 1
+    pipeline_finish_terminal "$basin_id"
+}
+
+pipeline_rule_3() {
+    local basin_id=$1
+    local eligibility
+    local reason
+    [[ $(reclaim_eligibility "$basin_id") == missing-diagnostic ]] || return 1
+    resolve_pipeline_compile_tools
+    compile_basin_locked "$basin_id" true
+    eligibility=$(reclaim_eligibility "$basin_id")
+    if [[ "$eligibility" == eligible ]]; then
+        pipeline_finish_terminal "$basin_id"
+        return 0
+    fi
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' \
+        "$campaign_dir/state/basins/$basin_id/current.json")
+    if [[ "$reason" == 'existing compile artifacts failed resume verification; retained for inspection' ]]; then
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    hfx_die "pipeline rule 3 produced an unsupported durable result for $basin_id"
+}
+
+pipeline_rule_4() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    local eligibility
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    [[ $("$JQ" -r '.stages.compile.attempts > 0' "$current") == true ]] || return 1
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+    case $reason in
+        'compile artifact path already exists; retained for inspection'|\
+        'existing compile artifacts failed resume verification; retained for inspection')
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+            ;;
+    esac
+    if [[ -e "$campaign_dir/basin-outputs/$basin_id" ||
+        -L "$campaign_dir/basin-outputs/$basin_id" ||
+        -e "$campaign_dir/reports/$basin_id-build-report.json" ||
+        -L "$campaign_dir/reports/$basin_id-build-report.json" ]]; then
+        resolve_pipeline_compile_tools
+        compile_basin_locked "$basin_id" true
+        reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+        if [[ "$reason" == 'compile artifact path already exists; retained for inspection' ]]; then
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+        fi
+        eligibility=$(reclaim_eligibility "$basin_id")
+        if [[ "$eligibility" == eligible ]]; then
+            pipeline_finish_terminal "$basin_id"
+            return 0
+        fi
+        hfx_die "pipeline rule 4 produced an unsupported durable result for $basin_id"
+    fi
+    transition_pipeline_basin "$basin_id" blocked \
+        'interrupted compile attempt cannot be safely repeated; retained for inspection'
+}
+
+pipeline_rule_5() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    [[ $("$JQ" -r '
+      .stages.acquire_basins.status == "succeeded" and
+      .stages.acquire_streamnet.status == "succeeded" and
+      .stages.compile.attempts == 0 and
+      ((.stages.compile.status == "pending" and
+        .stages.compile.failure_reason == null) or
+       (.stages.compile.status == "failed" and
+        .stages.compile.failure_reason == "acquisition prerequisites are not both succeeded")) and
+      .stages.compile.diagnostic_report == null and
+      .retention.inputs_reclaimed == false
+    ' "$current") == true ]] || return 1
+    [[ ! -e "$campaign_dir/basin-outputs/$basin_id" &&
+        ! -L "$campaign_dir/basin-outputs/$basin_id" &&
+        ! -e "$campaign_dir/reports/$basin_id-build-report.json" &&
+        ! -L "$campaign_dir/reports/$basin_id-build-report.json" ]] || return 1
+    transition_pipeline_basin "$basin_id" ready
+}
+
+pipeline_rule_6() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    if [[ "$basins_class" == inspection || "$streamnet_class" == inspection ]]; then
+        if [[ "$basins_class" == inspection ]]; then
+            reason=$("$JQ" -r '.stages.acquire_basins.failure_reason' "$current")
+        else
+            reason=$("$JQ" -r '.stages.acquire_streamnet.failure_reason' "$current")
+        fi
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    if [[ "$basins_class" == retryable || "$streamnet_class" == retryable ]]; then
+        transition_pipeline_basin "$basin_id" pending
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_7() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+    case $reason in
+        'compile artifact path already exists; retained for inspection'|\
+        'existing compile artifacts failed resume verification; retained for inspection')
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+            ;;
+    esac
+    if [[ $("$JQ" -r '.stages.compile.attempts == 0' "$current") == true ]] &&
+        [[ "$reason" == 'acquisition prerequisites are not both succeeded' || -z "$reason" ]] &&
+        [[ -e "$campaign_dir/basin-outputs/$basin_id" ||
+            -L "$campaign_dir/basin-outputs/$basin_id" ||
+            -e "$campaign_dir/reports/$basin_id-build-report.json" ||
+            -L "$campaign_dir/reports/$basin_id-build-report.json" ]]; then
+        if [[ -z "$reason" ]]; then
+            reason='compile artifact path already exists; retained for inspection'
+        fi
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_8() {
+    local basin_id=$1
+    hfx_die "pipeline durable compile state is contradictory for $basin_id"
+}
+
+reconstruct_pipeline_basin() {
+    local basin_id=$1
+    local basins_class
+    local streamnet_class
+    basins_class=$(classify_pipeline_acquisition_stage "$basin_id" acquire_basins)
+    streamnet_class=$(classify_pipeline_acquisition_stage "$basin_id" acquire_streamnet)
+    pipeline_rule_1 "$basin_id" && return
+    pipeline_rule_2 "$basin_id" && return
+    pipeline_rule_3 "$basin_id" && return
+    pipeline_rule_4 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_5 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_6 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_7 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_8 "$basin_id"
+}
+
+reconstruct_pipeline_records() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        reconstruct_pipeline_basin "$basin_id"
+    done < <(effective_basin_ids)
 }
 
 materialize_assembly_state() {
@@ -1505,22 +1809,7 @@ reconcile_reclaim_basin() {
         return 0
     fi
 
-    "$JQ" -e '
-      .stages.acquire_basins.status == "succeeded" and
-      .stages.acquire_streamnet.status == "succeeded" and
-      ([.stages.acquire_basins.failure_reason,.stages.acquire_streamnet.failure_reason] |
-       all(. != "acquisition report is unsafe or malformed; retained for inspection" and
-           . != "existing final file failed integrity verification; retained for inspection" and
-           . != "persisted evidence does not match final file; retained for inspection" and
-           . != "installed final failed integrity verification; retained for inspection")) and
-      .stages.compile.attempts > 0 and
-      ((.stages.compile.status == "succeeded" and
-        .stages.compile.failure_reason == null and
-        .stages.compile.diagnostic_report != null) or
-       (.stages.compile.status == "failed" and
-        (.stages.compile.failure_reason == "adapter build failed" or
-         .stages.compile.failure_reason == "adapter validation failed")))
-    ' "$current" >/dev/null || return 1
+    [[ $(reclaim_eligibility "$basin_id") == eligible ]] || return 1
 
     if [[ "$compile_status" == succeeded ]]; then
         if [[ "$verify_success" == true ]]; then
@@ -1544,6 +1833,7 @@ reconcile_reclaim_basin() {
 
 compile_basin_core() {
     local basin_id=$1
+    local defer_reclaim=${2-false}
     local current
     local acquire_basins_status
     local acquire_streamnet_status
@@ -1553,6 +1843,8 @@ compile_basin_core() {
     local streamnet
     local output
     local report
+    [[ "$defer_reclaim" == true || "$defer_reclaim" == false ]] ||
+        hfx_die "invalid deferred reclaim value: $defer_reclaim"
 
     if reconcile_reclaim_basin "$basin_id" true; then
         return
@@ -1576,7 +1868,8 @@ compile_basin_core() {
         if verify_compile_artifacts "$basin_id" "$output" "$report"; then
             if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
                 write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
-                if reconcile_reclaim_basin "$basin_id" true; then
+                if [[ "$defer_reclaim" == false ]] &&
+                    reconcile_reclaim_basin "$basin_id" true; then
                     :
                 fi
             fi
@@ -1612,7 +1905,8 @@ compile_basin_core() {
         write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
             "${diagnostic_report_json:-null}"
         interrupt_reclaim_boundary "$basin_id" terminal-state
-        if reconcile_reclaim_basin "$basin_id" true; then
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
             :
         fi
         return
@@ -1622,7 +1916,8 @@ compile_basin_core() {
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
         write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
         interrupt_reclaim_boundary "$basin_id" terminal-state
-        if reconcile_reclaim_basin "$basin_id" true; then
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
             :
         fi
         return
@@ -1631,7 +1926,8 @@ compile_basin_core() {
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
         write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
         interrupt_reclaim_boundary "$basin_id" terminal-state
-        if reconcile_reclaim_basin "$basin_id" true; then
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
             :
         fi
         return
@@ -1639,7 +1935,8 @@ compile_basin_core() {
     interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
     write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
     interrupt_reclaim_boundary "$basin_id" terminal-state
-    if reconcile_reclaim_basin "$basin_id" true; then
+    if [[ "$defer_reclaim" == false ]] &&
+        reconcile_reclaim_basin "$basin_id" true; then
         :
     fi
 }
@@ -1659,6 +1956,9 @@ print_basin_compile_status() {
 
 compile_basin_locked() {
     local basin_id=$1
+    local defer_reclaim=${2-false}
+    [[ "$defer_reclaim" == true || "$defer_reclaim" == false ]] ||
+        hfx_die "invalid deferred reclaim value: $defer_reclaim"
     acquire_campaign_lock
     validate_target_workspace_state "$basin_id"
     migrate_basin_state "$basin_id"
@@ -1672,7 +1972,7 @@ compile_basin_locked() {
             hfx_die "acquisition prerequisites are not both succeeded for $basin_id"
     fi
     establish_compile_contract
-    compile_basin_core "$basin_id"
+    compile_basin_core "$basin_id" "$defer_reclaim"
     validate_target_workspace_state "$basin_id"
     print_basin_compile_status "$basin_id"
 }
