@@ -28,6 +28,8 @@ readonly HFX_TDX_RECLAIM_PAIR_COUNT=5
 readonly HFX_TDX_RECLAIM_MAX_PARALLEL=4
 readonly HFX_TDX_RECLAIM_PAIR_BYTES=8859344896
 readonly HFX_TDX_RECLAIM_PEAK_BYTES=44296724480
+readonly HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS=2
+readonly HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS=2
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -860,10 +862,221 @@ materialize_pipeline_state() {
     atomic_install "$temporary" "$state" validate_pipeline_json
 }
 
+pipeline_recover_reconstruct_basin() {
+    local scheduler_recovery_id=$1
+    recover_running_stages_for_basin "$scheduler_recovery_id" false
+    reconstruct_pipeline_basin "$scheduler_recovery_id"
+}
+
+pipeline_selected_index() {
+    local sought_id=$1
+    local sought_index
+    pipeline_found_index=-1
+    for ((sought_index = 0; sought_index < ${#pipeline_selected_basin_ids[@]}; sought_index++)); do
+        if [[ "${pipeline_selected_basin_ids[$sought_index]}" == "$sought_id" ]]; then
+            pipeline_found_index=$sought_index
+            return 0
+        fi
+    done
+    return 1
+}
+
+pipeline_worker_index() {
+    local sought_id=$1
+    local sought_index
+    pipeline_found_index=-1
+    for ((sought_index = 0; sought_index < ${#pipeline_worker_basin_ids[@]}; sought_index++)); do
+        if [[ "${pipeline_worker_basin_ids[$sought_index]}" == "$sought_id" ]]; then
+            pipeline_found_index=$sought_index
+            return 0
+        fi
+    done
+    return 1
+}
+
+pipeline_basin_is_tracked() {
+    pipeline_worker_index "$1"
+}
+
+pipeline_wait_remove_worker() {
+    local remove_index=$1
+    local pid=${pipeline_worker_pids[$remove_index]}
+    local last=$((${#pipeline_worker_pids[@]} - 1))
+    local shift_index
+    pipeline_wait_status=0
+    wait "$pid" || pipeline_wait_status=$?
+    pipeline_removed_basin_id=${pipeline_worker_basin_ids[$remove_index]}
+    for ((shift_index = remove_index; shift_index < last; shift_index++)); do
+        pipeline_worker_pids[$shift_index]=${pipeline_worker_pids[$((shift_index + 1))]}
+        pipeline_worker_basin_ids[$shift_index]=${pipeline_worker_basin_ids[$((shift_index + 1))]}
+    done
+    unset "pipeline_worker_pids[$last]"
+    unset "pipeline_worker_basin_ids[$last]"
+}
+
+pipeline_parallel_limit_reached() {
+    if ((${#pipeline_worker_pids[@]} >= max_parallel)); then
+        return 0
+    fi
+    return 1
+}
+
+pipeline_read_timed_out() {
+    local read_status=$1
+    if ((read_status != 0)); then
+        return 0
+    fi
+    return 1
+}
+
+pipeline_sweep_vanished_workers() {
+    local worker_index=0
+    local vanished_basin_id
+    while ((worker_index < ${#pipeline_worker_pids[@]})); do
+        if kill -0 "${pipeline_worker_pids[$worker_index]}" 2>/dev/null; then
+            worker_index=$((worker_index + 1))
+        else
+            pipeline_wait_remove_worker "$worker_index"
+            vanished_basin_id=$pipeline_removed_basin_id
+            pipeline_round_reaped=1
+            pipeline_recover_reconstruct_basin "$vanished_basin_id"
+        fi
+    done
+}
+
+pipeline_scheduler_cleanup() {
+    local cleanup_pid
+    local cleanup_wait_status
+    ((pipeline_scheduler_active == 1)) || return
+    pipeline_scheduler_active=0
+    trap '' INT TERM
+    for cleanup_pid in ${pipeline_worker_pids[@]+"${pipeline_worker_pids[@]}"}; do
+        kill -TERM "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_pid in ${pipeline_worker_pids[@]+"${pipeline_worker_pids[@]}"}; do
+        cleanup_wait_status=0
+        wait "$cleanup_pid" || cleanup_wait_status=$?
+    done
+    pipeline_worker_pids=()
+    pipeline_worker_basin_ids=()
+    if ((pipeline_completion_open == 1)); then
+        exec 9>&-
+        pipeline_completion_open=0
+        if [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]]; then
+            "$RM" -- "$pipeline_completion_path"
+        fi
+    fi
+}
+
+pipeline_scheduler_signal() {
+    exit 130
+}
+
+pipeline_scheduler_exit() {
+    pipeline_exit_status=$?
+    pipeline_scheduler_cleanup
+    release_takeover_guard
+    release_lock
+    exit "$pipeline_exit_status"
+}
+
+pipeline_ordered_sweep() {
+    local basin_id
+    local status
+    local tracked
+    pipeline_sweep_count=0
+    while IFS= read -r basin_id; do
+        pipeline_sweep_count=$((pipeline_sweep_count + 1))
+        tracked=0
+        pipeline_basin_is_tracked "$basin_id" && tracked=1
+        if ((tracked == 0)); then
+            pipeline_recover_reconstruct_basin "$basin_id"
+        fi
+        status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+            "$campaign_dir/state/pipeline.json")
+        case $status:$tracked in
+            pending:0|ready:0|reclaimed:0|blocked:0|acquiring:1) ;;
+            pending:1|ready:1|compiling:1|terminal:1|reclaimed:1|blocked:1)
+                hfx_die "invalid pipeline status: $status"
+                ;;
+            acquiring:0|compiling:0|terminal:0)
+                hfx_die "invalid pipeline status: $status"
+                ;;
+            *) hfx_die "invalid pipeline status: $status" ;;
+        esac
+    done < <(effective_basin_ids)
+    "$JQ" -e --argjson observed "$pipeline_sweep_count" \
+        '(.basin_ids | length) == $observed' \
+        "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline ordered sweep count differs: observed $pipeline_sweep_count"
+}
+
+pipeline_finish_scheduler() {
+    local basin_id
+    local status
+    pipeline_ordered_sweep
+    pipeline_pending_count=0
+    pipeline_acquiring_count=0
+    pipeline_ready_count=0
+    pipeline_compiling_count=0
+    pipeline_terminal_count=0
+    pipeline_reclaimed_count=0
+    pipeline_blocked_count=0
+    while IFS= read -r basin_id; do
+        status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+            "$campaign_dir/state/pipeline.json")
+        case $status in
+            pending) pipeline_pending_count=$((pipeline_pending_count + 1)) ;;
+            acquiring) pipeline_acquiring_count=$((pipeline_acquiring_count + 1)) ;;
+            ready) pipeline_ready_count=$((pipeline_ready_count + 1)) ;;
+            compiling) pipeline_compiling_count=$((pipeline_compiling_count + 1)) ;;
+            terminal) pipeline_terminal_count=$((pipeline_terminal_count + 1)) ;;
+            reclaimed) pipeline_reclaimed_count=$((pipeline_reclaimed_count + 1)) ;;
+            blocked) pipeline_blocked_count=$((pipeline_blocked_count + 1)) ;;
+            *) hfx_die "invalid pipeline status: $status" ;;
+        esac
+    done < <(effective_basin_ids)
+    pipeline_scheduler_incomplete=0
+    ((pipeline_pending_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_acquiring_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_ready_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_compiling_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_terminal_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_blocked_count == 0)) || pipeline_scheduler_incomplete=1
+    if ((pipeline_scheduler_incomplete == 1)); then
+        print_status
+        printf 'pipeline_durable_unreclaimed=%s\n' \
+            "$((pipeline_pending_count + pipeline_acquiring_count + pipeline_ready_count + pipeline_compiling_count + pipeline_terminal_count + pipeline_blocked_count))"
+        set -- "$pipeline_pending_count" "$pipeline_acquiring_count" "$pipeline_ready_count" \
+            "$pipeline_compiling_count" "$pipeline_terminal_count" "$pipeline_reclaimed_count" \
+            "$pipeline_blocked_count"
+        hfx_die "pipeline incomplete: pending=$1 acquiring=$2 ready=$3 compiling=$4 terminal=$5 reclaimed=$6 blocked=$7"
+    fi
+}
+
 pipeline_campaign() {
     local locked_policy
-    local durable_unreclaimed=0
-    local scheduler_counts
+    local basin_id
+    local selected_index
+    local status
+    local read_status
+    local pipeline_completion_record
+    local completion_id
+    local completion_status
+    local pipeline_consumer_basin_id
+    local pipeline_round_before
+    local pipeline_round_after
+    pipeline_worker_pids=()
+    pipeline_worker_basin_ids=()
+    pipeline_selected_basin_ids=()
+    pipeline_dispatch_attempts=()
+    pipeline_consume_attempts=()
+    pipeline_round_snapshot_files=()
+    pipeline_attempt_exhausted=0
+    pipeline_completion_open=0
+    pipeline_scheduler_active=1
+    trap pipeline_scheduler_signal INT TERM
+    trap pipeline_scheduler_exit EXIT
     acquire_campaign_lock
     validate_workspace_state
     locked_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
@@ -871,25 +1084,131 @@ pipeline_campaign() {
         hfx_die 'campaign retention policy changed while acquiring the campaign lock'
     materialize_pipeline_state
     require_pipeline_selection
-    prepare_pipeline_durable_state
-    validate_workspace_state
+    resolve_pipeline_compile_tools
     establish_compile_contract
-    reconstruct_pipeline_records
+    pipeline_initial_sweep_count=0
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
+        pipeline_recover_reconstruct_basin "$basin_id"
+        pipeline_selected_basin_ids[${#pipeline_selected_basin_ids[@]}]=$basin_id
+        pipeline_dispatch_attempts[${#pipeline_dispatch_attempts[@]}]=0
+        pipeline_consume_attempts[${#pipeline_consume_attempts[@]}]=0
+        pipeline_initial_sweep_count=$((pipeline_initial_sweep_count + 1))
+    done < <(effective_basin_ids)
+    "$JQ" -e --argjson observed "$pipeline_initial_sweep_count" \
+        '(.basin_ids | length) == $observed' \
+        "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline ordered sweep count differs: observed $pipeline_initial_sweep_count"
+    pipeline_round_snapshot_files[0]=$campaign_dir/state/pipeline.json
+    for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
+        pipeline_round_snapshot_files[${#pipeline_round_snapshot_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
+    done
+    pipeline_completion_create_open
+    pipeline_completion_open=1
+    while :; do
+        pipeline_round_durable_changed=0
+        pipeline_round_dispatched=0
+        pipeline_round_reaped=0
+        pipeline_round_compiled=0
+        pipeline_projected_refused=0
+        pipeline_disk_refused=0
+        pipeline_round_before=$("$JQ" -cS . \
+            ${pipeline_round_snapshot_files[@]+"${pipeline_round_snapshot_files[@]}"})
+        pipeline_ordered_sweep
+        for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
+            pipeline_parallel_limit_reached && break
+            pipeline_basin_is_tracked "$basin_id" && continue
+            status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+                "$campaign_dir/state/pipeline.json")
+            [[ "$status" == pending ]] || continue
+            pipeline_selected_index "$basin_id"
+            selected_index=$pipeline_found_index
+            if ((pipeline_dispatch_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS)); then
+                pipeline_attempt_exhausted=1
+                continue
+            fi
+            if ! pipeline_projected_occupancy_allows "$basin_id"; then
+                pipeline_projected_refused=1
+                break
+            fi
+            if ! pipeline_dispatch_disk_guard; then
+                pipeline_disk_refused=1
+                break
+            fi
+            pipeline_dispatch_attempts[$selected_index]=$((pipeline_dispatch_attempts[$selected_index] + 1))
+            transition_pipeline_basin "$basin_id" acquiring
+        ( pipeline_acquisition_worker "$basin_id" ) &
+            pipeline_worker_pids[${#pipeline_worker_pids[@]}]=$!
+            pipeline_worker_basin_ids[${#pipeline_worker_basin_ids[@]}]=$basin_id
+            pipeline_round_dispatched=1
+        done
+        pipeline_consumer_basin_id=
+        for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
+            status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+                "$campaign_dir/state/pipeline.json")
+            [[ "$status" == ready ]] || continue
+            pipeline_selected_index "$basin_id"
+            selected_index=$pipeline_found_index
+            if ((pipeline_consume_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS)); then
+                pipeline_attempt_exhausted=1
+                continue
+            fi
+            pipeline_consumer_basin_id=$basin_id
+            break
+        done
+        if [[ -n "$pipeline_consumer_basin_id" ]]; then
+            pipeline_selected_index "$pipeline_consumer_basin_id"
+            selected_index=$pipeline_found_index
+            pipeline_consume_attempts[$selected_index]=$((pipeline_consume_attempts[$selected_index] + 1))
+            transition_pipeline_basin "$pipeline_consumer_basin_id" compiling
+        compile_basin_locked "$pipeline_consumer_basin_id" true
+            pipeline_recover_reconstruct_basin "$pipeline_consumer_basin_id"
+            pipeline_round_compiled=1
+            continue
+        fi
+        if ((${#pipeline_worker_pids[@]} > 0)); then
+            read_status=0
+            IFS= read -r -u 9 -t 1 pipeline_completion_record || read_status=$?
+            if pipeline_read_timed_out "$read_status"; then
+                pipeline_sweep_vanished_workers
+            else
+                completion_id=${pipeline_completion_record%%$'\t'*}
+                completion_status=${pipeline_completion_record#*$'\t'}
+                if [[ "$completion_id" == "$pipeline_completion_record" ||
+                      "$completion_status" == *$'\t'* ||
+                      ! "$completion_id" =~ ^[0-9]{10}$ ||
+                      ! "$completion_status" =~ ^[0-9]+$ ]] ||
+                    ((completion_status > 255)) ||
+                    ! pipeline_selected_index "$completion_id" ||
+                    ! pipeline_worker_index "$completion_id"; then
+                    hfx_die "malformed pipeline completion record: expected selected basin ID and exit status"
+                fi
+                selected_index=$pipeline_found_index
+                pipeline_wait_remove_worker "$selected_index"
+                ((pipeline_wait_status == completion_status)) ||
+                    hfx_die "pipeline completion status mismatch for $completion_id: record $completion_status; wait $pipeline_wait_status"
+                pipeline_round_reaped=1
+                pipeline_recover_reconstruct_basin "$completion_id"
+            fi
+            continue
+        fi
+        pipeline_round_after=$("$JQ" -cS . \
+            ${pipeline_round_snapshot_files[@]+"${pipeline_round_snapshot_files[@]}"})
+        [[ "$pipeline_round_before" == "$pipeline_round_after" ]] ||
+            pipeline_round_durable_changed=1
+        if ((pipeline_round_durable_changed == 0 && pipeline_round_dispatched == 0 &&
+             pipeline_round_reaped == 0 && pipeline_round_compiled == 0)); then
+            :
+        fi
+        pipeline_finish_scheduler
+        break
+    done
+    pipeline_scheduler_cleanup
+    trap 'release_takeover_guard; release_lock' EXIT
+    trap - INT TERM
     validate_workspace_state
-    durable_unreclaimed=$(pipeline_unreclaimed_count)
-    scheduler_counts=$("$JQ" -r '
-        . as $root |
-        ["pending","acquiring","ready","compiling","terminal","reclaimed","blocked"] |
-        map(. as $status | [$status, ([$root.basins[].status | select(. == $status)] | length)]) |
-        map(.[1]) | @tsv
-    ' "$campaign_dir/state/pipeline.json")
     print_status
-    printf 'pipeline_durable_unreclaimed=%s\n' "$durable_unreclaimed"
-    if ((durable_unreclaimed > 0)); then
-        local IFS=$'\t'
-        set -- $scheduler_counts
-        hfx_die "pipeline incomplete: pending=$1 acquiring=$2 ready=$3 compiling=$4 terminal=$5 reclaimed=$6 blocked=$7"
-    fi
+    printf 'pipeline_durable_unreclaimed=0\n'
 }
 
 require_pipeline_selection() {
@@ -3620,6 +3939,10 @@ elif [[ "$subcommand" == acquire || "$subcommand" == pipeline ]]; then
     else
         [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
             hfx_die 'pipeline requires retention policy reclaim-inputs-after-terminal'
+        CURL=$(resolve_command HFX_TDX_CURL curl)
+        SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+        OD=$(resolve_command HFX_TDX_OD od)
+        OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
         pipeline_campaign
     fi
 elif [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then

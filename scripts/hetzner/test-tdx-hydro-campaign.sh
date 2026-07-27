@@ -29,6 +29,44 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 set +x
 
+if [ "${HFX_TEST_GLOBAL_WATCHDOG_CHILD-}" != 1 ]; then
+    watchdog_script_dir=$(cd -P -- "${BASH_SOURCE[0]%/*}" && pwd)
+    watchdog_script=$watchdog_script_dir/${BASH_SOURCE[0]##*/}
+    export HFX_TEST_GLOBAL_WATCHDOG_CHILD=1
+    /bin/bash "$watchdog_script" "$@" &
+    watchdog_pid=$!
+    watchdog_attempt=0
+    while [ "$watchdog_attempt" -lt 1800 ]; do
+        watchdog_live=0
+        for watchdog_job in $(jobs -pr); do
+            [ "$watchdog_job" != "$watchdog_pid" ] || watchdog_live=1
+        done
+        [ "$watchdog_live" -eq 1 ] || break
+        watchdog_attempt=$((watchdog_attempt + 1))
+        sleep 1
+    done
+    if [ "$watchdog_attempt" -lt 1800 ]; then
+        watchdog_status=0
+        wait "$watchdog_pid" || watchdog_status=$?
+        exit "$watchdog_status"
+    fi
+    kill -TERM "$watchdog_pid" 2>/dev/null || :
+    watchdog_attempt=0
+    while [ "$watchdog_attempt" -lt 5 ]; do
+        watchdog_live=0
+        for watchdog_job in $(jobs -pr); do
+            [ "$watchdog_job" != "$watchdog_pid" ] || watchdog_live=1
+        done
+        [ "$watchdog_live" -eq 1 ] || break
+        watchdog_attempt=$((watchdog_attempt + 1))
+        sleep 1
+    done
+    [ "$watchdog_live" -eq 0 ] || kill -KILL "$watchdog_pid" 2>/dev/null || :
+    wait "$watchdog_pid" 2>/dev/null || :
+    printf '%s\n' 'test-tdx-hydro-campaign: error: global timeout after 1800 seconds' >&2
+    exit 1
+fi
+
 die() {
     printf 'test-tdx-hydro-campaign: error: %s\n' "$*" >&2
     exit 1
@@ -527,8 +565,6 @@ sed -n '/^pipeline_acquisition_worker() {$/,/^}$/p' "$runner" >"$case_stdout"
     die 'pipeline worker ownership resets are not the first two statements'
 [[ $(grep -c '^pipeline_acquisition_worker() {$' "$runner") -eq 1 ]] ||
     die 'pipeline worker definition count differs'
-[[ $(grep -c 'pipeline_acquisition_worker' "$runner") -eq 1 ]] ||
-    die 'pipeline worker has a production call site'
 trap_body=$(grep '^    trap ' "$case_stdout")
 [[ "$trap_body" != *'$1'* && "$trap_body" != *'$2'* &&
    "$trap_body" != *'$@'* && "$trap_body" != *'$*'* ]] ||
@@ -537,9 +573,11 @@ for trap_name in $(printf '%s\n' "$trap_body" | grep -oE '\$[A-Za-z_][A-Za-z0-9_
     ! grep -Eq "^[[:space:]]*local([[:space:]].*)?[[:space:]]$trap_name(=|[[:space:]]|$)" "$case_stdout" ||
         die "pipeline worker trap variable is local: $trap_name"
 done
-if grep -En 'pipeline_acquisition_worker[[:space:]]+[^&]*&' "$runner" >"$case_stdout"; then
+if grep -En '^[[:space:]]*pipeline_acquisition_worker[[:space:]]+[^&]*&' "$runner" >"$case_stdout"; then
     die 'pipeline worker has a bare background invocation'
 fi
+[[ $(grep -Fc '( pipeline_acquisition_worker "$basin_id" ) &' "$runner") -eq 1 ]] ||
+    die 'pipeline worker production call-site count differs'
 pass 'static Bash 3.2 compatibility checks pass'
 
 expected_campaign_commands=$test_tmp/expected-campaign-commands
@@ -1275,6 +1313,35 @@ maximum=0
 [ "$active" -le "$maximum" ] || printf '%s\n' "$active" >"$HFX_TEST_TRANSFER_STATE/maximum"
 printf 'start %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
+if [ -n "${HFX_TEST_PIPELINE_KILL_KEY-}" ] &&
+   [ "$key" = "$HFX_TEST_PIPELINE_KILL_KEY" ] &&
+   mkdir "$HFX_TEST_TRANSFER_STATE/kill-once-$key" 2>/dev/null; then
+    printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/killed-curl.pid"
+    printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/killed-worker.pid"
+    kill -KILL "$PPID"
+    sleep 1
+    exit 98
+fi
+if [ "${HFX_TEST_FATAL_HOLD-}" = 1 ]; then
+    printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/fatal-curl.$$"
+    printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/fatal-worker.$PPID"
+    if [ "$key" = "${HFX_TEST_FATAL_INJECT_KEY:?}" ]; then
+        fatal_attempt=0
+        while [ "$(find "$HFX_TEST_TRANSFER_STATE" -name 'fatal-worker.*' -type f |
+                   wc -l | tr -d ' ')" -lt 2 ]; do
+            fatal_attempt=$((fatal_attempt + 1))
+            [ "$fatal_attempt" -lt 1000 ] || exit 97
+            sleep 0.01
+        done
+        printf '%s\n' malformed >&9
+    fi
+    fatal_attempt=0
+    while [ "$fatal_attempt" -lt 600 ]; do
+        fatal_attempt=$((fatal_attempt + 1))
+        sleep 0.01
+    done
+    exit 97
+fi
 if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
     total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
@@ -1511,6 +1578,21 @@ case $command_name in
         report=$9
         [ "${10}" = --processing-basin-id ] || exit 82
         basin_id=${11}
+        if [ -n "${HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG-}" ]; then
+            build_mutex=${HFX_TEST_TRANSFER_STATE:?}/mutex
+            build_attempt=0
+            while ! mkdir "$build_mutex" 2>/dev/null; do
+                build_attempt=$((build_attempt + 1))
+                [ "$build_attempt" -lt 1000 ] || exit 95
+                sleep 0.01
+            done
+            build_active=0
+            [ ! -f "$HFX_TEST_TRANSFER_STATE/active" ] ||
+                build_active=$(cat "$HFX_TEST_TRANSFER_STATE/active")
+            printf 'build-active %s %s\n' "$basin_id" "$build_active" \
+                >>"$HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG"
+            rmdir "$build_mutex"
+        fi
         [ "${12}" = --fabric-version ] || exit 82
         fabric_version=${13}
         printf 'build\t--basins\t%s\t--streamnet\t%s\t--out\t%s\t--report\t%s\t--processing-basin-id\t%s\t--fabric-version\t%s\n' \
@@ -1636,7 +1718,28 @@ if [ "$1" = -c ]; then
     fi
     if [ "$2" = "$statvfs_program" ]; then
         [ "$3" = "${HFX_TEST_PIPELINE_CAMPAIGN_DIR:?}" ] || exit 93
-        printf '%s\n' "${HFX_TEST_PIPELINE_AVAILABLE_BYTES-44296724480}"
+        if [ -n "${HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE-}" ]; then
+            sequence=$HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+            [ -f "$sequence" ] && [ ! -L "$sequence" ] || exit 93
+            sequence_mutex=$sequence.mutex
+            sequence_attempt=0
+            while ! mkdir "$sequence_mutex" 2>/dev/null; do
+                sequence_attempt=$((sequence_attempt + 1))
+                [ "$sequence_attempt" -lt 1000 ] || exit 93
+                sleep 0.01
+            done
+            sequence_value=$(head -n 1 "$sequence")
+            [ -n "$sequence_value" ] || {
+                rmdir "$sequence_mutex"
+                exit 93
+            }
+            tail -n +2 "$sequence" >"$sequence.tmp"
+            mv "$sequence.tmp" "$sequence"
+            rmdir "$sequence_mutex"
+            printf '%s\n' "$sequence_value"
+        else
+            printf '%s\n' "${HFX_TEST_PIPELINE_AVAILABLE_BYTES-44296724480}"
+        fi
         exit
     fi
     exit 93
@@ -1653,6 +1756,42 @@ if [ "${1-}" = assemble ]; then
 fi
 exec "${HFX_TEST_ADAPTER_STUB:?}" "$@"
 FAKE_ADAPTER_PYTHON
+sed >"$test_tmp/pipeline-mv" <<'PIPELINE_MV'
+#!/bin/bash
+set -eu
+source_path=$1
+destination_path=$2
+if [ "$#" -eq 2 ] &&
+   [ "${HFX_TEST_KILLED_BASIN_ID-}" != "" ] &&
+   [ "$destination_path" = "${HFX_TEST_KILLED_CURRENT_PATH-}" ] &&
+   "${HFX_TEST_REAL_JQ:?}" -e --arg id "$HFX_TEST_KILLED_BASIN_ID" '
+     .processing_basin_id == $id and
+     ([.stages.acquire_basins,.stages.acquire_streamnet] |
+      any(.status == "pending" and
+          .failure_reason == "interrupted before terminal state; reset by recover"))
+   ' "$source_path" >/dev/null 2>&1; then
+    : >"${HFX_TEST_KILLED_PENDING_MARKER:?}"
+fi
+exec "${HFX_TEST_REAL_MV:?}" "$@"
+PIPELINE_MV
+sed >"$test_tmp/pipeline-rm" <<'PIPELINE_RM'
+#!/bin/bash
+set -eu
+last_argument=${!#}
+if [ -n "${HFX_TEST_FATAL_FIFO-}" ] &&
+   [ "$last_argument" = "$HFX_TEST_FATAL_FIFO" ]; then
+    [ -d "${HFX_TEST_FATAL_LOCK:?}" ] || exit 96
+    for pid_file in "${HFX_TEST_TRANSFER_STATE:?}"/fatal-worker.*; do
+        [ -f "$pid_file" ] || continue
+        worker_pid=$(cat "$pid_file")
+        if kill -0 "$worker_pid" 2>/dev/null; then
+            exit 96
+        fi
+    done
+    printf '%s\n' children-reaped-with-lock >"${HFX_TEST_FATAL_CLEANUP_MARKER:?}"
+fi
+exec "${HFX_TEST_REAL_RM:?}" "$@"
+PIPELINE_RM
 sed >"$test_tmp/fake-hfx" <<'FAKE_HFX'
 #!/bin/bash
 set -eu
@@ -1670,7 +1809,8 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 exit 0
 FAKE_HFX
 chmod +x "$test_tmp/fake-curl" "$test_tmp/recording-mkdir" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
-    "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx"
+    "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx" \
+    "$test_tmp/pipeline-mv" "$test_tmp/pipeline-rm"
 export HFX_TDX_CURL=$test_tmp/fake-curl
 export HFX_TDX_SHA256SUM=$test_tmp/fake-sha256sum
 export HFX_TDX_OGRINFO=$test_tmp/fake-ogrinfo
@@ -4088,6 +4228,8 @@ mkdir "$pipeline_root"
 set -- $(reclaim_subset_init_args pipeline "$pipeline_root")
 run_runner "$@" >"$case_stdout"
 pipeline_dir=$pipeline_root/tdx-hydro-pipeline
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$pipeline_dir
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$pipeline_dir/state/tmp/pipeline-completions.fifo
 expect_failure 'pipeline missing max parallel' pipeline --campaign pipeline \
     --workspace-root "$pipeline_root" --fabric-version fixture-v1
 expect_failure 'pipeline missing fabric version' pipeline --campaign pipeline \
@@ -4129,24 +4271,36 @@ assert_contains "$case_stderr" \
 [[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
     die 'symlinked pipeline campaign reached lock creation'
 nonexistent_tool=$test_tmp/does-not-exist
+for missing_pipeline_tool in HFX_TDX_CURL HFX_TDX_SHA256SUM HFX_TDX_OD HFX_TDX_OGRINFO; do
+    pipeline_status=0
+    env "$missing_pipeline_tool=$nonexistent_tool" \
+        "$selected_bash" "$runner" pipeline --campaign pipeline \
+        --workspace-root "$pipeline_root" --max-parallel 2 \
+        --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+        pipeline_status=$?
+    [[ "$pipeline_status" -ne 0 ]] || die 'missing pipeline tool unexpectedly succeeded'
+    assert_contains "$case_stderr" "required command '$nonexistent_tool' is not available"
+done
 pipeline_status=0
-HFX_TDX_CURL=$nonexistent_tool HFX_TDX_SHA256SUM=$nonexistent_tool \
-HFX_TDX_OD=$nonexistent_tool HFX_TDX_OGRINFO=$nonexistent_tool \
-    run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
-        --max-parallel 2 --fabric-version fixture-v1 \
-        >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
-[[ "$pipeline_status" -ne 0 ]] || die 'incomplete pipeline unexpectedly succeeded'
-assert_contains "$case_stdout" 'pipeline_durable_unreclaimed=3'
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 \
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 2 --fabric-version fixture-v1 \
+    >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
+[[ "$pipeline_status" -ne 0 ]] || die 'case 88 projected-capacity accepted pending termination'
+grep -F 'pipeline_durable_unreclaimed=3' "$case_stdout" >/dev/null ||
+    die 'case 89 disk refusal pre-state bounded refusal differs'
 assert_contains "$case_stderr" \
     'pipeline incomplete: pending=3 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
 [[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
     die 'pipeline left the campaign lock behind'
 sed -n '/^pipeline_campaign() {$/,/^}$/p' "$runner" >"$test_tmp/pipeline-coordinator"
-if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|fifo|acquire_basin|compile_campaign|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
-    "$test_tmp/pipeline-coordinator" >"$case_stdout"; then
-    die 'pipeline coordinator contains execution machinery'
-fi
-pass 'pipeline refuses pre-state errors and has no execution machinery'
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_ordered_sweep'
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_completion_create_open'
+assert_contains "$test_tmp/pipeline-coordinator" '( pipeline_acquisition_worker "$basin_id" ) &'
+grep -F 'compile_basin_locked "$pipeline_consumer_basin_id" true' "$test_tmp/pipeline-coordinator" >/dev/null ||
+    die 'case 88 projected-capacity serial consumer is absent'
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_sweep_vanished_workers'
+pass 'pipeline refuses pre-state errors and installs scheduler machinery'
 
 pipeline_state=$pipeline_dir/state/pipeline.json
 jq -e '
@@ -4158,13 +4312,13 @@ jq -e '
 ' "$pipeline_state" >/dev/null || die 'materialized pipeline document differs'
 [[ $(stat -f '%Lp' "$pipeline_state") == 644 ]] || die 'pipeline state mode differs'
 cp "$pipeline_state" "$test_tmp/pipeline-stable"
-expect_failure 'identical pipeline replay remains incomplete' pipeline --campaign pipeline \
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure 'identical pipeline replay remains incomplete' pipeline --campaign pipeline \
     --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v1
 cmp "$test_tmp/pipeline-stable" "$pipeline_state"
 expect_failure 'pipeline fabric drift' pipeline --campaign pipeline \
     --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v2
 assert_contains "$case_stderr" 'pipeline parameters changed; use a new campaign ID'
-expect_failure 'pipeline max reduction remains incomplete' pipeline --campaign pipeline \
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure 'pipeline max reduction remains incomplete' pipeline --campaign pipeline \
     --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
 jq -e '.max_parallel == 1' "$pipeline_state" >/dev/null ||
     die 'pipeline max-parallel reduction was not persisted'
@@ -4326,8 +4480,24 @@ HFX_TEST_REAL_RM=$(command -v rm)
 export HFX_TEST_REAL_RM
 export HFX_TDX_RM=$test_tmp/recovery-rm
 : >"$HFX_TEST_ADAPTER_LOG"
-expect_failure 'mixed recovery remains incomplete' pipeline --campaign pipeline \
-    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$HFX_TDX_RM
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    pipeline_recover_reconstruct_basin 1020000010
+    pipeline_recover_reconstruct_basin 7020000010
+    pipeline_recover_reconstruct_basin 9020000010
+)
+rm -r "$pipeline_dir/state/locks/campaign.lock"
 unset HFX_TDX_RM
 jq -e '
   .basins["1020000010"].status == "reclaimed" and
@@ -4370,9 +4540,22 @@ while IFS='|' read -r recovery_class recovery_reason; do
     else
         recovery_state_fixture 1020000010 failed "$recovery_reason" pending 0 '' false
     fi
-    expect_failure "acquisition classification $recovery_reason" pipeline \
-        --campaign pipeline --workspace-root "$pipeline_root" \
-        --max-parallel 1 --fabric-version fixture-v1
+    (
+        # shellcheck source=/dev/null
+        source "$definitions"
+        JQ=$(command -v jq)
+        MV=$(command -v mv)
+        MKDIR=$(command -v mkdir)
+        RM=$(command -v rm)
+        CHMOD=$(command -v chmod)
+        campaign_dir=$pipeline_dir
+        lock_path=$pipeline_dir/state/locks/campaign.lock
+        mkdir "$lock_path"
+        printf '%s\n' "$$" >"$lock_path/owner.pid"
+        lock_owned=1
+        pipeline_recover_reconstruct_basin 1020000010
+    )
+    rm -r "$pipeline_dir/state/locks/campaign.lock"
     recovery_actual=$(jq -r '.basins["1020000010"].status' "$pipeline_state")
     [[ "$recovery_actual" == "$recovery_class" ]] ||
         die "acquisition reason classified $recovery_actual instead of $recovery_class: $recovery_reason"
@@ -4394,8 +4577,18 @@ blocked|partial provenance path is unsafe; retained without traversal
 blocked|installed final failed integrity verification; retained for inspection
 RECOVERY_ACQUISITION_TABLE
 recovery_state_fixture 1020000010 failed 'unknown acquisition failure' pending 0 '' false
-expect_failure 'unknown acquisition reason' pipeline --campaign pipeline \
-    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    pipeline_recover_reconstruct_basin 1020000010
+) 2>"$case_stderr" && die 'unknown acquisition reason unexpectedly succeeded'
+rm -r "$pipeline_dir/state/locks/campaign.lock"
 assert_contains "$case_stderr" 'pipeline acquisition classifier rejected failure reason'
 recovery_state_fixture 1020000010 running '' pending 0 '' false
 (
@@ -4428,8 +4621,24 @@ for recovery_id in 1020000010 7020000010; do
 done
 : >"$HFX_TEST_ADAPTER_LOG"
 git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-before"
-expect_failure 'inspection recovery remains incomplete' pipeline --campaign pipeline \
-    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$(command -v rm)
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    for recovery_id in 1020000010 7020000010 9020000010; do
+        pipeline_recover_reconstruct_basin "$recovery_id"
+    done
+)
+rm -r "$pipeline_dir/state/locks/campaign.lock"
 jq -e '
   .basins["1020000010"].status == "pending" and
   .basins["7020000010"] == {
@@ -4441,6 +4650,11 @@ jq -e '
     blocked_reason:"interrupted compile attempt cannot be safely repeated; retained for inspection"
   }
 ' "$pipeline_state" >/dev/null || die 'nonterminal and positive-attempt recovery results differ'
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure \
+    'blocked recovery remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+jq -e '.basins["7020000010"].status == "blocked"' "$pipeline_state" >/dev/null ||
+    die 'blocked basin was relabelled by bounded incomplete termination'
 [[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) -eq 0 ]] ||
     die 'positive-attempt recovery repeated a build'
 for recovery_id in 1020000010 7020000010; do
@@ -4778,6 +4992,195 @@ for stub_status in 0 7; do
         die "worker record differs for stub $stub_status"
 done
 pass 'pipeline worker notification obeys Bash 3.2 trap contracts'
+
+scheduler_init() {
+    scheduler_root=$1 scheduler_name=$2
+    shift 2
+    mkdir "$scheduler_root"
+    scheduler_args=(init --campaign "$scheduler_name" --workspace-root "$scheduler_root")
+    for scheduler_id do scheduler_args[${#scheduler_args[@]}]=--basin
+        scheduler_args[${#scheduler_args[@]}]=$scheduler_id
+    done
+    scheduler_args+=(--retention-policy reclaim-inputs-after-terminal
+        --available-memory-bytes 30000000000 --available-disk-bytes 491737129060
+        --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 206220202290
+        --assembly-memory-ceiling-bytes 30000000000 --assembly-scratch-ceiling-bytes 206220202290
+        --assembled-artifact-bytes 206220202290 --active-compile-scratch-bytes 30000000000
+        --filesystem-overhead-bytes 5000000000)
+    run_runner ${scheduler_args[@]+"${scheduler_args[@]}"} >"$case_stdout"
+}
+scheduler_ids=(1020000010 2020000010 3020000010 4020000010 5020000010 7020000010)
+
+scheduler_init "$test_tmp/workspaces/scheduler88" scheduler88 \
+    ${scheduler_ids[@]+"${scheduler_ids[@]}"}
+scheduler88=$test_tmp/workspaces/scheduler88/tdx-hydro-scheduler88
+cp -R "$scheduler88" "$test_tmp/scheduler88-pristine"
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign scheduler88 --workspace-root "$test_tmp/workspaces/scheduler88" \
+    --max-parallel 4 >"$case_stdout"
+for scheduler_index in 2 3 4 5; do
+    scheduler_id=${scheduler_ids[$scheduler_index]}
+    cp "$test_tmp/scheduler88-pristine/state/basins/$scheduler_id/current.json" \
+        "$scheduler88/state/basins/$scheduler_id/current.json"
+    rm -f "$scheduler88/downloads/$scheduler_id-"*
+done
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler88
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler88/state/tmp/pipeline-completions.fifo
+export HFX_TEST_BARRIER_COUNT=4
+export HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG=$test_tmp/scheduler88-build-active
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner pipeline --campaign scheduler88 --workspace-root "$test_tmp/workspaces/scheduler88" \
+    --max-parallel 4 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 88 projected-capacity pipeline failed'
+unset HFX_TEST_BARRIER_COUNT HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG
+jq -e '[.basins[] | .status == "reclaimed" and .blocked_reason == null] | all' \
+    "$scheduler88/state/pipeline.json" >/dev/null ||
+    die 'case 88 projected-capacity final statuses differ'
+[[ $(<"$test_tmp/transfer-state/maximum") -eq 4 &&
+   $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 6 &&
+   $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") -eq 12 ]] ||
+    die "case 88 projected-capacity concurrency or compile counts differ: max=$(<"$test_tmp/transfer-state/maximum") build=$(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) validate=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)"
+awk '$1=="build-active" && $3>0 {found=1} END{exit !found}' \
+    "$test_tmp/scheduler88-build-active" ||
+    die 'case 88 projected-capacity compile did not overlap acquisition'
+[[ ! -e "$HFX_TEST_PIPELINE_COMPLETION_PATH" &&
+   ! -e "$scheduler88/state/locks/campaign.lock" ]] ||
+    die 'case 88 projected-capacity cleanup differs'
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    max_parallel=4
+    pipeline_worker_pids=(11 12 13)
+    ! pipeline_parallel_limit_reached
+    pipeline_worker_pids[3]=14
+    pipeline_parallel_limit_reached
+) || die 'case 88 projected-capacity parallel equality differs'
+scheduler_init "$test_tmp/workspaces/scheduler88fail" scheduler88fail 1020000010
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$test_tmp/workspaces/scheduler88fail/tdx-hydro-scheduler88fail
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/tmp/pipeline-completions.fifo
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+pipeline_status=0
+HFX_TEST_FAIL_KEY=1020000010-basins HFX_TEST_RESUME_MODE=short \
+run_runner pipeline --campaign scheduler88fail \
+    --workspace-root "$test_tmp/workspaces/scheduler88fail" --max-parallel 1 \
+    --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
+[[ "$pipeline_status" -ne 0 ]] &&
+    jq -e '.stages.acquire_basins.attempts == 2' \
+        "$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/basins/1020000010/current.json" >/dev/null ||
+    die 'case 88 projected-capacity dispatch exhaustion differs'
+assert_contains "$case_stderr" 'pipeline incomplete: pending=1 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+jq -e '.basins["1020000010"].status == "pending"' "$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/pipeline.json" >/dev/null ||
+    die 'case 88 projected-capacity exhausted basin changed state'
+pass 'case 88 projected-capacity'
+
+scheduler_init "$test_tmp/workspaces/scheduler89" scheduler89 1020000010 2020000010
+scheduler89=$test_tmp/workspaces/scheduler89/tdx-hydro-scheduler89
+cp -R "$scheduler89" "$test_tmp/scheduler89-pristine"
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign scheduler89 --workspace-root "$test_tmp/workspaces/scheduler89" \
+    --max-parallel 2 >"$case_stdout"
+cp "$test_tmp/scheduler89-pristine/state/basins/2020000010/current.json" \
+    "$scheduler89/state/basins/2020000010/current.json"
+rm -f "$scheduler89/downloads/2020000010-"*
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler89
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler89/state/tmp/pipeline-completions.fifo
+sequence=$test_tmp/scheduler89-sequence
+printf '%s\n' 35437379583 44296724480 >"$sequence"
+export HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE=$sequence
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner pipeline --campaign scheduler89 --workspace-root "$test_tmp/workspaces/scheduler89" \
+    --max-parallel 4 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    die 'case 89 disk refusal pipeline failed'
+unset HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+[[ ! -s "$sequence" ]] || die 'case 89 disk refusal guard-call count differs'
+assert_contains "$case_stderr" 'insufficient pipeline dispatch disk: available 35437379583 bytes; required 35437379584 bytes'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler89/state/pipeline.json" >/dev/null ||
+    die 'case 89 disk refusal final statuses differ'
+pass 'case 89 disk refusal'
+
+scheduler_init "$test_tmp/workspaces/scheduler90" scheduler90 1020000010 2020000010 3020000010
+scheduler90=$test_tmp/workspaces/scheduler90/tdx-hydro-scheduler90
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler90
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler90/state/tmp/pipeline-completions.fifo
+export HFX_TEST_PIPELINE_KILL_KEY=1020000010-basins
+export HFX_TEST_KILLED_BASIN_ID=1020000010
+export HFX_TEST_KILLED_CURRENT_PATH=$scheduler90/state/basins/1020000010/current.json
+export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-pending
+export HFX_TEST_REAL_MV=$(command -v mv)
+export HFX_TDX_MV=$test_tmp/pipeline-mv
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+run_runner pipeline --campaign scheduler90 --workspace-root "$test_tmp/workspaces/scheduler90" \
+    --max-parallel 3 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 90 vanished SIGKILL pipeline failed'
+unset HFX_TEST_PIPELINE_KILL_KEY HFX_TDX_MV
+[[ -f "$HFX_TEST_KILLED_PENDING_MARKER" &&
+   $(grep -c '^start 1020000010-basins' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+    die 'case 90 vanished SIGKILL recovery or retry differs'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler90/state/pipeline.json" >/dev/null ||
+    die 'case 90 vanished SIGKILL final statuses differ'
+helper_state=$scheduler90/state/basins/1020000010/current.json
+jq '.retention.inputs_reclaimed=false |
+  .stages.acquire_basins={status:"running",attempts:1,failure_reason:null,evidence:null} |
+  .stages.acquire_streamnet={status:"pending",attempts:0,failure_reason:null,evidence:null} |
+  .stages.compile={status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}' \
+    "$helper_state" >"$helper_state.tmp"
+mv "$helper_state.tmp" "$helper_state"
+jq '.basins["1020000010"]={status:"acquiring",blocked_reason:null}' \
+    "$scheduler90/state/pipeline.json" >"$scheduler90/state/pipeline.json.tmp"
+mv "$scheduler90/state/pipeline.json.tmp" "$scheduler90/state/pipeline.json"
+export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-helper-pending
+(
+    ( exit 0 ) & helper_pid=$!
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq); MV=$test_tmp/pipeline-mv
+    MKDIR=$(command -v mkdir); RM=$(command -v rm); CHMOD=$(command -v chmod)
+    campaign_dir=$scheduler90
+    lock_path=$scheduler90/state/locks/campaign.lock
+    mkdir "$lock_path"; printf '%s\n' "$$" >"$lock_path/owner.pid"; lock_owned=1
+    pipeline_worker_pids=("$helper_pid")
+    pipeline_worker_basin_ids=(1020000010)
+    pipeline_round_reaped=0
+    pipeline_sweep_vanished_workers
+    ((${#pipeline_worker_pids[@]} == 0))
+    [[ -f "$HFX_TEST_KILLED_PENDING_MARKER" ]]
+) || die 'case 90 vanished SIGKILL isolated liveness recovery differs'
+rm -r "$scheduler90/state/locks/campaign.lock"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    pipeline_read_timed_out 1 && pipeline_read_timed_out 142 &&
+        pipeline_read_timed_out 37 && ! pipeline_read_timed_out 0
+) || die 'case 90 vanished SIGKILL timeout classification differs'
+pass 'case 90 vanished SIGKILL'
+
+scheduler_init "$test_tmp/workspaces/scheduler91" scheduler91 1020000010 2020000010
+scheduler91=$test_tmp/workspaces/scheduler91/tdx-hydro-scheduler91
+grep -F '        kill -TERM "$cleanup_pid" 2>/dev/null || :' "$runner" >/dev/null || die 'case 91 fatal cleanup child TERM is absent'
+grep -F '        wait "$cleanup_pid" || cleanup_wait_status=$?' "$runner" >/dev/null || die 'case 91 fatal cleanup child wait is absent'
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler91
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler91/state/tmp/pipeline-completions.fifo
+export HFX_TEST_FATAL_HOLD=1 HFX_TEST_FATAL_INJECT_KEY=1020000010-basins
+export HFX_TEST_FATAL_FIFO=$HFX_TEST_PIPELINE_COMPLETION_PATH
+export HFX_TEST_FATAL_LOCK=$scheduler91/state/locks/campaign.lock
+export HFX_TEST_FATAL_CLEANUP_MARKER=$test_tmp/scheduler91-cleanup
+export HFX_TEST_REAL_RM=$(command -v rm)
+export HFX_TDX_RM=$test_tmp/pipeline-rm
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+pipeline_status=0
+run_runner pipeline --campaign scheduler91 --workspace-root "$test_tmp/workspaces/scheduler91" \
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    pipeline_status=$?
+[[ "$pipeline_status" -ne 0 && $(<"$HFX_TEST_FATAL_CLEANUP_MARKER") == children-reaped-with-lock ]] ||
+    die 'case 91 fatal cleanup ordering differs'
+assert_contains "$case_stderr" 'malformed pipeline completion record: expected selected basin ID and exit status'
+unset HFX_TEST_FATAL_HOLD HFX_TDX_RM HFX_TEST_FATAL_FIFO
+run_runner pipeline --campaign scheduler91 --workspace-root "$test_tmp/workspaces/scheduler91" \
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 91 fatal cleanup recovery replay failed'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler91/state/pipeline.json" >/dev/null ||
+    die 'case 91 fatal cleanup replay statuses differ'
+pass 'case 91 fatal cleanup'
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||
