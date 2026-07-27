@@ -60,6 +60,7 @@ usage() {
         '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
         '       tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
+        '       tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -250,6 +251,37 @@ validate_compile_json() {
     ' "$file" >/dev/null 2>&1 || hfx_die "compile state is malformed: $file"
 }
 
+validate_pipeline_json() {
+    local file=$1
+    "$JQ" -e '
+        def valid_id: type == "string" and test("^[0-9]{10}$");
+        def valid_status:
+            . == "pending" or . == "acquiring" or . == "ready" or
+            . == "compiling" or . == "terminal" or . == "reclaimed" or
+            . == "blocked";
+        type == "object" and
+        keys == ["basin_ids","basins","fabric_version","max_parallel","schema_version"] and
+        .schema_version == 1 and
+        (.fabric_version | type == "string" and length > 0 and
+            (test("[[:cntrl:]]") | not)) and
+        (.max_parallel | type == "number" and . == floor and . >= 1 and . <= 4) and
+        (.basin_ids | type == "array" and length > 0 and
+            all(.[]; valid_id) and . == (sort | unique)) and
+        (.basins | type == "object") and
+        (.basins | keys) == .basin_ids and
+        ([.basins[] |
+            type == "object" and keys == ["blocked_reason","status"] and
+            (.status | valid_status) and
+            (if .status == "blocked" then
+                (.blocked_reason | type == "string" and length > 0 and
+                    (test("[[:cntrl:]]") | not))
+             else .blocked_reason == null end)
+        ] | all) and
+        ([.basins[].status | select(. == "compiling")] | length) <= 1 and
+        ([.basins[].status | select(. == "acquiring")] | length) <= .max_parallel
+    ' "$file" >/dev/null 2>&1 || hfx_die "pipeline state is malformed: $file"
+}
+
 validate_assembly_json() {
     local file=$1
     "$JQ" -e --slurpfile inventory "$campaign_dir/state/inventory.json" '
@@ -416,6 +448,16 @@ lock_owned=0
 lock_path=
 takeover_owned=0
 takeover_path=
+campaign_lock_is_owned() {
+    if ((lock_owned == 1)) &&
+        [[ -d "$lock_path" && ! -L "$lock_path" ]] &&
+        [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]] &&
+        [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 release_takeover_guard() {
     if ((takeover_owned == 1)) && [[ -n "$takeover_path" && -d "$takeover_path" && ! -L "$takeover_path" ]] &&
         [[ -f "$takeover_path/owner.pid" && ! -L "$takeover_path/owner.pid" ]] &&
@@ -472,10 +514,7 @@ acquire_campaign_lock() {
     local state
     lock_path=$locks_dir/campaign.lock
     takeover_path=$locks_dir/campaign.lock.takeover
-    if ((lock_owned == 1)) &&
-        [[ -d "$lock_path" && ! -L "$lock_path" ]] &&
-        [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]] &&
-        [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
+    if campaign_lock_is_owned; then
         return
     fi
     if "$MKDIR" "$lock_path" 2>/dev/null; then
@@ -548,6 +587,11 @@ validate_campaign_structure() {
         [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]] ||
             hfx_die "assembly state is not a regular file: $campaign_dir/state/assembly.json"
         validate_assembly_json "$campaign_dir/state/assembly.json"
+    fi
+    if [[ -e "$campaign_dir/state/pipeline.json" || -L "$campaign_dir/state/pipeline.json" ]]; then
+        [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]] ||
+            hfx_die "pipeline state is not a regular file: $campaign_dir/state/pipeline.json"
+        validate_pipeline_json "$campaign_dir/state/pipeline.json"
     fi
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
@@ -681,6 +725,14 @@ print_status() {
         "$JQ" -s '[.[] | select(.schema_version == 4 and .retention.inputs_reclaimed == true)] | length' \
             ${state_files[@]+"${state_files[@]}"}
     fi
+    if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]]; then
+        "$JQ" -r '
+            "pipeline_max_parallel=\(.max_parallel)",
+            "pipeline_fabric_version=\(.fabric_version)",
+            ("pending","acquiring","ready","compiling","terminal","reclaimed","blocked") as $status |
+            "pipeline_\($status)=\([.basins[].status | select(. == $status)] | length)"
+        ' "$campaign_dir/state/pipeline.json"
+    fi
     if [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]]; then
         stage=$("$JQ" -r '.status' "$campaign_dir/state/assembly.json")
     else
@@ -693,6 +745,129 @@ print_status() {
             printf 'assemble_%s=0\n' "$status"
         fi
     done
+}
+
+pipeline_temporary_path() {
+    printf '%s\n' "$campaign_dir/state/tmp/pipeline.json.tmp.$$"
+}
+
+prepare_pipeline_temporary() {
+    local temporary
+    temporary=$(pipeline_temporary_path)
+    if [[ -e "$temporary" || -L "$temporary" ]]; then
+        [[ -f "$temporary" && ! -L "$temporary" ]] ||
+            hfx_die "pipeline temporary is unsafe: $temporary"
+    fi
+    printf '%s\n' "$temporary"
+}
+
+transition_pipeline_basin() {
+    local basin_id=$1
+    local status=$2
+    local blocked_reason=${3-}
+    local state=$campaign_dir/state/pipeline.json
+    local temporary
+    campaign_lock_is_owned || hfx_die 'pipeline state transition requires the parent campaign lock'
+    validate_pipeline_json "$state"
+    "$JQ" -e --arg id "$basin_id" \
+        '(.basin_ids | index($id) != null) and (.basins | has($id))' "$state" >/dev/null ||
+        hfx_die "pipeline basin is not selected: $basin_id"
+    case $status in
+        pending|acquiring|ready|compiling|terminal|reclaimed)
+            [[ -z "$blocked_reason" ]] ||
+                hfx_die "pipeline status $status requires a null blocked reason"
+            ;;
+        blocked)
+            [[ -n "$blocked_reason" && ! "$blocked_reason" =~ [[:cntrl:]] ]] ||
+                hfx_die 'pipeline blocked status requires a nonempty reason without ASCII control characters'
+            ;;
+        *) hfx_die "invalid pipeline status: $status" ;;
+    esac
+    temporary=$(prepare_pipeline_temporary)
+    "$JQ" --arg id "$basin_id" --arg status "$status" --arg reason "$blocked_reason" '
+        .basins[$id].status = $status |
+        .basins[$id].blocked_reason = (if $status == "blocked" then $reason else null end)
+    ' "$state" >"$temporary"
+    atomic_install "$temporary" "$state" validate_pipeline_json
+}
+
+materialize_pipeline_state() {
+    local state=$campaign_dir/state/pipeline.json
+    local temporary
+    local existing_fabric
+    local same_ids
+    local selected_ids_json
+    local basin_id
+    local selected_ids=()
+    campaign_lock_is_owned || hfx_die 'pipeline state materialization requires the parent campaign lock'
+    while IFS= read -r basin_id; do
+        selected_ids[${#selected_ids[@]}]=$basin_id
+    done < <(effective_basin_ids)
+    selected_ids_json=$("$JQ" -cn --args '$ARGS.positional' -- \
+        ${selected_ids[@]+"${selected_ids[@]}"})
+    if [[ -e "$state" || -L "$state" ]]; then
+        [[ -f "$state" && ! -L "$state" ]] ||
+            hfx_die "pipeline state is not a regular file: $state"
+        validate_pipeline_json "$state"
+        existing_fabric=$("$JQ" -r '.fabric_version' "$state")
+        same_ids=$("$JQ" -e --argjson expected "$selected_ids_json" \
+            '.basin_ids == $expected' "$state" >/dev/null &&
+            printf true || printf false)
+        [[ "$existing_fabric" == "$fabric_version" && "$same_ids" == true ]] ||
+            hfx_die 'pipeline parameters changed; use a new campaign ID'
+        if [[ $("$JQ" -r '.max_parallel' "$state") != "$max_parallel" ]]; then
+            temporary=$(prepare_pipeline_temporary)
+            "$JQ" --argjson max_parallel "$max_parallel" \
+                '.max_parallel = $max_parallel' "$state" >"$temporary"
+            atomic_install "$temporary" "$state" validate_pipeline_json
+        fi
+        return
+    fi
+    temporary=$(prepare_pipeline_temporary)
+    "$JQ" -n --arg fabric_version "$fabric_version" \
+        --argjson max_parallel "$max_parallel" --args '
+        $ARGS.positional as $ids |
+        {
+          schema_version: 1,
+          fabric_version: $fabric_version,
+          max_parallel: $max_parallel,
+          basin_ids: $ids,
+          basins: ($ids | map({key: ., value: {status:"pending",blocked_reason:null}}) | from_entries)
+        }
+    ' -- ${selected_ids[@]+"${selected_ids[@]}"} >"$temporary"
+    atomic_install "$temporary" "$state" validate_pipeline_json
+}
+
+pipeline_campaign() {
+    local locked_policy
+    local basin_id
+    local durable_unreclaimed=0
+    local scheduler_counts
+    acquire_campaign_lock
+    validate_workspace_state
+    locked_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$locked_policy" == "$acquire_retention_policy" ]] ||
+        hfx_die 'campaign retention policy changed while acquiring the campaign lock'
+    materialize_pipeline_state
+    while IFS= read -r basin_id; do
+        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+            "$campaign_dir/state/basins/$basin_id/current.json") != true ]]; then
+            durable_unreclaimed=$((durable_unreclaimed + 1))
+        fi
+    done < <(effective_basin_ids)
+    scheduler_counts=$("$JQ" -r '
+        . as $root |
+        ["pending","acquiring","ready","compiling","terminal","reclaimed","blocked"] |
+        map(. as $status | [$status, ([$root.basins[].status | select(. == $status)] | length)]) |
+        map(.[1]) | @tsv
+    ' "$campaign_dir/state/pipeline.json")
+    print_status
+    printf 'pipeline_durable_unreclaimed=%s\n' "$durable_unreclaimed"
+    if ((durable_unreclaimed > 0)); then
+        local IFS=$'\t'
+        set -- $scheduler_counts
+        hfx_die "pipeline incomplete: pending=$1 acquiring=$2 ready=$3 compiling=$4 terminal=$5 reclaimed=$6 blocked=$7"
+    fi
 }
 
 materialize_assembly_state() {
@@ -2726,7 +2901,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|compile-basin|progress|assemble|evidence|publish) ;;
+    init|status|recover|acquire|compile|compile-basin|progress|pipeline|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -2801,14 +2976,15 @@ while (($# > 0)); do
             retention_policy=$value
             ;;
         --max-parallel)
-            [[ "$subcommand" == acquire ]] || usage_error 'option --max-parallel is valid only for acquire'
+            [[ "$subcommand" == acquire || "$subcommand" == pipeline ]] ||
+                usage_error 'option --max-parallel is valid only for acquire or pipeline'
             ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
             max_parallel_seen=1
             max_parallel=$value
             ;;
         --fabric-version)
-            [[ "$subcommand" == compile || "$subcommand" == compile-basin ]] ||
-                usage_error 'option --fabric-version is valid only for compile or compile-basin'
+            [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline ]] ||
+                usage_error 'option --fabric-version is valid only for compile, compile-basin, or pipeline'
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
             fabric_version=$value
@@ -2883,7 +3059,7 @@ if [[ "$subcommand" == compile-basin ]]; then
     [[ "${basin_ids[0]}" =~ ^[0-9]{10}$ ]] ||
         hfx_die "invalid processing basin ID '${basin_ids[0]}'; expected an authoritative 10-digit ID"
 fi
-if [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then
+if [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline ]]; then
     ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
     [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
         usage_error 'option --fabric-version requires a non-empty non-option value'
@@ -2947,7 +3123,7 @@ elif [[ "$subcommand" == progress ]]; then
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
-elif [[ "$subcommand" == acquire ]]; then
+elif [[ "$subcommand" == acquire || "$subcommand" == pipeline ]]; then
     ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
     [[ "$max_parallel" =~ ^[0-9]+$ ]] || usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     ((max_parallel >= 1 && max_parallel <= 62)) ||
@@ -2959,11 +3135,17 @@ elif [[ "$subcommand" == acquire ]]; then
         ((max_parallel >= 1 && max_parallel <= HFX_TDX_RECLAIM_MAX_PARALLEL)) ||
             usage_error "option --max-parallel must be a base-10 integer from 1 through $HFX_TDX_RECLAIM_MAX_PARALLEL for retention policy reclaim-inputs-after-terminal"
     fi
-    CURL=$(resolve_command HFX_TDX_CURL curl)
-    SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
-    OD=$(resolve_command HFX_TDX_OD od)
-    OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
-    acquire_campaign
+    if [[ "$subcommand" == acquire ]]; then
+        CURL=$(resolve_command HFX_TDX_CURL curl)
+        SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+        OD=$(resolve_command HFX_TDX_OD od)
+        OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+        acquire_campaign
+    else
+        [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
+            hfx_die 'pipeline requires retention policy reclaim-inputs-after-terminal'
+        pipeline_campaign
+    fi
 elif [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
