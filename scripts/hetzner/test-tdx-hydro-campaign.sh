@@ -111,6 +111,24 @@ subset_init_args() {
         --filesystem-overhead-bytes 1
 }
 
+reclaim_subset_init_args() {
+    printf '%s\n' \
+        init --campaign "$1" --workspace-root "$2" \
+        --basin 7020000010 \
+        --basin 1020000010 \
+        --basin 9020000010 \
+        --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 30000000000 \
+        --available-disk-bytes 491737129060 \
+        --peak-in-flight-download-bytes 44296724480 \
+        --retained-basin-output-bytes 206220202290 \
+        --assembly-memory-ceiling-bytes 30000000000 \
+        --assembly-scratch-ceiling-bytes 206220202290 \
+        --assembled-artifact-bytes 206220202290 \
+        --active-compile-scratch-bytes 30000000000 \
+        --filesystem-overhead-bytes 5000000000
+}
+
 copy_workspace() {
     local name=$1
     local destination=$test_tmp/workspaces/$name
@@ -275,6 +293,7 @@ assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -470,9 +489,11 @@ for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
     forbidden_nameref='(declare|local)[[:space:]]+-n'
     forbidden_lock='f''lock'
     forbidden_bashpid='BASH''PID'
+    forbidden_varfd='\{[A-Za-z_][A-Za-z0-9_]*\}<>'
     if grep -En -e "$forbidden_assoc" -e "$forbidden_wait" -e "$forbidden_map" -e "$forbidden_read" \
         -e "$forbidden_case_change" -e "$forbidden_glob" -e "$forbidden_negative" -e "$forbidden_v" \
-        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" "$script" >"$case_stdout"; then
+        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" \
+        -e "$forbidden_varfd" "$script" >"$case_stdout"; then
         die "forbidden Bash-4 construct found in $script"
     fi
     if grep -En '"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"' "$script" |
@@ -4018,6 +4039,167 @@ if grep -F 'never-publish' "$aws_log" >/dev/null; then
     die 'publication exposed the per-basin canary'
 fi
 pass 'publication never invokes assembly and never consults adapter or HFX'
+
+pipeline_root=$test_tmp/workspaces/pipeline
+mkdir "$pipeline_root"
+set -- $(reclaim_subset_init_args pipeline "$pipeline_root")
+run_runner "$@" >"$case_stdout"
+pipeline_dir=$pipeline_root/tdx-hydro-pipeline
+expect_failure 'pipeline missing max parallel' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --fabric-version fixture-v1
+expect_failure 'pipeline missing fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2
+for invalid_parallel in 0 x 5; do
+    expect_failure "pipeline invalid max parallel $invalid_parallel" pipeline --campaign pipeline \
+        --workspace-root "$pipeline_root" --max-parallel "$invalid_parallel" \
+        --fabric-version fixture-v1
+done
+expect_failure 'pipeline repeated max parallel' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --max-parallel 2 \
+    --fabric-version fixture-v1
+expect_failure 'pipeline repeated fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 \
+    --fabric-version fixture-v1 --fabric-version fixture-v1
+expect_failure 'pipeline control fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version $'bad\nversion'
+expect_failure 'pipeline option ownership max' status --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2
+assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire or pipeline'
+expect_failure 'pipeline option ownership fabric' status --campaign pipeline \
+    --workspace-root "$pipeline_root" --fabric-version fixture-v1
+assert_contains "$case_stderr" \
+    'option --fabric-version is valid only for compile, compile-basin, or pipeline'
+retain_pipeline_root=$test_tmp/workspaces/pipeline-retain
+mkdir "$retain_pipeline_root"
+set -- $(subset_init_args retainpipe "$retain_pipeline_root")
+run_runner "$@" >"$case_stdout"
+expect_failure 'pipeline retain-all policy' pipeline --campaign retainpipe \
+    --workspace-root "$retain_pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+assert_contains "$case_stderr" 'pipeline requires retention policy reclaim-inputs-after-terminal'
+[[ ! -e "$retain_pipeline_root/tdx-hydro-retainpipe/state/pipeline.json" ]] ||
+    die 'retain-all pipeline refusal created scheduler state'
+ln -s "$pipeline_dir" "$pipeline_root/tdx-hydro-symlinkpipe"
+expect_failure 'pipeline symlinked campaign' pipeline --campaign symlinkpipe \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+assert_contains "$case_stderr" \
+    "hfx: error: campaign does not exist safely: $pipeline_root/tdx-hydro-symlinkpipe"
+[[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
+    die 'symlinked pipeline campaign reached lock creation'
+nonexistent_tool=$test_tmp/does-not-exist
+pipeline_status=0
+HFX_TDX_CURL=$nonexistent_tool HFX_TDX_SHA256SUM=$nonexistent_tool \
+HFX_TDX_OD=$nonexistent_tool HFX_TDX_OGRINFO=$nonexistent_tool \
+    run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+        --max-parallel 2 --fabric-version fixture-v1 \
+        >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
+[[ "$pipeline_status" -ne 0 ]] || die 'incomplete pipeline unexpectedly succeeded'
+assert_contains "$case_stdout" 'pipeline_durable_unreclaimed=3'
+assert_contains "$case_stderr" \
+    'pipeline incomplete: pending=3 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+[[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
+    die 'pipeline left the campaign lock behind'
+sed -n '/^pipeline_campaign() {$/,/^}$/p' "$runner" >"$test_tmp/pipeline-coordinator"
+if grep -En '(^|[[:space:]])&([[:space:]]|$)|FIFO|acquire_basin|compile_campaign|recover_|reconcile_|capacity|occupancy|disk_guard|[[:space:]]wait([[:space:]]|$)|[[:space:]]sleep([[:space:]]|$)' \
+    "$test_tmp/pipeline-coordinator" >"$case_stdout"; then
+    die 'pipeline coordinator contains execution machinery'
+fi
+pass 'pipeline refuses pre-state errors and has no execution machinery'
+
+pipeline_state=$pipeline_dir/state/pipeline.json
+jq -e '
+  keys == ["basin_ids","basins","fabric_version","max_parallel","schema_version"] and
+  .schema_version == 1 and .fabric_version == "fixture-v1" and .max_parallel == 2 and
+  .basin_ids == ["1020000010","7020000010","9020000010"] and
+  ([.basins[] | keys == ["blocked_reason","status"] and
+    .status == "pending" and .blocked_reason == null] | all)
+' "$pipeline_state" >/dev/null || die 'materialized pipeline document differs'
+[[ $(stat -f '%Lp' "$pipeline_state") == 644 ]] || die 'pipeline state mode differs'
+cp "$pipeline_state" "$test_tmp/pipeline-stable"
+expect_failure 'identical pipeline replay remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+cmp "$test_tmp/pipeline-stable" "$pipeline_state"
+expect_failure 'pipeline fabric drift' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v2
+assert_contains "$case_stderr" 'pipeline parameters changed; use a new campaign ID'
+expect_failure 'pipeline max reduction remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+jq -e '.max_parallel == 1' "$pipeline_state" >/dev/null ||
+    die 'pipeline max-parallel reduction was not persisted'
+for pipeline_mutation in malformed extra-key bad-status excessive-acquiring; do
+    mutation_root=$test_tmp/workspaces/pipeline-$pipeline_mutation
+    mkdir "$mutation_root"
+    cp -R "$pipeline_dir" "$mutation_root/tdx-hydro-pipeline"
+    mutation_state=$mutation_root/tdx-hydro-pipeline/state/pipeline.json
+    case $pipeline_mutation in
+        malformed) printf '%s\n' '{' >"$mutation_state" ;;
+        extra-key) jq '.extra=true' "$mutation_state" >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state" ;;
+        bad-status) jq '.basins["1020000010"].status="unknown"' "$mutation_state" >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state" ;;
+        excessive-acquiring)
+            jq '.max_parallel=1 | .basins["1020000010"].status="acquiring" |
+                .basins["7020000010"].status="acquiring"' "$mutation_state" \
+                >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state"
+            ;;
+    esac
+    expect_failure "pipeline validator $pipeline_mutation" progress --campaign pipeline \
+        --workspace-root "$mutation_root"
+    assert_contains "$case_stderr" 'pipeline state is malformed:'
+done
+definitions=$test_tmp/pipeline-definitions.sh
+sed '/^if (($# == 1))/,$d' \
+    "$runner" >"$definitions"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$(command -v rm)
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    transition_pipeline_basin 1020000010 ready
+)
+jq -e '.basins["1020000010"] == {status:"ready",blocked_reason:null} and
+  .basins["7020000010"].status == "pending"' "$pipeline_state" >/dev/null ||
+    die 'parent transition did not change exactly one record'
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+pass 'pipeline state is validated, atomic, replayable, and parent-owned'
+
+mkdir "$pipeline_dir/state/locks/campaign.lock"
+printf '%s\n' "$$" >"$pipeline_dir/state/locks/campaign.lock/owner.pid"
+cp -R "$pipeline_dir" "$test_tmp/pipeline-progress-before"
+run_runner progress --campaign pipeline --workspace-root "$pipeline_root" >"$case_stdout"
+inputs_line=$(grep -n '^inputs_reclaimed=' "$case_stdout" | cut -d: -f1)
+pipeline_line=$(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1)
+assembly_line=$(grep -n '^assemble_pending=' "$case_stdout" | cut -d: -f1)
+[[ "$pipeline_line" -eq "$((inputs_line + 1))" && "$assembly_line" -eq "$((pipeline_line + 9))" ]] ||
+    die 'pipeline progress field ordering differs'
+for scheduler_status in pending acquiring ready compiling terminal reclaimed blocked; do
+    assert_contains "$case_stdout" "pipeline_${scheduler_status}="
+done
+diff -ru "$test_tmp/pipeline-progress-before" "$pipeline_dir"
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+for basin_id in 1020000010 7020000010 9020000010; do
+    basin_state=$pipeline_dir/state/basins/$basin_id/current.json
+    jq --arg id "$basin_id" '
+      .stages.acquire_basins={status:"succeeded",attempts:1,failure_reason:null,
+        evidence:{bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",layer_name:($id+"_basins")}} |
+      .stages.acquire_streamnet={status:"succeeded",attempts:1,failure_reason:null,
+        evidence:{bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",layer_name:($id+"_streamnet")}} |
+      .stages.compile={status:"failed",attempts:1,failure_reason:"adapter build failed",diagnostic_report:null} |
+      .retention.inputs_reclaimed=true
+    ' "$basin_state" >"$basin_state.tmp"
+    mv "$basin_state.tmp" "$basin_state"
+done
+cp "$pipeline_state" "$test_tmp/pipeline-authoritative-stable"
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+assert_contains "$case_stdout" 'pipeline_durable_unreclaimed=0'
+cmp "$test_tmp/pipeline-authoritative-stable" "$pipeline_state"
+pass 'pipeline progress is lock-free and durable basin state stays authoritative'
 
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||

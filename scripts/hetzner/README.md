@@ -278,6 +278,8 @@ tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-pa
 tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>
 tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>
 tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>
+tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
 ```
@@ -447,15 +449,39 @@ The runner phases are:
    nonempty regular files and uploads the exact persisted inventory; it does
    not invoke assembly or validate dataset semantics.
 
+`pipeline` is available only for campaigns using
+`reclaim-inputs-after-terminal`. It validates `--max-parallel` from `1..4`
+and persists that JSON number with the nonempty `--fabric-version` and the
+sorted effective basin IDs in optional schema-1 `state/pipeline.json`. Fabric
+version and selected basin IDs are immutable on replay. Max parallel may
+change within `1..4`, including a safe reduction, when the resulting document
+remains valid.
+
+Pipeline records contain `status` and `blocked_reason`. The seven statuses
+reserve this future transition vocabulary:
+`pending -> acquiring -> ready -> compiling -> terminal -> reclaimed`, plus
+`blocked`. Only the lock-owning parent atomically writes the document. This
+step materializes records as `pending` and performs no transition. Do not
+hand-edit `state/pipeline.json`.
+
 `status` retains its lock-taking validation semantics and prints sizing plus
 deterministic per-stage counts. Only reclaim mode also prints a deterministic
-reclaimed-input count. `progress` renders the same deterministic counts
-directly from the current atomically installed campaign, basin, and assembly
-state without locking, migration, recovery, reconciliation, or writes. It is
-therefore suitable for timed checkpoints while a pipeline owns the lock.
-Scheduler-specific progress fields do not exist in this step; M5-S3B will add
-persisted scheduler counts without weakening the lock-free, write-free
-contract.
+reclaimed-input count. When pipeline state exists, status and progress then
+print `pipeline_max_parallel`, `pipeline_fabric_version`, and the seven
+`pipeline_<status>` counts, in that order, before the four assembly counts.
+`progress` renders the same deterministic counts directly from one atomically
+installed pipeline snapshot without locking, migration, recovery,
+reconciliation, or writes.
+
+Pipeline state is advisory; durable per-basin state is authoritative. A stale
+all-pending document is harmless because M5-S3B-1b re-derives scheduler state
+before later dispatch. This step exits zero only when every selected durable
+basin has schema 4 and `retention.inputs_reclaimed == true`. Otherwise it
+prints durable and scheduler counts and exits nonzero immediately.
+
+This step modifies no compile function, performs no recovery reconstruction,
+and has no `defer_reclaim`, dispatch loop, worker, fork, FIFO, occupancy guard,
+capacity probe, or disk guard.
 `recover` changes interrupted `running` stages back to `pending` and completes
 an interrupted terminal reclaim; `acquire` and `compile` also perform the
 applicable recovery before work. Operational
