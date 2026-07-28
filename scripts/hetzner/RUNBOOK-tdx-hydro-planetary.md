@@ -478,7 +478,7 @@ run_pipeline_checkpoint() {
     if test "$checkpoint_hour" -eq 24; then
       printf '%s\n' 'checkpoint_miss=hour-24 remaining_hours_max=48 projected_completion_hours=72.0 result=TEARDOWN; equality cannot resume' >&2
     else
-      printf '%s\n' 'checkpoint_miss=hour-44 remaining_hours_max=28.6 projected_completion_hours=72.6 result=TEARDOWN; ceiling exceeded' >&2
+      printf '%s\n' 'checkpoint_miss=hour-44 remaining_hours_max=28.6 projected_completion_hours=72.35 result=TEARDOWN; ceiling exceeded' >&2
     fi
     workload_barrier_refuse tdx-pipeline "missed-hour-${checkpoint_hour}-checkpoint"
   else
@@ -487,7 +487,7 @@ run_pipeline_checkpoint() {
 }
 wait_for_workload() {
   if test "$#" -ne 3; then workload_barrier_refuse invalid-arguments expected-workload-max-polls-phase-deadline-hours; fi
-  local workload=$1 max_polls=$2 phase_deadline_hours=$3 poll poll_status origin now hard_deadline phase_deadline elapsed_hours workload_exit next_poll delay
+  local workload=$1 max_polls=$2 phase_deadline_hours=$3 poll poll_status origin now hard_deadline phase_deadline checkpoint_hour_44_at elapsed_hours workload_exit next_poll delay
   local checkpoint_hour_24_done=0 checkpoint_hour_44_done=0
   case "$workload" in
     tdx-init|tdx-calibrate-2|tdx-calibrate-4|tdx-pipeline|tdx-recover|tdx-assemble|tdx-evidence|tdx-publish) ;;
@@ -498,10 +498,11 @@ wait_for_workload() {
      hard_deadline=$(cat "$LOCAL_EVIDENCE_DIR/hard-deadline-epoch.txt") &&
      [[ "$origin" =~ ^[0-9]+$ && "$hard_deadline" =~ ^[0-9]+$ ]]; then
     phase_deadline=$((origin + phase_deadline_hours * 3600))
+    checkpoint_hour_44_at=$((origin + 44 * 3600 - 15 * 60))
   else
     workload_barrier_refuse "$workload" malformed-deadline-evidence
   fi
-  for ((poll=0; poll<=max_polls; poll++)); do
+  for ((poll=0; ; poll++)); do
     now=$(date +%s)
     if elapsed_hours=$(awk -v n="$now" -v o="$origin" 'BEGIN { printf "%.10f", (n-o)/3600 }'); then
       :
@@ -524,7 +525,7 @@ wait_for_workload() {
             run_pipeline_checkpoint 24 26 "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log"
             checkpoint_hour_24_done=1
           fi
-          if test "$checkpoint_hour_44_done" -eq 0 && awk -v e="$elapsed_hours" 'BEGIN { exit !(e >= 44) }'; then
+          if test "$checkpoint_hour_44_done" -eq 0 && test "$now" -ge "$checkpoint_hour_44_at" && test "$now" -lt "$phase_deadline"; then
             run_pipeline_checkpoint 44 62 "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log"
             checkpoint_hour_44_done=1
           fi
@@ -536,11 +537,12 @@ wait_for_workload() {
         if test "$now" -ge "$phase_deadline"; then
           workload_barrier_refuse "$workload" "running-at-phase-deadline-hour-${phase_deadline_hours}"
         fi
-        if test "$poll" -ge "$max_polls"; then
-          workload_barrier_refuse "$workload" "poll-timeout-${max_polls}x300s"
-        fi
         delay=300
         if test "$next_poll" -gt "$phase_deadline"; then delay=$((phase_deadline - now)); fi
+        if test "$workload" = tdx-pipeline && test "$checkpoint_hour_44_done" -eq 0 &&
+           test "$now" -lt "$checkpoint_hour_44_at" && test "$next_poll" -gt "$checkpoint_hour_44_at"; then
+          delay=$((checkpoint_hour_44_at - now))
+        fi
         sleep "$delay"
         ;;
       3)
@@ -583,16 +585,16 @@ REMOTE_WORKLOAD_LOG
         if test "$now" -ge "$phase_deadline"; then
           workload_barrier_refuse "$workload" "poll-failure-at-phase-deadline-hour-${phase_deadline_hours}"
         fi
-        if test "$poll" -ge "$max_polls"; then
-          workload_barrier_refuse "$workload" "poll-timeout-${max_polls}x300s"
-        fi
         delay=300
         if test "$next_poll" -gt "$phase_deadline"; then delay=$((phase_deadline - now)); fi
+        if test "$workload" = tdx-pipeline && test "$checkpoint_hour_44_done" -eq 0 &&
+           test "$now" -lt "$checkpoint_hour_44_at" && test "$next_poll" -gt "$checkpoint_hour_44_at"; then
+          delay=$((checkpoint_hour_44_at - now))
+        fi
         sleep "$delay"
         ;;
     esac
   done
-  workload_barrier_refuse "$workload" "poll-timeout-${max_polls}x300s"
 }
 
 OBSERVED_AVAILABLE_DISK_BYTES=
@@ -660,7 +662,7 @@ wait_for_workload tdx-calibrate-4 108 44
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
-Status exit 0 means running; 3 means absent or finished. Every standalone status invocation must retain the `|| test "$?" -eq 3` guard; the barrier instead captures both values inside `if`/`else`, where documented exit 3 cannot trigger errexit. `wait_for_workload` polls every 300 seconds, recomputes elapsed time from `provisioning-request-epoch.txt` on every poll, shortens the last sleep to land exactly on a phase boundary, observes that boundary without adding another interval, refuses a still-running workload there, and refuses before another poll would reach the 72-hour hard deadline. Its `max_polls` values count 300-second waits and are secondary caps: init is 24 waits, the full two-hour 0-2 phase, but its hour-2 bound removes time already spent provisioning, bootstrapping, converging, and preflighting; each calibration is 108 waits, its measured nine-hour cohort cap, inside the single shared hour-2-to-hour-44 allowance; pipeline is 504 waits, the 42 hours charged by the hour-2 gate, also ending at hour 44; recovery is 48 waits, its four-hour operation cap, inside that same shared allowance; assembly is 24 waits, the two hours charged before the hour-46 gate; evidence and publish are each bounded by hour 58, so validation, both workloads, parking proof, and export consume one shared 12-hour verification allowance rather than two 12-hour allowances. Thus the maxima are not additive, and no barrier can continue across hour 72.
+Status exit 0 means running; 3 means absent or finished. Every standalone status invocation must retain the `|| test "$?" -eq 3` guard; the barrier instead captures both values inside `if`/`else`, where documented exit 3 cannot trigger errexit. `wait_for_workload` polls every 300 seconds, recomputes elapsed time from `provisioning-request-epoch.txt` on every poll, shortens the last sleep to land exactly on a phase boundary, observes that boundary without adding another interval, refuses a still-running workload there, and refuses before another poll would reach the 72-hour hard deadline. Its retained `max_polls` values count estimated 300-second waits for reporting only and never trigger refusal; the absolute phase deadline and hard deadline are the only time-based teardown bounds. Init's estimate is 24 waits; each calibration's is 108 waits; pipeline's is 504 waits; recovery's is 48 waits; assembly's is 24 waits; evidence's and publish's are each 144 waits. The phase deadlines remain shared absolute bounds, the estimates are not additive, and no barrier can continue across hour 72.
 
 On absent-or-finished, the barrier waits five seconds and reads the canonical log again before classifying, closing the tmux-exit/log-drain race. Canonical exit 0 returns. Any recorded nonzero, missing record after the retry, or transport failure enters the bounded paused-dispatch classification with the named section-11 remedy; it does not fall through errexit into teardown. Pipeline/FIFO/lock/liveness/state-transition/orchestration defects; landed adapter/assembly/order/merged-snap/coverage/validator defects; invalid observed counts; switch breaches; and source-undetermined diagnostics remain explicit salvage-and-teardown outcomes once identified. Transient NGA/SSH/Git/apt/quota failures, retained acquisition/compile conflicts, takeover/destination-exists, and publish credential-environment failures pause for their named remedies. No subsequent campaign command may be issued from the trapped shell until the barrier returns. A pause is bounded by hour 72; the operator may end it sooner only by sending TERM to the trapped shell and confirming salvage, default teardown, and the zero-footprint proof. Each successful retry truncates the canonical log, so an earlier attempt's exit survives only in its timestamped run log; retain and inspect the named timestamped log before retrying. Cohort two must compile, terminal-classify, and reclaim before cohort four starts. The synchronous serial consumer at runner lines 2030-2052 selects one ready basin and calls `compile_basin_locked`. `calibrate` releases its lock at 4691-4692 before nested pipeline reacquires it at 1972; start nothing in that window. A premature pipeline produces the misleading selection-mismatch diagnostic; finish calibration instead.
 
@@ -738,7 +740,8 @@ The acquisition projection is 33-37 hours; serial compilation 16-18 hours; overl
 | hour 2 | temporal preflight gate |
 | hour 24 | live `pipeline_reclaimed >= 26`; persisted checkpoint |
 | 34-42h | calibration and pipeline finish |
-| hour 44 | `pipeline_reclaimed=62`; persisted checkpoint |
+| hour 43h45m | hour-44 `pipeline_reclaimed=62` persisted checkpoint |
+| hour 44 | pipeline phase deadline |
 | 1h48m-2h | assembly |
 | hour 46 | temporal assembly gate |
 | 0-12h after | verify, park, retain evidence |
@@ -767,7 +770,7 @@ checkpoint_observed_terminal_count=$("$JQ" -r '[.basins[].status | select(. == "
 
 Only `reclaimed` counts; an advisory `terminal` does not. Read live `pipeline_reclaimed`, not the stored-as-of-stop count. `status` locks and may expose malformed calibration that progress does not.
 
-The two checkpoint calls are inside `wait_for_workload`'s `tdx-pipeline` running branch. Each poll computes elapsed hours from `provisioning-request-epoch.txt`. Once elapsed first reaches 24, the barrier runs the live checkpoint for 26 exactly once and tees stdout to `checkpoint-hour-24.log`; once elapsed first reaches 44, it runs the live checkpoint for 62 exactly once and tees stdout to `checkpoint-hour-44.log`. The explicit `checkpoint_hour_24_done` and `checkpoint_hour_44_done` flags prevent repeats on later polls. If the pipeline records canonical exit 0 before a checkpoint hour, the barrier returns and no checkpoint is issued against a stopped workload.
+The two checkpoint calls are inside `wait_for_workload`'s `tdx-pipeline` running branch. Each poll computes elapsed hours from `provisioning-request-epoch.txt`. Once elapsed first reaches 24, the barrier runs the live checkpoint for 26 exactly once and tees stdout to `checkpoint-hour-24.log`; the barrier shortens a sleep to run the hour-44 live checkpoint for 62 exactly once at hour 43h45m and tee stdout to `checkpoint-hour-44.log`. A MET hour-44 checkpoint has a bounded 15-minute grace, through the hour-44 pipeline phase deadline, for the pipeline to record canonical exit 0; this ends by hour 44, well before the maximum-charged post-pipeline allowance would cross hour 72. The explicit `checkpoint_hour_24_done` and `checkpoint_hour_44_done` flags prevent repeats on later polls. If the pipeline records canonical exit 0 before a checkpoint hour, the barrier returns and no checkpoint is issued against a stopped workload.
 
 The parser remains no-abort: its `grep` counts use `|| true`, and every checkpoint command captures pipeline status with `|| checkpoint_status=$?`. It first distinguishes stopped-checkpoint refusal, absent snapshot, and transport failure from a complete missed contract. Those failures, plus malformed/no-result or contradictory result/status evidence, enter bounded paused dispatch with their named remedy; none is treated as a miss or allowed to fall through errexit. Only exactly one `checkpoint_result=missed` with status 1 and none of those failure diagnostics is a miss.
 
@@ -783,7 +786,7 @@ checkpoint_signal=<not-required|sent|no-live-owner>
 
 The command signals the campaign-lock owner, not specifically the scheduler (lines 1425-1502). Interruptible lock owners are `acquire`, `compile`, `compile-basin`, `calibrate`, `assemble`, `evidence`, `publish`, `status`, and `recover`. `checkpoint` does not lock; dispatch lines 4961-4972 only validate structure. A miss may interrupt any listed lock owner, but planned checkpoints occur during the live pipeline. All state writes are atomic. Non-miss checkpoint failures retain their evidence for the named recovery.
 
-A MET checkpoint lets the barrier continue. A MISSED checkpoint is a deliberate teardown trigger because the run cannot finish inside the hard ceiling. At hour 24, maximum-charged remaining work is 48 hours = 32 hours pipeline + 2 hours assembly + 12 hours verification + 2 hours teardown; `24 + 48 = 72.0`, and strict refusal on equality makes resumption impossible. At hour 44, maximum-charged remaining work is 28.6 hours = 12.6 hours pipeline + 2 hours assembly + 12 hours verification + 2 hours teardown; `44 + 28.6 = 72.6`, beyond the ceiling. The miss branch retains the checkpoint log, explicitly salvages and tears down, and exits.
+A MET checkpoint lets the barrier continue through its bounded grace. A MISSED checkpoint is a deliberate teardown trigger because the run cannot finish inside the hard ceiling. At hour 24, maximum-charged remaining work is 48 hours = 32 hours pipeline + 2 hours assembly + 12 hours verification + 2 hours teardown; `24 + 48 = 72.0`, and strict refusal on equality makes resumption impossible. At the hour-44 checkpoint at hour 43h45m, maximum-charged remaining work is 28.6 hours = 12.6 hours pipeline + 2 hours assembly + 12 hours verification + 2 hours teardown; `43.75 + 28.6 = 72.35`, beyond the ceiling. The miss branch retains the checkpoint log, explicitly salvages and tears down, and exits.
 
 Absent snapshot says exactly `hfx: error: pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint`: keep dispatch paused, retain the evidence, and use only that named recovery after authorization. A stopped-checkpoint refusal, malformed output, or transport failure follows the same paused-dispatch rule and is not converted into a miss. A refused spend/time gate or expiry of a stated barrier/watchdog bound remains a deliberate explicit salvage-and-teardown trigger. Hours 2,46,58 use `campaign_gate`, never expected count zero.
 
