@@ -811,7 +811,7 @@ validate_calibration_json() {
             (.excluded_drain_tail | type == "object" and
                 keys == ["bytes","elapsed_seconds","end_bytes","end_timestamp_seconds","start_bytes","start_timestamp_seconds"] and
                 (to_entries | all(.[]; .value | i64)) and
-                .elapsed_seconds == .end_timestamp_seconds - .start_timestamp_seconds and
+                .elapsed_seconds <= .end_timestamp_seconds - .start_timestamp_seconds and
                 .bytes == .end_bytes - .start_bytes) and
             (.raw as $r | .steady_state as $s | .excluded_drain_tail as $d |
                 $s.start_timestamp_seconds >= $r.start_timestamp_seconds and
@@ -941,42 +941,67 @@ calibration_product_bytes() {
     local product
     local path
     local observed
+    local restart
+    local wc_output
+    local calibration_product_retry
+    local calibration_wc_count
     local resident_paths=()
     local state_files=()
-    while IFS= read -r basin_id; do
-        state_files[${#state_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
-        for product in basins streamnet; do
-            path=$campaign_dir/downloads/$basin_id-$product.gpkg
-            if [[ ! -f "$path" || -L "$path" ]]; then
-                path=$path.partial
-            fi
-            if [[ -f "$path" && ! -L "$path" ]]; then
-                resident_paths[${#resident_paths[@]}]=$path
-            fi
-        done
-    done < <(effective_basin_ids)
-    calibration_byte_count=$("$JQ" -s '
-      [.[] | select(.retention.inputs_reclaimed == true) |
-       .stages.acquire_basins.evidence.bytes, .stages.acquire_streamnet.evidence.bytes] | add // 0
-    ' ${state_files[@]+"${state_files[@]}"})
-    calibration_byte_count=$(normalize_nonnegative_i64 "$calibration_byte_count") ||
-        hfx_die 'calibration durable product length is malformed'
-    if ((${#resident_paths[@]} > 0)); then
-        observed=0
-        while IFS= read -r calibration_wc_line; do
-            calibration_wc_suffix=${calibration_wc_line##* }
-            calibration_wc_count=${calibration_wc_line% *}
-            calibration_wc_count=${calibration_wc_count##* }
-            calibration_wc_count=$(normalize_nonnegative_i64 "$calibration_wc_count") ||
-                hfx_die 'calibration product length is malformed'
-            if [[ "$calibration_wc_suffix" == total ]]; then
-                observed=$calibration_wc_count
-            else
+    calibration_product_retry=0
+    while :; do
+        resident_paths=()
+        state_files=()
+        while IFS= read -r basin_id; do
+            state_files[${#state_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
+            for product in basins streamnet; do
+                path=$campaign_dir/downloads/$basin_id-$product.gpkg
+                if [[ ! -f "$path" || -L "$path" ]]; then
+                    path=$path.partial
+                fi
+                if [[ -f "$path" && ! -L "$path" ]]; then
+                    resident_paths[${#resident_paths[@]}]=$path
+                fi
+            done
+        done < <(effective_basin_ids)
+        calibration_byte_count=0
+        if ((${#state_files[@]} > 0)); then
+            calibration_byte_count=$("$JQ" -s '
+              [.[] | select(.retention.inputs_reclaimed == true) |
+               .stages.acquire_basins.evidence.bytes, .stages.acquire_streamnet.evidence.bytes] | add // 0
+            ' ${state_files[@]+"${state_files[@]}"})
+        fi
+        calibration_byte_count=$(normalize_nonnegative_i64 "$calibration_byte_count") ||
+            hfx_die 'calibration durable product length is malformed'
+        if ((${#resident_paths[@]} > 0)); then
+            observed=0
+            restart=0
+            for path in ${resident_paths[@]+"${resident_paths[@]}"}; do
+                if ! wc_output=$("$WC" -c "$path" 2>&1); then
+                    if [[ ! -e "$path" && ! -L "$path" ]]; then
+                        restart=1
+                        break
+                    fi
+                    printf '%s\n' "$wc_output" >&2
+                    hfx_die "could not measure calibration product length: $path"
+                fi
+                calibration_wc_count=${wc_output%" $path"}
+                [[ "$calibration_wc_count" != "$wc_output" ]] ||
+                    hfx_die "calibration product length is malformed: $path"
+                calibration_wc_count=$(printf '%s\n' "$calibration_wc_count" | "$TR" -d ' ')
+                calibration_wc_count=$(normalize_nonnegative_i64 "$calibration_wc_count") ||
+                    hfx_die "calibration product length is malformed: $path"
                 observed=$(checked_add "$observed" "$calibration_wc_count")
+            done
+            if ((restart == 1)); then
+                calibration_product_retry=$((calibration_product_retry + 1))
+                ((calibration_product_retry <= 16)) ||
+                    hfx_die 'calibration products changed repeatedly while measuring lengths'
+                continue
             fi
-        done <<<"$("$WC" -c ${resident_paths[@]+"${resident_paths[@]}"} 2>/dev/null || :)"
-        calibration_byte_count=$(checked_add "$calibration_byte_count" "$observed")
-    fi
+            calibration_byte_count=$(checked_add "$calibration_byte_count" "$observed")
+        fi
+        break
+    done
 }
 
 calibration_append_sample() {
@@ -1097,11 +1122,6 @@ calibration_scan_traces() {
     ((calibration_first_full_index >= 0 && calibration_last_full_index + 1 < index)) ||
         hfx_die 'calibration trace lacks a full-occupancy record and lower successor'
     calibration_steady_end_index=$((calibration_last_full_index + 1))
-    ((calibration_occupancies[$calibration_steady_end_index] < max_parallel)) ||
-        hfx_die 'calibration corrected interval lacks a lower successor'
-    for ((attempt = calibration_steady_end_index + 1; attempt < index; attempt++)); do
-        ((calibration_occupancies[$attempt] < max_parallel)) || hfx_die 'calibration occupancy returned to full after drain began'
-    done
 }
 
 calibration_count_retries() {
@@ -4348,6 +4368,12 @@ calibrate_campaign() {
     fi
     if calibration_terminal_reclaimed; then
         ((calibration_attempts > 0)) || hfx_die 'terminal calibration cohort has no retained attempt'
+        calibration_orphan_trace=$campaign_dir/state/calibration/$calibration_name-attempt-$((calibration_attempts + 1)).samples.tsv
+        if [[ -e "$calibration_orphan_trace" || -L "$calibration_orphan_trace" ]]; then
+            [[ -f "$calibration_orphan_trace" && ! -L "$calibration_orphan_trace" ]] ||
+                hfx_die "calibration attempt trace is unsafe: $calibration_orphan_trace"
+            "$RM" -- "$calibration_orphan_trace"
+        fi
         calibration_trace_file=$campaign_dir/state/calibration/$calibration_name-attempt-$calibration_attempts.samples.tsv
         calibration_scan_traces
         calibration_compile_completions=${calibration_completions[$calibration_last_index]}

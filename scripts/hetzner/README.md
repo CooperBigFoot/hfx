@@ -1002,6 +1002,10 @@ M5-S4 must apply the 4,167,474 bytes/second abort test to a cohort whose correct
 When only a zero-compile corrected window is available, M5-S4 must treat the threshold as UNMET rather than met.
 The frozen `selected_throughput_validity` is `compile-observed` if either
 candidate contains a compile, otherwise `no-compile-observed`.
+When the corrected interval falls back to the gap-excluded raw interval, its
+compile count is forced to zero even if compiles occurred. The binding rule
+therefore reports the threshold as UNMET; inspect the disclosed attempts to
+distinguish this conservative fallback from a genuinely zero-compile window.
 
 In the pinned scheduler, parallel-4 dispatches all four in its first round; its
 first reap begins permanent drain, so its corrected window contains zero compile

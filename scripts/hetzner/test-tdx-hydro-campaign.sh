@@ -583,8 +583,33 @@ calibration_measurement_case() {
         die 'terminal replay did not clamp the corrected-end byte regression'
     [[ ! -e "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ]] ||
         die 'terminal replay scheduled a new attempt'
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n102\t48\t1\t1\t1\n' >"$trace"
+    printf '110\t48\t1\t1\t1\n121\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=2 |
+        .cohorts["parallel-2"].measurement=null' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    printf 'orphan\n' >"$calibration_dir/state/calibration/parallel-2-attempt-3.samples.tsv"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .attempts == 2 and
+      .measurement.excluded_drain_tail.start_timestamp_seconds == 102 and
+      .measurement.excluded_drain_tail.end_timestamp_seconds == 140 and
+      .measurement.excluded_drain_tail.elapsed_seconds == 30 and
+      .measurement.excluded_drain_tail.elapsed_seconds <
+        (.measurement.excluded_drain_tail.end_timestamp_seconds -
+         .measurement.excluded_drain_tail.start_timestamp_seconds)' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'two-attempt drain tail did not exclude inter-attempt idle time'
+    [[ ! -e "$calibration_dir/state/calibration/parallel-2-attempt-3.samples.tsv" ]] ||
+        die 'terminal replay retained its orphan next-attempt trace'
+    rm -f -- "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
     printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n112\t144\t1\t2\t2\n113\t144\t0\t2\t2\n' >"$trace"
-    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=1 |
+        .cohorts["parallel-2"].measurement=null' \
         "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
     mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
     mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
