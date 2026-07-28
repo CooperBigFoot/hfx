@@ -854,6 +854,315 @@ calibration_scheduler_shape_case() {
     pass 'calibration callbacks preserve the scheduler and static contracts'
 }
 
+checkpoint_new_campaign() {
+    local name=$1
+    set -- $(init_args "$name" "$test_tmp")
+    run_runner "$@" >/dev/null
+}
+
+checkpoint_schema_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-schema
+    checkpoint_new_campaign checkpoint-schema
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{
+  "schema_version": 1,
+  "fabric_version": "fixture-v1",
+  "max_parallel": 2,
+  "basin_ids": ["1020000010", "7020000010", "9020000010"],
+  "basins": {
+    "1020000010": {"status": "reclaimed", "blocked_reason": null},
+    "7020000010": {"status": "reclaimed", "blocked_reason": null},
+    "9020000010": {"status": "terminal", "blocked_reason": null}
+  }
+}
+EOF
+    run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 2 >"$case_stdout"
+    diff -u <(printf '%s\n' checkpoint_expected_terminal_count=2 \
+        checkpoint_observed_terminal_count=2 checkpoint_result=met \
+        checkpoint_run_state=running checkpoint_signal=not-required) "$case_stdout"
+    mv "$dir/state/pipeline.json" "$dir/state/pipeline.evidence.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 3 >"$case_stdout" 2>"$case_stderr"; then
+        die 'absent checkpoint pipeline snapshot unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" 'pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint'
+    printf '{\n' >"$dir/state/checkpoints.json"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_resume=recovered-malformed
+    [[ -f "$dir/state/checkpoint-recovery/rejected-1.json" ]] || die 'malformed checkpoint was not archived'
+    mv "$dir/state/pipeline.evidence.json" "$dir/state/pipeline.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 2,
+      "observed_terminal_count": 2,
+      "result": "met"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-met.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'decreasing checkpoint expectation unexpectedly succeeded'
+    fi
+    cmp "$test_tmp/checkpoint-met.json" "$dir/state/checkpoints.json"
+    assert_contains "$case_stderr" 'checkpoint expected count cannot decrease below 2; rerun checkpoint with 2 or a higher value'
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-stopped.json"
+    run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 3 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_observed_terminal_count=2
+    cmp "$test_tmp/checkpoint-stopped.json" "$dir/state/checkpoints.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 4 >"$case_stdout" 2>"$case_stderr"; then
+        die 'different stopped checkpoint expectation unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" 'stopped checkpoint expects 3; run checkpoint-resume, then checkpoint with an equal or higher expected value'
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": 1,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed"
+    }
+  ]
+}
+EOF
+    run_runner progress --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_run_state=running
+    assert_contains "$case_stdout" checkpoint_result=missed
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": []
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-2.expected"
+    run_runner progress --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_state=malformed
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-2.expected" "$dir/state/checkpoint-recovery/rejected-2.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 2,
+      "observed_terminal_count": 2,
+      "result": "met"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-3.expected"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-3.expected" "$dir/state/checkpoint-recovery/rejected-3.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed",
+      "extra": true
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-4.expected"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-4.expected" "$dir/state/checkpoint-recovery/rejected-4.json"
+    /bin/rm -- "$dir/state/checkpoints.json"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_resume=recovered-malformed
+    assert_contains "$case_stdout" checkpoint_recovery_path=state/checkpoint-recovery/rejected-1.json
+    pass 'checkpoint schema recovery and absent snapshots remain operator-recoverable'
+}
+
+checkpoint_stop_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-stop
+    local owner
+    local race_dir=$test_tmp/tdx-hydro-checkpoint-race
+    local race_mkdir=$test_tmp/checkpoint-race-mkdir
+    checkpoint_new_campaign checkpoint-stop
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{"schema_version":1,"fabric_version":"fixture-v1","max_parallel":2,"basin_ids":["9020000010"],"basins":{"9020000010":{"status":"terminal","blocked_reason":null}}}
+EOF
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'missed checkpoint unexpectedly succeeded'
+    fi
+    diff -u <(printf '%s\n' checkpoint_expected_terminal_count=1 \
+        checkpoint_observed_terminal_count=0 checkpoint_result=missed \
+        checkpoint_run_state=stopped checkpoint_signal=no-live-owner) "$case_stdout"
+    jq -e '.run_state == "stopped" and (.entries | length) == 1' "$dir/state/checkpoints.json" >/dev/null
+    run_runner checkpoint-resume --campaign checkpoint-stop --workspace-root "$test_tmp" >"$case_stdout"
+    diff -u <(printf '%s\n' checkpoint_resume=resumed checkpoint_run_state=running) "$case_stdout"
+    jq -e '.run_state == "running" and .resume_after_entry_count == 1' "$dir/state/checkpoints.json" >/dev/null
+    /usr/bin/tail -f /dev/null &
+    owner=$!
+    mkdir "$dir/state/locks/campaign.lock"
+    printf '%s\n' "$owner" >"$dir/state/locks/campaign.lock/owner.pid"
+    run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_signal=sent
+    if kill -0 "$owner" 2>/dev/null; then
+        kill -TERM "$owner" 2>/dev/null || :
+        wait "$owner" 2>/dev/null || :
+        die 'checkpoint TERM did not stop the validated live owner'
+    fi
+    wait "$owner" 2>/dev/null || :
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-live-stopped.json"
+    run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_signal=no-live-owner
+    cmp "$test_tmp/checkpoint-live-stopped.json" "$dir/state/checkpoints.json"
+    export HFX_TEST_PS_MODE=error
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'indeterminate checkpoint owner unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "checkpoint owner PID $owner is indeterminate; resolve that PID or ps ambiguity, then rerun the same checkpoint"
+    export HFX_TEST_PS_MODE=live
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'failed checkpoint TERM delivery unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "could not deliver TERM to checkpoint owner PID $owner; rerun the same checkpoint with the same expected value"
+    unset HFX_TEST_PS_MODE
+    printf 'unsafe\n' >"$dir/state/locks/campaign.lock/owner.pid"
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'unsafe checkpoint owner contents unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "checkpoint campaign lock owner contents are unsafe: $dir/state/locks/campaign.lock/owner.pid; correct or move that exact entry, then rerun the same checkpoint"
+    cmp "$test_tmp/checkpoint-live-stopped.json" "$dir/state/checkpoints.json"
+    rm -r "$dir/state/locks/campaign.lock"
+    set -- $(reclaim_subset_init_args checkpoint-race "$test_tmp")
+    run_runner "$@" >/dev/null
+    cat >"$race_mkdir" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+    if [[ "$argument" == */state/locks/campaign.lock ]]; then
+        printf '%s\n' '{"schema_version":1,"run_state":"stopped","resume_after_entry_count":null,"entries":[{"expected_terminal_count":1,"observed_terminal_count":0,"result":"missed"}]}' >"$HFX_TEST_RACE_STATE"
+    fi
+done
+exec /bin/mkdir "$@"
+EOF
+    chmod +x "$race_mkdir"
+    export HFX_TEST_RACE_STATE=$race_dir/state/checkpoints.json
+    export HFX_TDX_MKDIR=$race_mkdir
+    if run_runner pipeline --campaign checkpoint-race --workspace-root "$test_tmp" \
+        --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'post-lock stopped checkpoint race unexpectedly scheduled pipeline work'
+    fi
+    assert_contains "$case_stderr" 'pipeline is stopped by checkpoint control; run checkpoint-resume, then rerun the exact pipeline command'
+    [[ ! -e "$race_dir/state/pipeline.json" && ! -e "$race_dir/state/tmp/pipeline-completions.fifo" ]] ||
+        die 'post-lock checkpoint guard allowed scheduler materialization'
+    unset HFX_TDX_MKDIR
+    unset HFX_TEST_RACE_STATE
+    pass 'missed checkpoint stops the live pipeline and explicit resume preserves durable work'
+}
+
+checkpoint_progress_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-progress
+    local original_jq
+    local zero_jq=$test_tmp/zero-effective-jq
+    set -- $(reclaim_subset_init_args checkpoint-progress "$test_tmp")
+    run_runner "$@" >/dev/null
+    original_jq=/usr/bin/jq
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{
+  "schema_version": 1,
+  "fabric_version": "fixture-v1",
+  "max_parallel": 2,
+  "basin_ids": ["1020000010", "7020000010", "9020000010"],
+  "basins": {
+    "1020000010": {"status": "reclaimed", "blocked_reason": null},
+    "7020000010": {"status": "reclaimed", "blocked_reason": null},
+    "9020000010": {"status": "terminal", "blocked_reason": null}
+  }
+}
+EOF
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": null,
+  "entries": []
+}
+EOF
+    cp -R "$dir" "$test_tmp/checkpoint-progress.before"
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    diff -ru "$test_tmp/checkpoint-progress.before" "$dir"
+    assert_contains "$case_stdout" checkpoint_run_state=running
+    assert_contains "$case_stdout" checkpoint_entry_count=0
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{"schema_version":1,"run_state":"running","resume_after_entry_count":null,"entries":[{"expected_terminal_count":2,"observed_terminal_count":2,"result":"met"}]}
+EOF
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_expected_terminal_count=2
+    assert_contains "$case_stdout" checkpoint_observed_terminal_count=2
+    [[ $(grep -n '^checkpoint_run_state=' "$case_stdout" | cut -d: -f1) -eq \
+        $(($(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1) + 9)) ]] ||
+        die 'checkpoint progress block does not follow the complete pipeline block'
+    [[ $(grep -n '^assemble_pending=' "$case_stdout" | cut -d: -f1) -eq \
+        $(($(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1) + 14)) ]] ||
+        die 'assembly block does not follow the complete checkpoint block'
+    cat >"$zero_jq" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$#" -eq 3 && "$1" == -r ]] &&
+    { [[ "$2" == 'keys[]' ]] || [[ "$2" == '.basin_ids[]' ]]; }; then
+    exit 0
+fi
+exec "$HFX_TEST_REAL_JQ" "$@"
+EOF
+    chmod +x "$zero_jq"
+    export HFX_TEST_REAL_JQ=$original_jq
+    export HFX_TDX_JQ=$zero_jq
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    [[ $(grep -Ec '^(acquire_basins|acquire_streamnet|compile)_(pending|running|succeeded|failed)=0$' "$case_stdout") -eq 12 ]] ||
+        die 'zero-ID progress did not report twelve exact zero stage counts'
+    assert_contains "$case_stdout" inputs_reclaimed=0
+    printf '{\n' >"$dir/state/checkpoints.json"
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_state=malformed
+    assert_contains "$case_stdout" 'checkpoint_recovery=run checkpoint-resume'
+    unset HFX_TDX_JQ
+    unset HFX_TEST_REAL_JQ
+    pass 'checkpoint progress is lock-free ordered and safe for empty basin reads'
+}
+
 case ${HFX_TEST_FOCUS-} in
     '') ;;
     cohort) calibration_cohort_case; printf '1..%d\n' "$passed"; exit 0 ;;
@@ -861,6 +1170,9 @@ case ${HFX_TEST_FOCUS-} in
     calibration-replay) calibration_replay_case; printf '1..%d\n' "$passed"; exit 0 ;;
     disclosure) calibration_disclosure_case; printf '1..%d\n' "$passed"; exit 0 ;;
     scheduler-shape) calibration_scheduler_shape_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-schema) checkpoint_schema_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-stop) checkpoint_stop_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-progress) checkpoint_progress_case; printf '1..%d\n' "$passed"; exit 0 ;;
     *) die "unknown HFX_TEST_FOCUS: $HFX_TEST_FOCUS" ;;
 esac
 
@@ -5904,6 +6216,9 @@ calibration_measurement_case
 calibration_replay_case
 calibration_disclosure_case
 calibration_scheduler_shape_case
+checkpoint_schema_case
+checkpoint_stop_case
+checkpoint_progress_case
 
 printf '1..%d\n' "$passed"
 if [[ "$skipped" -eq 0 ]]; then

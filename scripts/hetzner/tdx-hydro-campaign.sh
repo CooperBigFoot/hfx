@@ -67,6 +67,8 @@ usage() {
         '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh checkpoint --campaign <id> [--workspace-root <path>] --expected-terminal-count <1..62>' \
+        '       tdx-hydro-campaign.sh checkpoint-resume --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -1334,6 +1336,251 @@ calibration_require_pipeline_freeze() {
     [[ "$max_parallel" == "$calibration_selection" ]] || hfx_die 'pipeline max-parallel differs from frozen calibration selection'
 }
 
+validate_checkpoints_json() {
+    local file=$1
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "checkpoint state is not a regular file: $file"
+    "$JQ" -e --argjson max_i64 "$HFX_TDX_MAX_I64" '
+def checkpoint_count:
+  type == "number" and . == floor and . >= 0 and . <= 62;
+def entry_index:
+  type == "number" and . == floor and . >= 0 and . <= $max_i64;
+type == "object" and
+keys == ["entries","resume_after_entry_count","run_state","schema_version"] and
+.schema_version == 1 and
+(.run_state == "running" or .run_state == "stopped") and
+(.resume_after_entry_count == null or
+  (.resume_after_entry_count | entry_index)) and
+(.entries | type == "array" and all(.[];
+  type == "object" and
+  keys == ["expected_terminal_count","observed_terminal_count","result"] and
+  (.expected_terminal_count | checkpoint_count) and
+  .expected_terminal_count >= 1 and
+  (.observed_terminal_count | checkpoint_count) and
+  (.result == "met" or .result == "missed") and
+  (if .result == "met"
+   then .observed_terminal_count >= .expected_terminal_count
+   else .observed_terminal_count < .expected_terminal_count
+   end))) and
+([.entries[].expected_terminal_count] as $expected |
+  $expected == ($expected | sort)) and
+(.entries as $entries |
+if ($entries | length) == 0 then
+  .run_state == "running" and .resume_after_entry_count == null
+elif .run_state == "stopped" then
+  $entries[(($entries | length) - 1)].result == "missed" and
+  .resume_after_entry_count == null
+elif $entries[(($entries | length) - 1)].result == "met" then
+  .resume_after_entry_count == null
+else
+  $entries[(($entries | length) - 1)].result == "missed" and
+  .resume_after_entry_count == ($entries | length)
+end)
+' "$file" >/dev/null 2>&1 || hfx_die "checkpoint state is malformed: $file"
+}
+
+checkpoint_write_empty() {
+    local state=$campaign_dir/state/checkpoints.json
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    printf '%s\n' '{' '  "schema_version": 1,' '  "run_state": "running",' \
+        '  "resume_after_entry_count": null,' '  "entries": []' '}' >"$temporary"
+    atomic_install "$temporary" "$state" validate_checkpoints_json
+}
+
+checkpoint_read_observed_terminal_count() {
+    local pipeline_state=$campaign_dir/state/pipeline.json
+    [[ -e "$pipeline_state" || -L "$pipeline_state" ]] ||
+        hfx_die 'pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint'
+    [[ -f "$pipeline_state" && ! -L "$pipeline_state" ]] ||
+        hfx_die "pipeline state is not a regular file: $pipeline_state"
+    validate_pipeline_json "$pipeline_state"
+    checkpoint_observed_terminal_count=$("$JQ" -r '[.basins[].status | select(. == "reclaimed")] | length' "$pipeline_state")
+    [[ "$checkpoint_observed_terminal_count" =~ ^([0-9]|[1-5][0-9]|6[0-2])$ ]] ||
+        hfx_die "checkpoint observed terminal count is invalid: $checkpoint_observed_terminal_count"
+}
+
+checkpoint_install_entry() {
+    local expected=$1
+    local observed=$2
+    local result=$3
+    local run_state=$4
+    local state=$campaign_dir/state/checkpoints.json
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_checkpoints_json "$state"
+        "$JQ" --argjson expected "$expected" --argjson observed "$observed" \
+            --arg result "$result" --arg run_state "$run_state" '
+            .entries += [{expected_terminal_count:$expected, observed_terminal_count:$observed, result:$result}] |
+            .run_state=$run_state | .resume_after_entry_count=null
+        ' "$state" >"$temporary"
+    else
+        "$JQ" -n --argjson expected "$expected" --argjson observed "$observed" \
+            --arg result "$result" --arg run_state "$run_state" '
+            {schema_version:1, run_state:$run_state, resume_after_entry_count:null,
+             entries:[{expected_terminal_count:$expected, observed_terminal_count:$observed, result:$result}]}
+        ' >"$temporary"
+    fi
+    atomic_install "$temporary" "$state" validate_checkpoints_json
+}
+
+checkpoint_print_result() {
+    printf 'checkpoint_expected_terminal_count=%s\n' "$1"
+    printf 'checkpoint_observed_terminal_count=%s\n' "$2"
+    printf 'checkpoint_result=%s\n' "$3"
+    printf 'checkpoint_run_state=%s\n' "$4"
+}
+
+checkpoint_signal_owner() {
+    local lock=$campaign_dir/state/locks/campaign.lock
+    local owner_path=$lock/owner.pid
+    local checkpoint_owner
+    local checkpoint_kill_status
+    local state
+    if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+        printf 'checkpoint_signal=no-live-owner\n'
+        return 1
+    fi
+    [[ -d "$lock" && ! -L "$lock" ]] ||
+        hfx_die "checkpoint campaign lock is unsafe: $lock; inspect and move that exact entry, then rerun the same checkpoint"
+    [[ -f "$owner_path" && ! -L "$owner_path" ]] ||
+        hfx_die "checkpoint campaign lock owner is unsafe: $owner_path; inspect and move that exact entry, then rerun the same checkpoint"
+    checkpoint_owner=$(<"$owner_path")
+    [[ "$checkpoint_owner" =~ ^[1-9][0-9]*$ ]] ||
+        hfx_die "checkpoint campaign lock owner contents are unsafe: $owner_path; correct or move that exact entry, then rerun the same checkpoint"
+    state=$(pid_state "$checkpoint_owner")
+    case $state in
+        live)
+            set +e
+        kill -TERM "$checkpoint_owner"
+            checkpoint_kill_status=$?
+            set -e
+            if ((checkpoint_kill_status != 0)); then
+                hfx_die "could not deliver TERM to checkpoint owner PID $checkpoint_owner; rerun the same checkpoint with the same expected value"
+            fi
+            printf 'checkpoint_signal=sent\n'
+            ;;
+        dead) printf 'checkpoint_signal=no-live-owner\n' ;;
+        *) hfx_die "checkpoint owner PID $checkpoint_owner is indeterminate; resolve that PID or ps ambiguity, then rerun the same checkpoint" ;;
+    esac
+    return 1
+}
+
+checkpoint_campaign() {
+    local state=$campaign_dir/state/checkpoints.json
+    local entry_count=0
+    local latest_expected=
+    local latest_observed=
+    local run_state=running
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_checkpoints_json "$state" || :
+        run_state=$("$JQ" -r '.run_state' "$state")
+        entry_count=$("$JQ" -r '.entries | length' "$state")
+        if ((entry_count > 0)); then
+            latest_expected=$("$JQ" -r '.entries[(.entries | length) - 1].expected_terminal_count' "$state")
+            latest_observed=$("$JQ" -r '.entries[(.entries | length) - 1].observed_terminal_count' "$state")
+        fi
+        if [[ "$run_state" == stopped ]]; then
+            [[ "$expected_terminal_count" == "$latest_expected" ]] ||
+                hfx_die "stopped checkpoint expects $latest_expected; run checkpoint-resume, then checkpoint with an equal or higher expected value"
+            checkpoint_print_result "$latest_expected" "$latest_observed" missed stopped
+            checkpoint_signal_owner
+            return 1
+        fi
+        if ((entry_count > 0)) && ((expected_terminal_count < latest_expected)); then
+            hfx_die "checkpoint expected count cannot decrease below $latest_expected; rerun checkpoint with $latest_expected or a higher value"
+        fi
+    fi
+    checkpoint_read_observed_terminal_count
+    if ((checkpoint_observed_terminal_count >= expected_terminal_count)); then
+        checkpoint_install_entry "$expected_terminal_count" "$checkpoint_observed_terminal_count" met running
+        checkpoint_print_result "$expected_terminal_count" "$checkpoint_observed_terminal_count" met running
+        printf 'checkpoint_signal=not-required\n'
+        return
+    fi
+    checkpoint_install_entry "$expected_terminal_count" "$checkpoint_observed_terminal_count" missed stopped
+    checkpoint_print_result "$expected_terminal_count" "$checkpoint_observed_terminal_count" missed stopped
+    checkpoint_signal_owner
+    return 1
+}
+
+checkpoint_resume_campaign() {
+    local state=$campaign_dir/state/checkpoints.json
+    local recovery=$campaign_dir/state/checkpoint-recovery
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    local count
+    local rejected=
+    local index
+    if [[ ! -e "$state" && ! -L "$state" ]]; then
+        if [[ -e "$recovery" || -L "$recovery" ]]; then
+            [[ -d "$recovery" && ! -L "$recovery" ]] ||
+                hfx_die "checkpoint recovery path is unsafe: $recovery; inspect and move that exact entry, then rerun checkpoint-resume"
+            set -- "$recovery"/rejected-*.json
+            if [[ -e "$1" || -L "$1" ]]; then
+                rejected=$1
+            fi
+        fi
+        if [[ -n "$rejected" ]]; then
+            checkpoint_write_empty
+            printf 'checkpoint_resume=recovered-malformed\n'
+            printf 'checkpoint_recovery_path=%s\n' "${rejected#"$campaign_dir/"}"
+        else
+            printf 'checkpoint_resume=already-running\n'
+        fi
+        printf 'checkpoint_run_state=running\n'
+        return
+    fi
+    if (validate_checkpoints_json "$state") 2>/dev/null; then
+        if [[ $("$JQ" -r '.run_state' "$state") == running ]]; then
+            printf 'checkpoint_resume=already-running\ncheckpoint_run_state=running\n'
+            return
+        fi
+        count=$("$JQ" -r '.entries | length' "$state")
+        "$JQ" --argjson count "$count" '.run_state="running" | .resume_after_entry_count=$count' \
+            "$state" >"$temporary"
+        atomic_install "$temporary" "$state" validate_checkpoints_json
+        printf 'checkpoint_resume=resumed\ncheckpoint_run_state=running\n'
+        return
+    fi
+    if [[ -e "$recovery" || -L "$recovery" ]]; then
+        [[ -d "$recovery" && ! -L "$recovery" ]] ||
+            hfx_die "checkpoint recovery path is unsafe: $recovery; inspect and move that exact entry, then rerun checkpoint-resume"
+    else
+        "$MKDIR" "$recovery"
+        "$CHMOD" 0755 "$recovery"
+    fi
+    for ((index = 1; index <= 100000; index++)); do
+        rejected=$recovery/rejected-$index.json
+        if [[ ! -e "$rejected" && ! -L "$rejected" ]]; then
+            break
+        fi
+        rejected=
+    done
+    [[ -n "$rejected" ]] ||
+        hfx_die "checkpoint recovery archive is full at $recovery; move preserved rejected entries to operator storage, then rerun checkpoint-resume"
+    "$MV" "$state" "$rejected"
+    checkpoint_write_empty
+    printf 'checkpoint_resume=recovered-malformed\n'
+    printf 'checkpoint_recovery_path=%s\n' "${rejected#"$campaign_dir/"}"
+    printf 'checkpoint_run_state=running\n'
+}
+
+checkpoint_require_pipeline_running_prelock() {
+    local state=$campaign_dir/state/checkpoints.json
+    [[ ! -e "$state" && ! -L "$state" ]] && return
+    if ! (validate_checkpoints_json "$state") 2>/dev/null; then
+        hfx_die 'checkpoint state is malformed; run checkpoint-resume, then rerun the exact pipeline command'
+    fi
+    [[ $("$JQ" -r '.run_state' "$state") == running ]] ||
+        hfx_die 'pipeline is stopped by checkpoint control; run checkpoint-resume, then rerun the exact pipeline command'
+}
+
+checkpoint_require_pipeline_running() {
+    checkpoint_require_pipeline_running_prelock
+}
+
+print_zero_count() {
+    printf '0\n'
+}
+
 print_status() {
     local stage
     local status
@@ -1354,15 +1601,23 @@ print_status() {
     for stage in acquire_basins acquire_streamnet compile; do
         for status in pending running succeeded failed; do
             printf '%s_%s=' "$stage" "$status"
-            "$JQ" -s --arg stage "$stage" --arg status "$status" \
-                '[.[].stages[$stage].status | select(. == $status)] | length' \
-                ${state_files[@]+"${state_files[@]}"}
+            if (( ${#state_files[@]} > 0 )); then
+                "$JQ" -s --arg stage "$stage" --arg status "$status" \
+                    '[.[].stages[$stage].status | select(. == $status)] | length' \
+                    ${state_files[@]+"${state_files[@]}"}
+            else
+                print_zero_count
+            fi
         done
     done
     if [[ $("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json") == reclaim-inputs-after-terminal ]]; then
         printf 'inputs_reclaimed='
-        "$JQ" -s '[.[] | select(.schema_version == 4 and .retention.inputs_reclaimed == true)] | length' \
-            ${state_files[@]+"${state_files[@]}"}
+        if (( ${#state_files[@]} > 0 )); then
+            "$JQ" -s '[.[] | select(.schema_version == 4 and .retention.inputs_reclaimed == true)] | length' \
+                ${state_files[@]+"${state_files[@]}"}
+        else
+            print_zero_count
+        fi
     fi
     if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]]; then
         "$JQ" -r '
@@ -1371,6 +1626,24 @@ print_status() {
             ("pending","acquiring","ready","compiling","terminal","reclaimed","blocked") as $status |
             "pipeline_\($status)=\([.basins[].status | select(. == $status)] | length)"
         ' "$campaign_dir/state/pipeline.json"
+    fi
+    if [[ -e "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]]; then
+        if [[ ! -f "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]] ||
+            ! (validate_checkpoints_json "$campaign_dir/state/checkpoints.json") 2>/dev/null; then
+            printf 'checkpoint_state=malformed\n'
+            printf 'checkpoint_recovery=run checkpoint-resume\n'
+        else
+            "$JQ" -r '
+              "checkpoint_run_state=\(.run_state)",
+              "checkpoint_entry_count=\(.entries | length)",
+              if (.entries | length) > 0 then
+                .entries[(.entries | length) - 1] as $latest |
+            "checkpoint_expected_terminal_count=\($latest.expected_terminal_count)",
+                "checkpoint_observed_terminal_count=\($latest.observed_terminal_count)",
+                "checkpoint_result=\($latest.result)"
+              else empty end
+            ' "$campaign_dir/state/checkpoints.json"
+        fi
     fi
     if [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]]; then
         stage=$("$JQ" -r '.status' "$campaign_dir/state/assembly.json")
@@ -1697,6 +1970,7 @@ pipeline_campaign() {
     trap pipeline_scheduler_signal INT TERM
     trap pipeline_scheduler_exit EXIT
     acquire_campaign_lock
+    checkpoint_require_pipeline_running
     validate_workspace_state
     locked_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
     [[ "$locked_policy" == "$acquire_retention_policy" ]] ||
@@ -4435,7 +4709,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|compile-basin|progress|pipeline|calibrate|assemble|evidence|publish) ;;
+    init|status|recover|acquire|compile|compile-basin|progress|pipeline|calibrate|checkpoint|checkpoint-resume|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -4463,6 +4737,8 @@ max_parallel=
 max_parallel_seen=0
 fabric_version=
 fabric_version_seen=0
+expected_terminal_count=
+expected_terminal_count_seen=0
 publication_out=
 publication_out_seen=0
 publication_report=
@@ -4478,7 +4754,7 @@ basin_ids=()
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
+        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--fabric-version|--expected-terminal-count|--out|--report|--notice|--citation|--scratch-prefix)
             shift
             (($# > 0)) && [[ -n "$1" ]] || usage_error "option $option requires a value"
             if [[ "$1" == -* ]] &&
@@ -4525,6 +4801,14 @@ while (($# > 0)); do
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
             fabric_version=$value
+            ;;
+        --expected-terminal-count)
+            [[ "$subcommand" == checkpoint ]] ||
+                usage_error 'option --expected-terminal-count is valid only for checkpoint'
+            ((expected_terminal_count_seen == 0)) ||
+                usage_error 'option --expected-terminal-count may not be repeated'
+            expected_terminal_count_seen=1
+            expected_terminal_count=$value
             ;;
         --out)
             [[ "$subcommand" == publish ]] || usage_error 'option --out is valid only for publish'
@@ -4588,6 +4872,15 @@ validate_inventory_file "$inventory_source"
 
 campaign_dir=$workspace_root/tdx-hydro-$campaign
 trap 'release_takeover_guard; release_lock' EXIT
+
+if [[ "$subcommand" == checkpoint ]]; then
+    ((expected_terminal_count_seen == 1)) ||
+        usage_error 'option --expected-terminal-count is required for checkpoint'
+    [[ "$expected_terminal_count" =~ ^([1-9]|[1-5][0-9]|6[0-2])$ ]] ||
+        usage_error 'option --expected-terminal-count must be a canonical base-10 integer from 1 through 62'
+elif ((expected_terminal_count_seen != 0)); then
+    usage_error 'option --expected-terminal-count is valid only for checkpoint'
+fi
 
 if [[ "$subcommand" == compile-basin ]]; then
     ((${#basin_ids[@]} > 0)) || usage_error 'option --basin is required for compile-basin'
@@ -4665,6 +4958,18 @@ elif [[ "$subcommand" == progress ]]; then
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
+elif [[ "$subcommand" == checkpoint || "$subcommand" == checkpoint-resume ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_campaign_structure
+    if [[ "$subcommand" == checkpoint ]]; then
+        if [[ -e "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]] &&
+            ! (validate_checkpoints_json "$campaign_dir/state/checkpoints.json") 2>/dev/null; then
+            hfx_die 'checkpoint state is malformed; run checkpoint-resume, then rerun the same checkpoint command'
+        fi
+        checkpoint_campaign
+    else
+        checkpoint_resume_campaign
+    fi
 elif [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" == calibrate ]]; then
     ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
     if [[ "$subcommand" == calibrate ]]; then
@@ -4692,6 +4997,7 @@ elif [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" =
     else
         [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
             hfx_die 'pipeline requires retention policy reclaim-inputs-after-terminal'
+        checkpoint_require_pipeline_running_prelock
         if [[ -e "$campaign_dir/state/calibration.json" || -L "$campaign_dir/state/calibration.json" ]]; then
             validate_calibration_json "$campaign_dir/state/calibration.json"
             [[ $("$JQ" -r '.fabric_version' "$campaign_dir/state/calibration.json") == "$fabric_version" ]] ||

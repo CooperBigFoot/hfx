@@ -1076,6 +1076,109 @@ the paid box. This step does not verify that dependency because bootstrap
 scripts and the runbook convergence gate are outside this step's write set.
 The documentation states no real throughput result and no real selected value.
 
+## Expected-terminal checkpoints
+
+Checkpoint controls record cumulative expectations without changing scheduler
+or basin state:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint \
+  --campaign <id> \
+  --workspace-root <path> \
+  --expected-terminal-count <1..62>
+
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+`state/checkpoints.json` is append-only history plus a running/stopped control.
+Expected counts may stay equal or increase. The observed count is the number of
+`reclaimed` records in one atomically installed `state/pipeline.json` snapshot.
+`terminal`, `blocked`, and basin-state records do not add to that count. A met
+entry remains running. A missed entry is installed with stopped state before
+the command inspects the campaign-lock owner or sends TERM.
+
+The monotonic constraint means an operator can never lower a recorded
+expectation for the life of the campaign. Resume plus rerunning `pipeline`
+remains available, and only checkpoint history is monotonic.
+
+`checkpoint` does not take the campaign lock. A live pipeline receives TERM at
+the exact validated owner PID and performs its existing exit-130 worker drain,
+FIFO removal, and lock release. If no live owner exists, stopped state remains
+durable. Repeating the same missed checkpoint retries owner adjudication and
+TERM delivery without appending. Pipeline checks stopped state before lock
+acquisition and again after acquisition before scheduler work.
+
+Resume explicitly:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+Resume changes only checkpoint control fields. It does not start the pipeline,
+rewrite checkpoint entries, relabel a basin, alter attempts or evidence, remove
+durable state, or change calibration. Rerun pipeline separately with its frozen
+parameters. A missed checkpoint, a stopped campaign, an absent pipeline
+snapshot, and a malformed checkpoint document are recoverable states.
+
+If the pipeline snapshot is absent, checkpoint refuses without creating an
+entry. Materialize or resume the existing pipeline, then rerun checkpoint:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh pipeline \
+  --campaign <id> \
+  --workspace-root <path> \
+  --max-parallel <frozen-1-through-4> \
+  --fabric-version <frozen-value>
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint \
+  --campaign <id> \
+  --workspace-root <path> \
+  --expected-terminal-count <1..62>
+```
+
+If `state/checkpoints.json` is malformed or unsafe, `progress` reports the
+condition without hiding the rest of campaign status. Run `checkpoint-resume`.
+It moves the exact rejected directory entry without dereferencing it to the
+first unused `state/checkpoint-recovery/rejected-N.json`, installs a fresh
+running control, and preserves the rejected entry for inspection. Replay after
+an interruption between those operations completes the fresh control install.
+
+The lock-free read command is:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh progress \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+An absent checkpoint document prints no checkpoint lines. An empty running
+document prints:
+
+```text
+checkpoint_run_state=running
+checkpoint_entry_count=0
+```
+
+A nonempty valid document prints:
+
+```text
+checkpoint_run_state=<running|stopped>
+checkpoint_entry_count=<integer>
+checkpoint_expected_terminal_count=<integer>
+checkpoint_observed_terminal_count=<integer>
+checkpoint_result=<met|missed>
+```
+
+A malformed document prints:
+
+```text
+checkpoint_state=malformed
+checkpoint_recovery=run checkpoint-resume
+```
+
 ## Troubleshooting
 
 | Symptom | Cause | Remedy |
