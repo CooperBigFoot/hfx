@@ -6,7 +6,7 @@ This runbook governs one paid, irreversible, unattended 62-basin campaign. Execu
 
 `83aa26c` is the original campaign source contract. `ab1e3c2` is the checkpoint implementation and complete command-surface authority used to author this document. The paid run uses one later immutable `origin/main` revision containing M5-S1, M5-S2, M5-S3, M5-S3B, M5-S3C-1, M5-S3C-2, and this M5-S4 runbook. Never guess or hard-code that future merge SHA.
 
-Only the exact campaign server and volume named below may be mutated. No glob, prefix match, label selector, wildcard deletion, or cleanup discovery is permitted. Never touch `pourpoint-web-1`. The old `grit-d8-m3` volume was deleted on 2026-07-24 and its absence is expected; README lines 733-735 are stale when they call it intentionally retained. That resolution is prose only: no executable command may query, create, mutate, list, or filter either protected name.
+Only the exact campaign server and volume named below may be mutated. No glob, prefix match, label selector, wildcard deletion, or cleanup discovery is permitted. Unfiltered, read-only project inventories are allowed only where section 16 explicitly requires them; they never authorize mutation, and any unaccounted row is escalation-only. Never touch `pourpoint-web-1`. The old `grit-d8-m3` volume was deleted on 2026-07-24 and its absence is expected; README lines 733-735 are stale when they call it intentionally retained. That resolution is prose only: no executable command may query, create, mutate, list, or filter either protected name.
 
 The secrets environment file is accepted only as a path. Never print, `cat`, `echo`, log, archive, copy, hash, or transmit its contents. Disable tracing before reading its path and before every command that sources it. Never deliver under `hfx/`; parking is confined to the frozen scratch prefix. Default teardown is mandatory on success, failure, abort, refusal, and either hard switch. `--keep-volume` is forbidden for this campaign.
 
@@ -123,8 +123,32 @@ Blank, negative, nonnumeric, NaN, infinity, unknown VAT treatment, or unknown ou
 Define the reusable phase/checkpoint/resume gate here; deferred expansion means it is called only after `SERVER_IP` exists. Every remaining range is supplied at its maximum, never minimum. Missing, malformed, or unbounded estimates refuse. Equality refuses.
 
 ```bash
+campaign_gate_decision() {
+  if test "$#" -ne 5; then printf '%s\n' REFUSE; return 0; fi
+  local server_gross=$1 volume_gross=$2 elapsed_hours=$3 projected_completion_hours=$4 projected_total_eur=$5
+  if [[ "$server_gross" =~ ^[0-9]+([.][0-9]+)?$ && "$volume_gross" =~ ^[0-9]+([.][0-9]+)?$ &&
+        "$elapsed_hours" =~ ^[0-9]+([.][0-9]+)?$ && "$projected_completion_hours" =~ ^[0-9]+([.][0-9]+)?$ &&
+        "$projected_total_eur" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    awk -v h="$projected_completion_hours" -v t="$projected_total_eur" 'BEGIN{print (h<72 && t<60)?"PASS":"REFUSE"}'
+  else
+    printf '%s\n' REFUSE
+  fi
+}
+test "$(campaign_gate_decision '' 0.044 1 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 '' 1 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 '' 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 1 '' 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 1 2 '')" = REFUSE
+test "$(campaign_gate_decision invalid 0.044 1 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 invalid 1 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 invalid 2 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 1 invalid 3)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 1 2 invalid)" = REFUSE
+test "$(campaign_gate_decision 0.31 0.044 100 128.6 44.5167397260)" = REFUSE
+
 campaign_gate() {
   test "$#" -eq 3
+  local IFS=$' \n\t'
   local phase=$1 remaining_hours=$2 remaining_outbound_eur=$3 now origin elapsed projected_hours progress_file result total
   [[ "$remaining_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]
   [[ "$remaining_outbound_eur" =~ ^[0-9]+([.][0-9]+)?$ ]]
@@ -140,14 +164,21 @@ campaign_gate() {
         --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work > "$progress_file.retry"
       progress_file="$progress_file.retry"
     }
-  read -r SERVER_GROSS VOLUME_GROSS < <(awk -F= '
+  SERVER_GROSS= VOLUME_GROSS= elapsed= projected_hours= total=
+  if ! read -r SERVER_GROSS VOLUME_GROSS < <(awk -F= '
     /server_eur_per_hour_gross=/{s=$2}
     /volume_eur_per_gb_month_gross=/{v=$2}
-    END{print s,v}' "$LOCAL_EVIDENCE_DIR/current-price-preflight.txt")
-  read -r elapsed projected_hours total < <(awk -v n="$now" -v o="$origin" -v r="$remaining_hours" \
-    -v s="$SERVER_GROSS" -v v="$VOLUME_GROSS" -v out="$remaining_outbound_eur" '
-    BEGIN { e=(n-o)/3600; p=e+r; t=p*(s+600*v/730)+out; printf "%.10f %.10f %.10f\n",e,p,t }')
-  result=$(awk -v h="$projected_hours" -v t="$total" 'BEGIN{print (h<72 && t<60)?"PASS":"REFUSE"}')
+    END{print s,v}' "$LOCAL_EVIDENCE_DIR/current-price-preflight.txt"); then
+    SERVER_GROSS= VOLUME_GROSS=
+  fi
+  if [[ "$SERVER_GROSS" =~ ^[0-9]+([.][0-9]+)?$ && "$VOLUME_GROSS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if ! read -r elapsed projected_hours total < <(awk -v n="$now" -v o="$origin" -v r="$remaining_hours" \
+      -v s="$SERVER_GROSS" -v v="$VOLUME_GROSS" -v out="$remaining_outbound_eur" '
+      BEGIN { e=(n-o)/3600; p=e+r; t=p*(s+600*v/730)+out; printf "%.10f %.10f %.10f\n",e,p,t }'); then
+      elapsed= projected_hours= total=
+    fi
+  fi
+  result=$(campaign_gate_decision "$SERVER_GROSS" "$VOLUME_GROSS" "$elapsed" "$projected_hours" "$total")
   {
     printf 'timestamp_utc=%s\nphase=%s\nremaining_hours_max=%s\nremaining_outbound_eur_max=%s\n' "$(date -u +%FT%TZ)" "$phase" "$remaining_hours" "$remaining_outbound_eur"
     printf 'elapsed_hours=%s\nprojected_completion_hours=%s\nprojected_total_eur=%s\nresult=%s\n' "$elapsed" "$projected_hours" "$total" "$result"
@@ -227,8 +258,12 @@ cleanup() {
   zero_footprint; proof_ok=$?
   if test "$teardown_ok" -eq 0 && test "$proof_ok" -eq 0; then CLEANUP_COMPLETE=1; fi
   CLEANUP_RUNNING=0
-  test "$CLEANUP_COMPLETE" -eq 1 || return 1
-  return "$prior"
+  if test "$CLEANUP_COMPLETE" -eq 1; then
+    set -e
+    return "$prior"
+  fi
+  set -e
+  return 1
 }
 trap 'prior=$?; trap - EXIT INT TERM HUP; cleanup || prior=1; exit "$prior"' EXIT
 trap 'exit 130' INT
@@ -372,6 +407,50 @@ required_disk_bytes=$(checked_add "$required_disk_bytes" "$filesystem_overhead_b
 Capture workstation-side disk with exactly one identical retry for transport failure or empty output. The cleanup trap is armed, so a persistent failure is a deliberate refusal-to-teardown, not an accident. Assertions are unchanged; real shortfall tears down.
 
 ```bash
+workload_barrier_refuse() {
+  local workload=$1 reason=$2
+  printf 'workload_barrier=REFUSE workload=%s reason=%s; salvage and default teardown\n' "$workload" "$reason" >&2
+  if ! cleanup; then printf '%s\n' 'workload_barrier_cleanup=FAILED; retain teardown diagnostics' >&2; fi
+  trap - EXIT INT TERM HUP
+  exit 1
+}
+wait_for_workload() {
+  if test "$#" -ne 2; then workload_barrier_refuse invalid-arguments expected-workload-and-max-polls; fi
+  local workload=$1 max_polls=$2 poll poll_status
+  case "$workload" in
+    tdx-init|tdx-calibrate-2|tdx-calibrate-4|tdx-pipeline|tdx-recover|tdx-assemble|tdx-evidence|tdx-publish) ;;
+    *) workload_barrier_refuse "$workload" invalid-workload ;;
+  esac
+  for ((poll=1; poll<=max_polls; poll++)); do
+    poll_status=0
+    if ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload "$workload"; then
+      poll_status=0
+    else
+      poll_status=$?
+    fi
+    case "$poll_status" in
+      0) sleep 300 ;;
+      3)
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+          "root@$SERVER_IP" bash -s -- "$workload" <<'REMOTE_WORKLOAD_LOG'
+set -Eeuo pipefail
+workload=$1
+grep -Eq '^launch: finished at [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z with exit 0$' "/mnt/hfx/logs/hfx-tdx-m5-planetary-$workload.log"
+REMOTE_WORKLOAD_LOG
+        then
+          return 0
+        fi
+        workload_barrier_refuse "$workload" absent-or-finished-without-canonical-exit-0
+        ;;
+      *)
+        printf 'workload_barrier_poll=RETRY workload=%s status=%s poll=%s/%s\n' "$workload" "$poll_status" "$poll" "$max_polls" >&2
+        sleep 300
+        ;;
+    esac
+  done
+  workload_barrier_refuse "$workload" "poll-timeout-${max_polls}x300s"
+}
+
 OBSERVED_AVAILABLE_DISK_BYTES=
 for probe_attempt in 1 2; do
   OBSERVED_AVAILABLE_DISK_BYTES=$(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" "df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' '") && test -n "$OBSERVED_AVAILABLE_DISK_BYTES" && break
@@ -388,6 +467,7 @@ test "$OBSERVED_AVAILABLE_DISK_BYTES" -ge 496737129060
   --assembled-artifact-bytes 206220202290 --active-compile-scratch-bytes 30000000000 \
   --filesystem-overhead-bytes 5000000000
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-init || test "$?" -eq 3
+wait_for_workload tdx-init 24
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
@@ -428,13 +508,15 @@ Run sequentially, with no overlapping campaign command:
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-calibrate-2 -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh calibrate --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel 2 --fabric-version NGA-TDX-Hydro-20230126
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-2 || test "$?" -eq 3
+wait_for_workload tdx-calibrate-2 108
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-calibrate-4 -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh calibrate --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel 4 --fabric-version NGA-TDX-Hydro-20230126
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-4 || test "$?" -eq 3
+wait_for_workload tdx-calibrate-4 108
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
-Status exit 0 means running; 3 means absent or finished. Every status invocation must retain the `|| test "$?" -eq 3` guard: an unguarded documented exit 3 aborts the trapped shell and triggers teardown. The canonical log's recorded command exit determines success for the latest start. Each successful retry truncates that canonical log, so an earlier attempt's exit survives only in its timestamped run log; retain and inspect the named timestamped log before retrying. Cohort two must compile, terminal-classify, and reclaim before cohort four starts. The synchronous serial consumer at runner lines 2030-2052 selects one ready basin and calls `compile_basin_locked`. `calibrate` releases its lock at 4691-4692 before nested pipeline reacquires it at 1972; start nothing in that window. A premature pipeline produces the misleading selection-mismatch diagnostic; finish calibration instead.
+Status exit 0 means running; 3 means absent or finished. Every status invocation must retain the `|| test "$?" -eq 3` guard: an unguarded documented exit 3 aborts the trapped shell and triggers teardown. `wait_for_workload` polls every 300 seconds, treats both documented status values explicitly, retries other poll failures within its bound, and requires the canonical log's exact successful-finish record before returning. Its maxima are 2 hours for init, 9 hours per calibration, 44 hours for pipeline, 4 hours for recovery, 3 hours for assembly, and 12 hours each for evidence and publish. A timeout or absent/finished workload without canonical exit 0 is a classified refusal that explicitly salvages and tears down; it is not an accidental errexit path. No subsequent campaign command may be issued until the barrier returns. Each successful retry truncates that canonical log, so an earlier attempt's exit survives only in its timestamped run log; retain and inspect the named timestamped log before retrying. Cohort two must compile, terminal-classify, and reclaim before cohort four starts. The synchronous serial consumer at runner lines 2030-2052 selects one ready basin and calls `compile_basin_locked`. `calibrate` releases its lock at 4691-4692 before nested pipeline reacquires it at 1972; start nothing in that window. A premature pipeline produces the misleading selection-mismatch diagnostic; finish calibration instead.
 
 `launch.sh tail --log <basename>` executes `tail -n 50 -f` and never returns while the connection remains healthy. The in-line monitoring commands in this trapped shell therefore use the non-blocking, lock-free campaign `progress` command. Run any interactive `launch.sh tail` only from a separate, explicitly labelled shell with none of this runbook's traps installed. Ctrl-C in the trapped runbook shell executes its INT handler, reaches the EXIT cleanup trap, and tears down the campaign; it is not a safe way to stop monitoring here.
 
@@ -496,6 +578,7 @@ Repeat memory and disk probes immediately before pipeline:
 ssh -o BatchMode=yes "root@$SERVER_IP" "awk '/MemAvailable:/ {exit !(\$2*1024>=30000000000)}' /proc/meminfo && test \"\$(df -B1 --output=avail /mnt/hfx | tail -n1 | tr -d ' ')\" -ge 491737129060"
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-pipeline -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh pipeline --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel "$FROZEN_MAX_PARALLEL" --fabric-version NGA-TDX-Hydro-20230126
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-pipeline || test "$?" -eq 3
+wait_for_workload tdx-pipeline 528
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
@@ -539,9 +622,63 @@ checkpoint_observed_terminal_count=$("$JQ" -r '[.basins[].status | select(. == "
 Only `reclaimed` counts; an advisory `terminal` does not. Read live `pipeline_reclaimed`, not the stored-as-of-stop count. `status` locks and may expose malformed calibration that progress does not.
 
 ```bash
+parse_checkpoint_result() {
+  if test "$#" -ne 1; then
+    printf '%s\n' 'checkpoint_state=malformed checkpoint_recovery=retain-and-rerun-identical-checkpoint' >&2
+    while sleep 300; do :; done
+  fi
+  local checkpoint_log=$1 met_count missed_count
+  checkpoint_result=
+  met_count=$(grep -Fxc 'checkpoint_result=met' "$checkpoint_log" || true)
+  missed_count=$(grep -Fxc 'checkpoint_result=missed' "$checkpoint_log" || true)
+  if test "$met_count" -eq 1 && test "$missed_count" -eq 0; then
+    checkpoint_result=met
+  elif test "$met_count" -eq 0 && test "$missed_count" -eq 1; then
+    checkpoint_result=missed
+  fi
+}
+pause_for_checkpoint_recovery() {
+  local checkpoint_log=$1 recovery=$2
+  printf 'checkpoint_state=unclassified\ncheckpoint_log=%s\ncheckpoint_recovery=%s\n' "$checkpoint_log" "$recovery" >> "$LOCAL_EVIDENCE_DIR/checkpoint-recovery-required.log"
+  printf 'checkpoint_state=unclassified checkpoint_log=%s checkpoint_recovery=%s\n' "$checkpoint_log" "$recovery" >&2
+  printf '%s\n' 'Dispatch is paused without exiting the trapped shell; complete the named recovery from an operator shell. The hour-72 watchdog remains armed.' >&2
+  while sleep 300; do :; done
+}
+restart_frozen_pipeline() {
+  ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-pipeline -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh pipeline --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel "$FROZEN_MAX_PARALLEL" --fabric-version NGA-TDX-Hydro-20230126
+  wait_for_workload tdx-pipeline 528
+}
+
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 checkpoint_status=0
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --expected-terminal-count 26 2>&1 | tee "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log" || checkpoint_status=$?
+parse_checkpoint_result "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log"
+if test "$checkpoint_result" = met; then
+  if test "$checkpoint_status" -ne 0; then
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log" retain-and-rerun-identical-checkpoint
+  fi
+elif test "$checkpoint_result" = missed; then
+  if test "$checkpoint_status" -ne 1; then
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log" retain-and-rerun-identical-checkpoint
+  fi
+  campaign_gate checkpoint-resume 48 0
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work; then
+    restart_frozen_pipeline
+  else
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log" checkpoint-resume-then-restart-frozen-pipeline
+  fi
+else
+  if grep -Fq 'stopped checkpoint expects ' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log"; then
+    checkpoint_recovery=checkpoint-resume-then-rerun-equal-or-higher-checkpoint
+  elif grep -Fq 'pipeline snapshot is absent' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log"; then
+    checkpoint_recovery=restart-frozen-pipeline-then-rerun-checkpoint
+  elif test "$checkpoint_status" -eq 255; then
+    checkpoint_recovery=retry-identical-checkpoint-after-transport-recovers
+  else
+    checkpoint_recovery=retain-malformed-output-then-checkpoint-resume
+  fi
+  pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-24.log" "$checkpoint_recovery"
+fi
 ```
 
 At hour 44 repeat progress, then:
@@ -549,6 +686,33 @@ At hour 44 repeat progress, then:
 ```bash
 checkpoint_status=0
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --expected-terminal-count 62 2>&1 | tee "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log" || checkpoint_status=$?
+parse_checkpoint_result "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log"
+if test "$checkpoint_result" = met; then
+  if test "$checkpoint_status" -ne 0; then
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log" retain-and-rerun-identical-checkpoint
+  fi
+elif test "$checkpoint_result" = missed; then
+  if test "$checkpoint_status" -ne 1; then
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log" retain-and-rerun-identical-checkpoint
+  fi
+  campaign_gate checkpoint-resume 28.6 0
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work; then
+    restart_frozen_pipeline
+  else
+    pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log" checkpoint-resume-then-restart-frozen-pipeline
+  fi
+else
+  if grep -Fq 'stopped checkpoint expects ' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log"; then
+    checkpoint_recovery=checkpoint-resume-then-rerun-equal-or-higher-checkpoint
+  elif grep -Fq 'pipeline snapshot is absent' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log"; then
+    checkpoint_recovery=restart-frozen-pipeline-then-rerun-checkpoint
+  elif test "$checkpoint_status" -eq 255; then
+    checkpoint_recovery=retry-identical-checkpoint-after-transport-recovers
+  else
+    checkpoint_recovery=retain-malformed-output-then-checkpoint-resume
+  fi
+  pause_for_checkpoint_recovery "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log" "$checkpoint_recovery"
+fi
 ```
 
 With pipefail, the status is SSH's. Every invocation resets `checkpoint_status=0`. A met result exits 0 and says `not-required`; a missed result prints five complete lines and exits 1; stopped replay prints missed and exits 1; every refusal exits 1. Status 1 is recoverable only if retained output is a complete expected missed contract:
@@ -563,31 +727,15 @@ checkpoint_signal=<not-required|sent|no-live-owner>
 
 The command signals the campaign-lock owner, not specifically the scheduler (lines 1425-1502). Interruptible lock owners are `acquire`, `compile`, `compile-basin`, `calibrate`, `assemble`, `evidence`, `publish`, `status`, and `recover`. `checkpoint` and resume do not lock; dispatch lines 4961-4972 only validate structure. A miss may interrupt any listed lock owner, but planned checkpoints occur during pipeline. All state writes are atomic and identical argv is recoverable after gate PASS.
 
-```bash
-checkpoint_result=
-if test "$(grep -Fxc 'checkpoint_result=met' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log")" -eq 1; then checkpoint_result=met; fi
-if test "$(grep -Fxc 'checkpoint_result=missed' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log")" -eq 1; then
-  test -z "$checkpoint_result"
-  checkpoint_result=missed
-fi
-test -n "$checkpoint_result"
-if test "$checkpoint_result" = met; then
-  test "$checkpoint_status" -eq 0
-else
-  test "$checkpoint_status" -eq 1
-  campaign_gate checkpoint-resume 28.6 0
-  ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
-fi
-```
-
 A MET hour-44 checkpoint proceeds directly to section 12 and never runs the resume gate or `checkpoint-resume`. A MISSED hour-44 checkpoint is the designed recoverable outcome, not a campaign failure or teardown trigger; only that branch charges the 28.6-hour maximum of 12.6 hours remaining pipeline, 2 hours assembly, 12 hours verification, and 2 hours teardown before resuming.
 
-Resume does not start pipeline; rerun the exact frozen pipeline argv. Absent snapshot says exactly `hfx: error: pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint`: resume checkpoint control if stopped, rerun pipeline, repeat checkpoint. Malformed output must be retained as `checkpoint_state=malformed` and `checkpoint_recovery=run checkpoint-resume`; resume archives rejection. Hours 2,46,58,60 use `campaign_gate`, never expected count zero.
+Resume does not start pipeline; `restart_frozen_pipeline` reruns the exact frozen pipeline argv and waits for its canonical exit 0. At hour 24, the resume gate's 48-hour maximum is 32 hours of remaining pipeline plus 2 hours assembly, 12 hours verification, and 2 hours teardown. Absent snapshot says exactly `hfx: error: pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint`: resume checkpoint control if stopped, rerun pipeline, repeat checkpoint. Malformed output must be retained as `checkpoint_state=malformed` and `checkpoint_recovery=run checkpoint-resume`; resume archives rejection. The explicit third branch classifies absent snapshot, stopped-expects-N, transport, malformed/no-result, and contradictory result/status evidence and pauses dispatch without returning nonzero into the EXIT trap. A refused spend/time gate, a canonical completed-workload failure, or expiry of a stated barrier/watchdog bound remains a deliberate explicit salvage-and-teardown trigger. Hours 2,46,58 use `campaign_gate`, never expected count zero.
 
 Ordinary interruption: progress, ensure no live owner, then:
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-recover -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh recover --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
+wait_for_workload tdx-recover 48
 ```
 
 Then gate and rerun pipeline. Resume re-hashes succeeded finals, so charge I/O. Reclaimed failed basins cannot retry in place; separately authorized reacquisition costs about 30 minutes.
@@ -651,6 +799,8 @@ REMOTE_TAKEOVER_RECOVERY
 
 For `.campaign.lock.stale.<pid>`, manually copy only the exact diagnostic path:
 
+At the following prompt, a path outside the exact grammar deliberately exits into evidence salvage and default teardown; it is not a recoverable no-match.
+
 ```bash
 read -r -p 'Exact stale lock path from diagnostic: ' STALE_LOCK_PATH
 case "$STALE_LOCK_PATH" in "$CAMPAIGN_DIR/state/locks/".campaign.lock.stale.[0-9]*) ;; *) exit 1;; esac
@@ -684,6 +834,7 @@ available=$(df -B1 --output=avail /mnt/hfx | tail -n1 | tr -d ' ')
 REMOTE_ASSEMBLY_PREFLIGHT
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-assemble -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh assemble --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-assemble || test "$?" -eq 3
+wait_for_workload tdx-assemble 36
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 campaign_gate hour-46 14 0
 ```
@@ -713,6 +864,7 @@ Generate deterministic evidence before publication and require its acquisition, 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-evidence -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh evidence --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-evidence || test "$?" -eq 3
+wait_for_workload tdx-evidence 144
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
@@ -730,6 +882,7 @@ sha256sum /root/hfx/adapters/tdx-hydro/NOTICE /root/hfx/adapters/tdx-hydro/CITAT
 REMOTE_ATTR
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-publish -- /bin/bash -c 'set -Eeuo pipefail; set +x; set -a; source /etc/pourpoint-hfx.env; set +a; [[ ${AWS_ACCESS_KEY_ID+x} && -n "${AWS_ACCESS_KEY_ID-}" ]]; [[ ${AWS_SECRET_ACCESS_KEY+x} && -n "${AWS_SECRET_ACCESS_KEY-}" ]]; exec /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh publish --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --out /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/assembly/dataset --report /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/reports/assembly.json --notice /root/hfx/adapters/tdx-hydro/NOTICE --citation /root/hfx/adapters/tdx-hydro/CITATION.txt --scratch-prefix scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0.3.0'
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-publish || test "$?" -eq 3
+wait_for_workload tdx-publish 144
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
@@ -811,7 +964,7 @@ cleanup
 
 It runs exactly:
 
-```bash
+```text
 ./scripts/hetzner/teardown.sh --campaign tdx-m5-planetary 2>&1 | tee "$LOCAL_EVIDENCE_DIR/teardown.log"
 ```
 
@@ -825,7 +978,7 @@ Then it independently retains exact-name server and volume lists and proves both
 
 ### Post-teardown orphan visibility boundary
 
-The verbatim proof and the two filtered arrays cover only the exact server and volume names. They cannot detect orphaned snapshots, floating IPs, primary IPs, firewalls, SSH keys, or any resource created under a mistyped campaign name. `provision.sh` creates the server with default networking, without `--without-ipv4`, so the server receives an implicit billable Primary IPv4 that the two-name proof does not verify.
+The verbatim proof and the two filtered arrays cover only the exact server and volume names. They cannot detect orphaned snapshots, floating IPs, primary IPs, firewalls, SSH keys, or any resource created under a mistyped campaign name. `provision.sh` creates the server with default networking, without `--without-ipv4`, so the server receives an implicit billable Primary IPv4 that the two-name proof does not verify (`ab1e3c2:scripts/hetzner/provision.sh:408-420`).
 
 After teardown, retain these read-only project inventories as evidence. Compare every row with the operator's accounted project inventory. If any row is unaccounted for, ESCALATE; never use these listings to drive deletion.
 
