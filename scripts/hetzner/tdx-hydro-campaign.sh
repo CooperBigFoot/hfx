@@ -22,6 +22,17 @@ readonly HFX_TDX_SQLITE_MAGIC=53514c69746520666f726d6174203300
 readonly HFX_TDX_DEFAULT_ADAPTER_PYTHON=/opt/hfx-geo/bin/python
 readonly HFX_TDX_DEFAULT_HFX=/root/hfx/target/release/hfx
 readonly HFX_TDX_MAX_LIST_PAGES=1000
+# Reclaim mode reserves five copies of the largest measured source pair:
+# 5 * (6,979,305,472 basins bytes + 1,880,039,424 streamnet bytes).
+readonly HFX_TDX_RECLAIM_PAIR_COUNT=5
+readonly HFX_TDX_RECLAIM_MAX_PARALLEL=4
+readonly HFX_TDX_RECLAIM_PAIR_BYTES=8859344896
+readonly HFX_TDX_RECLAIM_PEAK_BYTES=44296724480
+readonly HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS=2
+readonly HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS=2
+readonly HFX_TDX_CALIBRATION_MARGIN_PERCENT=5
+readonly HFX_TDX_CALIBRATION_PARALLEL_2_IDS="1020011530 3020003790 6020006540 8020008900"
+readonly HFX_TDX_CALIBRATION_PARALLEL_4_IDS="2020003440 4020006940 7020014250 9020000010"
 
 # NGA acquisition contract for later slices:
 # https://earth-info.nga.mil/php/download.php?file=<processing-basin-id>-<product>-gpkg
@@ -35,6 +46,9 @@ hfx_die() {
     exit 1
 }
 
+((HFX_TDX_RECLAIM_PAIR_COUNT * HFX_TDX_RECLAIM_PAIR_BYTES == HFX_TDX_RECLAIM_PEAK_BYTES)) ||
+    hfx_die 'internal reclaim sizing constants are inconsistent'
+
 hfx_log() {
     local message
     local IFS=' '
@@ -44,11 +58,17 @@ hfx_log() {
 
 usage() {
     printf '%s\n' \
-        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>' \
+        'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
         '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
+        '       tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>' \
+        '       tdx-hydro-campaign.sh checkpoint --campaign <id> [--workspace-root <path>] --expected-terminal-count <1..62>' \
+        '       tdx-hydro-campaign.sh checkpoint-resume --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -96,6 +116,20 @@ normalize_positive_i64() {
     printf '%s\n' "$normalized"
 }
 
+normalize_nonnegative_i64() {
+    local value=$1
+    local normalized=$value
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    while [[ ${#normalized} -gt 1 && ${normalized#0} != "$normalized" ]]; do
+        normalized=${normalized#0}
+    done
+    if [[ ${#normalized} -gt 19 ]] ||
+        [[ ${#normalized} -eq 19 && "$normalized" > "$HFX_TDX_MAX_I64" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$normalized"
+}
+
 checked_add() {
     local total=$1
     local addend=$2
@@ -132,6 +166,12 @@ validate_selection_file() {
 }
 
 effective_basin_ids() {
+    if [[ -n "${effective_basin_ids_file-}" ]]; then
+        [[ -f "$effective_basin_ids_file" && ! -L "$effective_basin_ids_file" ]] ||
+            hfx_die "active calibration cohort is not a regular file: $effective_basin_ids_file"
+        "$JQ" -r '.basin_ids[]' "$effective_basin_ids_file"
+        return
+    fi
     if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
         "$JQ" -r '.basin_ids[]' "$campaign_dir/state/selection.json"
     else
@@ -141,31 +181,91 @@ effective_basin_ids() {
 
 validate_campaign_json() {
     local file=$1
-    "$JQ" -e --arg campaign "$campaign" --argjson max_i64 "$HFX_TDX_MAX_I64" '
+    local policy
+    local input_bytes
+    local retained_output_bytes
+    local active_scratch_bytes
+    local assembly_scratch_bytes
+    local artifact_bytes
+    local overhead_bytes
+    local assembly_peak_bytes
+    local expected_disk_bytes=0
+    local persisted_disk_bytes
+    "$JQ" -e --arg campaign "$campaign" --argjson max_i64 "$HFX_TDX_MAX_I64" \
+        --argjson reclaim_peak "$HFX_TDX_RECLAIM_PEAK_BYTES" '
+        def positive_i64:
+            type == "number" and . == floor and . > 0 and . <= $max_i64;
         type == "object" and
         (keys == ["campaign","inventory","retention","schema_version","sizing"]) and
-        .schema_version == 1 and
+        .schema_version == 2 and
         .campaign == $campaign and
         (.inventory | type == "object" and keys == ["count","source"] and
             .source == "adapters/tdx-hydro/data/tdx_header_numbers.json" and .count == 62) and
-        (.retention | type == "object" and
-            keys == ["policy","reclaim_inputs","retain_acquired_inputs","retain_basin_outputs","retain_external_reports"] and
-            .policy == "retain-all-through-publication" and
-            .reclaim_inputs == false and .retain_acquired_inputs == true and
-            .retain_basin_outputs == true and .retain_external_reports == true) and
-        (.sizing | type == "object" and
-            keys == ["assembled_artifact_bytes","assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
-                     "available_disk_bytes","available_memory_bytes","required_disk_bytes","required_memory_bytes",
-                     "retained_basin_output_bytes","retained_input_bytes"] and
-            (to_entries | all(.value | type == "number" and . == floor and . > 0 and . <= $max_i64)) and
-            .required_memory_bytes == .assembly_memory_ceiling_bytes and
-            .required_disk_bytes == (
-                .retained_input_bytes + .retained_basin_output_bytes +
-                .assembly_scratch_ceiling_bytes + .assembled_artifact_bytes
-            ) and
-            .available_memory_bytes >= .required_memory_bytes and
-            .available_disk_bytes >= .required_disk_bytes)
+        if .retention.policy == "retain-all-through-publication" then
+            (.retention == {
+                policy: "retain-all-through-publication",
+                reclaim_inputs: false,
+                retain_acquired_inputs: true,
+                retain_basin_outputs: true,
+                retain_external_reports: true
+            }) and
+            (.sizing | type == "object" and
+                keys == ["active_compile_scratch_bytes","assembled_artifact_bytes",
+                         "assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
+                         "available_disk_bytes","available_memory_bytes","filesystem_overhead_bytes",
+                         "required_disk_bytes","required_memory_bytes","retained_basin_output_bytes",
+                         "retained_input_bytes"] and
+                (to_entries | all(.value | positive_i64)))
+        elif .retention.policy == "reclaim-inputs-after-terminal" then
+            (.retention == {
+                policy: "reclaim-inputs-after-terminal",
+                reclaim_inputs: true,
+                retain_acquired_inputs: false,
+                retain_basin_outputs: true,
+                retain_external_reports: true
+            }) and
+            (.sizing | type == "object" and
+                keys == ["active_compile_scratch_bytes","assembled_artifact_bytes",
+                         "assembly_memory_ceiling_bytes","assembly_scratch_ceiling_bytes",
+                         "available_disk_bytes","available_memory_bytes","filesystem_overhead_bytes",
+                         "peak_in_flight_download_bytes","required_disk_bytes","required_memory_bytes",
+                         "retained_basin_output_bytes"] and
+                (to_entries | all(.value | positive_i64)) and
+                .peak_in_flight_download_bytes == $reclaim_peak)
+        else false
+        end and
+        (.sizing.required_memory_bytes == .sizing.assembly_memory_ceiling_bytes) and
+        (.sizing.available_memory_bytes >= .sizing.required_memory_bytes) and
+        (.sizing.available_disk_bytes >= .sizing.required_disk_bytes)
     ' "$file" >/dev/null 2>&1 || hfx_die "campaign state is malformed: $file"
+
+    policy=$("$JQ" -r '.retention.policy' "$file")
+    case $policy in
+        retain-all-through-publication)
+            input_bytes=$("$JQ" -r '.sizing.retained_input_bytes' "$file")
+            ;;
+        reclaim-inputs-after-terminal)
+            input_bytes=$("$JQ" -r '.sizing.peak_in_flight_download_bytes' "$file")
+            ;;
+        *) hfx_die "campaign state is malformed: $file" ;;
+    esac
+    retained_output_bytes=$("$JQ" -r '.sizing.retained_basin_output_bytes' "$file")
+    active_scratch_bytes=$("$JQ" -r '.sizing.active_compile_scratch_bytes' "$file")
+    assembly_scratch_bytes=$("$JQ" -r '.sizing.assembly_scratch_ceiling_bytes' "$file")
+    artifact_bytes=$("$JQ" -r '.sizing.assembled_artifact_bytes' "$file")
+    overhead_bytes=$("$JQ" -r '.sizing.filesystem_overhead_bytes' "$file")
+    persisted_disk_bytes=$("$JQ" -r '.sizing.required_disk_bytes' "$file")
+    assembly_peak_bytes=$assembly_scratch_bytes
+    if ((artifact_bytes > assembly_peak_bytes)); then
+        assembly_peak_bytes=$artifact_bytes
+    fi
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$input_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$retained_output_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$active_scratch_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$assembly_peak_bytes")
+    expected_disk_bytes=$(checked_add "$expected_disk_bytes" "$overhead_bytes")
+    [[ "$persisted_disk_bytes" == "$expected_disk_bytes" ]] ||
+        hfx_die "campaign state is malformed: $file"
 }
 
 validate_compile_json() {
@@ -177,6 +277,37 @@ validate_compile_json() {
         (.fabric_version | type == "string" and length > 0 and
             (test("[\u0000-\u001f\u007f]") | not))
     ' "$file" >/dev/null 2>&1 || hfx_die "compile state is malformed: $file"
+}
+
+validate_pipeline_json() {
+    local file=$1
+    "$JQ" -e '
+        def valid_id: type == "string" and test("^[0-9]{10}$");
+        def valid_status:
+            . == "pending" or . == "acquiring" or . == "ready" or
+            . == "compiling" or . == "terminal" or . == "reclaimed" or
+            . == "blocked";
+        type == "object" and
+        keys == ["basin_ids","basins","fabric_version","max_parallel","schema_version"] and
+        .schema_version == 1 and
+        (.fabric_version | type == "string" and length > 0 and
+            (test("[[:cntrl:]]") | not)) and
+        (.max_parallel | type == "number" and . == floor and . >= 1 and . <= 4) and
+        (.basin_ids | type == "array" and length > 0 and
+            all(.[]; valid_id) and . == (sort | unique)) and
+        (.basins | type == "object") and
+        (.basins | keys) == .basin_ids and
+        ([.basins[] |
+            type == "object" and keys == ["blocked_reason","status"] and
+            (.status | valid_status) and
+            (if .status == "blocked" then
+                (.blocked_reason | type == "string" and length > 0 and
+                    (test("[[:cntrl:]]") | not))
+             else .blocked_reason == null end)
+        ] | all) and
+        ([.basins[].status | select(. == "compiling")] | length) <= 1 and
+        ([.basins[].status | select(. == "acquiring")] | length) <= .max_parallel
+    ' "$file" >/dev/null 2>&1 || hfx_die "pipeline state is malformed: $file"
 }
 
 validate_assembly_json() {
@@ -280,9 +411,25 @@ validate_basin_json() {
                 (.failure_reason == null or .failure_reason == "interrupted before terminal state; reset by recover") and
                 .evidence == null
             else false end;
+        def valid_v4_terminal:
+            (.stages.acquire_basins.status == "succeeded") and
+            (.stages.acquire_streamnet.status == "succeeded") and
+            (.stages.compile.attempts > 0) and
+            ((.stages.compile.status == "succeeded" and
+              .stages.compile.failure_reason == null and
+              (.stages.compile.diagnostic_report | valid_diagnostic)) or
+             (.stages.compile.status == "failed" and
+              (.stages.compile.failure_reason == "adapter build failed" or
+               .stages.compile.failure_reason == "adapter validation failed") and
+              (.stages.compile.failure_reason | length > 0) and
+              (.stages.compile.diagnostic_report == null or
+               (.stages.compile.diagnostic_report | valid_diagnostic))));
         type == "object" and
-        keys == ["processing_basin_id","schema_version","stages"] and
-        (.schema_version == 1 or .schema_version == 2 or .schema_version == 3) and .processing_basin_id == $basin_id and
+        (if .schema_version == 4
+         then keys == ["processing_basin_id","retention","schema_version","stages"]
+         else keys == ["processing_basin_id","schema_version","stages"] end) and
+        (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 4) and
+        .processing_basin_id == $basin_id and
         (.stages | type == "object" and
             keys == ["acquire_basins","acquire_streamnet","compile"]) and
         if .schema_version == 1 then
@@ -293,10 +440,19 @@ validate_basin_json() {
             (.stages.compile | valid_v1_stage) and
             (.stages.acquire_basins | valid_v2_acquire) and
             (.stages.acquire_streamnet | valid_v2_acquire)
-        else
+        elif .schema_version == 3 then
             (.stages.compile | valid_v3_compile) and
             (.stages.acquire_basins | valid_v2_acquire) and
             (.stages.acquire_streamnet | valid_v2_acquire)
+        else
+            (.retention | type == "object" and
+             keys == ["inputs_reclaimed","policy"] and
+             (.inputs_reclaimed | type == "boolean") and
+             .policy == "reclaim-inputs-after-terminal") and
+            (.stages.compile | valid_v3_compile) and
+            (.stages.acquire_basins | valid_v2_acquire) and
+            (.stages.acquire_streamnet | valid_v2_acquire) and
+            (if .retention.inputs_reclaimed then valid_v4_terminal else true end)
         end
     ' "$file" >/dev/null 2>&1 || hfx_die "basin state is malformed for $basin_id: $file"
 }
@@ -320,6 +476,16 @@ lock_owned=0
 lock_path=
 takeover_owned=0
 takeover_path=
+campaign_lock_is_owned() {
+    if ((lock_owned == 1)) &&
+        [[ -d "$lock_path" && ! -L "$lock_path" ]] &&
+        [[ -f "$lock_path/owner.pid" && ! -L "$lock_path/owner.pid" ]] &&
+        [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 release_takeover_guard() {
     if ((takeover_owned == 1)) && [[ -n "$takeover_path" && -d "$takeover_path" && ! -L "$takeover_path" ]] &&
         [[ -f "$takeover_path/owner.pid" && ! -L "$takeover_path/owner.pid" ]] &&
@@ -330,6 +496,8 @@ release_takeover_guard() {
 }
 
 release_lock() {
+    # Release retains its pre-existing missing-symlink guard on owner.pid. Re-entry
+    # is stronger because it authorizes work and therefore explicitly rejects one.
     if ((lock_owned == 1)) && [[ -n "$lock_path" && -d "$lock_path" && ! -L "$lock_path" ]] &&
         [[ -f "$lock_path/owner.pid" ]] && [[ $(<"$lock_path/owner.pid") == "$$" ]]; then
         "$RM" -r -- "$lock_path"
@@ -374,6 +542,9 @@ acquire_campaign_lock() {
     local state
     lock_path=$locks_dir/campaign.lock
     takeover_path=$locks_dir/campaign.lock.takeover
+    if campaign_lock_is_owned; then
+        return
+    fi
     if "$MKDIR" "$lock_path" 2>/dev/null; then
         printf '%s\n' "$$" >"$lock_path/owner.pid"
         lock_owned=1
@@ -428,13 +599,7 @@ acquire_campaign_lock() {
     release_takeover_guard
 }
 
-validate_workspace_state() {
-    local expected_count
-    local basin_id
-    local basin_dir
-    local actual_dirs
-    local actual_files
-
+validate_campaign_structure() {
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign path is not a safe directory: $campaign_dir"
     for required_dir in downloads basin-outputs reports assembly assembly/scratch publication state state/basins state/locks state/tmp; do
         [[ -d "$campaign_dir/$required_dir" && ! -L "$campaign_dir/$required_dir" ]] ||
@@ -451,6 +616,11 @@ validate_workspace_state() {
             hfx_die "assembly state is not a regular file: $campaign_dir/state/assembly.json"
         validate_assembly_json "$campaign_dir/state/assembly.json"
     fi
+    if [[ -e "$campaign_dir/state/pipeline.json" || -L "$campaign_dir/state/pipeline.json" ]]; then
+        [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]] ||
+            hfx_die "pipeline state is not a regular file: $campaign_dir/state/pipeline.json"
+        validate_pipeline_json "$campaign_dir/state/pipeline.json"
+    fi
     validate_inventory_file "$campaign_dir/state/inventory.json"
     "$JQ" -e -S --slurp '.[0] == .[1]' "$inventory_source" "$campaign_dir/state/inventory.json" >/dev/null 2>&1 ||
         hfx_die 'campaign inventory differs from the authoritative tracked crosswalk'
@@ -459,6 +629,65 @@ validate_workspace_state() {
             hfx_die "basin selection state is not a regular file: $campaign_dir/state/selection.json"
         validate_selection_file "$campaign_dir/state/selection.json"
     fi
+}
+
+for_each_pipeline_source_path() {
+    local basin_id=$1
+    local callback=$2
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg"
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg.partial"
+    "$callback" "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial"
+    "$callback" "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"
+}
+
+reclaimed_source_must_be_absent() {
+    local candidate_path=$1
+    [[ ! -e "$candidate_path" && ! -L "$candidate_path" ]] ||
+        hfx_die "reclaimed basin source artifact remains for $pipeline_source_basin_id: $candidate_path; move that exact path out of downloads, then rerun recover"
+}
+
+validate_reclaimed_sources_absent() {
+    local basin_id=$1
+    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed' "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
+        pipeline_source_basin_id=$basin_id
+        for_each_pipeline_source_path "$basin_id" reclaimed_source_must_be_absent
+    fi
+}
+
+validate_target_basin() {
+    local basin_id=$1
+    local basin_dir=$campaign_dir/state/basins/$basin_id
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '$basin_id'; expected an authoritative 10-digit ID"
+    "$JQ" -e --arg id "$basin_id" 'has($id)' "$campaign_dir/state/inventory.json" >/dev/null ||
+        hfx_die "processing basin ID is not in the authoritative inventory: $basin_id"
+    if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
+        "$JQ" -e --arg id "$basin_id" '.basin_ids | index($id) != null' \
+            "$campaign_dir/state/selection.json" >/dev/null ||
+            hfx_die "processing basin ID is not in the frozen campaign selection: $basin_id"
+    fi
+    [[ -d "$basin_dir" && ! -L "$basin_dir" ]] ||
+        hfx_die "basin directory is missing or unsafe: $basin_id"
+    validate_basin_json "$basin_dir/current.json" "$basin_id"
+    validate_reclaimed_sources_absent "$basin_id"
+}
+
+validate_target_workspace_state() {
+    local basin_id=$1
+    validate_campaign_structure
+    validate_target_basin "$basin_id"
+}
+
+validate_workspace_state() {
+    local expected_count
+    local basin_id
+    local basin_dir
+    local actual_dirs
+    local actual_files
+
+    validate_campaign_structure
     expected_count=$("$JQ" -r 'length' "$campaign_dir/state/inventory.json")
     actual_dirs=$("$FIND" "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d | "$WC" -l | "$TR" -d ' ')
     [[ "$actual_dirs" == "$expected_count" ]] || hfx_die "expected $expected_count basin directories; found $actual_dirs"
@@ -468,6 +697,7 @@ validate_workspace_state() {
         basin_dir=$campaign_dir/state/basins/$basin_id
         [[ -d "$basin_dir" && ! -L "$basin_dir" ]] || hfx_die "basin directory is missing or unsafe: $basin_id"
         validate_basin_json "$basin_dir/current.json" "$basin_id"
+        validate_reclaimed_sources_absent "$basin_id"
     done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
     if "$FIND" "$campaign_dir/state/basins" -mindepth 1 -maxdepth 1 -type d |
         while IFS= read -r basin_dir; do
@@ -482,17 +712,873 @@ validate_workspace_state() {
 
 print_sizing() {
     "$JQ" -r '
-        .sizing |
+        . as $root |
+        $root.sizing |
+        "retention_policy=\($root.retention.policy)",
         "available_memory_bytes=\(.available_memory_bytes)",
         "available_disk_bytes=\(.available_disk_bytes)",
-        "retained_input_bytes=\(.retained_input_bytes)",
+        (if $root.retention.policy == "retain-all-through-publication"
+         then "retained_input_bytes=\(.retained_input_bytes)"
+         else "peak_in_flight_download_bytes=\(.peak_in_flight_download_bytes)" end),
         "retained_basin_output_bytes=\(.retained_basin_output_bytes)",
         "assembly_memory_ceiling_bytes=\(.assembly_memory_ceiling_bytes)",
         "assembly_scratch_ceiling_bytes=\(.assembly_scratch_ceiling_bytes)",
         "assembled_artifact_bytes=\(.assembled_artifact_bytes)",
+        "active_compile_scratch_bytes=\(.active_compile_scratch_bytes)",
+        "filesystem_overhead_bytes=\(.filesystem_overhead_bytes)",
         "required_memory_bytes=\(.required_memory_bytes)",
         "required_disk_bytes=\(.required_disk_bytes)"
     ' "$campaign_dir/state/campaign.json"
+}
+
+validate_calibration_cohort() {
+    local file=$1
+    local expected_name=$2
+    local expected_parallel=$3
+    local expected_ids=$4
+    local ids_json
+    ids_json=$("$JQ" -cn --arg ids "$expected_ids" '$ids | split(" ")')
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "calibration cohort is not a regular file: $file"
+    "$JQ" -e --arg name "$expected_name" --argjson parallel "$expected_parallel" \
+        --argjson ids "$ids_json" --slurpfile inventory "$campaign_dir/state/inventory.json" '
+        type == "object" and keys == ["basin_ids","max_parallel","name","schema_version"] and
+        .schema_version == 1 and .name == $name and .max_parallel == $parallel and
+        .basin_ids == $ids and (.basin_ids | length == 4 and . == (sort | unique) and
+            all(.[]; type == "string" and $inventory[0][.] != null))
+    ' "$file" >/dev/null 2>&1 || hfx_die "calibration cohort is malformed: $file"
+}
+
+# A corrected throughput whose steady_state.compile_completions == 0 is NOT a valid input to the M5-S4 spend-abort threshold.
+# M5-S4 must apply the 4,167,474 bytes/second abort test to a cohort whose corrected window contains at least one compile completion.
+# When only a zero-compile corrected window is available, M5-S4 must treat the threshold as UNMET rather than met.
+# When the cohorts are within the five-percent margin and parallel-4 compile_completions is 0, the disclosed asymmetry decides: select parallel-2.
+# In the pinned scheduler, parallel-4 dispatches all four in its first round; its first reap begins permanent drain,
+# so its corrected window contains zero compile completions and zero compile wall seconds by construction.
+# Production overlaps compile with acquisition at both settings, making parallel-4 systematically optimistic; it may flip
+# a five-percent choice and elevate the value later consumed by the 4,167,474 bytes/second spend threshold.
+calibration_select() {
+    local small=$1
+    local large=$2
+    local small_completions=$3
+    local large_completions=$4
+    local selected_value
+    if ((small_completions > 0 && large_completions == 0)); then
+        selected_value=2
+    elif ((small_completions == 0 && large_completions > 0)); then
+        selected_value=4
+    elif ((small >= large)); then
+        selected_value=2
+    elif ((100 * small >= (100 - HFX_TDX_CALIBRATION_MARGIN_PERCENT) * large)); then
+        selected_value=2
+    else
+        selected_value=4
+    fi
+    calibration_selection=$selected_value
+    if ((small_completions > 0 || large_completions > 0)); then
+        calibration_selection_validity=compile-observed
+    else
+        calibration_selection_validity=no-compile-observed
+    fi
+}
+
+validate_calibration_json() {
+    local file=$1
+    local small
+    local large
+    local retained
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "calibration state is not a regular file: $file"
+    "$JQ" -e --arg p2 "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" \
+        --arg p4 "$HFX_TDX_CALIBRATION_PARALLEL_4_IDS" --argjson max_i64 "$HFX_TDX_MAX_I64" '
+        def i64: type == "number" and floor == . and . >= 0 and . <= 9223372036854775807;
+        def pos: i64 and . > 0;
+        def expected($s): $s | split(" ");
+        def measure:
+            type == "object" and keys == ["excluded_drain_tail","raw","steady_state"] and
+            (.raw | type == "object" and
+                keys == ["bytes","elapsed_seconds","end_timestamp_seconds","retries","start_timestamp_seconds","throughput_bytes_per_second"] and
+                (to_entries | all(.[]; .value | i64)) and
+                (.bytes | pos) and (.elapsed_seconds | pos) and (.throughput_bytes_per_second | pos) and
+                .end_timestamp_seconds >= .start_timestamp_seconds + .elapsed_seconds and
+                .throughput_bytes_per_second == (.bytes / .elapsed_seconds | floor)) and
+            (.steady_state | type == "object" and
+                keys == ["attempts","bytes","compile_completions","compile_wall_seconds","elapsed_seconds","end_bytes","end_timestamp_seconds","start_bytes","start_timestamp_seconds","throughput_bytes_per_second"] and
+                (.attempts | type == "array" and length > 0 and all(.[]; i64 and . > 0) and . == (sort | unique)) and
+                (del(.attempts) | to_entries | all(.[]; .value | i64)) and
+                (.bytes | pos) and (.elapsed_seconds | pos) and (.throughput_bytes_per_second | pos) and
+                .end_timestamp_seconds >= .start_timestamp_seconds + .elapsed_seconds and
+                .bytes == .end_bytes - .start_bytes and
+                .throughput_bytes_per_second == (.bytes / .elapsed_seconds | floor) and
+                .compile_completions <= 4 and .elapsed_seconds <= ($max_i64 / 4 | floor) and
+                .compile_wall_seconds <= .elapsed_seconds * 4) and
+            (.excluded_drain_tail | type == "object" and
+                keys == ["bytes","elapsed_seconds","end_bytes","end_timestamp_seconds","start_bytes","start_timestamp_seconds"] and
+                (to_entries | all(.[]; .value | i64)) and
+                .elapsed_seconds <= .end_timestamp_seconds - .start_timestamp_seconds and
+                .bytes == .end_bytes - .start_bytes) and
+            (.raw as $r | .steady_state as $s | .excluded_drain_tail as $d |
+                $s.start_timestamp_seconds >= $r.start_timestamp_seconds and
+                $s.end_timestamp_seconds <= $r.end_timestamp_seconds and
+                $d.start_timestamp_seconds == $s.end_timestamp_seconds and
+                $d.start_bytes == $s.end_bytes and $d.end_timestamp_seconds == $r.end_timestamp_seconds and
+                $d.end_bytes == $r.bytes);
+        def cohort($parallel; $ids):
+            type == "object" and keys == ["attempts","basin_ids","max_parallel","measurement","status"] and
+            .max_parallel == $parallel and .basin_ids == expected($ids) and
+            (.attempts | i64) and
+            if .status == "pending" then .attempts == 0 and .measurement == null
+            elif .status == "running" then .attempts > 0 and .measurement == null
+            elif .status == "measured" then .attempts > 0 and (.measurement | measure)
+            else false end;
+        type == "object" and keys == ["cohorts","fabric_version","schema_version","selected_max_parallel","selected_throughput_validity"] and
+        .schema_version == 1 and (.fabric_version | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+        (.selected_max_parallel == null or .selected_max_parallel == 2 or .selected_max_parallel == 4) and
+        (.selected_throughput_validity == null or .selected_throughput_validity == "compile-observed" or
+            .selected_throughput_validity == "no-compile-observed") and
+        (.cohorts | type == "object" and keys == ["parallel-2","parallel-4"] and
+            (.["parallel-2"] | cohort(2; $p2)) and
+            (.["parallel-4"] | cohort(4; $p4))) and
+        ((expected($p2) + expected($p4)) | length == 8 and length == (unique | length)) and
+        (if .selected_max_parallel == null then
+            .selected_throughput_validity == null and ([.cohorts[].status] | any(. != "measured"))
+         else .selected_throughput_validity != null and ([.cohorts[].status] | all(. == "measured")) end)
+    ' "$file" >/dev/null 2>&1 || hfx_die "calibration state is malformed: $file"
+    retained=$("$JQ" -r '.selected_max_parallel // "null"' "$file")
+    if [[ "$retained" != null ]]; then
+        small=$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$file")
+        large=$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.throughput_bytes_per_second' "$file")
+        calibration_select "$small" "$large" \
+            "$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.compile_completions' "$file")" \
+            "$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.compile_completions' "$file")"
+        [[ "$retained" == "$calibration_selection" &&
+            $("$JQ" -r '.selected_throughput_validity' "$file") == "$calibration_selection_validity" ]] ||
+            hfx_die "calibration state is malformed: $file"
+    fi
+}
+
+materialize_calibration_state() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_calibration_json "$state"
+        return
+    fi
+    "$JQ" -n --arg fabric "$fabric_version" \
+        --arg p2 "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" --arg p4 "$HFX_TDX_CALIBRATION_PARALLEL_4_IDS" '{
+          schema_version:1, fabric_version:$fabric, selected_max_parallel:null, selected_throughput_validity:null,
+          cohorts:{
+            "parallel-2":{max_parallel:2,basin_ids:($p2|split(" ")),status:"pending",attempts:0,measurement:null},
+            "parallel-4":{max_parallel:4,basin_ids:($p4|split(" ")),status:"pending",attempts:0,measurement:null}
+          }
+        }' >"$temporary"
+    atomic_install "$temporary" "$state" validate_calibration_json
+}
+
+calibration_install_cohort() {
+    local name=$1
+    local parallel=$2
+    local ids=$3
+    local destination=$campaign_dir/state/calibration/$name.json
+    local temporary=$campaign_dir/state/tmp/$name.json.tmp.$$
+    "$MKDIR" -p "$campaign_dir/state/calibration"
+    if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        "$JQ" -n --arg name "$name" --argjson parallel "$parallel" --arg ids "$ids" \
+            '{schema_version:1,name:$name,max_parallel:$parallel,basin_ids:($ids|split(" "))}' >"$temporary"
+        validate_calibration_cohort "$temporary" "$name" "$parallel" "$ids"
+        "$CHMOD" 0644 "$temporary"
+        "$MV" "$temporary" "$destination"
+    fi
+    validate_calibration_cohort "$destination" "$name" "$parallel" "$ids"
+    effective_basin_ids_file=$destination
+}
+
+calibration_first_start_valid() {
+    local basin_id
+    local basin_ids=${1-}
+    if [[ -n "$basin_ids" ]]; then
+        calibration_first_start_input=$(printf '%s\n' "$basin_ids" | "$TR" ' ' '\n')
+    else
+        calibration_first_start_input=$(effective_basin_ids)
+    fi
+    while IFS= read -r basin_id; do
+        "$JQ" -e '
+          .schema_version == 4 and .retention.inputs_reclaimed == false and
+          (.stages.acquire_basins == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.acquire_streamnet == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
+          (.stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null})
+        ' "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
+    done <<<"$calibration_first_start_input"
+}
+
+calibration_admit() {
+    calibration_admission_bytes=$((HFX_TDX_RECLAIM_PEAK_BYTES + max_parallel * HFX_TDX_RECLAIM_PAIR_BYTES))
+    ((calibration_admission_bytes >= HFX_TDX_RECLAIM_PEAK_BYTES)) || hfx_die 'calibration admission arithmetic overflowed'
+    pipeline_available_bytes
+    ((pipeline_available_byte_count >= calibration_admission_bytes)) ||
+        hfx_die "insufficient calibration disk: available $pipeline_available_byte_count bytes; required $calibration_admission_bytes bytes"
+}
+
+calibration_now() {
+    local value
+    if [[ -n "${HFX_TDX_CALIBRATION_NOW_FILE-}" ]]; then
+        [[ -f "$HFX_TDX_CALIBRATION_NOW_FILE" && ! -L "$HFX_TDX_CALIBRATION_NOW_FILE" ]] ||
+            hfx_die 'calibration timestamp fixture is unsafe'
+        IFS= read -r value <"$HFX_TDX_CALIBRATION_NOW_FILE" || hfx_die 'calibration timestamp fixture is exhausted'
+        calibration_clock_first=1
+        while IFS= read -r calibration_clock_line; do
+            if ((calibration_clock_first == 1)); then
+                calibration_clock_first=0
+            else
+                printf '%s\n' "$calibration_clock_line"
+            fi
+        done <"$HFX_TDX_CALIBRATION_NOW_FILE" >"$HFX_TDX_CALIBRATION_NOW_FILE.tmp"
+        "$MV" "$HFX_TDX_CALIBRATION_NOW_FILE.tmp" "$HFX_TDX_CALIBRATION_NOW_FILE"
+    else
+        value=$(/bin/date +%s)
+    fi
+    calibration_timestamp=$(normalize_nonnegative_i64 "$value") || hfx_die 'calibration timestamp is malformed'
+}
+
+calibration_product_bytes() {
+    local basin_id
+    local product
+    local path
+    local observed
+    local restart
+    local wc_output
+    local calibration_product_retry
+    local calibration_wc_count
+    local resident_paths=()
+    local state_files=()
+    calibration_product_retry=0
+    while :; do
+        resident_paths=()
+        state_files=()
+        while IFS= read -r basin_id; do
+            state_files[${#state_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
+            for product in basins streamnet; do
+                path=$campaign_dir/downloads/$basin_id-$product.gpkg
+                if [[ ! -f "$path" || -L "$path" ]]; then
+                    path=$path.partial
+                fi
+                if [[ -f "$path" && ! -L "$path" ]]; then
+                    resident_paths[${#resident_paths[@]}]=$path
+                fi
+            done
+        done < <(effective_basin_ids)
+        calibration_byte_count=0
+        if ((${#state_files[@]} > 0)); then
+            calibration_byte_count=$("$JQ" -s '
+              [.[] | select(.retention.inputs_reclaimed == true) |
+               .stages.acquire_basins.evidence.bytes, .stages.acquire_streamnet.evidence.bytes] | add // 0
+            ' ${state_files[@]+"${state_files[@]}"})
+        fi
+        calibration_byte_count=$(normalize_nonnegative_i64 "$calibration_byte_count") ||
+            hfx_die 'calibration durable product length is malformed'
+        if ((${#resident_paths[@]} > 0)); then
+            observed=0
+            restart=0
+            for path in ${resident_paths[@]+"${resident_paths[@]}"}; do
+                if ! wc_output=$("$WC" -c "$path" 2>&1); then
+                    if [[ ! -e "$path" && ! -L "$path" ]]; then
+                        restart=1
+                        break
+                    fi
+                    printf '%s\n' "$wc_output" >&2
+                    hfx_die "could not measure calibration product length: $path"
+                fi
+                calibration_wc_count=${wc_output%" $path"}
+                [[ "$calibration_wc_count" != "$wc_output" ]] ||
+                    hfx_die "calibration product length is malformed: $path"
+                calibration_wc_count=$(printf '%s\n' "$calibration_wc_count" | "$TR" -d ' ')
+                calibration_wc_count=$(normalize_nonnegative_i64 "$calibration_wc_count") ||
+                    hfx_die "calibration product length is malformed: $path"
+                observed=$(checked_add "$observed" "$calibration_wc_count")
+            done
+            if ((restart == 1)); then
+                calibration_product_retry=$((calibration_product_retry + 1))
+                ((calibration_product_retry <= 16)) ||
+                    hfx_die 'calibration products changed repeatedly while measuring lengths'
+                continue
+            fi
+            calibration_byte_count=$(checked_add "$calibration_byte_count" "$observed")
+        fi
+        break
+    done
+}
+
+calibration_append_sample() {
+    local timestamp=$1
+    local bytes=$2
+    local occupancy=$3
+    local completions=$4
+    local wall=$5
+    printf '%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$bytes" "$occupancy" "$completions" "$wall" >>"$calibration_trace_file"
+}
+
+calibration_observe() {
+    local event=$1
+    local occupancy=0
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    case $event in
+        dispatch|ordinary-reap|vanished-sweep) ;;
+        *) hfx_die "unknown calibration observation: $event" ;;
+    esac
+    calibration_now
+    calibration_product_bytes
+    occupancy=${#pipeline_worker_pids[@]}
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" "$occupancy" \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+}
+
+calibration_compile_started() {
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    [[ -z "$calibration_compile_basin" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_now
+    calibration_compile_basin=$pipeline_consumer_basin_id
+    calibration_compile_start=$calibration_timestamp
+}
+
+calibration_compile_finished() {
+    local elapsed
+    [[ "${calibration_active-0}" == 1 ]] || return 0
+    [[ "$calibration_compile_basin" == "$pipeline_consumer_basin_id" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_now
+    ((calibration_timestamp >= calibration_compile_start)) || hfx_die 'calibration compile timestamp regressed'
+    elapsed=$((calibration_timestamp - calibration_compile_start))
+    calibration_compile_completions=$((calibration_compile_completions + 1))
+    calibration_compile_wall_seconds=$(checked_add "$calibration_compile_wall_seconds" "$elapsed")
+    calibration_compile_basin=
+    calibration_product_bytes
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" "${#pipeline_worker_pids[@]}" \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+}
+
+calibration_scan_traces() {
+    local attempt
+    local line
+    local timestamp
+    local observed
+    local occupancy
+    local completions
+    local wall
+    local previous_timestamp=-1
+    local index=0
+    local trace
+    local extra_count
+    local require_complete=${calibration_scan_require_complete-1}
+    calibration_timestamps=()
+    calibration_bytes=()
+    calibration_occupancies=()
+    calibration_completions=()
+    calibration_walls=()
+    calibration_attempt_numbers=()
+    calibration_running_max_bytes=0
+    calibration_first_full_index=-1
+    calibration_last_full_index=-1
+    for ((attempt = 1; attempt <= calibration_attempts; attempt++)); do
+        trace=$campaign_dir/state/calibration/$calibration_name-attempt-$attempt.samples.tsv
+        [[ -f "$trace" && ! -L "$trace" ]] || hfx_die "calibration attempt trace is missing or unsafe: $trace"
+        while IFS=$'\t' read -r timestamp observed occupancy completions wall; do
+            [[ -n "$timestamp" && -n "$observed" && -n "$occupancy" && -n "$completions" && -n "$wall" ]] ||
+                hfx_die "calibration attempt trace is malformed: $trace"
+            timestamp=$(normalize_nonnegative_i64 "$timestamp") || hfx_die "calibration attempt trace is malformed: $trace"
+            calibration_observed_bytes=$(normalize_nonnegative_i64 "$observed") || hfx_die "calibration attempt trace is malformed: $trace"
+            occupancy=$(normalize_nonnegative_i64 "$occupancy") || hfx_die "calibration attempt trace is malformed: $trace"
+            completions=$(normalize_nonnegative_i64 "$completions") || hfx_die "calibration attempt trace is malformed: $trace"
+            wall=$(normalize_nonnegative_i64 "$wall") || hfx_die "calibration attempt trace is malformed: $trace"
+            ((timestamp >= previous_timestamp && occupancy <= max_parallel && completions <= 4)) ||
+                hfx_die "calibration attempt trace is malformed: $trace"
+            if ((index > 0)); then
+                ((completions >= calibration_completions[$((index - 1))] && wall >= calibration_walls[$((index - 1))])) ||
+                    hfx_die "calibration attempt trace counters regressed: $trace"
+            fi
+            if ((calibration_observed_bytes > calibration_running_max_bytes)); then
+                calibration_running_max_bytes=$calibration_observed_bytes
+            fi
+    calibration_observed_bytes=$calibration_running_max_bytes
+            calibration_timestamps[$index]=$timestamp
+            calibration_bytes[$index]=$calibration_observed_bytes
+            calibration_occupancies[$index]=$occupancy
+            calibration_completions[$index]=$completions
+            calibration_walls[$index]=$wall
+            calibration_attempt_numbers[$index]=$attempt
+            if ((occupancy == max_parallel)); then
+                ((calibration_first_full_index < 0)) && calibration_first_full_index=$index
+                calibration_last_full_index=$index
+            fi
+            previous_timestamp=$timestamp
+            index=$((index + 1))
+        done <"$trace"
+    done
+    extra_count=$("$FIND" "$campaign_dir/state/calibration" -maxdepth 1 -type f -name "$calibration_name-attempt-*.samples.tsv" | "$WC" -l | "$TR" -d ' ')
+    if [[ "$extra_count" != "$calibration_attempts" ]]; then
+        trace=$campaign_dir/state/calibration/$calibration_name-attempt-$((calibration_attempts + 1)).samples.tsv
+        [[ "$extra_count" == $((calibration_attempts + 1)) && -f "$trace" && ! -L "$trace" ]] ||
+            hfx_die 'calibration attempt traces are not contiguous'
+    fi
+    ((index > 0)) || hfx_die 'calibration attempt traces are empty'
+    calibration_last_index=$((index - 1))
+    if ((require_complete == 0)); then
+        return
+    fi
+    ((calibration_first_full_index >= 0 && calibration_last_full_index + 1 < index)) ||
+        hfx_die 'calibration trace lacks a full-occupancy record and lower successor'
+    calibration_steady_end_index=$((calibration_last_full_index + 1))
+}
+
+calibration_count_retries() {
+    local basin_id
+    local attempts
+    calibration_retries=0
+    while IFS= read -r basin_id; do
+        attempts=$("$JQ" -r '[.stages.acquire_basins.attempts,.stages.acquire_streamnet.attempts] | add' \
+            "$campaign_dir/state/basins/$basin_id/current.json")
+        ((attempts >= 2)) || hfx_die 'calibration acquisition attempts are inconsistent'
+        calibration_retries=$(checked_add "$calibration_retries" "$((attempts - 2))")
+    done < <(effective_basin_ids)
+}
+
+calibration_compute_measurement() {
+    local raw_start=${calibration_timestamps[0]}
+    local raw_end=${calibration_timestamps[$calibration_last_index]}
+    local raw_bytes=${calibration_bytes[$calibration_last_index]}
+    local steady_start=${calibration_timestamps[$calibration_first_full_index]}
+    local steady_end=${calibration_timestamps[$calibration_steady_end_index]}
+    local steady_start_bytes=${calibration_bytes[$calibration_first_full_index]}
+    local steady_end_bytes=${calibration_bytes[$calibration_steady_end_index]}
+    local steady_completions=$((calibration_completions[$calibration_steady_end_index] - calibration_completions[$calibration_first_full_index]))
+    local steady_wall=$((calibration_walls[$calibration_steady_end_index] - calibration_walls[$calibration_first_full_index]))
+    local raw_elapsed=0
+    local steady_elapsed=0
+    local drain_elapsed=0
+    local index
+    local first_attempt=${calibration_attempt_numbers[$calibration_first_full_index]}
+    local last_attempt=${calibration_attempt_numbers[$calibration_steady_end_index]}
+    for ((index = 1; index <= calibration_last_index; index++)); do
+        if ((calibration_attempt_numbers[$index] == calibration_attempt_numbers[$((index - 1))])); then
+            calibration_interval_elapsed=$((calibration_timestamps[$index] - calibration_timestamps[$((index - 1))]))
+            raw_elapsed=$(checked_add "$raw_elapsed" "$calibration_interval_elapsed")
+            if ((index > calibration_first_full_index && index <= calibration_steady_end_index)); then
+                steady_elapsed=$(checked_add "$steady_elapsed" "$calibration_interval_elapsed")
+            elif ((index > calibration_steady_end_index)); then
+                drain_elapsed=$(checked_add "$drain_elapsed" "$calibration_interval_elapsed")
+            fi
+        fi
+    done
+    if ((steady_elapsed == 0)); then
+        steady_start=$raw_start
+        steady_end=$raw_end
+        steady_start_bytes=0
+        steady_end_bytes=$raw_bytes
+        steady_elapsed=$raw_elapsed
+        steady_completions=0
+        steady_wall=0
+        drain_elapsed=0
+        first_attempt=${calibration_attempt_numbers[0]}
+        last_attempt=${calibration_attempt_numbers[$calibration_last_index]}
+    fi
+    calibration_raw_bytes=$raw_bytes
+    calibration_corrected_bytes=$((steady_end_bytes - steady_start_bytes))
+    calibration_corrected_elapsed=$steady_elapsed
+    ((raw_elapsed > 0 && raw_bytes > 0 && steady_elapsed > 0 && calibration_corrected_bytes > 0)) ||
+        hfx_die 'calibration measurement requires positive raw and corrected intervals and bytes'
+    calibration_raw_throughput=$((calibration_raw_bytes / raw_elapsed))
+    calibration_corrected_throughput=$((calibration_corrected_bytes / calibration_corrected_elapsed))
+    ((calibration_raw_throughput > 0 && calibration_corrected_throughput > 0)) ||
+        hfx_die 'calibration throughput rounded to zero'
+    calibration_count_retries
+    calibration_measurement_json=$("$JQ" -cn \
+        --argjson rs "$raw_start" --argjson re "$raw_end" --argjson rb "$raw_bytes" --argjson rel "$raw_elapsed" \
+        --argjson rr "$calibration_retries" --argjson rt "$calibration_raw_throughput" \
+        --argjson ss "$steady_start" --argjson se "$steady_end" --argjson sb "$steady_start_bytes" \
+        --argjson eb "$steady_end_bytes" --argjson b "$calibration_corrected_bytes" --argjson el "$steady_elapsed" \
+        --argjson t "$calibration_corrected_throughput" --argjson cc "$steady_completions" --argjson cw "$steady_wall" \
+        --argjson fa "$first_attempt" --argjson la "$last_attempt" --argjson del "$drain_elapsed" '{
+          raw:{start_timestamp_seconds:$rs,end_timestamp_seconds:$re,bytes:$rb,elapsed_seconds:$rel,retries:$rr,throughput_bytes_per_second:$rt},
+          steady_state:{start_timestamp_seconds:$ss,end_timestamp_seconds:$se,attempts:[range($fa;$la+1)],start_bytes:$sb,end_bytes:$eb,bytes:$b,elapsed_seconds:$el,throughput_bytes_per_second:$t,compile_completions:$cc,compile_wall_seconds:$cw},
+          excluded_drain_tail:{start_timestamp_seconds:$se,end_timestamp_seconds:$re,start_bytes:$eb,end_bytes:$rb,bytes:($rb-$eb),elapsed_seconds:$del}
+        }')
+}
+
+calibration_terminal_reclaimed() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        "$JQ" -e '.schema_version == 4 and .retention.inputs_reclaimed == true and
+            (.stages.compile.status == "succeeded" or .stages.compile.status == "failed")' \
+            "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
+    done < <(effective_basin_ids)
+}
+
+calibration_append_terminal_sample() {
+    local last_record
+    local retained_record=
+    calibration_now
+    calibration_product_bytes
+    last_record="$calibration_timestamp"$'\t'"$calibration_byte_count"$'\t'"0"$'\t'"$calibration_compile_completions"$'\t'"$calibration_compile_wall_seconds"
+    while IFS= read -r calibration_terminal_line; do retained_record=$calibration_terminal_line; done <"$calibration_trace_file"
+    if [[ ! -s "$calibration_trace_file" ]] || [[ "$retained_record" != "$last_record" ]]; then
+        calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" 0 \
+            "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+    fi
+}
+
+calibration_finalize() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local archive=$campaign_dir/state/calibration/$calibration_name-pipeline.json
+    local archive_hash
+    local live_hash
+    local live_matches=false
+    calibration_scan_traces
+    calibration_compute_measurement
+    if [[ "$calibration_name" == parallel-4 ]]; then
+        calibration_select \
+            "$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$state")" \
+            "$("$JQ" -r '.steady_state.throughput_bytes_per_second' <<<"$calibration_measurement_json")" \
+            "$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.compile_completions' "$state")" \
+            "$("$JQ" -r '.steady_state.compile_completions' <<<"$calibration_measurement_json")"
+        "$JQ" --arg name "$calibration_name" --argjson measurement "$calibration_measurement_json" \
+            --argjson selected "$calibration_selection" --arg validity "$calibration_selection_validity" '
+            .cohorts[$name].status="measured" | .cohorts[$name].measurement=$measurement |
+            .selected_max_parallel=$selected | .selected_throughput_validity=$validity
+        ' "$state" >"$temporary"
+    else
+        "$JQ" --arg name "$calibration_name" --argjson measurement "$calibration_measurement_json" '
+            .cohorts[$name].status="measured" | .cohorts[$name].measurement=$measurement
+        ' "$state" >"$temporary"
+    fi
+    atomic_install "$temporary" "$state" validate_calibration_json
+    if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]] &&
+        [[ $("$JQ" -r --arg ids "$ids" '(.basins | keys) == ($ids | split(" ") | sort)' \
+            "$campaign_dir/state/pipeline.json") == true ]]; then
+        live_matches=true
+    fi
+    if [[ -e "$archive" || -L "$archive" ]]; then
+        [[ -f "$archive" && ! -L "$archive" ]] || hfx_die "calibration pipeline archive is unsafe: $archive"
+        if [[ "$live_matches" == true ]]; then
+            archive_hash=$("$SHA256SUM" "$archive")
+            archive_hash=${archive_hash%% *}
+            live_hash=$("$SHA256SUM" "$campaign_dir/state/pipeline.json")
+            live_hash=${live_hash%% *}
+            [[ "$archive_hash" == "$live_hash" ]] || hfx_die 'calibration pipeline archive differs from live state'
+        fi
+    elif [[ "$live_matches" == true ]]; then
+        "$CHMOD" 0644 "$campaign_dir/state/pipeline.json"
+        "$MV" "$campaign_dir/state/pipeline.json" "$archive"
+    else
+        printf '%s\n' 'calibration pipeline archive unavailable; retained unrelated live pipeline state' >&2
+        return
+    fi
+    [[ -f "$archive" && ! -L "$archive" ]] || hfx_die 'calibration pipeline archive is missing'
+    [[ "$live_matches" != true || (! -e "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json") ]] ||
+        "$RM" -- "$campaign_dir/state/pipeline.json"
+}
+
+calibration_freeze_selection() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local small
+    local large
+    local retained
+    validate_calibration_json "$state"
+    [[ $("$JQ" -r '[.cohorts[].status] | all(. == "measured")' "$state") == true ]] || return 0
+    small=$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' "$state")
+    large=$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.throughput_bytes_per_second' "$state")
+    calibration_select "$small" "$large" \
+        "$("$JQ" -r '.cohorts["parallel-2"].measurement.steady_state.compile_completions' "$state")" \
+        "$("$JQ" -r '.cohorts["parallel-4"].measurement.steady_state.compile_completions' "$state")"
+    retained=$("$JQ" -r '.selected_max_parallel // "null"' "$state")
+    if [[ "$retained" == null ]]; then
+        "$JQ" --argjson selected "$calibration_selection" --arg validity "$calibration_selection_validity" \
+            '.selected_max_parallel=$selected | .selected_throughput_validity=$validity' "$state" >"$temporary"
+        atomic_install "$temporary" "$state" validate_calibration_json
+    else
+        [[ "$retained" == "$calibration_selection" ]] || hfx_die 'calibration selection cannot be overwritten'
+    fi
+}
+
+print_calibration_disclosure() {
+    validate_calibration_json "$campaign_dir/state/calibration.json"
+    "$JQ" -r '
+      "calibration_fabric_version=\(.fabric_version)",
+      "calibration_selected_max_parallel=\(.selected_max_parallel // "pending")",
+      "calibration_selected_throughput_validity=\(.selected_throughput_validity // "pending")",
+      (.cohorts | to_entries[] | .key as $name | .value as $c |
+        "calibration_\($name|gsub("-";"_"))_status=\($c.status)",
+        if $c.status == "measured" then
+          "calibration_\($name|gsub("-";"_"))_raw_start_timestamp_seconds=\($c.measurement.raw.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_end_timestamp_seconds=\($c.measurement.raw.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_bytes=\($c.measurement.raw.bytes)",
+          "calibration_\($name|gsub("-";"_"))_raw_elapsed_seconds=\($c.measurement.raw.elapsed_seconds)",
+          "calibration_\($name|gsub("-";"_"))_raw_retries=\($c.measurement.raw.retries)",
+          "calibration_\($name|gsub("-";"_"))_raw_throughput_bytes_per_second=\($c.measurement.raw.throughput_bytes_per_second)",
+          "calibration_\($name|gsub("-";"_"))_steady_start_timestamp_seconds=\($c.measurement.steady_state.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_end_timestamp_seconds=\($c.measurement.steady_state.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_attempts=\($c.measurement.steady_state.attempts|join(","))",
+          "calibration_\($name|gsub("-";"_"))_steady_start_bytes=\($c.measurement.steady_state.start_bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_end_bytes=\($c.measurement.steady_state.end_bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_bytes=\($c.measurement.steady_state.bytes)",
+          "calibration_\($name|gsub("-";"_"))_steady_elapsed_seconds=\($c.measurement.steady_state.elapsed_seconds)",
+          "calibration_\($name|gsub("-";"_"))_steady_throughput_bytes_per_second=\($c.measurement.steady_state.throughput_bytes_per_second)",
+          "calibration_\($name|gsub("-";"_"))_steady_compile_completions=\($c.measurement.steady_state.compile_completions)",
+          "calibration_\($name|gsub("-";"_"))_steady_compile_wall_seconds=\($c.measurement.steady_state.compile_wall_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_start_timestamp_seconds=\($c.measurement.excluded_drain_tail.start_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_end_timestamp_seconds=\($c.measurement.excluded_drain_tail.end_timestamp_seconds)",
+          "calibration_\($name|gsub("-";"_"))_drain_start_bytes=\($c.measurement.excluded_drain_tail.start_bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_end_bytes=\($c.measurement.excluded_drain_tail.end_bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_bytes=\($c.measurement.excluded_drain_tail.bytes)",
+          "calibration_\($name|gsub("-";"_"))_drain_elapsed_seconds=\($c.measurement.excluded_drain_tail.elapsed_seconds)"
+        else empty end)
+    ' "$campaign_dir/state/calibration.json"
+}
+
+calibration_require_pipeline_freeze() {
+    [[ "$max_parallel" == "$calibration_selection" ]] || hfx_die 'pipeline max-parallel differs from frozen calibration selection'
+}
+
+validate_checkpoints_json() {
+    local file=$1
+    [[ -f "$file" && ! -L "$file" ]] || hfx_die "checkpoint state is not a regular file: $file"
+    "$JQ" -e --argjson max_i64 "$HFX_TDX_MAX_I64" '
+def checkpoint_count:
+  type == "number" and . == floor and . >= 0 and . <= 62;
+def entry_index:
+  type == "number" and . == floor and . >= 0 and . <= $max_i64;
+type == "object" and
+keys == ["entries","resume_after_entry_count","run_state","schema_version"] and
+.schema_version == 1 and
+(.run_state == "running" or .run_state == "stopped") and
+(.resume_after_entry_count == null or
+  (.resume_after_entry_count | entry_index)) and
+(.entries | type == "array" and all(.[];
+  type == "object" and
+  keys == ["expected_terminal_count","observed_terminal_count","result"] and
+  (.expected_terminal_count | checkpoint_count) and
+  .expected_terminal_count >= 1 and
+  (.observed_terminal_count | checkpoint_count) and
+  (.result == "met" or .result == "missed") and
+  (if .result == "met"
+   then .observed_terminal_count >= .expected_terminal_count
+   else .observed_terminal_count < .expected_terminal_count
+   end))) and
+([.entries[].expected_terminal_count] as $expected |
+  $expected == ($expected | sort)) and
+(.entries as $entries |
+if ($entries | length) == 0 then
+  .run_state == "running" and .resume_after_entry_count == null
+elif .run_state == "stopped" then
+  $entries[(($entries | length) - 1)].result == "missed" and
+  .resume_after_entry_count == null
+elif $entries[(($entries | length) - 1)].result == "met" then
+  .resume_after_entry_count == null
+else
+  $entries[(($entries | length) - 1)].result == "missed" and
+  .resume_after_entry_count == ($entries | length)
+end)
+' "$file" >/dev/null 2>&1 || hfx_die "checkpoint state is malformed: $file"
+}
+
+checkpoint_write_empty() {
+    local state=$campaign_dir/state/checkpoints.json
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    printf '%s\n' '{' '  "schema_version": 1,' '  "run_state": "running",' \
+        '  "resume_after_entry_count": null,' '  "entries": []' '}' >"$temporary"
+    atomic_install "$temporary" "$state" validate_checkpoints_json
+}
+
+checkpoint_read_observed_terminal_count() {
+    local pipeline_state=$campaign_dir/state/pipeline.json
+    [[ -e "$pipeline_state" || -L "$pipeline_state" ]] ||
+        hfx_die 'pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint'
+    [[ -f "$pipeline_state" && ! -L "$pipeline_state" ]] ||
+        hfx_die "pipeline state is not a regular file: $pipeline_state"
+    validate_pipeline_json "$pipeline_state"
+    checkpoint_observed_terminal_count=$("$JQ" -r '[.basins[].status | select(. == "reclaimed")] | length' "$pipeline_state")
+    [[ "$checkpoint_observed_terminal_count" =~ ^([0-9]|[1-5][0-9]|6[0-2])$ ]] ||
+        hfx_die "checkpoint observed terminal count is invalid: $checkpoint_observed_terminal_count"
+}
+
+checkpoint_install_entry() {
+    local expected=$1
+    local observed=$2
+    local result=$3
+    local run_state=$4
+    local state=$campaign_dir/state/checkpoints.json
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_checkpoints_json "$state"
+        "$JQ" --argjson expected "$expected" --argjson observed "$observed" \
+            --arg result "$result" --arg run_state "$run_state" '
+            .entries += [{expected_terminal_count:$expected, observed_terminal_count:$observed, result:$result}] |
+            .run_state=$run_state | .resume_after_entry_count=null
+        ' "$state" >"$temporary"
+    else
+        "$JQ" -n --argjson expected "$expected" --argjson observed "$observed" \
+            --arg result "$result" --arg run_state "$run_state" '
+            {schema_version:1, run_state:$run_state, resume_after_entry_count:null,
+             entries:[{expected_terminal_count:$expected, observed_terminal_count:$observed, result:$result}]}
+        ' >"$temporary"
+    fi
+    atomic_install "$temporary" "$state" validate_checkpoints_json
+}
+
+checkpoint_print_result() {
+    printf 'checkpoint_expected_terminal_count=%s\n' "$1"
+    printf 'checkpoint_observed_terminal_count=%s\n' "$2"
+    printf 'checkpoint_result=%s\n' "$3"
+    printf 'checkpoint_run_state=%s\n' "$4"
+}
+
+checkpoint_signal_owner() {
+    local lock=$campaign_dir/state/locks/campaign.lock
+    local owner_path=$lock/owner.pid
+    local checkpoint_owner
+    local checkpoint_kill_status
+    local state
+    if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+        printf 'checkpoint_signal=no-live-owner\n'
+        return 1
+    fi
+    [[ -d "$lock" && ! -L "$lock" ]] ||
+        hfx_die "checkpoint campaign lock is unsafe: $lock; inspect and move that exact entry, then rerun the same checkpoint"
+    [[ -f "$owner_path" && ! -L "$owner_path" ]] ||
+        hfx_die "checkpoint campaign lock owner is unsafe: $owner_path; inspect and move that exact entry, then rerun the same checkpoint"
+    checkpoint_owner=$(<"$owner_path")
+    [[ "$checkpoint_owner" =~ ^[1-9][0-9]*$ ]] ||
+        hfx_die "checkpoint campaign lock owner contents are unsafe: $owner_path; correct or move that exact entry, then rerun the same checkpoint"
+    state=$(pid_state "$checkpoint_owner")
+    case $state in
+        live)
+            set +e
+        kill -TERM "$checkpoint_owner"
+            checkpoint_kill_status=$?
+            set -e
+            if ((checkpoint_kill_status != 0)); then
+                hfx_die "could not deliver TERM to checkpoint owner PID $checkpoint_owner; rerun the same checkpoint with the same expected value"
+            fi
+            printf 'checkpoint_signal=sent\n'
+            ;;
+        dead) printf 'checkpoint_signal=no-live-owner\n' ;;
+        *) hfx_die "checkpoint owner PID $checkpoint_owner is indeterminate; resolve that PID or ps ambiguity, then rerun the same checkpoint" ;;
+    esac
+    return 1
+}
+
+checkpoint_campaign() {
+    local state=$campaign_dir/state/checkpoints.json
+    local entry_count=0
+    local latest_expected=
+    local latest_observed=
+    local run_state=running
+    if [[ -e "$state" || -L "$state" ]]; then
+        validate_checkpoints_json "$state" || :
+        run_state=$("$JQ" -r '.run_state' "$state")
+        entry_count=$("$JQ" -r '.entries | length' "$state")
+        if ((entry_count > 0)); then
+            latest_expected=$("$JQ" -r '.entries[(.entries | length) - 1].expected_terminal_count' "$state")
+            latest_observed=$("$JQ" -r '.entries[(.entries | length) - 1].observed_terminal_count' "$state")
+        fi
+        if [[ "$run_state" == stopped ]]; then
+            [[ "$expected_terminal_count" == "$latest_expected" ]] ||
+                hfx_die "stopped checkpoint expects $latest_expected; run checkpoint-resume, then checkpoint with an equal or higher expected value"
+            checkpoint_print_result "$latest_expected" "$latest_observed" missed stopped
+            checkpoint_signal_owner
+            return 1
+        fi
+        if ((entry_count > 0)) && ((expected_terminal_count < latest_expected)); then
+            hfx_die "checkpoint expected count cannot decrease below $latest_expected; rerun checkpoint with $latest_expected or a higher value"
+        fi
+    fi
+    checkpoint_read_observed_terminal_count
+    if ((checkpoint_observed_terminal_count >= expected_terminal_count)); then
+        checkpoint_install_entry "$expected_terminal_count" "$checkpoint_observed_terminal_count" met running
+        checkpoint_print_result "$expected_terminal_count" "$checkpoint_observed_terminal_count" met running
+        printf 'checkpoint_signal=not-required\n'
+        return
+    fi
+    checkpoint_install_entry "$expected_terminal_count" "$checkpoint_observed_terminal_count" missed stopped
+    checkpoint_print_result "$expected_terminal_count" "$checkpoint_observed_terminal_count" missed stopped
+    checkpoint_signal_owner
+    return 1
+}
+
+checkpoint_resume_campaign() {
+    local state=$campaign_dir/state/checkpoints.json
+    local recovery=$campaign_dir/state/checkpoint-recovery
+    local temporary=$campaign_dir/state/tmp/checkpoints.json.tmp.$$
+    local count
+    local rejected=
+    local index
+    if [[ ! -e "$state" && ! -L "$state" ]]; then
+        if [[ -e "$recovery" || -L "$recovery" ]]; then
+            [[ -d "$recovery" && ! -L "$recovery" ]] ||
+                hfx_die "checkpoint recovery path is unsafe: $recovery; inspect and move that exact entry, then rerun checkpoint-resume"
+            set -- "$recovery"/rejected-*.json
+            if [[ -e "$1" || -L "$1" ]]; then
+                rejected=$1
+            fi
+        fi
+        if [[ -n "$rejected" ]]; then
+            checkpoint_write_empty
+            printf 'checkpoint_resume=recovered-malformed\n'
+            printf 'checkpoint_recovery_path=%s\n' "${rejected#"$campaign_dir/"}"
+        else
+            printf 'checkpoint_resume=already-running\n'
+        fi
+        printf 'checkpoint_run_state=running\n'
+        return
+    fi
+    if (validate_checkpoints_json "$state") 2>/dev/null; then
+        if [[ $("$JQ" -r '.run_state' "$state") == running ]]; then
+            printf 'checkpoint_resume=already-running\ncheckpoint_run_state=running\n'
+            return
+        fi
+        count=$("$JQ" -r '.entries | length' "$state")
+        "$JQ" --argjson count "$count" '.run_state="running" | .resume_after_entry_count=$count' \
+            "$state" >"$temporary"
+        atomic_install "$temporary" "$state" validate_checkpoints_json
+        printf 'checkpoint_resume=resumed\ncheckpoint_run_state=running\n'
+        return
+    fi
+    if [[ -e "$recovery" || -L "$recovery" ]]; then
+        [[ -d "$recovery" && ! -L "$recovery" ]] ||
+            hfx_die "checkpoint recovery path is unsafe: $recovery; inspect and move that exact entry, then rerun checkpoint-resume"
+    else
+        "$MKDIR" "$recovery"
+        "$CHMOD" 0755 "$recovery"
+    fi
+    for ((index = 1; index <= 100000; index++)); do
+        rejected=$recovery/rejected-$index.json
+        if [[ ! -e "$rejected" && ! -L "$rejected" ]]; then
+            break
+        fi
+        rejected=
+    done
+    [[ -n "$rejected" ]] ||
+        hfx_die "checkpoint recovery archive is full at $recovery; move preserved rejected entries to operator storage, then rerun checkpoint-resume"
+    "$MV" "$state" "$rejected"
+    checkpoint_write_empty
+    printf 'checkpoint_resume=recovered-malformed\n'
+    printf 'checkpoint_recovery_path=%s\n' "${rejected#"$campaign_dir/"}"
+    printf 'checkpoint_run_state=running\n'
+}
+
+checkpoint_require_pipeline_running_prelock() {
+    local state=$campaign_dir/state/checkpoints.json
+    [[ ! -e "$state" && ! -L "$state" ]] && return
+    if ! (validate_checkpoints_json "$state") 2>/dev/null; then
+        hfx_die 'checkpoint state is malformed; run checkpoint-resume, then rerun the exact pipeline command'
+    fi
+    [[ $("$JQ" -r '.run_state' "$state") == running ]] ||
+        hfx_die 'pipeline is stopped by checkpoint control; run checkpoint-resume, then rerun the exact pipeline command'
+}
+
+checkpoint_require_pipeline_running() {
+    checkpoint_require_pipeline_running_prelock
+}
+
+print_zero_count() {
+    printf '0\n'
 }
 
 print_status() {
@@ -515,11 +1601,50 @@ print_status() {
     for stage in acquire_basins acquire_streamnet compile; do
         for status in pending running succeeded failed; do
             printf '%s_%s=' "$stage" "$status"
-            "$JQ" -s --arg stage "$stage" --arg status "$status" \
-                '[.[].stages[$stage].status | select(. == $status)] | length' \
-                ${state_files[@]+"${state_files[@]}"}
+            if (( ${#state_files[@]} > 0 )); then
+                "$JQ" -s --arg stage "$stage" --arg status "$status" \
+                    '[.[].stages[$stage].status | select(. == $status)] | length' \
+                    ${state_files[@]+"${state_files[@]}"}
+            else
+                print_zero_count
+            fi
         done
     done
+    if [[ $("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json") == reclaim-inputs-after-terminal ]]; then
+        printf 'inputs_reclaimed='
+        if (( ${#state_files[@]} > 0 )); then
+            "$JQ" -s '[.[] | select(.schema_version == 4 and .retention.inputs_reclaimed == true)] | length' \
+                ${state_files[@]+"${state_files[@]}"}
+        else
+            print_zero_count
+        fi
+    fi
+    if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]]; then
+        "$JQ" -r '
+            "pipeline_max_parallel=\(.max_parallel)",
+            "pipeline_fabric_version=\(.fabric_version)",
+            ("pending","acquiring","ready","compiling","terminal","reclaimed","blocked") as $status |
+            "pipeline_\($status)=\([.basins[].status | select(. == $status)] | length)"
+        ' "$campaign_dir/state/pipeline.json"
+    fi
+    if [[ -e "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]]; then
+        if [[ ! -f "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]] ||
+            ! (validate_checkpoints_json "$campaign_dir/state/checkpoints.json") 2>/dev/null; then
+            printf 'checkpoint_state=malformed\n'
+            printf 'checkpoint_recovery=run checkpoint-resume\n'
+        else
+            "$JQ" -r '
+              "checkpoint_run_state=\(.run_state)",
+              "checkpoint_entry_count=\(.entries | length)",
+              if (.entries | length) > 0 then
+                .entries[(.entries | length) - 1] as $latest |
+            "checkpoint_expected_terminal_count=\($latest.expected_terminal_count)",
+                "checkpoint_observed_terminal_count=\($latest.observed_terminal_count)",
+                "checkpoint_result=\($latest.result)"
+              else empty end
+            ' "$campaign_dir/state/checkpoints.json"
+        fi
+    fi
     if [[ -f "$campaign_dir/state/assembly.json" && ! -L "$campaign_dir/state/assembly.json" ]]; then
         stage=$("$JQ" -r '.status' "$campaign_dir/state/assembly.json")
     else
@@ -532,6 +1657,912 @@ print_status() {
             printf 'assemble_%s=0\n' "$status"
         fi
     done
+}
+
+pipeline_temporary_path() {
+    printf '%s\n' "$campaign_dir/state/tmp/pipeline.json.tmp.$$"
+}
+
+prepare_pipeline_temporary() {
+    local temporary
+    temporary=$(pipeline_temporary_path)
+    if [[ -e "$temporary" || -L "$temporary" ]]; then
+        [[ -f "$temporary" && ! -L "$temporary" ]] ||
+            hfx_die "pipeline temporary is unsafe: $temporary"
+    fi
+    printf '%s\n' "$temporary"
+}
+
+transition_pipeline_basin() {
+    local basin_id=$1
+    local status=$2
+    local blocked_reason=${3-}
+    local state=$campaign_dir/state/pipeline.json
+    local temporary
+    campaign_lock_is_owned || hfx_die 'pipeline state transition requires the parent campaign lock'
+    validate_pipeline_json "$state"
+    "$JQ" -e --arg id "$basin_id" \
+        '(.basin_ids | index($id) != null) and (.basins | has($id))' "$state" >/dev/null ||
+        hfx_die "pipeline basin is not selected: $basin_id"
+    case $status in
+        pending|acquiring|ready|compiling|terminal|reclaimed)
+            [[ -z "$blocked_reason" ]] ||
+                hfx_die "pipeline status $status requires a null blocked reason"
+            ;;
+        blocked)
+            [[ -n "$blocked_reason" && ! "$blocked_reason" =~ [[:cntrl:]] ]] ||
+                hfx_die 'pipeline blocked status requires a nonempty reason without ASCII control characters'
+            ;;
+        *) hfx_die "invalid pipeline status: $status" ;;
+    esac
+    temporary=$(prepare_pipeline_temporary)
+    "$JQ" --arg id "$basin_id" --arg status "$status" --arg reason "$blocked_reason" '
+        .basins[$id].status = $status |
+        .basins[$id].blocked_reason = (if $status == "blocked" then $reason else null end)
+    ' "$state" >"$temporary"
+    atomic_install "$temporary" "$state" validate_pipeline_json
+}
+
+materialize_pipeline_state() {
+    local state=$campaign_dir/state/pipeline.json
+    local temporary
+    local existing_fabric
+    local same_ids
+    local selected_ids_json
+    local basin_id
+    local selected_ids=()
+    campaign_lock_is_owned || hfx_die 'pipeline state materialization requires the parent campaign lock'
+    while IFS= read -r basin_id; do
+        selected_ids[${#selected_ids[@]}]=$basin_id
+    done < <(effective_basin_ids)
+    selected_ids_json=$("$JQ" -cn --args '$ARGS.positional' -- \
+        ${selected_ids[@]+"${selected_ids[@]}"})
+    if [[ -e "$state" || -L "$state" ]]; then
+        [[ -f "$state" && ! -L "$state" ]] ||
+            hfx_die "pipeline state is not a regular file: $state"
+        validate_pipeline_json "$state"
+        existing_fabric=$("$JQ" -r '.fabric_version' "$state")
+        same_ids=$("$JQ" -e --argjson expected "$selected_ids_json" \
+            '.basin_ids == $expected' "$state" >/dev/null &&
+            printf true || printf false)
+        [[ "$existing_fabric" == "$fabric_version" && "$same_ids" == true ]] ||
+            hfx_die 'pipeline parameters changed; use a new campaign ID'
+        if [[ $("$JQ" -r '.max_parallel' "$state") != "$max_parallel" ]]; then
+            temporary=$(prepare_pipeline_temporary)
+            "$JQ" --argjson max_parallel "$max_parallel" \
+                '.max_parallel = $max_parallel' "$state" >"$temporary"
+            atomic_install "$temporary" "$state" validate_pipeline_json
+        fi
+        return
+    fi
+    temporary=$(prepare_pipeline_temporary)
+    "$JQ" -n --arg fabric_version "$fabric_version" \
+        --argjson max_parallel "$max_parallel" --args '
+        $ARGS.positional as $ids |
+        {
+          schema_version: 1,
+          fabric_version: $fabric_version,
+          max_parallel: $max_parallel,
+          basin_ids: $ids,
+          basins: ($ids | map({key: ., value: {status:"pending",blocked_reason:null}}) | from_entries)
+        }
+    ' -- ${selected_ids[@]+"${selected_ids[@]}"} >"$temporary"
+    atomic_install "$temporary" "$state" validate_pipeline_json
+}
+
+pipeline_recover_reconstruct_basin() {
+    local scheduler_recovery_id=$1
+    recover_running_stages_for_basin "$scheduler_recovery_id" false
+    reconstruct_pipeline_basin "$scheduler_recovery_id"
+}
+
+pipeline_selected_index() {
+    local sought_id=$1
+    local sought_index
+    pipeline_found_index=-1
+    for ((sought_index = 0; sought_index < ${#pipeline_selected_basin_ids[@]}; sought_index++)); do
+        if [[ "${pipeline_selected_basin_ids[$sought_index]}" == "$sought_id" ]]; then
+            pipeline_found_index=$sought_index
+            return 0
+        fi
+    done
+    return 1
+}
+
+pipeline_worker_index() {
+    local sought_id=$1
+    local sought_index
+    pipeline_found_index=-1
+    for ((sought_index = 0; sought_index < ${#pipeline_worker_basin_ids[@]}; sought_index++)); do
+        if [[ "${pipeline_worker_basin_ids[$sought_index]}" == "$sought_id" ]]; then
+            pipeline_found_index=$sought_index
+            return 0
+        fi
+    done
+    return 1
+}
+
+pipeline_basin_is_tracked() {
+    pipeline_worker_index "$1"
+}
+
+pipeline_wait_remove_worker() {
+    local remove_index=$1
+    local pid=${pipeline_worker_pids[$remove_index]}
+    local last=$((${#pipeline_worker_pids[@]} - 1))
+    local shift_index
+    pipeline_wait_status=0
+    wait "$pid" || pipeline_wait_status=$?
+    pipeline_removed_basin_id=${pipeline_worker_basin_ids[$remove_index]}
+    for ((shift_index = remove_index; shift_index < last; shift_index++)); do
+        pipeline_worker_pids[$shift_index]=${pipeline_worker_pids[$((shift_index + 1))]}
+        pipeline_worker_basin_ids[$shift_index]=${pipeline_worker_basin_ids[$((shift_index + 1))]}
+    done
+    unset "pipeline_worker_pids[$last]"
+    unset "pipeline_worker_basin_ids[$last]"
+}
+
+pipeline_parallel_limit_reached() {
+    if ((${#pipeline_worker_pids[@]} >= max_parallel)); then
+        return 0
+    fi
+    return 1
+}
+
+pipeline_read_timed_out() {
+    local read_status=$1
+    if ((read_status != 0)); then
+        return 0
+    fi
+    return 1
+}
+
+pipeline_sweep_vanished_workers() {
+    local worker_index=0
+    local vanished_basin_id
+    local vanished_selected_index
+    while ((worker_index < ${#pipeline_worker_pids[@]})); do
+        if kill -0 "${pipeline_worker_pids[$worker_index]}" 2>/dev/null; then
+            worker_index=$((worker_index + 1))
+        else
+            pipeline_wait_remove_worker "$worker_index"
+            vanished_basin_id=$pipeline_removed_basin_id
+            pipeline_selected_index "$vanished_basin_id"
+            vanished_selected_index=$pipeline_found_index
+            pipeline_swept_completion_statuses[$vanished_selected_index]=$pipeline_wait_status
+            pipeline_round_reaped=1
+            pipeline_recover_reconstruct_basin "$vanished_basin_id"
+        fi
+    done
+}
+
+pipeline_scheduler_cleanup() {
+    local cleanup_pid
+    local cleanup_wait_status
+    ((pipeline_scheduler_active == 1)) || return
+    pipeline_scheduler_active=0
+    trap '' INT TERM
+    for cleanup_pid in ${pipeline_worker_pids[@]+"${pipeline_worker_pids[@]}"}; do
+        kill -TERM "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_pid in ${pipeline_worker_pids[@]+"${pipeline_worker_pids[@]}"}; do
+        cleanup_wait_status=0
+        wait "$cleanup_pid" || cleanup_wait_status=$?
+    done
+    pipeline_worker_pids=()
+    pipeline_worker_basin_ids=()
+    if ((pipeline_completion_open == 1)); then
+        exec 9>&-
+        pipeline_completion_open=0
+        if [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]]; then
+            "$RM" -- "$pipeline_completion_path"
+        fi
+    fi
+}
+
+pipeline_scheduler_signal() {
+    exit 130
+}
+
+pipeline_scheduler_exit() {
+    pipeline_exit_status=$?
+    pipeline_scheduler_cleanup
+    release_takeover_guard
+    release_lock
+    exit "$pipeline_exit_status"
+}
+
+pipeline_ordered_sweep() {
+    local basin_id
+    local status
+    local tracked
+    pipeline_sweep_count=0
+    while IFS= read -r basin_id; do
+        pipeline_sweep_count=$((pipeline_sweep_count + 1))
+        tracked=0
+        pipeline_basin_is_tracked "$basin_id" && tracked=1
+        if ((tracked == 0)); then
+            pipeline_recover_reconstruct_basin "$basin_id"
+        fi
+        status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+            "$campaign_dir/state/pipeline.json")
+        case $status:$tracked in
+            pending:0|ready:0|reclaimed:0|blocked:0|acquiring:1) ;;
+            pending:1|ready:1|compiling:1|terminal:1|reclaimed:1|blocked:1)
+                hfx_die "invalid pipeline status: $status"
+                ;;
+            acquiring:0|compiling:0|terminal:0)
+                hfx_die "invalid pipeline status: $status"
+                ;;
+            *) hfx_die "invalid pipeline status: $status" ;;
+        esac
+    done < <(effective_basin_ids)
+    "$JQ" -e --argjson observed "$pipeline_sweep_count" \
+        '(.basin_ids | length) == $observed' \
+        "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline ordered sweep count differs: observed $pipeline_sweep_count"
+}
+
+pipeline_finish_scheduler() {
+    local basin_id
+    local status
+    pipeline_ordered_sweep
+    pipeline_pending_count=0
+    pipeline_acquiring_count=0
+    pipeline_ready_count=0
+    pipeline_compiling_count=0
+    pipeline_terminal_count=0
+    pipeline_reclaimed_count=0
+    pipeline_blocked_count=0
+    while IFS= read -r basin_id; do
+        status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+            "$campaign_dir/state/pipeline.json")
+        case $status in
+            pending) pipeline_pending_count=$((pipeline_pending_count + 1)) ;;
+            acquiring) pipeline_acquiring_count=$((pipeline_acquiring_count + 1)) ;;
+            ready) pipeline_ready_count=$((pipeline_ready_count + 1)) ;;
+            compiling) pipeline_compiling_count=$((pipeline_compiling_count + 1)) ;;
+            terminal) pipeline_terminal_count=$((pipeline_terminal_count + 1)) ;;
+            reclaimed) pipeline_reclaimed_count=$((pipeline_reclaimed_count + 1)) ;;
+            blocked) pipeline_blocked_count=$((pipeline_blocked_count + 1)) ;;
+            *) hfx_die "invalid pipeline status: $status" ;;
+        esac
+    done < <(effective_basin_ids)
+    pipeline_scheduler_incomplete=0
+    ((pipeline_pending_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_acquiring_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_ready_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_compiling_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_terminal_count == 0)) || pipeline_scheduler_incomplete=1
+    ((pipeline_blocked_count == 0)) || pipeline_scheduler_incomplete=1
+    if ((pipeline_scheduler_incomplete == 1)); then
+        print_status
+        printf 'pipeline_durable_unreclaimed=%s\n' \
+            "$((pipeline_pending_count + pipeline_acquiring_count + pipeline_ready_count + pipeline_compiling_count + pipeline_terminal_count + pipeline_blocked_count))"
+        set -- "$pipeline_pending_count" "$pipeline_acquiring_count" "$pipeline_ready_count" \
+            "$pipeline_compiling_count" "$pipeline_terminal_count" "$pipeline_reclaimed_count" \
+            "$pipeline_blocked_count"
+        hfx_die "pipeline incomplete: pending=$1 acquiring=$2 ready=$3 compiling=$4 terminal=$5 reclaimed=$6 blocked=$7"
+    fi
+}
+
+pipeline_campaign() {
+    local locked_policy
+    local basin_id
+    local selected_index
+    local status
+    local read_status
+    local pipeline_completion_record
+    local completion_id
+    local completion_status
+    local swept_completion_status
+    local pipeline_consumer_basin_id
+    local pipeline_round_before
+    local pipeline_round_after
+    pipeline_worker_pids=()
+    pipeline_worker_basin_ids=()
+    pipeline_selected_basin_ids=()
+    pipeline_dispatch_attempts=()
+    pipeline_consume_attempts=()
+    pipeline_swept_completion_statuses=()
+    pipeline_completion_open=0
+    pipeline_scheduler_active=1
+    trap pipeline_scheduler_signal INT TERM
+    trap pipeline_scheduler_exit EXIT
+    acquire_campaign_lock
+    checkpoint_require_pipeline_running
+    validate_workspace_state
+    locked_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$locked_policy" == "$acquire_retention_policy" ]] ||
+        hfx_die 'campaign retention policy changed while acquiring the campaign lock'
+    materialize_pipeline_state
+    require_pipeline_selection
+    resolve_pipeline_compile_tools
+    establish_compile_contract
+    pipeline_initial_sweep_count=0
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
+        pipeline_recover_reconstruct_basin "$basin_id"
+        pipeline_selected_basin_ids[${#pipeline_selected_basin_ids[@]}]=$basin_id
+        pipeline_dispatch_attempts[${#pipeline_dispatch_attempts[@]}]=0
+        pipeline_consume_attempts[${#pipeline_consume_attempts[@]}]=0
+        pipeline_swept_completion_statuses[${#pipeline_swept_completion_statuses[@]}]=
+        pipeline_initial_sweep_count=$((pipeline_initial_sweep_count + 1))
+    done < <(effective_basin_ids)
+    "$JQ" -e --argjson observed "$pipeline_initial_sweep_count" \
+        '(.basin_ids | length) == $observed' \
+        "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline ordered sweep count differs: observed $pipeline_initial_sweep_count"
+    pipeline_completion_create_open
+    pipeline_completion_open=1
+    while :; do
+        pipeline_round_durable_changed=0
+        pipeline_round_dispatched=0
+        pipeline_round_reaped=0
+        pipeline_round_compiled=0
+        pipeline_round_before=$("$JQ" -cS . "$campaign_dir/state/pipeline.json")
+        pipeline_ordered_sweep
+        for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
+            pipeline_parallel_limit_reached && break
+            pipeline_basin_is_tracked "$basin_id" && continue
+            status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+                "$campaign_dir/state/pipeline.json")
+            [[ "$status" == pending ]] || continue
+            pipeline_selected_index "$basin_id"
+            selected_index=$pipeline_found_index
+            if ((pipeline_dispatch_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_DISPATCH_ATTEMPTS)); then
+                continue
+            fi
+            if ! pipeline_projected_occupancy_allows "$basin_id"; then
+                break
+            fi
+            if ! pipeline_dispatch_disk_guard; then
+                break
+            fi
+            pipeline_dispatch_attempts[$selected_index]=$((pipeline_dispatch_attempts[$selected_index] + 1))
+            transition_pipeline_basin "$basin_id" acquiring
+        ( pipeline_acquisition_worker "$basin_id" ) &
+            pipeline_worker_pids[${#pipeline_worker_pids[@]}]=$!
+            pipeline_worker_basin_ids[${#pipeline_worker_basin_ids[@]}]=$basin_id
+            pipeline_round_dispatched=1
+        done
+        calibration_observe dispatch
+        pipeline_consumer_basin_id=
+        for basin_id in ${pipeline_selected_basin_ids[@]+"${pipeline_selected_basin_ids[@]}"}; do
+            status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+                "$campaign_dir/state/pipeline.json")
+            [[ "$status" == ready ]] || continue
+            pipeline_selected_index "$basin_id"
+            selected_index=$pipeline_found_index
+            if ((pipeline_consume_attempts[$selected_index] >= HFX_TDX_PIPELINE_MAX_CONSUME_ATTEMPTS)); then
+                continue
+            fi
+            pipeline_consumer_basin_id=$basin_id
+            break
+        done
+        if [[ -n "$pipeline_consumer_basin_id" ]]; then
+            pipeline_selected_index "$pipeline_consumer_basin_id"
+            selected_index=$pipeline_found_index
+            pipeline_consume_attempts[$selected_index]=$((pipeline_consume_attempts[$selected_index] + 1))
+            transition_pipeline_basin "$pipeline_consumer_basin_id" compiling
+            calibration_compile_started
+        compile_basin_locked "$pipeline_consumer_basin_id" true
+            calibration_compile_finished
+            pipeline_recover_reconstruct_basin "$pipeline_consumer_basin_id"
+            pipeline_round_compiled=1
+            continue
+        fi
+        if ((${#pipeline_worker_pids[@]} > 0)); then
+            read_status=0
+            IFS= read -r -u 9 -t 1 pipeline_completion_record || read_status=$?
+            if pipeline_read_timed_out "$read_status"; then
+                pipeline_sweep_vanished_workers
+                calibration_observe vanished-sweep
+            else
+                completion_id=${pipeline_completion_record%%$'\t'*}
+                completion_status=${pipeline_completion_record#*$'\t'}
+                if [[ "$completion_id" == "$pipeline_completion_record" ||
+                      "$completion_status" == *$'\t'* ||
+                      ! "$completion_id" =~ ^[0-9]{10}$ ||
+                      ! "$completion_status" =~ ^[0-9]+$ ]] ||
+                    ((completion_status > 255)) ||
+                    ! pipeline_selected_index "$completion_id"; then
+                    hfx_die "malformed pipeline completion record: expected selected basin ID and exit status"
+                fi
+                selected_index=$pipeline_found_index
+                swept_completion_status=${pipeline_swept_completion_statuses[$selected_index]-}
+                if [[ -n "$swept_completion_status" ]]; then
+                    pipeline_swept_completion_statuses[$selected_index]=
+                    if ((swept_completion_status == completion_status)); then
+                        continue
+                    fi
+                fi
+                if ! pipeline_worker_index "$completion_id"; then
+                    continue
+                fi
+                selected_index=$pipeline_found_index
+                pipeline_wait_remove_worker "$selected_index"
+                calibration_observe ordinary-reap
+                ((pipeline_wait_status == completion_status)) ||
+                    hfx_die "pipeline completion status mismatch for $completion_id: record $completion_status; wait $pipeline_wait_status"
+                pipeline_round_reaped=1
+                pipeline_recover_reconstruct_basin "$completion_id"
+            fi
+            continue
+        fi
+        pipeline_round_after=$("$JQ" -cS . "$campaign_dir/state/pipeline.json")
+        [[ "$pipeline_round_before" == "$pipeline_round_after" ]] ||
+            pipeline_round_durable_changed=1
+        if ((pipeline_round_durable_changed == 0 && pipeline_round_dispatched == 0 &&
+             pipeline_round_reaped == 0 && pipeline_round_compiled == 0)); then
+            pipeline_finish_scheduler
+            break
+        fi
+    done
+    pipeline_scheduler_cleanup
+    trap 'release_takeover_guard; release_lock' EXIT
+    trap - INT TERM
+    validate_workspace_state
+    print_status
+    printf 'pipeline_durable_unreclaimed=0\n'
+}
+
+require_pipeline_selection() {
+    local selected_ids_json
+    local basin_id
+    local selected_ids=()
+    while IFS= read -r basin_id; do
+        selected_ids[${#selected_ids[@]}]=$basin_id
+    done < <(effective_basin_ids)
+    selected_ids_json=$("$JQ" -cn --args '$ARGS.positional' -- \
+        ${selected_ids[@]+"${selected_ids[@]}"})
+    "$JQ" -e --argjson selected "$selected_ids_json" '
+        .basin_ids == $selected and (.basins | keys) == $selected
+    ' "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die 'pipeline selection differs from durable campaign selection'
+}
+
+prepare_pipeline_durable_state() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
+    done < <(effective_basin_ids)
+    while IFS= read -r basin_id; do
+        recover_running_stages_for_basin "$basin_id" false
+    done < <(effective_basin_ids)
+}
+
+pipeline_unreclaimed_count() {
+    local basin_id
+    local count=0
+    while IFS= read -r basin_id; do
+        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+            "$campaign_dir/state/basins/$basin_id/current.json") != true ]]; then
+            count=$((count + 1))
+        fi
+    done < <(effective_basin_ids)
+    printf '%s\n' "$count"
+}
+
+reclaim_eligibility() {
+    local basin_id=$1
+    "$JQ" -r '
+      def eligible:
+        .stages.acquire_basins.status == "succeeded" and
+        .stages.acquire_streamnet.status == "succeeded" and
+        ([.stages.acquire_basins.failure_reason,.stages.acquire_streamnet.failure_reason] |
+         all(. != "acquisition report is unsafe or malformed; retained for inspection" and
+             . != "existing final file failed integrity verification; retained for inspection" and
+             . != "persisted evidence does not match final file; retained for inspection" and
+             . != "installed final failed integrity verification; retained for inspection")) and
+        .stages.compile.attempts > 0 and
+        ((.stages.compile.status == "succeeded" and
+          .stages.compile.failure_reason == null and
+          .stages.compile.diagnostic_report != null) or
+         (.stages.compile.status == "failed" and
+          (.stages.compile.failure_reason == "adapter build failed" or
+           .stages.compile.failure_reason == "adapter validation failed")));
+      if eligible then "eligible"
+      elif (.stages.compile.diagnostic_report = {} | eligible) then "missing-diagnostic"
+      else "ineligible"
+      end
+    ' "$campaign_dir/state/basins/$basin_id/current.json"
+}
+
+classify_pipeline_acquisition_stage() {
+    local basin_id=$1
+    local stage=$2
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local status
+    local reason
+    status=$("$JQ" -r --arg stage "$stage" '.stages[$stage].status' "$current")
+    reason=$("$JQ" -r --arg stage "$stage" '.stages[$stage].failure_reason // ""' "$current")
+    case $status in
+        succeeded) printf '%s\n' terminal ;;
+        pending) printf '%s\n' retryable ;;
+        failed)
+            case $reason in
+                'partial changed during ignored-Range continuation'|\
+                'continuation response failed provenance verification'|\
+                'transfer failed'|\
+                'download provenance or size verification failed'|\
+                'download failed integrity verification')
+                    printf '%s\n' retryable
+                    ;;
+                'acquisition report is unsafe or malformed; retained for inspection'|\
+                'existing final file failed integrity verification; retained for inspection'|\
+                'persisted evidence does not match final file; retained for inspection'|\
+                'partial provenance path is unsafe; retained without traversal'|\
+                'installed final failed integrity verification; retained for inspection')
+                    printf '%s\n' inspection
+                    ;;
+                *) hfx_die "pipeline acquisition classifier rejected failure reason for $basin_id $stage: $reason" ;;
+            esac
+            ;;
+        running) hfx_die "pipeline acquisition classifier found residual running stage for $basin_id $stage" ;;
+        *) hfx_die "pipeline acquisition classifier rejected status for $basin_id $stage: $status" ;;
+    esac
+}
+
+resolve_pipeline_compile_tools() {
+    if [[ -z "${ADAPTER_PYTHON-}" ]]; then
+        ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
+        ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
+        HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
+    fi
+}
+
+pipeline_source_path_present() {
+    local candidate_path=$1
+    if [[ -e "$candidate_path" || -L "$candidate_path" ]]; then
+        pipeline_source_present=1
+    fi
+}
+
+pipeline_has_physical_pair() {
+    local basin_id=$1
+    pipeline_source_present=0
+    for_each_pipeline_source_path "$basin_id" pipeline_source_path_present
+    ((pipeline_source_present == 1))
+}
+
+pipeline_has_complete_pair() {
+    local basin_id=$1
+    [[ ( -e "$campaign_dir/downloads/$basin_id-basins.gpkg" ||
+          -L "$campaign_dir/downloads/$basin_id-basins.gpkg" ) &&
+       ( -e "$campaign_dir/downloads/$basin_id-streamnet.gpkg" ||
+          -L "$campaign_dir/downloads/$basin_id-streamnet.gpkg" ) ]]
+}
+
+pipeline_basin_occupies_pair() {
+    local basin_id=$1
+    local status
+    if pipeline_has_physical_pair "$basin_id"; then
+        return 0
+    fi
+    status=$("$JQ" -r --arg id "$basin_id" '.basins[$id].status' \
+        "$campaign_dir/state/pipeline.json")
+    case $status in
+        acquiring|ready|compiling|terminal) return 0 ;;
+        pending|reclaimed|blocked) return 1 ;;
+        *) hfx_die "invalid pipeline status: $status" ;;
+    esac
+}
+
+pipeline_count_occupancy() {
+    local basin_id
+    local actual=0
+    # M5-S3B-2b must run ordered recovery, including blocked-retention reclaim,
+    # before this counter on a dispatch path or operator-resolvable state can
+    # abort a paid run through the disk guard.
+    while IFS= read -r basin_id; do
+        if pipeline_basin_occupies_pair "$basin_id"; then
+            actual=$((actual + 1))
+        fi
+    done < <(effective_basin_ids)
+    ((actual <= HFX_TDX_RECLAIM_PAIR_COUNT)) ||
+        hfx_die "pipeline occupancy invariant exceeded: observed $actual pairs; maximum 5"
+    pipeline_occupancy_count=$actual
+}
+
+pipeline_projected_occupancy_allows() {
+    local basin_id=$1
+    local projected
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] &&
+        "$JQ" -e --arg id "$basin_id" \
+            '(.basin_ids | index($id) != null) and (.basins | has($id))' \
+            "$campaign_dir/state/pipeline.json" >/dev/null ||
+        hfx_die "pipeline basin is not selected: $basin_id"
+    pipeline_count_occupancy
+    projected=$pipeline_occupancy_count
+    if ! pipeline_basin_occupies_pair "$basin_id"; then
+        projected=$((projected + 1))
+    fi
+    ((projected <= HFX_TDX_RECLAIM_PAIR_COUNT))
+}
+
+pipeline_available_bytes() {
+    local output
+    local normalized
+    local program='import os, sys
+path = sys.argv[1]
+s = os.statvfs(path)
+print(s.f_bavail * s.f_frsize)'
+    if ! output=$("$ADAPTER_PYTHON" -c "$program" "$campaign_dir"); then
+        hfx_die 'pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count'
+    fi
+    if ! normalized=$(normalize_nonnegative_i64 "$output"); then
+        hfx_die 'pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count'
+    fi
+    pipeline_available_byte_count=$normalized
+}
+
+pipeline_dispatch_disk_guard() {
+    local basin_id
+    local present_pairs=0
+    local required_bytes
+    pipeline_count_occupancy
+    while IFS= read -r basin_id; do
+        if pipeline_has_complete_pair "$basin_id"; then
+            present_pairs=$((present_pairs + 1))
+        fi
+    done < <(effective_basin_ids)
+    pipeline_available_bytes
+    required_bytes=$((HFX_TDX_RECLAIM_PEAK_BYTES -
+        present_pairs * HFX_TDX_RECLAIM_PAIR_BYTES))
+    if ((pipeline_available_byte_count < required_bytes)); then
+        printf 'insufficient pipeline dispatch disk: available %s bytes; required %s bytes\n' \
+            "$pipeline_available_byte_count" "$required_bytes" >&2
+        return 1
+    fi
+}
+
+pipeline_completion_path_is_safe() {
+    [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]] ||
+        hfx_die "unsafe pipeline completion path: $pipeline_completion_path; expected a non-symlink named pipe"
+}
+
+pipeline_completion_create_open() {
+    local program='import os, sys
+path = sys.argv[1]
+old_umask = os.umask(0)
+try:
+    os.mkfifo(path, 0o600)
+finally:
+    os.umask(old_umask)'
+    pipeline_completion_path=$campaign_dir/state/tmp/pipeline-completions.fifo
+    if [[ -e "$pipeline_completion_path" || -L "$pipeline_completion_path" ]]; then
+        if [[ -p "$pipeline_completion_path" && ! -L "$pipeline_completion_path" ]]; then
+            "$RM" -- "$pipeline_completion_path"
+        else
+            hfx_die "unsafe pipeline completion path: $pipeline_completion_path; expected a non-symlink named pipe"
+        fi
+    fi
+    "$ADAPTER_PYTHON" -c "$program" "$pipeline_completion_path" ||
+        hfx_die "could not create pipeline completion path: $pipeline_completion_path"
+    pipeline_completion_path_is_safe
+    exec 9<>"$pipeline_completion_path"
+}
+
+pipeline_completion_close_remove() {
+    pipeline_completion_path=$campaign_dir/state/tmp/pipeline-completions.fifo
+    exec 9>&-
+    pipeline_completion_path_is_safe
+    "$RM" -- "$pipeline_completion_path"
+}
+
+# M5-S3B-2b must capture nonzero read and wait statuses with || status=$?,
+# wait once per PID, and treat any nonzero read as timeout because descriptor 9
+# prevents EOF. A zombie can satisfy kill -0 for one additional bounded round.
+pipeline_acquisition_worker() {
+    lock_owned=0
+    takeover_owned=0
+    local basin_id=$1
+    [[ "$basin_id" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '$basin_id'; expected an authoritative 10-digit ID"
+    pipeline_worker_basin_id=$basin_id
+    pipeline_worker_status=0
+    trap 'pipeline_worker_status=$?; printf "%s\t%s\n" "$pipeline_worker_basin_id" "$pipeline_worker_status" >&9 || :; exit "$pipeline_worker_status"' EXIT
+    acquire_basin "$basin_id"
+}
+
+pipeline_finish_terminal() {
+    local basin_id=$1
+    if [[ $("$JQ" -r '.stages.compile.status' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == succeeded ]]; then
+        resolve_pipeline_compile_tools
+    fi
+    transition_pipeline_basin "$basin_id" terminal
+    reconcile_reclaim_basin "$basin_id" true ||
+        hfx_die "pipeline terminal basin was not reclaimable: $basin_id"
+    [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]] ||
+        hfx_die "pipeline reclaim did not persist terminal state: $basin_id"
+    validate_reclaimed_sources_absent "$basin_id"
+    transition_pipeline_basin "$basin_id" reclaimed
+}
+
+pipeline_rule_1() {
+    local basin_id=$1
+    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
+        validate_reclaimed_sources_absent "$basin_id"
+        transition_pipeline_basin "$basin_id" reclaimed
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_2() {
+    local basin_id=$1
+    [[ $(reclaim_eligibility "$basin_id") == eligible ]] || return 1
+    [[ $("$JQ" -r '.retention.inputs_reclaimed == false' \
+        "$campaign_dir/state/basins/$basin_id/current.json") == true ]] || return 1
+    pipeline_finish_terminal "$basin_id"
+}
+
+pipeline_rule_3() {
+    local basin_id=$1
+    local eligibility
+    local reason
+    [[ $(reclaim_eligibility "$basin_id") == missing-diagnostic ]] || return 1
+    resolve_pipeline_compile_tools
+    compile_basin_locked "$basin_id" true
+    eligibility=$(reclaim_eligibility "$basin_id")
+    if [[ "$eligibility" == eligible ]]; then
+        pipeline_finish_terminal "$basin_id"
+        return 0
+    fi
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' \
+        "$campaign_dir/state/basins/$basin_id/current.json")
+    if [[ "$reason" == 'existing compile artifacts failed resume verification; retained for inspection' ]]; then
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    hfx_die "pipeline rule 3 produced an unsupported durable result for $basin_id"
+}
+
+pipeline_rule_4() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    local eligibility
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    [[ $("$JQ" -r '.stages.compile.attempts > 0' "$current") == true ]] || return 1
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+    case $reason in
+        'compile artifact path already exists; retained for inspection'|\
+        'existing compile artifacts failed resume verification; retained for inspection')
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+            ;;
+    esac
+    if [[ -e "$campaign_dir/basin-outputs/$basin_id" ||
+        -L "$campaign_dir/basin-outputs/$basin_id" ||
+        -e "$campaign_dir/reports/$basin_id-build-report.json" ||
+        -L "$campaign_dir/reports/$basin_id-build-report.json" ]]; then
+        resolve_pipeline_compile_tools
+        compile_basin_locked "$basin_id" true
+        reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+        if [[ "$reason" == 'compile artifact path already exists; retained for inspection' ]]; then
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+        fi
+        eligibility=$(reclaim_eligibility "$basin_id")
+        if [[ "$eligibility" == eligible ]]; then
+            pipeline_finish_terminal "$basin_id"
+            return 0
+        fi
+        hfx_die "pipeline rule 4 produced an unsupported durable result for $basin_id"
+    fi
+    transition_pipeline_basin "$basin_id" blocked \
+        'interrupted compile attempt cannot be safely repeated; retained for inspection'
+}
+
+pipeline_rule_5() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    [[ $("$JQ" -r '
+      .stages.acquire_basins.status == "succeeded" and
+      .stages.acquire_streamnet.status == "succeeded" and
+      .stages.compile.attempts == 0 and
+      ((.stages.compile.status == "pending" and
+        .stages.compile.failure_reason == null) or
+       (.stages.compile.status == "failed" and
+        .stages.compile.failure_reason == "acquisition prerequisites are not both succeeded")) and
+      .stages.compile.diagnostic_report == null and
+      .retention.inputs_reclaimed == false
+    ' "$current") == true ]] || return 1
+    [[ ! -e "$campaign_dir/basin-outputs/$basin_id" &&
+        ! -L "$campaign_dir/basin-outputs/$basin_id" &&
+        ! -e "$campaign_dir/reports/$basin_id-build-report.json" &&
+        ! -L "$campaign_dir/reports/$basin_id-build-report.json" ]] || return 1
+    transition_pipeline_basin "$basin_id" ready
+}
+
+pipeline_rule_6() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    if [[ "$basins_class" == inspection || "$streamnet_class" == inspection ]]; then
+        if [[ "$basins_class" == inspection ]]; then
+            reason=$("$JQ" -r '.stages.acquire_basins.failure_reason' "$current")
+        else
+            reason=$("$JQ" -r '.stages.acquire_streamnet.failure_reason' "$current")
+        fi
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    if [[ "$basins_class" == retryable || "$streamnet_class" == retryable ]]; then
+        transition_pipeline_basin "$basin_id" pending
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_7() {
+    local basin_id=$1
+    local basins_class=$2
+    local streamnet_class=$3
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local reason
+    [[ "$basins_class" == terminal && "$streamnet_class" == terminal ]] || return 1
+    reason=$("$JQ" -r '.stages.compile.failure_reason // ""' "$current")
+    case $reason in
+        'compile artifact path already exists; retained for inspection'|\
+        'existing compile artifacts failed resume verification; retained for inspection')
+            transition_pipeline_basin "$basin_id" blocked "$reason"
+            return 0
+            ;;
+    esac
+    if [[ $("$JQ" -r '.stages.compile.attempts == 0' "$current") == true ]] &&
+        [[ "$reason" == 'acquisition prerequisites are not both succeeded' || -z "$reason" ]] &&
+        [[ -e "$campaign_dir/basin-outputs/$basin_id" ||
+            -L "$campaign_dir/basin-outputs/$basin_id" ||
+            -e "$campaign_dir/reports/$basin_id-build-report.json" ||
+            -L "$campaign_dir/reports/$basin_id-build-report.json" ]]; then
+        if [[ -z "$reason" ]]; then
+            reason='compile artifact path already exists; retained for inspection'
+        fi
+        transition_pipeline_basin "$basin_id" blocked "$reason"
+        return 0
+    fi
+    return 1
+}
+
+pipeline_rule_8() {
+    local basin_id=$1
+    hfx_die "pipeline durable compile state is contradictory for $basin_id"
+}
+
+reconstruct_pipeline_basin() {
+    local basin_id=$1
+    local basins_class
+    local streamnet_class
+    basins_class=$(classify_pipeline_acquisition_stage "$basin_id" acquire_basins)
+    streamnet_class=$(classify_pipeline_acquisition_stage "$basin_id" acquire_streamnet)
+    pipeline_rule_1 "$basin_id" && return
+    pipeline_rule_2 "$basin_id" && return
+    pipeline_rule_3 "$basin_id" && return
+    pipeline_rule_4 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_5 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_6 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_7 "$basin_id" "$basins_class" "$streamnet_class" && return
+    pipeline_rule_8 "$basin_id"
+}
+
+reconstruct_pipeline_records() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        reconstruct_pipeline_basin "$basin_id"
+    done < <(effective_basin_ids)
 }
 
 materialize_assembly_state() {
@@ -564,6 +2595,8 @@ initialize_campaign() {
     local requested_basin_id
     local seen_basin_ids=' '
     local selection_temporary=$campaign_dir/state/.selection.json.tmp.$$
+    local retention_json
+    local sizing_input_json
 
     if [[ -e "$campaign_dir" || -L "$campaign_dir" ]]; then
         [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] ||
@@ -611,40 +2644,50 @@ initialize_campaign() {
         validate_selection_file "$selection_temporary" "$temporary"
     fi
 
+    case $retention_policy in
+        retain-all-through-publication)
+            retention_json='{"policy":"retain-all-through-publication","reclaim_inputs":false,"retain_acquired_inputs":true,"retain_basin_outputs":true,"retain_external_reports":true}'
+            sizing_input_json="{\"retained_input_bytes\":$retained_input_bytes}"
+            ;;
+        reclaim-inputs-after-terminal)
+            retention_json='{"policy":"reclaim-inputs-after-terminal","reclaim_inputs":true,"retain_acquired_inputs":false,"retain_basin_outputs":true,"retain_external_reports":true}'
+            sizing_input_json="{\"peak_in_flight_download_bytes\":$peak_in_flight_download_bytes}"
+            ;;
+        *) hfx_die "unsupported retention policy: $retention_policy" ;;
+    esac
+
     temporary=$campaign_dir/state/.campaign.json.tmp.$$
     "$JQ" -n \
         --arg campaign "$campaign" \
+        --argjson retention "$retention_json" \
+        --argjson sizing_input "$sizing_input_json" \
         --argjson available_memory_bytes "$available_memory_bytes" \
         --argjson available_disk_bytes "$available_disk_bytes" \
-        --argjson retained_input_bytes "$retained_input_bytes" \
         --argjson retained_basin_output_bytes "$retained_basin_output_bytes" \
         --argjson assembly_memory_ceiling_bytes "$assembly_memory_ceiling_bytes" \
         --argjson assembly_scratch_ceiling_bytes "$assembly_scratch_ceiling_bytes" \
         --argjson assembled_artifact_bytes "$assembled_artifact_bytes" \
+        --argjson active_compile_scratch_bytes "$active_compile_scratch_bytes" \
+        --argjson filesystem_overhead_bytes "$filesystem_overhead_bytes" \
         --argjson required_memory_bytes "$required_memory_bytes" \
         --argjson required_disk_bytes "$required_disk_bytes" '
         {
-          schema_version: 1,
+          schema_version: 2,
           campaign: $campaign,
           inventory: {source: "adapters/tdx-hydro/data/tdx_header_numbers.json", count: 62},
-          retention: {
-            policy: "retain-all-through-publication",
-            reclaim_inputs: false,
-            retain_acquired_inputs: true,
-            retain_basin_outputs: true,
-            retain_external_reports: true
-          },
-          sizing: {
+          retention: $retention,
+          sizing: ({
             available_memory_bytes: $available_memory_bytes,
             available_disk_bytes: $available_disk_bytes,
-            retained_input_bytes: $retained_input_bytes,
             retained_basin_output_bytes: $retained_basin_output_bytes,
             assembly_memory_ceiling_bytes: $assembly_memory_ceiling_bytes,
             assembly_scratch_ceiling_bytes: $assembly_scratch_ceiling_bytes,
             assembled_artifact_bytes: $assembled_artifact_bytes,
+            active_compile_scratch_bytes: $active_compile_scratch_bytes,
+            filesystem_overhead_bytes: $filesystem_overhead_bytes,
             required_memory_bytes: $required_memory_bytes,
             required_disk_bytes: $required_disk_bytes
-          }
+          } + $sizing_input)
         }' >"$temporary"
     validate_campaign_json "$temporary"
 
@@ -700,32 +2743,41 @@ initialize_campaign() {
     while IFS= read -r basin_id; do
         "$MKDIR" "$campaign_dir/state/basins/$basin_id"
         temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-        "$JQ" -n --arg basin_id "$basin_id" '{
-          schema_version: 3,
+        "$JQ" -n --arg basin_id "$basin_id" --arg policy "$retention_policy" '{
+          schema_version: (if $policy == "reclaim-inputs-after-terminal" then 4 else 3 end),
           processing_basin_id: $basin_id,
+          retention: (if $policy == "reclaim-inputs-after-terminal"
+                      then {inputs_reclaimed:false,policy:$policy} else null end),
           stages: {
             acquire_basins: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
             acquire_streamnet: {status: "pending", attempts: 0, failure_reason: null, evidence: null},
             compile: {status: "pending", attempts: 0, failure_reason: null, diagnostic_report: null}
           }
-        }' >"$temporary"
+        } | if $policy == "reclaim-inputs-after-terminal" then . else del(.retention) end' >"$temporary"
         atomic_install "$temporary" "$campaign_dir/state/basins/$basin_id/current.json" validate_basin_json "$basin_id"
     done < <("$JQ" -r 'keys[]' "$campaign_dir/state/inventory.json")
     validate_workspace_state
     print_status
 }
 
-migrate_basin_states() {
-    local basin_id
+migrate_basin_state() {
+    local basin_id=$1
     local current
     local temporary
-    while IFS= read -r basin_id; do
-        current=$campaign_dir/state/basins/$basin_id/current.json
-        if [[ $("$JQ" -r '.schema_version' "$current") != 3 ]]; then
-            temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-            "$JQ" '
+    local policy
+    local target_version
+    policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    if [[ "$policy" == reclaim-inputs-after-terminal ]]; then
+        target_version=4
+    else
+        target_version=3
+    fi
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    if [[ $("$JQ" -r '.schema_version' "$current") != "$target_version" ]]; then
+        temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+        "$JQ" --argjson target_version "$target_version" --arg policy "$policy" '
                 .schema_version as $version |
-                .schema_version = 3 |
+                .schema_version = $target_version |
                 if $version == 1 then
                     .stages.acquire_basins.evidence = null |
                     .stages.acquire_streamnet.evidence = null |
@@ -734,23 +2786,33 @@ migrate_basin_states() {
                     .stages.acquire_streamnet |=
                         if .status == "succeeded" then .status = "pending" else . end
                 else . end |
-                .stages.compile.diagnostic_report = null
-            ' "$current" >"$temporary"
-            atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
-        fi
+                if $version == 1 or $version == 2 then
+                    .stages.compile.diagnostic_report = null
+                else . end |
+                if $target_version == 4 then
+                    .retention = {inputs_reclaimed:false,policy:$policy}
+                else del(.retention) end
+        ' "$current" >"$temporary"
+        atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+    fi
+}
+
+migrate_basin_states() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        migrate_basin_state "$basin_id"
     done < <(effective_basin_ids)
 }
 
-recover_running_stages() {
-    local acquisition_only=${1-false}
-    local basin_id
+recover_running_stages_for_basin() {
+    local basin_id=$1
+    local acquisition_only=${2-false}
     local current
     local temporary
-    while IFS= read -r basin_id; do
-        current=$campaign_dir/state/basins/$basin_id/current.json
-        if "$JQ" -e '[.stages[].status] | any(. == "running")' "$current" >/dev/null; then
-            temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-            "$JQ" --argjson acquisition_only "$acquisition_only" '
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    if "$JQ" -e '[.stages[].status] | any(. == "running")' "$current" >/dev/null; then
+        temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+        "$JQ" --argjson acquisition_only "$acquisition_only" '
                 .stages |= with_entries(
                     if .value.status == "running" and
                         (($acquisition_only | not) or .key == "acquire_basins" or .key == "acquire_streamnet") then
@@ -761,17 +2823,30 @@ recover_running_stages() {
                     else .
                     end
                 )
-            ' "$current" >"$temporary"
-            atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
-        fi
+        ' "$current" >"$temporary"
+        atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+    fi
+}
+
+recover_running_stages() {
+    local acquisition_only=${1-false}
+    local basin_id
+    while IFS= read -r basin_id; do
+        recover_running_stages_for_basin "$basin_id" "$acquisition_only"
     done < <(effective_basin_ids)
 }
 
 recover_campaign() {
+    local basin_id
     acquire_campaign_lock
     validate_workspace_state
     materialize_assembly_state
     recover_running_stages false
+    while IFS= read -r basin_id; do
+        if reconcile_reclaim_basin "$basin_id" false; then
+            :
+        fi
+    done < <(effective_basin_ids)
     if [[ $("$JQ" -r '.status' "$campaign_dir/state/assembly.json") == running ]]; then
         write_assembly_state pending \
             "$("$JQ" -r '.attempts' "$campaign_dir/state/assembly.json")" \
@@ -1047,8 +3122,109 @@ verify_compile_artifacts() {
     "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"
 }
 
-compile_campaign() {
-    local basin_id
+interrupt_reclaim_boundary() {
+    local basin_id=$1
+    local boundary=$2
+    if [[ ${HFX_TEST_INTERRUPT_AFTER-} == "$basin_id:$boundary" ]]; then
+        kill -TERM "$$"
+        exit 143
+    fi
+}
+
+reclaim_terminal_inputs() {
+    local basin_id=$1
+    local downloads=$campaign_dir/downloads
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+    local candidate_path
+    local paths=(
+        "$downloads/$basin_id-basins.gpkg"
+        "$downloads/$basin_id-basins.gpkg.partial"
+        "$downloads/$basin_id-basins.gpkg.partial.json"
+        "$downloads/$basin_id-streamnet.gpkg"
+        "$downloads/$basin_id-streamnet.gpkg.partial"
+        "$downloads/$basin_id-streamnet.gpkg.partial.json"
+    )
+
+    [[ -d "$downloads" && ! -L "$downloads" ]] ||
+        hfx_die "reclaim source path is unsafe for $basin_id: $downloads; move that exact path out of downloads, replace downloads with a non-symlink directory if needed, then rerun recover"
+    for candidate_path in ${paths[@]+"${paths[@]}"}; do
+        if [[ -e "$candidate_path" || -L "$candidate_path" ]]; then
+            [[ -f "$candidate_path" && ! -L "$candidate_path" ]] ||
+                hfx_die "reclaim source path is unsafe for $basin_id: $candidate_path; move that exact path out of downloads, replace downloads with a non-symlink directory if needed, then rerun recover"
+        fi
+    done
+
+    "$RM" -f -- "${paths[0]}" "${paths[1]}" "${paths[2]}"
+    interrupt_reclaim_boundary "$basin_id" basins-input-reclaimed
+    "$RM" -f -- "${paths[3]}" "${paths[4]}" "${paths[5]}"
+    interrupt_reclaim_boundary "$basin_id" streamnet-input-reclaimed
+    "$JQ" '.retention.inputs_reclaimed = true' "$current" >"$temporary"
+    atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+    interrupt_reclaim_boundary "$basin_id" reclaimed-state
+}
+
+reconcile_reclaim_basin() {
+    local basin_id=$1
+    local verify_success=$2
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local schema_version
+    local compile_status
+    local output=$campaign_dir/basin-outputs/$basin_id
+    local report=$campaign_dir/reports/$basin_id-build-report.json
+    local retained_path
+
+    validate_basin_json "$current" "$basin_id"
+    [[ $("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json") == reclaim-inputs-after-terminal ]] ||
+        return 1
+    schema_version=$("$JQ" -r '.schema_version' "$current")
+    [[ "$schema_version" == 4 ]] || return 1
+    compile_status=$("$JQ" -r '.stages.compile.status' "$current")
+
+    if [[ $("$JQ" -r '.retention.inputs_reclaimed' "$current") == true ]]; then
+        for retained_path in \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg" \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial" \
+            "$campaign_dir/downloads/$basin_id-basins.gpkg.partial.json" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial" \
+            "$campaign_dir/downloads/$basin_id-streamnet.gpkg.partial.json"; do
+            [[ ! -e "$retained_path" && ! -L "$retained_path" ]] ||
+                hfx_die "reclaimed basin source artifact remains for $basin_id: $retained_path; move that exact path out of downloads, then rerun recover"
+        done
+        if [[ "$verify_success" == true && "$compile_status" == succeeded ]]; then
+            diagnostic_report_json=
+            verify_compile_artifacts "$basin_id" "$output" "$report" ||
+                hfx_die "reclaimed compile artifacts failed verification for $basin_id; restore retained output and report, then rerun compile"
+        fi
+        return 0
+    fi
+
+    [[ $(reclaim_eligibility "$basin_id") == eligible ]] || return 1
+
+    if [[ "$compile_status" == succeeded ]]; then
+        if [[ "$verify_success" == true ]]; then
+            diagnostic_report_json=
+            verify_compile_artifacts "$basin_id" "$output" "$report" ||
+                hfx_die "compile artifacts failed verification before reclaim for $basin_id"
+        else
+            for retained_path in \
+                "$output/catchments.parquet" \
+                "$output/graph.parquet" \
+                "$output/aux/snap_stems.parquet" \
+                "$report"; do
+                [[ -f "$retained_path" && ! -L "$retained_path" ]] ||
+                    hfx_die "retained compile evidence is missing or unsafe for $basin_id: $retained_path"
+            done
+        fi
+    fi
+    reclaim_terminal_inputs "$basin_id"
+    return 0
+}
+
+compile_basin_core() {
+    local basin_id=$1
+    local defer_reclaim=${2-false}
     local current
     local acquire_basins_status
     local acquire_streamnet_status
@@ -1058,79 +3234,171 @@ compile_campaign() {
     local streamnet
     local output
     local report
+    [[ "$defer_reclaim" == true || "$defer_reclaim" == false ]] ||
+        hfx_die "invalid deferred reclaim value: $defer_reclaim"
 
+    if reconcile_reclaim_basin "$basin_id" true; then
+        return
+    fi
+    current=$campaign_dir/state/basins/$basin_id/current.json
+    acquire_basins_status=$("$JQ" -r '.stages.acquire_basins.status' "$current")
+    acquire_streamnet_status=$("$JQ" -r '.stages.acquire_streamnet.status' "$current")
+    compile_status=$("$JQ" -r '.stages.compile.status' "$current")
+    attempts=$("$JQ" -r '.stages.compile.attempts' "$current")
+
+    [[ "$acquire_basins_status" == succeeded && "$acquire_streamnet_status" == succeeded ]] ||
+        hfx_die "acquisition prerequisites are not both succeeded for $basin_id"
+
+    basins=$campaign_dir/downloads/$basin_id-basins.gpkg
+    streamnet=$campaign_dir/downloads/$basin_id-streamnet.gpkg
+    output=$campaign_dir/basin-outputs/$basin_id
+    report=$campaign_dir/reports/$basin_id-build-report.json
+
+    if [[ "$compile_status" == succeeded ]]; then
+        diagnostic_report_json=
+        if verify_compile_artifacts "$basin_id" "$output" "$report"; then
+            if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
+                write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+                if [[ "$defer_reclaim" == false ]] &&
+                    reconcile_reclaim_basin "$basin_id" true; then
+                    :
+                fi
+            fi
+            return
+        fi
+        write_compile_stage "$basin_id" failed "$attempts" \
+            'existing compile artifacts failed resume verification; retained for inspection' \
+            "${diagnostic_report_json:-null}"
+        return
+    fi
+
+    if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
+        diagnostic_report_json=
+        verify_compile_report "$basin_id" "$output" "$report" || :
+        write_compile_stage "$basin_id" failed "$attempts" \
+            'compile artifact path already exists; retained for inspection' \
+            "${diagnostic_report_json:-null}"
+        return
+    fi
+
+    attempts=$((attempts + 1))
+    write_compile_stage "$basin_id" running "$attempts" ''
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
+        --basins "$basins" \
+        --streamnet "$streamnet" \
+        --out "$output" \
+        --report "$report" \
+        --processing-basin-id "$basin_id" \
+        --fabric-version "$fabric_version"; then
+        diagnostic_report_json=
+        verify_compile_report "$basin_id" "$output" "$report" || :
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
+            "${diagnostic_report_json:-null}"
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    diagnostic_report_json=
+    if ! verify_compile_report "$basin_id" "$output" "$report"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
+        interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
+        interrupt_reclaim_boundary "$basin_id" terminal-state
+        if [[ "$defer_reclaim" == false ]] &&
+            reconcile_reclaim_basin "$basin_id" true; then
+            :
+        fi
+        return
+    fi
+    interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
+    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+    interrupt_reclaim_boundary "$basin_id" terminal-state
+    if [[ "$defer_reclaim" == false ]] &&
+        reconcile_reclaim_basin "$basin_id" true; then
+        :
+    fi
+}
+
+print_basin_compile_status() {
+    local basin_id=$1
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    printf 'processing_basin_id=%s\n' "$basin_id"
+    "$JQ" -r '
+      "compile_status=\(.stages.compile.status)",
+      "compile_attempts=\(.stages.compile.attempts)",
+      (if .schema_version == 4
+       then "inputs_reclaimed=\(.retention.inputs_reclaimed)"
+       else "inputs_reclaimed=not-applicable" end)
+    ' "$current"
+}
+
+compile_basin_locked() {
+    local basin_id=$1
+    local defer_reclaim=${2-false}
+    [[ "$defer_reclaim" == true || "$defer_reclaim" == false ]] ||
+        hfx_die "invalid deferred reclaim value: $defer_reclaim"
+    acquire_campaign_lock
+    validate_target_workspace_state "$basin_id"
+    migrate_basin_state "$basin_id"
+    recover_running_stages_for_basin "$basin_id" false
+    validate_target_workspace_state "$basin_id"
+    if reconcile_reclaim_basin "$basin_id" true; then
+        :
+    else
+        [[ $("$JQ" -r '.stages.acquire_basins.status' "$campaign_dir/state/basins/$basin_id/current.json") == succeeded &&
+            $("$JQ" -r '.stages.acquire_streamnet.status' "$campaign_dir/state/basins/$basin_id/current.json") == succeeded ]] ||
+            hfx_die "acquisition prerequisites are not both succeeded for $basin_id"
+    fi
+    establish_compile_contract
+    compile_basin_core "$basin_id" "$defer_reclaim"
+    validate_target_workspace_state "$basin_id"
+    print_basin_compile_status "$basin_id"
+}
+
+compile_selected_basin() {
+    local basin_id=$1
+    acquire_campaign_lock
+    validate_target_workspace_state "$basin_id"
+    compile_basin_locked "$basin_id"
+}
+
+compile_campaign() {
+    local basin_id
+    local current
+    local attempts
     acquire_campaign_lock
     validate_workspace_state
     establish_compile_contract
     migrate_basin_states
     recover_running_stages false
     validate_workspace_state
-
     while IFS= read -r basin_id; do
+        if reconcile_reclaim_basin "$basin_id" true; then
+            continue
+        fi
         current=$campaign_dir/state/basins/$basin_id/current.json
-        acquire_basins_status=$("$JQ" -r '.stages.acquire_basins.status' "$current")
-        acquire_streamnet_status=$("$JQ" -r '.stages.acquire_streamnet.status' "$current")
-        compile_status=$("$JQ" -r '.stages.compile.status' "$current")
         attempts=$("$JQ" -r '.stages.compile.attempts' "$current")
-
-        if [[ "$acquire_basins_status" != succeeded || "$acquire_streamnet_status" != succeeded ]]; then
+        if [[ $("$JQ" -r '.stages.acquire_basins.status' "$current") != succeeded ||
+            $("$JQ" -r '.stages.acquire_streamnet.status' "$current") != succeeded ]]; then
             write_compile_stage "$basin_id" failed "$attempts" \
                 'acquisition prerequisites are not both succeeded'
             continue
         fi
-
-        basins=$campaign_dir/downloads/$basin_id-basins.gpkg
-        streamnet=$campaign_dir/downloads/$basin_id-streamnet.gpkg
-        output=$campaign_dir/basin-outputs/$basin_id
-        report=$campaign_dir/reports/$basin_id-build-report.json
-
-        if [[ "$compile_status" == succeeded ]]; then
-            diagnostic_report_json=
-            if verify_compile_artifacts "$basin_id" "$output" "$report"; then
-                if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
-                    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
-                fi
-                continue
-            fi
-            write_compile_stage "$basin_id" failed "$attempts" \
-                'existing compile artifacts failed resume verification; retained for inspection' \
-                "${diagnostic_report_json:-null}"
-            continue
-        fi
-
-        if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
-            diagnostic_report_json=
-            verify_compile_report "$basin_id" "$output" "$report" || :
-            write_compile_stage "$basin_id" failed "$attempts" \
-                'compile artifact path already exists; retained for inspection' \
-                "${diagnostic_report_json:-null}"
-            continue
-        fi
-
-        attempts=$((attempts + 1))
-        write_compile_stage "$basin_id" running "$attempts" ''
-        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" build \
-            --basins "$basins" \
-            --streamnet "$streamnet" \
-            --out "$output" \
-            --report "$report" \
-            --processing-basin-id "$basin_id" \
-            --fabric-version "$fabric_version"; then
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed'
-            continue
-        fi
-        diagnostic_report_json=
-        if ! verify_compile_report "$basin_id" "$output" "$report"; then
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
-            continue
-        fi
-        if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
-            write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
-            continue
-        fi
-        write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+        compile_basin_core "$basin_id"
     done < <(effective_basin_ids)
-
     validate_workspace_state
     print_status
 }
@@ -1282,12 +3550,12 @@ generate_evidence() {
     : >"$states"
     while IFS= read -r basin_id; do
         current=$campaign_dir/state/basins/$basin_id/current.json
-        [[ $("$JQ" -r '.schema_version' "$current") == 3 ]] ||
-            hfx_die "legacy basin state requires compile rerun before evidence: $basin_id"
+        case $("$JQ" -r '.schema_version' "$current") in
+            3|4) ;;
+            *) hfx_die "legacy basin state requires compile rerun before evidence: $basin_id" ;;
+        esac
         if "$JQ" -e '
-          (.stages.compile.status == "succeeded" and .stages.compile.diagnostic_report == null) or
-          (.stages.compile.failure_reason == "adapter validation failed" and
-            .stages.compile.diagnostic_report == null)
+          .stages.compile.status == "succeeded" and .stages.compile.diagnostic_report == null
         ' "$current" >/dev/null; then
             hfx_die "diagnostic state is incomplete for $basin_id; rerun compile"
         fi
@@ -2246,9 +4514,14 @@ acquire_product() {
 }
 
 acquire_basin() {
-    local basin_id=$1
     lock_owned=0
     takeover_owned=0
+    local basin_id=$1
+    # Bash clears a parent-set EXIT trap in an & subshell. These resets remain
+    # defense in depth so a worker can never satisfy campaign-lock re-entry.
+    if reconcile_reclaim_basin "$basin_id" false; then
+        return
+    fi
     acquire_product "$basin_id" basins
     acquire_product "$basin_id" streamnet
 }
@@ -2285,8 +4558,12 @@ interrupt_acquisition() {
 
 acquire_campaign() {
     local basin_id
+    local locked_retention_policy
     acquire_campaign_lock
     validate_workspace_state
+    locked_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$locked_retention_policy" == "$acquire_retention_policy" ]] ||
+        hfx_die 'campaign retention policy changed while acquiring the campaign lock'
     migrate_basin_states
     recover_running_stages true
     validate_workspace_state
@@ -2307,6 +4584,123 @@ acquire_campaign() {
     print_status
 }
 
+calibrate_campaign() {
+    local state=$campaign_dir/state/calibration.json
+    local temporary=$campaign_dir/state/tmp/calibration.json.tmp.$$
+    local status
+    local other_status
+    local ids
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_campaign_json "$campaign_dir/state/campaign.json"
+    acquire_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
+        hfx_die 'calibrate requires retention policy reclaim-inputs-after-terminal'
+    CURL=$(resolve_command HFX_TDX_CURL curl)
+    SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+    OD=$(resolve_command HFX_TDX_OD od)
+    OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+    acquire_campaign_lock
+    validate_workspace_state
+    if [[ ! -e "$state" && ! -L "$state" ]]; then
+        if [[ "$max_parallel" == 2 ]]; then
+            calibration_first_start_valid "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" ||
+                hfx_die 'calibration cohort has prior durable work; recover it before calibration'
+        else
+            hfx_die 'parallel-2 calibration must be measured before parallel-4 starts'
+        fi
+    fi
+    materialize_calibration_state
+    [[ $("$JQ" -r '.fabric_version' "$state") == "$fabric_version" ]] ||
+        hfx_die 'calibration fabric version is immutable'
+    status=$("$JQ" -r --arg name "parallel-$max_parallel" '.cohorts[$name].status' "$state")
+    if [[ "$max_parallel" == 2 ]]; then
+        calibration_name=parallel-2
+        ids=$HFX_TDX_CALIBRATION_PARALLEL_2_IDS
+        other_status=$("$JQ" -r '.cohorts["parallel-4"].status' "$state")
+        [[ "$other_status" == pending || ("$status" == measured && "$other_status" == measured) ]] ||
+            hfx_die 'calibration cohort status ordering is malformed'
+    else
+        calibration_name=parallel-4
+        ids=$HFX_TDX_CALIBRATION_PARALLEL_4_IDS
+        other_status=$("$JQ" -r '.cohorts["parallel-2"].status' "$state")
+        [[ "$other_status" == measured ]] || hfx_die 'parallel-2 calibration must be measured before parallel-4 starts'
+    fi
+    calibration_install_cohort "$calibration_name" "$max_parallel" "$ids"
+    if [[ "$status" == measured ]]; then
+        if [[ -f "$campaign_dir/state/pipeline.json" && ! -L "$campaign_dir/state/pipeline.json" ]]; then
+            calibration_attempts=$("$JQ" -r --arg name "$calibration_name" '.cohorts[$name].attempts' "$state")
+            calibration_terminal_reclaimed || hfx_die 'measured calibration retained a nonterminal pipeline snapshot'
+            calibration_finalize
+        fi
+        calibration_freeze_selection
+    print_calibration_disclosure
+        return
+    fi
+    calibration_attempts=$("$JQ" -r --arg name "$calibration_name" '.cohorts[$name].attempts' "$state")
+    if [[ "$status" == pending ]]; then
+        calibration_first_start_valid || hfx_die 'calibration cohort has prior durable work; recover it before calibration'
+    fi
+    if calibration_terminal_reclaimed; then
+        ((calibration_attempts > 0)) || hfx_die 'terminal calibration cohort has no retained attempt'
+        calibration_orphan_trace=$campaign_dir/state/calibration/$calibration_name-attempt-$((calibration_attempts + 1)).samples.tsv
+        if [[ -e "$calibration_orphan_trace" || -L "$calibration_orphan_trace" ]]; then
+            [[ -f "$calibration_orphan_trace" && ! -L "$calibration_orphan_trace" ]] ||
+                hfx_die "calibration attempt trace is unsafe: $calibration_orphan_trace"
+            "$RM" -- "$calibration_orphan_trace"
+        fi
+        calibration_trace_file=$campaign_dir/state/calibration/$calibration_name-attempt-$calibration_attempts.samples.tsv
+        calibration_scan_traces
+        calibration_compile_completions=${calibration_completions[$calibration_last_index]}
+        calibration_compile_wall_seconds=${calibration_walls[$calibration_last_index]}
+        calibration_append_terminal_sample
+        calibration_finalize
+        calibration_freeze_selection
+    print_calibration_disclosure
+        return
+    fi
+    resolve_pipeline_compile_tools
+    calibration_admit
+    calibration_attempt=$((calibration_attempts + 1))
+    calibration_trace_file=$campaign_dir/state/calibration/$calibration_name-attempt-$calibration_attempt.samples.tsv
+    if [[ -e "$calibration_trace_file" || -L "$calibration_trace_file" ]]; then
+        [[ -f "$calibration_trace_file" && ! -L "$calibration_trace_file" ]] ||
+            hfx_die "calibration attempt trace is unsafe: $calibration_trace_file"
+    fi
+    if ((calibration_attempts > 0)); then
+        calibration_scan_require_complete=0
+        calibration_scan_traces
+        calibration_scan_require_complete=1
+        calibration_compile_completions=${calibration_completions[$calibration_last_index]}
+        calibration_compile_wall_seconds=${calibration_walls[$calibration_last_index]}
+    else
+        calibration_compile_completions=0
+        calibration_compile_wall_seconds=0
+    fi
+    (umask 022; : >"$calibration_trace_file")
+    [[ -f "$calibration_trace_file" && ! -L "$calibration_trace_file" ]] || hfx_die 'could not create calibration attempt trace'
+    calibration_compile_basin=
+    calibration_active=1
+    calibration_now
+    calibration_product_bytes
+    calibration_append_sample "$calibration_timestamp" "$calibration_byte_count" 0 \
+        "$calibration_compile_completions" "$calibration_compile_wall_seconds"
+    "$JQ" --arg name "$calibration_name" --argjson attempt "$calibration_attempt" '
+        .cohorts[$name].status="running" | .cohorts[$name].attempts=$attempt
+    ' "$state" >"$temporary"
+    atomic_install "$temporary" "$state" validate_calibration_json
+    release_takeover_guard
+    release_lock
+    pipeline_campaign
+    [[ -z "$calibration_compile_basin" ]] || hfx_die 'unmatched calibration compile callback'
+    calibration_append_terminal_sample
+    calibration_active=0
+    calibration_attempts=$calibration_attempt
+    calibration_finalize
+    calibration_freeze_selection
+    effective_basin_ids_file=
+        print_calibration_disclosure
+}
+
 if (($# == 1)) && [[ "$1" == -h || "$1" == --help ]]; then
     usage
     exit 0
@@ -2315,7 +4709,7 @@ fi
 subcommand=$1
 shift
 case $subcommand in
-    init|status|recover|acquire|compile|assemble|evidence|publish) ;;
+    init|status|recover|acquire|compile|compile-basin|progress|pipeline|calibrate|checkpoint|checkpoint-resume|assemble|evidence|publish) ;;
     *) usage_error "unknown subcommand $subcommand" ;;
 esac
 
@@ -2326,15 +4720,25 @@ workspace_seen=0
 available_memory_bytes=
 available_disk_bytes=
 retained_input_bytes=
+peak_in_flight_download_bytes=
 retained_basin_output_bytes=
 assembly_memory_ceiling_bytes=
 assembly_scratch_ceiling_bytes=
 assembled_artifact_bytes=
+active_compile_scratch_bytes=
+filesystem_overhead_bytes=
 sizing_seen=' '
+retention_policy=retain-all-through-publication
+retention_policy_seen=0
+effective_basin_ids_file=
+calibration_active=0
+calibration_compile_basin=
 max_parallel=
 max_parallel_seen=0
 fabric_version=
 fabric_version_seen=0
+expected_terminal_count=
+expected_terminal_count_seen=0
 publication_out=
 publication_out_seen=0
 publication_report=
@@ -2350,9 +4754,13 @@ basin_ids=()
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--basin|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--max-parallel|--fabric-version|--out|--report|--notice|--citation|--scratch-prefix)
+        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--fabric-version|--expected-terminal-count|--out|--report|--notice|--citation|--scratch-prefix)
             shift
-            (($# > 0)) && [[ -n "$1" && "$1" != -* ]] || usage_error "option $option requires a value"
+            (($# > 0)) && [[ -n "$1" ]] || usage_error "option $option requires a value"
+            if [[ "$1" == -* ]] &&
+                ! [[ "$option" == --max-parallel && "$1" =~ ^-[0-9]+$ ]]; then
+                usage_error "option $option requires a value"
+            fi
             value=$1
             ;;
         -*) usage_error "unknown option $option" ;;
@@ -2370,20 +4778,37 @@ while (($# > 0)); do
             workspace_root=$value
             ;;
         --basin)
-            [[ "$subcommand" == init ]] || usage_error 'option --basin is valid only for init'
+            [[ "$subcommand" == init || "$subcommand" == compile-basin ]] ||
+                usage_error 'option --basin is valid only for init or compile-basin'
             basin_ids[${#basin_ids[@]}]=$value
             ;;
+        --retention-policy)
+            [[ "$subcommand" == init ]] || usage_error 'option --retention-policy is valid only for init'
+            ((retention_policy_seen == 0)) || usage_error 'option --retention-policy may not be repeated'
+            retention_policy_seen=1
+            retention_policy=$value
+            ;;
         --max-parallel)
-            [[ "$subcommand" == acquire ]] || usage_error 'option --max-parallel is valid only for acquire'
+            [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" == calibrate ]] ||
+                usage_error 'option --max-parallel is valid only for acquire, pipeline, or calibrate'
             ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
             max_parallel_seen=1
             max_parallel=$value
             ;;
         --fabric-version)
-            [[ "$subcommand" == compile ]] || usage_error 'option --fabric-version is valid only for compile'
+            [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline || "$subcommand" == calibrate ]] ||
+                usage_error 'option --fabric-version is valid only for compile, compile-basin, pipeline, or calibrate'
             ((fabric_version_seen == 0)) || usage_error 'option --fabric-version may not be repeated'
             fabric_version_seen=1
             fabric_version=$value
+            ;;
+        --expected-terminal-count)
+            [[ "$subcommand" == checkpoint ]] ||
+                usage_error 'option --expected-terminal-count is valid only for checkpoint'
+            ((expected_terminal_count_seen == 0)) ||
+                usage_error 'option --expected-terminal-count may not be repeated'
+            expected_terminal_count_seen=1
+            expected_terminal_count=$value
             ;;
         --out)
             [[ "$subcommand" == publish ]] || usage_error 'option --out is valid only for publish'
@@ -2448,19 +4873,69 @@ validate_inventory_file "$inventory_source"
 campaign_dir=$workspace_root/tdx-hydro-$campaign
 trap 'release_takeover_guard; release_lock' EXIT
 
+if [[ "$subcommand" == checkpoint ]]; then
+    ((expected_terminal_count_seen == 1)) ||
+        usage_error 'option --expected-terminal-count is required for checkpoint'
+    [[ "$expected_terminal_count" =~ ^([1-9]|[1-5][0-9]|6[0-2])$ ]] ||
+        usage_error 'option --expected-terminal-count must be a canonical base-10 integer from 1 through 62'
+elif ((expected_terminal_count_seen != 0)); then
+    usage_error 'option --expected-terminal-count is valid only for checkpoint'
+fi
+
+if [[ "$subcommand" == compile-basin ]]; then
+    ((${#basin_ids[@]} > 0)) || usage_error 'option --basin is required for compile-basin'
+    ((${#basin_ids[@]} == 1)) ||
+        usage_error 'option --basin may be specified exactly once for compile-basin'
+    [[ "${basin_ids[0]}" =~ ^[0-9]{10}$ ]] ||
+        hfx_die "invalid processing basin ID '${basin_ids[0]}'; expected an authoritative 10-digit ID"
+fi
+if [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline || "$subcommand" == calibrate ]]; then
+    ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
+    [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
+        usage_error 'option --fabric-version requires a non-empty non-option value'
+    [[ ! "$fabric_version" =~ [[:cntrl:]] ]] ||
+        usage_error 'option --fabric-version must not contain ASCII control characters'
+fi
+
 if [[ "$subcommand" == init ]]; then
-    for variable_name in available_memory_bytes available_disk_bytes retained_input_bytes retained_basin_output_bytes assembly_memory_ceiling_bytes assembly_scratch_ceiling_bytes assembled_artifact_bytes; do
+    case $retention_policy in
+        retain-all-through-publication)
+            [[ -n "$retained_input_bytes" ]] || usage_error 'option --retained-input-bytes is required'
+            [[ -z "$peak_in_flight_download_bytes" ]] ||
+                usage_error 'option --peak-in-flight-download-bytes is incompatible with retention policy retain-all-through-publication'
+            policy_input_name=retained_input_bytes
+            ;;
+        reclaim-inputs-after-terminal)
+            [[ -n "$peak_in_flight_download_bytes" ]] ||
+                usage_error 'option --peak-in-flight-download-bytes is required'
+            [[ -z "$retained_input_bytes" ]] ||
+                usage_error 'option --retained-input-bytes is incompatible with retention policy reclaim-inputs-after-terminal'
+            policy_input_name=peak_in_flight_download_bytes
+            ;;
+        *) usage_error "invalid retention policy '$retention_policy'; expected retain-all-through-publication or reclaim-inputs-after-terminal" ;;
+    esac
+    for variable_name in available_memory_bytes available_disk_bytes retained_basin_output_bytes assembly_memory_ceiling_bytes assembly_scratch_ceiling_bytes assembled_artifact_bytes active_compile_scratch_bytes filesystem_overhead_bytes "$policy_input_name"; do
         eval "value=\${$variable_name-}"
         [[ -n "$value" ]] || usage_error "option --${variable_name//_/-} is required"
         value=$(normalize_positive_i64 "$variable_name" "$value")
         eval "$variable_name=\$value"
     done
+    if [[ "$retention_policy" == reclaim-inputs-after-terminal ]] &&
+        [[ "$peak_in_flight_download_bytes" != "$HFX_TDX_RECLAIM_PEAK_BYTES" ]]; then
+        usage_error "option --peak-in-flight-download-bytes must equal $HFX_TDX_RECLAIM_PEAK_BYTES for retention policy reclaim-inputs-after-terminal"
+    fi
     required_memory_bytes=$assembly_memory_ceiling_bytes
+    assembly_peak_bytes=$assembly_scratch_ceiling_bytes
+    if ((assembled_artifact_bytes > assembly_peak_bytes)); then
+        assembly_peak_bytes=$assembled_artifact_bytes
+    fi
     required_disk_bytes=0
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$retained_input_bytes")
+    eval "policy_input_bytes=\${$policy_input_name}"
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$policy_input_bytes")
     required_disk_bytes=$(checked_add "$required_disk_bytes" "$retained_basin_output_bytes")
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembly_scratch_ceiling_bytes")
-    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembled_artifact_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$active_compile_scratch_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$assembly_peak_bytes")
+    required_disk_bytes=$(checked_add "$required_disk_bytes" "$filesystem_overhead_bytes")
     ((available_memory_bytes >= required_memory_bytes)) ||
         hfx_die "insufficient memory: available $available_memory_bytes bytes; required $required_memory_bytes bytes"
     ((available_disk_bytes >= required_disk_bytes)) ||
@@ -2470,32 +4945,82 @@ elif [[ "$subcommand" == status ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     acquire_campaign_lock
     validate_workspace_state
+    if [[ -e "$campaign_dir/state/calibration.json" || -L "$campaign_dir/state/calibration.json" ]]; then
+        if ! (validate_calibration_json "$campaign_dir/state/calibration.json") 2>/dev/null; then
+            printf 'calibration_state=malformed\n'
+        fi
+    fi
+    print_status
+elif [[ "$subcommand" == progress ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_workspace_state
     print_status
 elif [[ "$subcommand" == recover ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     recover_campaign
-elif [[ "$subcommand" == acquire ]]; then
+elif [[ "$subcommand" == checkpoint || "$subcommand" == checkpoint-resume ]]; then
+    [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
+    validate_campaign_structure
+    if [[ "$subcommand" == checkpoint ]]; then
+        if [[ -e "$campaign_dir/state/checkpoints.json" || -L "$campaign_dir/state/checkpoints.json" ]] &&
+            ! (validate_checkpoints_json "$campaign_dir/state/checkpoints.json") 2>/dev/null; then
+            hfx_die 'checkpoint state is malformed; run checkpoint-resume, then rerun the same checkpoint command'
+        fi
+        checkpoint_campaign
+    else
+        checkpoint_resume_campaign
+    fi
+elif [[ "$subcommand" == acquire || "$subcommand" == pipeline || "$subcommand" == calibrate ]]; then
     ((max_parallel_seen == 1)) || usage_error 'option --max-parallel is required'
+    if [[ "$subcommand" == calibrate ]]; then
+        [[ "$max_parallel" == 2 || "$max_parallel" == 4 ]] ||
+            usage_error 'option --max-parallel must be 2 or 4 for calibrate'
+        calibrate_campaign
+        exit 0
+    fi
     [[ "$max_parallel" =~ ^[0-9]+$ ]] || usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     ((max_parallel >= 1 && max_parallel <= 62)) ||
         usage_error 'option --max-parallel must be a base-10 integer from 1 through 62'
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
-    CURL=$(resolve_command HFX_TDX_CURL curl)
-    SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
-    OD=$(resolve_command HFX_TDX_OD od)
-    OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
-    acquire_campaign
-elif [[ "$subcommand" == compile ]]; then
-    ((fabric_version_seen == 1)) || usage_error 'option --fabric-version is required'
-    [[ -n "$fabric_version" && "$fabric_version" != -* ]] ||
-        usage_error 'option --fabric-version requires a non-empty non-option value'
-    [[ ! "$fabric_version" =~ [[:cntrl:]] ]] ||
-        usage_error 'option --fabric-version must not contain ASCII control characters'
+    validate_campaign_json "$campaign_dir/state/campaign.json"
+    acquire_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
+    if [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]]; then
+        ((max_parallel >= 1 && max_parallel <= HFX_TDX_RECLAIM_MAX_PARALLEL)) ||
+            usage_error "option --max-parallel must be a base-10 integer from 1 through $HFX_TDX_RECLAIM_MAX_PARALLEL for retention policy reclaim-inputs-after-terminal"
+    fi
+    if [[ "$subcommand" == acquire ]]; then
+        CURL=$(resolve_command HFX_TDX_CURL curl)
+        SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+        OD=$(resolve_command HFX_TDX_OD od)
+        OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+        acquire_campaign
+    else
+        [[ "$acquire_retention_policy" == reclaim-inputs-after-terminal ]] ||
+            hfx_die 'pipeline requires retention policy reclaim-inputs-after-terminal'
+        checkpoint_require_pipeline_running_prelock
+        if [[ -e "$campaign_dir/state/calibration.json" || -L "$campaign_dir/state/calibration.json" ]]; then
+            validate_calibration_json "$campaign_dir/state/calibration.json"
+            [[ $("$JQ" -r '.fabric_version' "$campaign_dir/state/calibration.json") == "$fabric_version" ]] ||
+                hfx_die 'pipeline fabric version differs from frozen calibration fabric version'
+            calibration_selection=$("$JQ" -r '.selected_max_parallel // "pending"' "$campaign_dir/state/calibration.json")
+            calibration_require_pipeline_freeze
+        fi
+        CURL=$(resolve_command HFX_TDX_CURL curl)
+        SHA256SUM=$(resolve_command HFX_TDX_SHA256SUM sha256sum)
+        OD=$(resolve_command HFX_TDX_OD od)
+        OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
+        pipeline_campaign
+    fi
+elif [[ "$subcommand" == compile || "$subcommand" == compile-basin ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")
     ADAPTER_SCRIPT=${HFX_TDX_ADAPTER_SCRIPT-$repo_root/adapters/tdx-hydro/build_adapter.py}
     HFX=$(resolve_command HFX_TDX_HFX "$HFX_TDX_DEFAULT_HFX")
-    compile_campaign
+    if [[ "$subcommand" == compile-basin ]]; then
+        compile_selected_basin "${basin_ids[0]}"
+    else
+        compile_campaign
+    fi
 elif [[ "$subcommand" == assemble ]]; then
     [[ -d "$campaign_dir" && ! -L "$campaign_dir" ]] || hfx_die "campaign does not exist safely: $campaign_dir"
     ADAPTER_PYTHON=$(resolve_command HFX_TDX_ADAPTER_PYTHON "$HFX_TDX_DEFAULT_ADAPTER_PYTHON")

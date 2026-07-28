@@ -29,6 +29,44 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 set +x
 
+if [ "${HFX_TEST_GLOBAL_WATCHDOG_CHILD-}" != 1 ]; then
+    watchdog_script_dir=$(cd -P -- "${BASH_SOURCE[0]%/*}" && pwd)
+    watchdog_script=$watchdog_script_dir/${BASH_SOURCE[0]##*/}
+    export HFX_TEST_GLOBAL_WATCHDOG_CHILD=1
+    /bin/bash "$watchdog_script" "$@" &
+    watchdog_pid=$!
+    watchdog_attempt=0
+    while [ "$watchdog_attempt" -lt 1800 ]; do
+        watchdog_live=0
+        for watchdog_job in $(jobs -pr); do
+            [ "$watchdog_job" != "$watchdog_pid" ] || watchdog_live=1
+        done
+        [ "$watchdog_live" -eq 1 ] || break
+        watchdog_attempt=$((watchdog_attempt + 1))
+        sleep 1
+    done
+    if [ "$watchdog_attempt" -lt 1800 ]; then
+        watchdog_status=0
+        wait "$watchdog_pid" || watchdog_status=$?
+        exit "$watchdog_status"
+    fi
+    kill -TERM "$watchdog_pid" 2>/dev/null || :
+    watchdog_attempt=0
+    while [ "$watchdog_attempt" -lt 5 ]; do
+        watchdog_live=0
+        for watchdog_job in $(jobs -pr); do
+            [ "$watchdog_job" != "$watchdog_pid" ] || watchdog_live=1
+        done
+        [ "$watchdog_live" -eq 1 ] || break
+        watchdog_attempt=$((watchdog_attempt + 1))
+        sleep 1
+    done
+    [ "$watchdog_live" -eq 0 ] || kill -KILL "$watchdog_pid" 2>/dev/null || :
+    wait "$watchdog_pid" 2>/dev/null || :
+    printf '%s\n' 'test-tdx-hydro-campaign: error: global timeout after 1800 seconds' >&2
+    exit 1
+fi
+
 die() {
     printf 'test-tdx-hydro-campaign: error: %s\n' "$*" >&2
     exit 1
@@ -84,12 +122,14 @@ init_args() {
     printf '%s\n' \
         init --campaign "$1" --workspace-root "$2" \
         --available-memory-bytes 11 \
-        --available-disk-bytes 26 \
+        --available-disk-bytes 29 \
         --retained-input-bytes 5 \
         --retained-basin-output-bytes 6 \
         --assembly-memory-ceiling-bytes 11 \
         --assembly-scratch-ceiling-bytes 7 \
-        --assembled-artifact-bytes 8
+        --assembled-artifact-bytes 8 \
+        --active-compile-scratch-bytes 9 \
+        --filesystem-overhead-bytes 1
 }
 
 subset_init_args() {
@@ -99,12 +139,32 @@ subset_init_args() {
         --basin 1020000010 \
         --basin 9020000010 \
         --available-memory-bytes 11 \
-        --available-disk-bytes 26 \
+        --available-disk-bytes 29 \
         --retained-input-bytes 5 \
         --retained-basin-output-bytes 6 \
         --assembly-memory-ceiling-bytes 11 \
         --assembly-scratch-ceiling-bytes 7 \
-        --assembled-artifact-bytes 8
+        --assembled-artifact-bytes 8 \
+        --active-compile-scratch-bytes 9 \
+        --filesystem-overhead-bytes 1
+}
+
+reclaim_subset_init_args() {
+    printf '%s\n' \
+        init --campaign "$1" --workspace-root "$2" \
+        --basin 7020000010 \
+        --basin 1020000010 \
+        --basin 9020000010 \
+        --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 30000000000 \
+        --available-disk-bytes 491737129060 \
+        --peak-in-flight-download-bytes 44296724480 \
+        --retained-basin-output-bytes 206220202290 \
+        --assembly-memory-ceiling-bytes 30000000000 \
+        --assembly-scratch-ceiling-bytes 206220202290 \
+        --assembled-artifact-bytes 206220202290 \
+        --active-compile-scratch-bytes 30000000000 \
+        --filesystem-overhead-bytes 5000000000
 }
 
 copy_workspace() {
@@ -199,7 +259,7 @@ if [[ -x /bin/bash && "$selected_bash" != /bin/bash ]]; then
     die 'the harness did not select /bin/bash'
 fi
 
-for command_name in jq grep diff find sort wc mktemp mkdir cp rm mv chmod tr sed ln touch git sleep head tail cmp; do
+for command_name in jq grep diff find sort wc mktemp mkdir mkfifo cp rm mv chmod tr sed ln touch git sleep head tail cmp perl; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is unavailable: $command_name"
 done
 [[ -f "$runner" ]] || die "runner is missing: $runner"
@@ -208,11 +268,13 @@ done
 [[ -f "$inventory" ]] || die "inventory is missing: $inventory"
 
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/hfx-tdx-campaign-test.XXXXXX")
+mutation_runner=
 case $test_tmp in
     "${TMPDIR:-/tmp}"/hfx-tdx-campaign-test.*) ;;
     *) die "mktemp returned an unsafe path: $test_tmp" ;;
 esac
 cleanup() {
+    [[ -z "${mutation_runner-}" || ! -e "$mutation_runner" ]] || rm -f -- "$mutation_runner"
     case ${test_tmp-} in
         "${TMPDIR:-/tmp}"/hfx-tdx-campaign-test.*)
             [[ -d "$test_tmp" && ! -L "$test_tmp" ]] && rm -rf -- "$test_tmp"
@@ -222,6 +284,17 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir "$test_tmp/fake-bin" "$test_tmp/invocations" "$test_tmp/workspaces"
+if [[ -n "${HFX_TEST_MUTATION_FROM-}" ]]; then
+    [[ $(grep -Fxc -- "$HFX_TEST_MUTATION_FROM" "$runner") -eq 1 ]] ||
+        die 'mutation anchor must occur exactly once'
+    mutation_runner=$SCRIPT_DIR/.tdx-hydro-campaign.mutated.$$
+    cp "$runner" "$mutation_runner"
+    HFX_TEST_MUTATION_FROM=$HFX_TEST_MUTATION_FROM HFX_TEST_MUTATION_TO=${HFX_TEST_MUTATION_TO-} \
+        perl -0pi -e 's/^\Q$ENV{HFX_TEST_MUTATION_FROM}\E$/$ENV{HFX_TEST_MUTATION_TO}/m' \
+        "$mutation_runner"
+    runner=$mutation_runner
+    unset HFX_TEST_MUTATION_FROM HFX_TEST_MUTATION_TO
+fi
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-before"
 case_stdout=$test_tmp/stdout
 case_stderr=$test_tmp/stderr
@@ -265,10 +338,852 @@ export PATH
 passed=0
 skipped=0
 
+calibration_fake_setup() {
+    if [[ ! -x "$test_tmp/fake-curl" ]]; then
+        sed -n "/^printf 'SQLite format 3/,/^export HFX_TEST_DIFF=/p" "$0" >"$test_tmp/calibration-fake-setup"
+        [[ -s "$test_tmp/calibration-fake-setup" ]] || die 'calibration fake setup extraction was empty'
+        source "$test_tmp/calibration-fake-setup"
+    fi
+    [[ -n "${HFX_TDX_ADAPTER_PYTHON-}" ]] || die 'calibration fake adapter was not installed'
+    if [[ $(wc -c <"$HFX_TEST_GPKG_TEMPLATE" | tr -d ' ') -eq 24 ]]; then
+        printf '123456789012345678901234' >>"$HFX_TEST_GPKG_TEMPLATE"
+    fi
+}
+
+calibration_new_campaign() {
+    local name=$1
+    calibration_root=$test_tmp/workspaces/$name
+    mkdir "$calibration_root"
+    run_runner init --campaign "$name" --workspace-root "$calibration_root" \
+        --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 30000000000 --available-disk-bytes 560000000000 \
+        --peak-in-flight-download-bytes 44296724480 \
+        --retained-basin-output-bytes 206220202290 \
+        --assembly-memory-ceiling-bytes 30000000000 \
+        --assembly-scratch-ceiling-bytes 206220202290 \
+        --assembled-artifact-bytes 206220202290 \
+        --active-compile-scratch-bytes 30000000000 \
+        --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+    calibration_dir=$calibration_root/tdx-hydro-$name
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$calibration_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$calibration_dir/state/tmp/pipeline-completions.fifo
+}
+
+calibration_measurement_json() {
+    local throughput=${1-1000000}
+    local completions=${2-2}
+    jq -cn --argjson throughput "$throughput" --argjson completions "$completions" '{
+      raw:{start_timestamp_seconds:100,end_timestamp_seconds:110,bytes:10000000,
+        elapsed_seconds:10,retries:0,throughput_bytes_per_second:1000000},
+      steady_state:{start_timestamp_seconds:100,end_timestamp_seconds:101,start_bytes:0,
+        attempts:[1],end_bytes:$throughput,bytes:$throughput,elapsed_seconds:1,
+        throughput_bytes_per_second:$throughput,compile_completions:$completions,
+        compile_wall_seconds:(if $completions == 0 then 0 else 1 end)},
+      excluded_drain_tail:{start_timestamp_seconds:101,end_timestamp_seconds:110,
+        start_bytes:$throughput,end_bytes:10000000,bytes:(10000000-$throughput),elapsed_seconds:9}
+    }'
+}
+
+calibration_write_state() {
+    local dir=$1
+    local p2=$2
+    local p4=$3
+    local selection=${4-null}
+    local measurement
+    measurement=$(calibration_measurement_json)
+    jq -n --arg p2 "$p2" --arg p4 "$p4" --argjson selected "$selection" \
+        --argjson measurement "$measurement" 'def cohort($parallel;$ids;$status):
+      {max_parallel:$parallel,basin_ids:($ids|split(" ")),status:$status,
+       attempts:(if $status == "pending" then 0 else 1 end),
+       measurement:(if $status == "measured" then $measurement else null end)};
+      {schema_version:1,fabric_version:"fixture-v1",selected_max_parallel:$selected,
+       selected_throughput_validity:(if $selected == null then null else "compile-observed" end),
+       cohorts:{"parallel-2":cohort(2;"1020011530 3020003790 6020006540 8020008900";$p2),
+                "parallel-4":cohort(4;"2020003440 4020006940 7020014250 9020000010";$p4)}}' \
+        >"$dir/state/calibration.json"
+}
+
+calibration_run() {
+    local name=$1
+    local parallel=$2
+    run_runner calibrate --campaign "$name" --workspace-root "$calibration_root" \
+        --max-parallel "$parallel" --fabric-version fixture-v1
+}
+
+calibration_prepare_workers() {
+    [[ ! -d "$test_tmp/transfer-state" ]] || rm -r -- "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    [[ -e "$test_tmp/invocations/adapter.log" ]] || : >"$test_tmp/invocations/adapter.log"
+    [[ -e "$test_tmp/invocations/hfx.log" ]] || : >"$test_tmp/invocations/hfx.log"
+    [[ -e "$test_tmp/invocations/hfx-status.log" ]] || : >"$test_tmp/invocations/hfx-status.log"
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$calibration_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$calibration_dir/state/tmp/pipeline-completions.fifo
+    export HFX_TEST_PIPELINE_AVAILABLE_BYTES=79734104064
+    export HFX_TEST_FAIL_KEY=
+    export HFX_TEST_FAIL_ONCE_KEY=
+    export HFX_TEST_HASH_MODE=
+    export HFX_TEST_OGR_MODE=
+    export HFX_TEST_RESUME_MODE=
+    export HFX_TEST_LOWERCASE_HEADERS=
+    export HFX_TEST_LEADING_ZERO_LENGTH=
+    export HFX_TEST_REDISPATCH_HOLD_KEY=
+    export HFX_TEST_REDISPATCH_RELEASE_MARKER=
+    export HFX_TEST_PIPELINE_KILL_KEY=
+    export HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG=
+    export HFX_TEST_FAIL_BUILD_ID=
+    export HFX_TEST_FAIL_VALIDATE_ID=
+    export HFX_TEST_REQUIRE_LOCK_OWNER=
+    export HFX_TEST_REQUIRE_CLEARED_DIAGNOSTIC=
+    export HFX_TEST_INTERRUPT_AFTER=
+    export HFX_TEST_FAIL_ASSEMBLY=
+    export HFX_TEST_FAIL_ASSEMBLY_VALIDATE=
+    HFX_TDX_CALIBRATION_NOW_FILE=$test_tmp/calibration-now
+    export HFX_TDX_CALIBRATION_NOW_FILE
+    calibration_clock=${HFX_TEST_CLOCK_START-100}
+    : >"$HFX_TDX_CALIBRATION_NOW_FILE"
+    while [[ "$calibration_clock" -le $((${HFX_TEST_CLOCK_START-100} + 400)) ]]; do
+        printf '%s\n' "$calibration_clock" >>"$HFX_TDX_CALIBRATION_NOW_FILE"
+        calibration_clock=$((calibration_clock + 1))
+    done
+}
+
+calibration_complete() {
+    local name=$1
+    local parallel=$2
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run "$name" "$parallel" >"$case_stdout" 2>"$case_stderr" || {
+        sed 's/^/calibration stdout: /' "$case_stdout" >&2
+        sed 's/^/calibration complete: /' "$case_stderr" >&2
+        die "calibration parallel-$parallel did not complete"
+    }
+}
+
+calibration_cohort_case() {
+    local name
+    local mutation
+    local p2
+    local p4
+    local parallel
+    local expected
+    calibration_fake_setup
+    calibration_new_campaign calibration-matrix
+    for name in pending:pending:2:disk running:pending:2:disk measured:pending:4:disk \
+        pending:running:2:ordering running:running:2:ordering measured:running:4:disk \
+        pending:measured:2:ordering running:measured:2:ordering measured:measured:2:success; do
+        IFS=: read -r p2 p4 parallel expected <<<"$name"
+        calibration_write_state "$calibration_dir" "$p2" "$p4" \
+            "$([[ "$p2:$p4" == measured:measured ]] && printf 2 || printf null)"
+        cp "$calibration_dir/state/calibration.json" "$test_tmp/matrix-before"
+        if [[ "$expected" == success ]]; then
+            calibration_run calibration-matrix "$parallel" >"$case_stdout"
+            assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
+        else
+            if [[ "$expected" == disk ]]; then
+                HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 \
+                    expect_failure "calibration matrix $p2/$p4" calibrate \
+                    --campaign calibration-matrix --workspace-root "$calibration_root" \
+                    --max-parallel "$parallel" --fabric-version fixture-v1
+                assert_contains "$case_stderr" 'insufficient calibration disk'
+            else
+                expect_failure "calibration matrix $p2/$p4" calibrate \
+                    --campaign calibration-matrix --workspace-root "$calibration_root" \
+                    --max-parallel "$parallel" --fabric-version fixture-v1
+                assert_contains "$case_stderr" 'calibration cohort status ordering is malformed'
+            fi
+            cmp "$test_tmp/matrix-before" "$calibration_dir/state/calibration.json"
+        fi
+    done
+    calibration_write_state "$calibration_dir" measured measured 2
+    for mutation in \
+        '.cohorts["parallel-2"].status = "measured" | .cohorts["parallel-2"].attempts = 1 | .cohorts["parallel-2"].measurement = null' \
+        '.cohorts["parallel-2"].measurement.extra = true' \
+        '.cohorts["parallel-2"].measurement.raw.elapsed_seconds = 0' \
+        '.cohorts["parallel-2"].measurement.steady_state.end_timestamp_seconds = 99' \
+        '.cohorts["parallel-2"].measurement.steady_state.bytes = 999999' \
+        '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second = 1' \
+        '.cohorts["parallel-2"].measurement.steady_state.compile_completions = 5' \
+        '.cohorts["parallel-2"].measurement.steady_state.compile_wall_seconds = 9223372036854775808' \
+        '.cohorts["parallel-2"].measurement.raw.bytes = 9223372036854775808'; do
+        calibration_write_state "$calibration_dir" measured measured 2
+        jq "$mutation" "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/malformed"
+        mv "$calibration_dir/state/tmp/malformed" "$calibration_dir/state/calibration.json"
+        jq -cS '.cohorts["parallel-4"]' "$calibration_dir/state/calibration.json" >"$test_tmp/p4-before"
+        cp "$calibration_dir/state/calibration.json" "$test_tmp/malformed-before"
+        expect_failure 'malformed calibration mutation' calibrate --campaign calibration-matrix \
+            --workspace-root "$calibration_root" --max-parallel 2 --fabric-version fixture-v1
+        assert_contains "$case_stderr" 'calibration state is malformed'
+        cmp "$test_tmp/malformed-before" "$calibration_dir/state/calibration.json"
+        jq -cS '.cohorts["parallel-4"]' "$calibration_dir/state/calibration.json" >"$test_tmp/p4-after"
+        cmp "$test_tmp/p4-before" "$test_tmp/p4-after"
+    done
+    calibration_write_state "$calibration_dir" measured measured 2
+    jq '.cohorts["parallel-2"].measurement.raw.bytes=40000000000 |
+        .cohorts["parallel-2"].measurement.raw.throughput_bytes_per_second=4000000000 |
+        .cohorts["parallel-2"].measurement.excluded_drain_tail.end_bytes=40000000000 |
+        .cohorts["parallel-2"].measurement.excluded_drain_tail.bytes=
+          (40000000000-.cohorts["parallel-2"].measurement.excluded_drain_tail.start_bytes)' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/large"
+    mv "$calibration_dir/state/tmp/large" "$calibration_dir/state/calibration.json"
+    calibration_run calibration-matrix 2 >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
+    calibration_new_campaign calibration-admission
+    cp -R "$calibration_dir/state/basins" "$test_tmp/admission-basins"
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=61989017472 \
+        expect_failure 'calibration admission shortfall' calibrate --campaign calibration-admission \
+        --workspace-root "$calibration_root" --max-parallel 2 --fabric-version fixture-v1
+    assert_contains "$case_stderr" 'insufficient calibration disk'
+    jq -e '.cohorts["parallel-2"] | .status == "pending" and .attempts == 0' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'admission shortfall changed the cohort'
+    diff -ru "$test_tmp/admission-basins" "$calibration_dir/state/basins"
+    [[ ! -e "$calibration_dir/state/pipeline.json" ]] || die 'admission shortfall created pipeline state'
+    [[ $(find "$calibration_dir/state/calibration" -name '*.samples.tsv' | wc -l | tr -d ' ') -eq 0 ]] ||
+        die 'admission shortfall created an attempt trace'
+    pass 'calibration cohorts and schema are immutable and fail closed'
+}
+
+calibration_measurement_case() {
+    local trace=$test_tmp/calibration-idle-refill.tsv
+    local regression=$test_tmp/calibration-regression.tsv
+    local attempts
+    printf '100\t0\t2\t0\t0\n101\t500000\t1\t0\t0\n102\t1000000\t2\t1\t1\n103\t2000000\t1\t2\t2\n110\t10000000\t0\t2\t2\n' >"$trace"
+    printf '100\t0\t2\t0\t0\n101\t500000\t1\t0\t0\n102\t1000000\t2\t1\t1\n103\t800000\t1\t2\t2\n110\t10000000\t0\t2\t2\n' >"$regression"
+    [[ $(wc -l <"$trace" | tr -d ' ') -eq 5 && $(wc -l <"$regression" | tr -d ' ') -eq 5 ]] ||
+        die 'calibration trace fixtures are incomplete'
+    calibration_fake_setup
+    calibration_new_campaign calibration-measurement
+    calibration_complete calibration-measurement 2
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .measurement.raw.bytes == 384 and
+      .measurement.steady_state.end_bytes > .measurement.steady_state.start_bytes and
+      .measurement.steady_state.compile_completions > 0' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die "real parallel-2 calibration measurement differs: $(jq -c '.cohorts["parallel-2"].measurement' "$calibration_dir/state/calibration.json")"
+    attempts=$(jq -r '.cohorts["parallel-2"].attempts' "$calibration_dir/state/calibration.json")
+    [[ "$attempts" -eq 1 ]] || die 'first calibration did not create attempt one'
+    trace=$calibration_dir/state/calibration/parallel-2-attempt-1.samples.tsv
+    cp "$regression" "$trace"
+    jq '.cohorts["parallel-2"].status="running" |
+        .cohorts["parallel-2"].measurement=null' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    unset HFX_TEST_CLOCK_START
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .attempts == 1 and
+      .measurement.raw.bytes == 10000000 and
+      .measurement.steady_state.end_bytes == 1000000 and
+      .measurement.steady_state.bytes == 1000000 and
+      .measurement.steady_state.throughput_bytes_per_second == 333333 and
+      .measurement.steady_state.compile_completions == 2' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'terminal replay did not clamp the corrected-end byte regression'
+    [[ ! -e "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ]] ||
+        die 'terminal replay scheduled a new attempt'
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n102\t48\t1\t1\t1\n' >"$trace"
+    printf '110\t48\t1\t1\t1\n121\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=2 |
+        .cohorts["parallel-2"].measurement=null' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    printf 'orphan\n' >"$calibration_dir/state/calibration/parallel-2-attempt-3.samples.tsv"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .attempts == 2 and
+      .measurement.excluded_drain_tail.start_timestamp_seconds == 102 and
+      .measurement.excluded_drain_tail.end_timestamp_seconds == 140 and
+      .measurement.excluded_drain_tail.elapsed_seconds == 30 and
+      .measurement.excluded_drain_tail.elapsed_seconds <
+        (.measurement.excluded_drain_tail.end_timestamp_seconds -
+         .measurement.excluded_drain_tail.start_timestamp_seconds)' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'two-attempt drain tail did not exclude inter-attempt idle time'
+    [[ ! -e "$calibration_dir/state/calibration/parallel-2-attempt-3.samples.tsv" ]] ||
+        die 'terminal replay retained its orphan next-attempt trace'
+    rm -f -- "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n112\t144\t1\t2\t2\n113\t144\t0\t2\t2\n' >"$trace"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=1 |
+        .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    [[ $(jq -r '.cohorts["parallel-2"].measurement.steady_state.throughput_bytes_per_second' \
+        "$calibration_dir/state/calibration.json") -eq 13 ]] ||
+        die 'single-attempt corrected throughput differs from 144 bytes over 11 seconds'
+    printf '100\t0\t0\t0\t0\n101\t0\t2\t0\t0\n' >"$trace"
+    printf '110\t0\t2\t0\t0\n121\t144\t1\t2\t2\n122\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].attempts=2 |
+        .cohorts["parallel-2"].measurement=null' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"].measurement.steady_state |
+      .bytes == 144 and .elapsed_seconds == 11 and .throughput_bytes_per_second == 13 and
+      .attempts == [1,2]' "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'inter-attempt idle time diluted corrected throughput'
+    printf '110\t0\t1\t0\t0\n121\t144\t0\t2\t2\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    jq -e '.cohorts["parallel-2"].measurement.steady_state |
+      .elapsed_seconds > 0 and .bytes > 0 and .compile_completions == 0' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'narrow resume did not retain an explicitly invalid nonzero fallback interval'
+    printf '140\t384\t0\t2\t2\n' >>"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    jq '.cohorts["parallel-2"].status="running" | .cohorts["parallel-2"].measurement=null' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/replay.json"
+    mv "$calibration_dir/state/tmp/replay.json" "$calibration_dir/state/calibration.json"
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    before=$(wc -l <"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" | tr -d ' ')
+    HFX_TEST_CLOCK_START=140 calibration_prepare_workers
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    [[ $(wc -l <"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" | tr -d ' ') -eq "$before" ]] ||
+        die 'terminal sample de-duplication appended an identical record'
+    calibration_write_state "$calibration_dir" measured measured null
+    jq --argjson p2 "$(calibration_measurement_json 1000000 2)" \
+        --argjson p4 "$(calibration_measurement_json 1100000 0)" \
+        '.cohorts["parallel-2"].measurement=$p2 | .cohorts["parallel-4"].measurement=$p4 |
+         .selected_max_parallel=2 | .selected_throughput_validity="compile-observed"' "$calibration_dir/state/calibration.json" \
+        >"$calibration_dir/state/tmp/ranking"
+    mv "$calibration_dir/state/tmp/ranking" "$calibration_dir/state/calibration.json"
+    calibration_run calibration-measurement 2 >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_selected_max_parallel=2'
+    jq --argjson p2 "$(calibration_measurement_json 1044999 2)" \
+        '.cohorts["parallel-2"].measurement=$p2 |
+         .cohorts["parallel-4"].measurement.steady_state.compile_completions=2 |
+         .cohorts["parallel-4"].measurement.steady_state.compile_wall_seconds=1 |
+         .selected_max_parallel=4 | .selected_throughput_validity="compile-observed"' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/ranking"
+    mv "$calibration_dir/state/tmp/ranking" "$calibration_dir/state/calibration.json"
+    calibration_run calibration-measurement 4 >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_selected_max_parallel=4'
+    pass 'calibration traces recover paid work and compute bounded measurements'
+}
+
+calibration_replay_case() {
+    local before
+    local build_before
+    calibration_fake_setup
+    calibration_new_campaign calibration-replay
+    calibration_write_state "$calibration_dir" running pending null
+    mkdir "$calibration_dir/state/calibration"
+    jq -n '{schema_version:1,name:"parallel-2",max_parallel:2,
+      basin_ids:["1020011530","3020003790","6020006540","8020008900"]}' \
+        >"$calibration_dir/state/calibration/parallel-2.json"
+    printf '100\t0\t2\t0\t0\n101\t1\t1\t0\t0\n' \
+        >"$calibration_dir/state/calibration/parallel-2-attempt-1.samples.tsv"
+    printf 'orphan\n' >"$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv"
+    build_before=$(grep -c '^build' "$test_tmp/invocations/adapter.log" || :)
+    HFX_TEST_CLOCK_START=110
+    calibration_complete calibration-replay 2
+    unset HFX_TEST_CLOCK_START
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .attempts == 2 and .measurement.raw.start_timestamp_seconds == 100' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'running calibration did not resume in attempt two over the ordered concatenation'
+    [[ -s "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ]] ||
+        die 'resumed calibration did not retain attempt two'
+    ! grep -q orphan "$calibration_dir/state/calibration/parallel-2-attempt-2.samples.tsv" ||
+        die 'orphan attempt trace was not adopted and truncated'
+    calibration_complete calibration-replay 4
+    jq -e '.selected_max_parallel == 2 and .selected_throughput_validity == "compile-observed" and
+      ([.cohorts[].status] | all(. == "measured"))' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'both cohorts did not freeze the five-percent selection'
+    [[ $(find "$calibration_dir/state/calibration" -name '*-pipeline.json' | wc -l | tr -d ' ') -eq 2 ]] ||
+        die 'both scheduler snapshots were not archived'
+    [[ $(($(grep -c '^build' "$test_tmp/invocations/adapter.log") - build_before)) -eq 8 ]] ||
+        die 'both four-basin cohorts were not compiled'
+    jq -s -e '[.[] | select(.retention.inputs_reclaimed == true)] | length == 8' \
+        "$calibration_dir"/state/basins/{1020011530,3020003790,6020006540,8020008900,2020003440,4020006940,7020014250,9020000010}/current.json \
+        >/dev/null || die 'both cohorts were not reclaimed'
+    before=$(wc -l <"$test_tmp/invocations/adapter.log" | tr -d ' ')
+    calibration_run calibration-replay 4 >"$case_stdout"
+    [[ $(wc -l <"$test_tmp/invocations/adapter.log" | tr -d ' ') -eq "$before" ]] ||
+        die 'measured replay rescheduled paid work'
+    mv "$calibration_dir/state/calibration/parallel-2-pipeline.json" "$calibration_dir/state/pipeline.json"
+    jq '.basins["2020003440"]=.basins["1020011530"] |
+        .basin_ids=(.basins|keys)' "$calibration_dir/state/pipeline.json" \
+        >"$calibration_dir/state/tmp/production-pipeline"
+    mv "$calibration_dir/state/tmp/production-pipeline" "$calibration_dir/state/pipeline.json"
+    calibration_run calibration-replay 2 >"$case_stdout" 2>"$case_stderr" || {
+        sed 's/^/unrelated pipeline: /' "$case_stderr" >&2
+        die 'measured replay with unrelated pipeline failed'
+    }
+    [[ -f "$calibration_dir/state/pipeline.json" &&
+        ! -e "$calibration_dir/state/calibration/parallel-2-pipeline.json" ]] ||
+        die 'calibration finalization relocated unrelated production pipeline state'
+    calibration_selected=$(jq -r '.selected_max_parallel' "$calibration_dir/state/calibration.json")
+    [[ "$calibration_selected" -eq 2 ]] && calibration_wrong=4 || calibration_wrong=2
+    expect_failure 'pipeline parallelism differs from calibration' pipeline \
+        --campaign calibration-replay --workspace-root "$calibration_root" \
+        --max-parallel "$calibration_wrong" --fabric-version fixture-v1
+    assert_contains "$case_stderr" 'pipeline max-parallel differs from frozen calibration selection'
+    pass 'calibration schedules both cohorts, reclaims them, and freezes selection'
+}
+
+calibration_disclosure_case() {
+    local expected=$test_tmp/calibration-disclosure.expected
+    sed >"$expected" <<'DISCLOSURE'
+calibration_fabric_version=fixture-v1
+calibration_selected_max_parallel=2
+calibration_selected_throughput_validity=compile-observed
+calibration_parallel_2_status=measured
+calibration_parallel_2_raw_start_timestamp_seconds=100
+calibration_parallel_2_raw_end_timestamp_seconds=110
+calibration_parallel_2_raw_bytes=10000000
+calibration_parallel_2_raw_elapsed_seconds=10
+calibration_parallel_2_raw_retries=0
+calibration_parallel_2_raw_throughput_bytes_per_second=1000000
+calibration_parallel_2_steady_start_timestamp_seconds=100
+calibration_parallel_2_steady_end_timestamp_seconds=101
+calibration_parallel_2_steady_attempts=1
+calibration_parallel_2_steady_start_bytes=0
+calibration_parallel_2_steady_end_bytes=1000000
+calibration_parallel_2_steady_bytes=1000000
+calibration_parallel_2_steady_elapsed_seconds=1
+calibration_parallel_2_steady_throughput_bytes_per_second=1000000
+calibration_parallel_2_steady_compile_completions=2
+calibration_parallel_2_steady_compile_wall_seconds=2
+calibration_parallel_2_drain_start_timestamp_seconds=101
+calibration_parallel_2_drain_end_timestamp_seconds=110
+calibration_parallel_2_drain_start_bytes=1000000
+calibration_parallel_2_drain_end_bytes=10000000
+calibration_parallel_2_drain_bytes=9000000
+calibration_parallel_2_drain_elapsed_seconds=9
+calibration_parallel_4_status=measured
+calibration_parallel_4_raw_start_timestamp_seconds=100
+calibration_parallel_4_raw_end_timestamp_seconds=110
+calibration_parallel_4_raw_bytes=10000000
+calibration_parallel_4_raw_elapsed_seconds=10
+calibration_parallel_4_raw_retries=0
+calibration_parallel_4_raw_throughput_bytes_per_second=1000000
+calibration_parallel_4_steady_start_timestamp_seconds=100
+calibration_parallel_4_steady_end_timestamp_seconds=101
+calibration_parallel_4_steady_attempts=1
+calibration_parallel_4_steady_start_bytes=0
+calibration_parallel_4_steady_end_bytes=1000000
+calibration_parallel_4_steady_bytes=1000000
+calibration_parallel_4_steady_elapsed_seconds=1
+calibration_parallel_4_steady_throughput_bytes_per_second=1000000
+calibration_parallel_4_steady_compile_completions=0
+calibration_parallel_4_steady_compile_wall_seconds=0
+calibration_parallel_4_drain_start_timestamp_seconds=101
+calibration_parallel_4_drain_end_timestamp_seconds=110
+calibration_parallel_4_drain_start_bytes=1000000
+calibration_parallel_4_drain_end_bytes=10000000
+calibration_parallel_4_drain_bytes=9000000
+calibration_parallel_4_drain_elapsed_seconds=9
+DISCLOSURE
+    [[ $(wc -l <"$expected" | tr -d ' ') -eq 49 ]] || die 'calibration disclosure fixture does not contain 49 lines'
+    calibration_fake_setup
+    calibration_new_campaign calibration-disclosure
+    calibration_write_state "$calibration_dir" measured measured 2
+    jq '.cohorts["parallel-2"].measurement.steady_state.compile_wall_seconds=2 |
+        .cohorts["parallel-4"].measurement.steady_state.compile_completions=0 |
+        .cohorts["parallel-4"].measurement.steady_state.compile_wall_seconds=0' \
+        "$calibration_dir/state/calibration.json" >"$calibration_dir/state/tmp/disclosure"
+    mv "$calibration_dir/state/tmp/disclosure" "$calibration_dir/state/calibration.json"
+    run_runner status --campaign calibration-disclosure --workspace-root "$calibration_root" \
+        >"$test_tmp/status-with-calibration"
+    run_runner progress --campaign calibration-disclosure --workspace-root "$calibration_root" \
+        >"$test_tmp/progress-with-calibration"
+    mv "$calibration_dir/state/calibration.json" "$calibration_dir/state/tmp/calibration.saved"
+    run_runner status --campaign calibration-disclosure --workspace-root "$calibration_root" \
+        >"$test_tmp/status-without-calibration"
+    run_runner progress --campaign calibration-disclosure --workspace-root "$calibration_root" \
+        >"$test_tmp/progress-without-calibration"
+    mv "$calibration_dir/state/tmp/calibration.saved" "$calibration_dir/state/calibration.json"
+    cmp "$test_tmp/status-with-calibration" "$test_tmp/status-without-calibration"
+    cmp "$test_tmp/progress-with-calibration" "$test_tmp/progress-without-calibration"
+    cp "$calibration_dir/state/calibration.json" "$calibration_dir/state/tmp/calibration.saved"
+    printf '{\n' >"$calibration_dir/state/calibration.json"
+    run_runner status --campaign calibration-disclosure --workspace-root "$calibration_root" >"$case_stdout"
+    assert_contains "$case_stdout" 'calibration_state=malformed'
+    mv "$calibration_dir/state/tmp/calibration.saved" "$calibration_dir/state/calibration.json"
+    calibration_run calibration-disclosure 2 >"$case_stdout"
+    tail -n 49 "$case_stdout" >"$test_tmp/disclosure.actual"
+    cmp "$expected" "$test_tmp/disclosure.actual"
+    cp "$case_stdout" "$test_tmp/disclosure.first"
+    calibration_run calibration-disclosure 2 >"$case_stdout"
+    cmp "$test_tmp/disclosure.first" "$case_stdout"
+    [[ $(tail -n 49 "$case_stdout" | wc -l | tr -d ' ') -eq 49 ]] ||
+        die 'calibration disclosure was not the final complete block'
+    calibration_new_campaign calibration-disclosure-scheduled
+    calibration_complete calibration-disclosure-scheduled 2
+    assert_contains "$case_stdout" 'calibration_parallel_2_status=measured'
+    pass 'calibration disclosure is complete ordered and byte-preserving'
+}
+
+calibration_scheduler_shape_case() {
+    local build_before
+    calibration_fake_setup
+    calibration_new_campaign calibration-scheduler
+    calibration_prepare_workers
+    build_before=$(grep -c '^build' "$test_tmp/invocations/adapter.log" || :)
+    export HFX_TEST_PIPELINE_KILL_KEY=1020011530-basins
+    calibration_run calibration-scheduler 2 >"$case_stdout" 2>"$case_stderr" || {
+        sed 's/^/calibration scheduler: /' "$case_stderr" >&2
+        die 'calibration scheduler callback fixture failed'
+    }
+    unset HFX_TEST_PIPELINE_KILL_KEY
+    jq -e '.cohorts["parallel-2"] |
+      .status == "measured" and .measurement.steady_state.compile_completions > 0 and
+      .measurement.steady_state.compile_wall_seconds >= 0' \
+        "$calibration_dir/state/calibration.json" >/dev/null ||
+        die 'scheduler callbacks did not produce a measured cohort'
+    [[ $(grep -c '^start 1020011530-basins' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+        die 'vanished calibration worker was not swept and retried'
+    [[ $(($(grep -c '^build' "$test_tmp/invocations/adapter.log") - build_before)) -eq 4 ]] ||
+        die 'compile callbacks did not bracket all four builds'
+    pass 'calibration callbacks preserve the scheduler and static contracts'
+}
+
+checkpoint_new_campaign() {
+    local name=$1
+    set -- $(init_args "$name" "$test_tmp")
+    run_runner "$@" >/dev/null
+}
+
+checkpoint_schema_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-schema
+    checkpoint_new_campaign checkpoint-schema
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{
+  "schema_version": 1,
+  "fabric_version": "fixture-v1",
+  "max_parallel": 2,
+  "basin_ids": ["1020000010", "7020000010", "9020000010"],
+  "basins": {
+    "1020000010": {"status": "reclaimed", "blocked_reason": null},
+    "7020000010": {"status": "reclaimed", "blocked_reason": null},
+    "9020000010": {"status": "terminal", "blocked_reason": null}
+  }
+}
+EOF
+    run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 2 >"$case_stdout"
+    diff -u <(printf '%s\n' checkpoint_expected_terminal_count=2 \
+        checkpoint_observed_terminal_count=2 checkpoint_result=met \
+        checkpoint_run_state=running checkpoint_signal=not-required) "$case_stdout"
+    mv "$dir/state/pipeline.json" "$dir/state/pipeline.evidence.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 3 >"$case_stdout" 2>"$case_stderr"; then
+        die 'absent checkpoint pipeline snapshot unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" 'pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint'
+    printf '{\n' >"$dir/state/checkpoints.json"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_resume=recovered-malformed
+    [[ -f "$dir/state/checkpoint-recovery/rejected-1.json" ]] || die 'malformed checkpoint was not archived'
+    mv "$dir/state/pipeline.evidence.json" "$dir/state/pipeline.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 2,
+      "observed_terminal_count": 2,
+      "result": "met"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-met.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'decreasing checkpoint expectation unexpectedly succeeded'
+    fi
+    cmp "$test_tmp/checkpoint-met.json" "$dir/state/checkpoints.json"
+    assert_contains "$case_stderr" 'checkpoint expected count cannot decrease below 2; rerun checkpoint with 2 or a higher value'
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-stopped.json"
+    run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 3 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_observed_terminal_count=2
+    cmp "$test_tmp/checkpoint-stopped.json" "$dir/state/checkpoints.json"
+    if run_runner checkpoint --campaign checkpoint-schema --workspace-root "$test_tmp" \
+        --expected-terminal-count 4 >"$case_stdout" 2>"$case_stderr"; then
+        die 'different stopped checkpoint expectation unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" 'stopped checkpoint expects 3; run checkpoint-resume, then checkpoint with an equal or higher expected value'
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": 1,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed"
+    }
+  ]
+}
+EOF
+    run_runner progress --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_run_state=running
+    assert_contains "$case_stdout" checkpoint_result=missed
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": []
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-2.expected"
+    run_runner progress --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_state=malformed
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-2.expected" "$dir/state/checkpoint-recovery/rejected-2.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 2,
+      "observed_terminal_count": 2,
+      "result": "met"
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-3.expected"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-3.expected" "$dir/state/checkpoint-recovery/rejected-3.json"
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "stopped",
+  "resume_after_entry_count": null,
+  "entries": [
+    {
+      "expected_terminal_count": 3,
+      "observed_terminal_count": 2,
+      "result": "missed",
+      "extra": true
+    }
+  ]
+}
+EOF
+    cp "$dir/state/checkpoints.json" "$test_tmp/rejected-4.expected"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    cmp "$test_tmp/rejected-4.expected" "$dir/state/checkpoint-recovery/rejected-4.json"
+    /bin/rm -- "$dir/state/checkpoints.json"
+    run_runner checkpoint-resume --campaign checkpoint-schema --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_resume=recovered-malformed
+    assert_contains "$case_stdout" checkpoint_recovery_path=state/checkpoint-recovery/rejected-1.json
+    pass 'checkpoint schema recovery and absent snapshots remain operator-recoverable'
+}
+
+checkpoint_stop_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-stop
+    local owner
+    local race_dir=$test_tmp/tdx-hydro-checkpoint-race
+    local race_mkdir=$test_tmp/checkpoint-race-mkdir
+    checkpoint_new_campaign checkpoint-stop
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{"schema_version":1,"fabric_version":"fixture-v1","max_parallel":2,"basin_ids":["9020000010"],"basins":{"9020000010":{"status":"terminal","blocked_reason":null}}}
+EOF
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'missed checkpoint unexpectedly succeeded'
+    fi
+    diff -u <(printf '%s\n' checkpoint_expected_terminal_count=1 \
+        checkpoint_observed_terminal_count=0 checkpoint_result=missed \
+        checkpoint_run_state=stopped checkpoint_signal=no-live-owner) "$case_stdout"
+    jq -e '.run_state == "stopped" and (.entries | length) == 1' "$dir/state/checkpoints.json" >/dev/null
+    run_runner checkpoint-resume --campaign checkpoint-stop --workspace-root "$test_tmp" >"$case_stdout"
+    diff -u <(printf '%s\n' checkpoint_resume=resumed checkpoint_run_state=running) "$case_stdout"
+    jq -e '.run_state == "running" and .resume_after_entry_count == 1' "$dir/state/checkpoints.json" >/dev/null
+    /usr/bin/tail -f /dev/null &
+    owner=$!
+    mkdir "$dir/state/locks/campaign.lock"
+    printf '%s\n' "$owner" >"$dir/state/locks/campaign.lock/owner.pid"
+    run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_signal=sent
+    if kill -0 "$owner" 2>/dev/null; then
+        kill -TERM "$owner" 2>/dev/null || :
+        wait "$owner" 2>/dev/null || :
+        die 'checkpoint TERM did not stop the validated live owner'
+    fi
+    wait "$owner" 2>/dev/null || :
+    cp "$dir/state/checkpoints.json" "$test_tmp/checkpoint-live-stopped.json"
+    run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr" || :
+    assert_contains "$case_stdout" checkpoint_signal=no-live-owner
+    cmp "$test_tmp/checkpoint-live-stopped.json" "$dir/state/checkpoints.json"
+    export HFX_TEST_PS_MODE=error
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'indeterminate checkpoint owner unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "checkpoint owner PID $owner is indeterminate; resolve that PID or ps ambiguity, then rerun the same checkpoint"
+    export HFX_TEST_PS_MODE=live
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'failed checkpoint TERM delivery unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "could not deliver TERM to checkpoint owner PID $owner; rerun the same checkpoint with the same expected value"
+    unset HFX_TEST_PS_MODE
+    printf 'unsafe\n' >"$dir/state/locks/campaign.lock/owner.pid"
+    if run_runner checkpoint --campaign checkpoint-stop --workspace-root "$test_tmp" \
+        --expected-terminal-count 1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'unsafe checkpoint owner contents unexpectedly succeeded'
+    fi
+    assert_contains "$case_stderr" "checkpoint campaign lock owner contents are unsafe: $dir/state/locks/campaign.lock/owner.pid; correct or move that exact entry, then rerun the same checkpoint"
+    cmp "$test_tmp/checkpoint-live-stopped.json" "$dir/state/checkpoints.json"
+    rm -r "$dir/state/locks/campaign.lock"
+    set -- $(reclaim_subset_init_args checkpoint-race "$test_tmp")
+    run_runner "$@" >/dev/null
+    cat >"$race_mkdir" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+    if [[ "$argument" == */state/locks/campaign.lock ]]; then
+        printf '%s\n' '{"schema_version":1,"run_state":"stopped","resume_after_entry_count":null,"entries":[{"expected_terminal_count":1,"observed_terminal_count":0,"result":"missed"}]}' >"$HFX_TEST_RACE_STATE"
+    fi
+done
+exec /bin/mkdir "$@"
+EOF
+    chmod +x "$race_mkdir"
+    export HFX_TEST_RACE_STATE=$race_dir/state/checkpoints.json
+    export HFX_TDX_MKDIR=$race_mkdir
+    if run_runner pipeline --campaign checkpoint-race --workspace-root "$test_tmp" \
+        --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr"; then
+        die 'post-lock stopped checkpoint race unexpectedly scheduled pipeline work'
+    fi
+    assert_contains "$case_stderr" 'pipeline is stopped by checkpoint control; run checkpoint-resume, then rerun the exact pipeline command'
+    [[ ! -e "$race_dir/state/pipeline.json" && ! -e "$race_dir/state/tmp/pipeline-completions.fifo" ]] ||
+        die 'post-lock checkpoint guard allowed scheduler materialization'
+    unset HFX_TDX_MKDIR
+    unset HFX_TEST_RACE_STATE
+    pass 'missed checkpoint stops the live pipeline and explicit resume preserves durable work'
+}
+
+checkpoint_progress_case() {
+    local dir=$test_tmp/tdx-hydro-checkpoint-progress
+    local original_jq
+    local zero_jq=$test_tmp/zero-effective-jq
+    set -- $(reclaim_subset_init_args checkpoint-progress "$test_tmp")
+    run_runner "$@" >/dev/null
+    original_jq=/usr/bin/jq
+    cat >"$dir/state/pipeline.json" <<'EOF'
+{
+  "schema_version": 1,
+  "fabric_version": "fixture-v1",
+  "max_parallel": 2,
+  "basin_ids": ["1020000010", "7020000010", "9020000010"],
+  "basins": {
+    "1020000010": {"status": "reclaimed", "blocked_reason": null},
+    "7020000010": {"status": "reclaimed", "blocked_reason": null},
+    "9020000010": {"status": "terminal", "blocked_reason": null}
+  }
+}
+EOF
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{
+  "schema_version": 1,
+  "run_state": "running",
+  "resume_after_entry_count": null,
+  "entries": []
+}
+EOF
+    cp -R "$dir" "$test_tmp/checkpoint-progress.before"
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    diff -ru "$test_tmp/checkpoint-progress.before" "$dir"
+    assert_contains "$case_stdout" checkpoint_run_state=running
+    assert_contains "$case_stdout" checkpoint_entry_count=0
+    cat >"$dir/state/checkpoints.json" <<'EOF'
+{"schema_version":1,"run_state":"running","resume_after_entry_count":null,"entries":[{"expected_terminal_count":2,"observed_terminal_count":2,"result":"met"}]}
+EOF
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_expected_terminal_count=2
+    assert_contains "$case_stdout" checkpoint_observed_terminal_count=2
+    [[ $(grep -n '^checkpoint_run_state=' "$case_stdout" | cut -d: -f1) -eq \
+        $(($(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1) + 9)) ]] ||
+        die 'checkpoint progress block does not follow the complete pipeline block'
+    [[ $(grep -n '^assemble_pending=' "$case_stdout" | cut -d: -f1) -eq \
+        $(($(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1) + 14)) ]] ||
+        die 'assembly block does not follow the complete checkpoint block'
+    cat >"$zero_jq" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$#" -eq 3 && "$1" == -r ]] &&
+    { [[ "$2" == 'keys[]' ]] || [[ "$2" == '.basin_ids[]' ]]; }; then
+    exit 0
+fi
+exec "$HFX_TEST_REAL_JQ" "$@"
+EOF
+    chmod +x "$zero_jq"
+    export HFX_TEST_REAL_JQ=$original_jq
+    export HFX_TDX_JQ=$zero_jq
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    [[ $(grep -Ec '^(acquire_basins|acquire_streamnet|compile)_(pending|running|succeeded|failed)=0$' "$case_stdout") -eq 12 ]] ||
+        die 'zero-ID progress did not report twelve exact zero stage counts'
+    assert_contains "$case_stdout" inputs_reclaimed=0
+    printf '{\n' >"$dir/state/checkpoints.json"
+    run_runner progress --campaign checkpoint-progress --workspace-root "$test_tmp" >"$case_stdout"
+    assert_contains "$case_stdout" checkpoint_state=malformed
+    assert_contains "$case_stdout" 'checkpoint_recovery=run checkpoint-resume'
+    unset HFX_TDX_JQ
+    unset HFX_TEST_REAL_JQ
+    pass 'checkpoint progress is lock-free ordered and safe for empty basin reads'
+}
+
+case ${HFX_TEST_FOCUS-} in
+    '') ;;
+    cohort) calibration_cohort_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    measurement) calibration_measurement_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    calibration-replay) calibration_replay_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    disclosure) calibration_disclosure_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    scheduler-shape) calibration_scheduler_shape_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-schema) checkpoint_schema_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-stop) checkpoint_stop_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    checkpoint-progress) checkpoint_progress_case; printf '1..%d\n' "$passed"; exit 0 ;;
+    *) die "unknown HFX_TEST_FOCUS: $HFX_TEST_FOCUS" ;;
+esac
+
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
-assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>'
+assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
@@ -283,6 +1198,17 @@ expect_failure 'missing value' status --campaign
 expect_failure 'option-shaped value' status --campaign --workspace-root
 expect_failure 'unknown option' status --campaign unknown --workspace-root "$argument_root" --bogus value
 expect_failure 'relative workspace root' status --campaign relative --workspace-root relative
+expect_failure 'calibrate missing max parallel' calibrate --campaign missing --workspace-root "$argument_root" --fabric-version fixture-v1
+expect_failure 'calibrate duplicate max parallel' calibrate --campaign duplicate-cal --workspace-root "$argument_root" --max-parallel 2 --max-parallel 4 --fabric-version fixture-v1
+expect_failure 'calibrate parallel one' calibrate --campaign parallel-one --workspace-root "$argument_root" --max-parallel 1 --fabric-version fixture-v1
+expect_failure 'calibrate parallel three' calibrate --campaign parallel-three --workspace-root "$argument_root" --max-parallel 3 --fabric-version fixture-v1
+expect_failure 'calibrate parallel five' calibrate --campaign parallel-five --workspace-root "$argument_root" --max-parallel 5 --fabric-version fixture-v1
+expect_failure 'calibrate foreign option' calibrate --campaign foreign --workspace-root "$argument_root" --max-parallel 2 --fabric-version fixture-v1 --out nope
+expect_failure 'calibrate malformed fabric' calibrate --campaign fabric --workspace-root "$argument_root" --max-parallel 2 --fabric-version $'bad\nvalue'
+expect_failure 'max parallel usage scope' status --campaign scope --max-parallel 2
+assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire, pipeline, or calibrate'
+expect_failure 'fabric version usage scope' status --campaign scope --fabric-version v1
+assert_contains "$case_stderr" 'option --fabric-version is valid only for compile, compile-basin, pipeline, or calibrate'
 mkdir "$test_tmp/workspaces/symlink-target"
 ln -s "$test_tmp/workspaces/symlink-target" "$test_tmp/workspaces/symlink-root"
 expect_failure 'symlink workspace root' status --campaign symlink --workspace-root "$test_tmp/workspaces/symlink-root"
@@ -296,14 +1222,59 @@ expect_failure 'option-shaped fabric version' compile --campaign compile --works
     --fabric-version --campaign
 expect_failure 'control fabric version' compile --campaign compile --workspace-root "$argument_root" \
     --fabric-version $'bad\nversion'
+expect_failure 'missing compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
+expect_failure 'repeated compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --basin 1020000010 --basin 7020000010 --fabric-version version
+expect_failure 'malformed compile-basin basin' compile-basin --campaign compile --workspace-root "$argument_root" \
+    --basin malformed --fabric-version version
+expect_failure 'missing compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010
+expect_failure 'repeated compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 \
+    --fabric-version version --fabric-version version
+expect_failure 'empty compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version ''
+expect_failure 'option-shaped compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version --campaign
+expect_failure 'control compile-basin fabric version' compile-basin --campaign compile \
+    --workspace-root "$argument_root" --basin 1020000010 --fabric-version $'bad\nversion'
+expect_failure 'fabric version on progress' progress --campaign compile --workspace-root "$argument_root" \
+    --fabric-version version
+expect_failure 'basin on progress' progress --campaign compile --workspace-root "$argument_root" \
+    --basin 1020000010
 expect_failure 'foreign fabric version' status --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
 expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
-for foreign_basin_command in status recover acquire compile assemble evidence publish; do
+expect_failure 'empty retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy ''
+expect_failure 'option-shaped retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy --available-memory-bytes
+expect_failure 'unknown retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-some
+expect_failure 'case-changed retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy Retain-all-through-publication
+expect_failure 'repeated retention policy' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-all-through-publication \
+    --retention-policy retain-all-through-publication
+expect_failure 'foreign retention policy' status --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy retain-all-through-publication
+expect_failure 'missing max parallel' acquire --campaign arguments --workspace-root "$argument_root"
+expect_failure 'repeated max parallel' acquire --campaign arguments --workspace-root "$argument_root" \
+    --max-parallel 1 --max-parallel 2
+expect_failure 'foreign max parallel' status --campaign arguments --workspace-root "$argument_root" \
+    --max-parallel 1
+for invalid_parallel in 0 -1 x 63; do
+    expect_failure "invalid max parallel $invalid_parallel" acquire --campaign arguments \
+        --workspace-root "$argument_root" --max-parallel "$invalid_parallel"
+    assert_contains "$case_stderr" \
+        'hfx: error: option --max-parallel must be a base-10 integer from 1 through 62'
+done
+for foreign_basin_command in status recover acquire compile progress assemble evidence publish; do
     expect_failure "basin on $foreign_basin_command" "$foreign_basin_command" \
         --campaign foreign --workspace-root "$argument_root" --basin 1020000010
-    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init' ]] ||
+    [[ $(tail -1 "$case_stderr") == 'hfx: error: option --basin is valid only for init or compile-basin' ]] ||
         die "foreign --basin diagnostic differs for $foreign_basin_command"
 done
 for publication_option in --out --report --notice --citation --scratch-prefix; do
@@ -317,26 +1288,94 @@ for publication_option in --out --report --notice --citation --scratch-prefix; d
         "$publication_option"
 done
 expect_failure 'zero sizing' init --campaign zero --workspace-root "$argument_root" \
-    --available-memory-bytes 0 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 0 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'negative sizing' init --campaign negative --workspace-root "$argument_root" \
-    --available-memory-bytes -1 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes -1 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'nonnumeric sizing' init --campaign text --workspace-root "$argument_root" \
-    --available-memory-bytes nope --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes nope --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 expect_failure 'scalar overflow' init --campaign scalar-overflow --workspace-root "$argument_root" \
-    --available-memory-bytes 9223372036854775808 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 9223372036854775808 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+for invalid_byte in 0 -1 nope 9223372036854775808; do
+    expect_failure "invalid active scratch $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --available-memory-bytes 1 --available-disk-bytes 5 \
+        --retained-input-bytes 1 --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes "$invalid_byte" \
+        --filesystem-overhead-bytes 1
+    expect_failure "invalid filesystem overhead $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --available-memory-bytes 1 --available-disk-bytes 5 \
+        --retained-input-bytes 1 --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes "$invalid_byte"
+    expect_failure "invalid reclaim peak $invalid_byte" init --campaign arguments \
+        --workspace-root "$argument_root" --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 1 --available-disk-bytes 5 \
+        --peak-in-flight-download-bytes "$invalid_byte" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+done
+expect_failure 'retain-all incompatible peak' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+expect_failure 'reclaim incompatible retained input' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy reclaim-inputs-after-terminal --available-memory-bytes 1 \
+    --available-disk-bytes 44296724484 --retained-input-bytes 1 \
+    --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
+for unsafe_peak in 44296724479 44296724481; do
+    expect_failure "unsafe reclaim peak $unsafe_peak" init --campaign arguments \
+        --workspace-root "$argument_root" --retention-policy reclaim-inputs-after-terminal \
+        --available-memory-bytes 1 --available-disk-bytes 44296724484 \
+        --peak-in-flight-download-bytes "$unsafe_peak" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+    assert_contains "$case_stderr" 'option --peak-in-flight-download-bytes must equal 44296724480'
+done
+expect_failure 'missing active scratch' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --filesystem-overhead-bytes 1
+expect_failure 'missing filesystem overhead' init --campaign arguments --workspace-root "$argument_root" \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
+    --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1
+expect_failure 'missing reclaim peak' init --campaign arguments --workspace-root "$argument_root" \
+    --retention-policy reclaim-inputs-after-terminal --available-memory-bytes 1 \
+    --available-disk-bytes 5 --retained-basin-output-bytes 1 \
+    --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+    --filesystem-overhead-bytes 1
+for repeated_byte_option in active-compile-scratch-bytes filesystem-overhead-bytes; do
+    set -- $(init_args arguments "$argument_root")
+    expect_failure "repeated $repeated_byte_option" "$@" \
+        "--$repeated_byte_option" 1
+done
 touch "$argument_root/tdx-hydro-unsafe"
 expect_failure 'unsafe pre-existing path' init --campaign unsafe --workspace-root "$argument_root" \
-    --available-memory-bytes 1 --available-disk-bytes 4 --retained-input-bytes 1 \
+    --available-memory-bytes 1 --available-disk-bytes 5 --retained-input-bytes 1 \
     --retained-basin-output-bytes 1 --assembly-memory-ceiling-bytes 1 \
-    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1
+    --assembly-scratch-ceiling-bytes 1 --assembled-artifact-bytes 1 \
+    --active-compile-scratch-bytes 1 --filesystem-overhead-bytes 1
 pass 'argument and path validation rejects invalid forms'
 
 for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
@@ -351,9 +1390,11 @@ for script in "$runner" "$SCRIPT_DIR/test-tdx-hydro-campaign.sh"; do
     forbidden_nameref='(declare|local)[[:space:]]+-n'
     forbidden_lock='f''lock'
     forbidden_bashpid='BASH''PID'
+    forbidden_varfd='\{[A-Za-z_][A-Za-z0-9_]*\}<>'
     if grep -En -e "$forbidden_assoc" -e "$forbidden_wait" -e "$forbidden_map" -e "$forbidden_read" \
         -e "$forbidden_case_change" -e "$forbidden_glob" -e "$forbidden_negative" -e "$forbidden_v" \
-        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" "$script" >"$case_stdout"; then
+        -e "$forbidden_nameref" -e "$forbidden_lock" -e "$forbidden_bashpid" \
+        -e "$forbidden_varfd" "$script" >"$case_stdout"; then
         die "forbidden Bash-4 construct found in $script"
     fi
     if grep -En '"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"' "$script" |
@@ -375,6 +1416,31 @@ assert_contains "$runner" 'header_status" == 200'
 assert_contains "$runner" '[Ee][Tt][Aa][Gg]:*'
 assert_contains "$runner" '.curl-headers.$basin_id.$product.$$'
 assert_contains "$runner" '.curl-stats.$basin_id.$product.$$'
+[[ $(grep -Fc '"$JQ" -r '\''keys[]'\'' "$campaign_dir/state/inventory.json"' "$runner") -eq 3 ]] ||
+    die 'runner does not contain exactly three textual three-argument keys[] reads'
+sed -n '/^acquire_basin() {$/,/^}$/p' "$runner" >"$case_stdout"
+[[ $(sed -n '2p' "$case_stdout") == '    lock_owned=0' &&
+   $(sed -n '3p' "$case_stdout") == '    takeover_owned=0' ]] ||
+    die 'acquisition child ownership resets are not the first two statements'
+sed -n '/^pipeline_acquisition_worker() {$/,/^}$/p' "$runner" >"$case_stdout"
+[[ $(sed -n '2p' "$case_stdout") == '    lock_owned=0' &&
+   $(sed -n '3p' "$case_stdout") == '    takeover_owned=0' ]] ||
+    die 'pipeline worker ownership resets are not the first two statements'
+[[ $(grep -c '^pipeline_acquisition_worker() {$' "$runner") -eq 1 ]] ||
+    die 'pipeline worker definition count differs'
+trap_body=$(grep '^    trap ' "$case_stdout")
+[[ "$trap_body" != *'$1'* && "$trap_body" != *'$2'* &&
+   "$trap_body" != *'$@'* && "$trap_body" != *'$*'* ]] ||
+    die 'pipeline worker trap uses positional parameters'
+for trap_name in $(printf '%s\n' "$trap_body" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | tr -d '$' | sort -u); do
+    ! grep -Eq "^[[:space:]]*local([[:space:]].*)?[[:space:]]$trap_name(=|[[:space:]]|$)" "$case_stdout" ||
+        die "pipeline worker trap variable is local: $trap_name"
+done
+if grep -En '^[[:space:]]*pipeline_acquisition_worker[[:space:]]+[^&]*&' "$runner" >"$case_stdout"; then
+    die 'pipeline worker has a bare background invocation'
+fi
+[[ $(grep -Fc '( pipeline_acquisition_worker "$basin_id" ) &' "$runner") -eq 1 ]] ||
+    die 'pipeline worker production call-site count differs'
 pass 'static Bash 3.2 compatibility checks pass'
 
 expected_campaign_commands=$test_tmp/expected-campaign-commands
@@ -531,17 +1597,18 @@ assert_contains "$case_stderr" "required command '/root/hfx/target/release/hfx' 
 pass 'compile resolves both frozen command defaults behaviorally'
 jq -e '
     keys == ["campaign","inventory","retention","schema_version","sizing"] and
-    .schema_version == 1 and .campaign == "equal" and
+    .schema_version == 2 and .campaign == "equal" and
     .inventory == {source:"adapters/tdx-hydro/data/tdx_header_numbers.json",count:62} and
     .retention == {
       policy:"retain-all-through-publication",reclaim_inputs:false,
       retain_acquired_inputs:true,retain_basin_outputs:true,retain_external_reports:true
     } and
     .sizing == {
-      available_memory_bytes:11,available_disk_bytes:26,retained_input_bytes:5,
+      available_memory_bytes:11,available_disk_bytes:29,retained_input_bytes:5,
       retained_basin_output_bytes:6,assembly_memory_ceiling_bytes:11,
       assembly_scratch_ceiling_bytes:7,assembled_artifact_bytes:8,
-      required_memory_bytes:11,required_disk_bytes:26
+      active_compile_scratch_bytes:9,filesystem_overhead_bytes:1,
+      required_memory_bytes:11,required_disk_bytes:29
     }
 ' "$campaign_dir/state/campaign.json" >/dev/null || die 'campaign JSON shape differs'
 jq -S '.' "$inventory" >"$test_tmp/expected-inventory.json"
@@ -580,20 +1647,33 @@ pass 'equal-capacity init creates the complete 62-basin contract'
 
 memory_root=$test_tmp/workspaces/memory
 mkdir "$memory_root"
-expect_failure 'memory undersizing' init --campaign memory --workspace-root "$memory_root" \
-    --available-memory-bytes 10 --available-disk-bytes 26 --retained-input-bytes 5 \
+
+under_reserved_root=$test_tmp/workspaces/under-reserved
+mkdir "$under_reserved_root"
+expect_failure 'missing active compile scratch' init --campaign under-reserved \
+    --workspace-root "$under_reserved_root" \
+    --available-memory-bytes 11 --available-disk-bytes 26 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
     --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
+[[ ! -e "$under_reserved_root/tdx-hydro-under-reserved" ]] ||
+    die 'missing active compile scratch refusal created campaign state'
+
+expect_failure 'memory undersizing' init --campaign memory --workspace-root "$memory_root" \
+    --available-memory-bytes 10 --available-disk-bytes 29 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'insufficient memory: available 10 bytes; required 11 bytes'
 [[ ! -e "$memory_root/tdx-hydro-memory" ]] || die 'memory refusal created campaign state'
 
 disk_root=$test_tmp/workspaces/disk
 mkdir "$disk_root"
 expect_failure 'disk undersizing' init --campaign disk --workspace-root "$disk_root" \
-    --available-memory-bytes 11 --available-disk-bytes 25 --retained-input-bytes 5 \
+    --available-memory-bytes 11 --available-disk-bytes 28 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
-    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
-assert_contains "$case_stderr" 'insufficient disk: available 25 bytes; required 26 bytes'
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
+assert_contains "$case_stderr" 'insufficient disk: available 28 bytes; required 29 bytes'
 [[ ! -e "$disk_root/tdx-hydro-disk" ]] || die 'disk refusal created campaign state'
 
 overflow_root=$test_tmp/workspaces/overflow
@@ -602,9 +1682,48 @@ expect_failure 'sum overflow' init --campaign overflow --workspace-root "$overfl
     --available-memory-bytes 1 --available-disk-bytes 9223372036854775807 \
     --retained-input-bytes 9223372036854775807 --retained-basin-output-bytes 1 \
     --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
-    --assembled-artifact-bytes 1
+    --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+    --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'required disk byte sum overflows signed 64-bit range'
 [[ ! -e "$overflow_root/tdx-hydro-overflow" ]] || die 'overflow refusal created campaign state'
+for overflow_spec in \
+    'overflow-active 9223372036854775806 1 1 1' \
+    'overflow-assembly 9223372036854775805 1 1 1' \
+    'overflow-overhead 9223372036854775804 1 1 1'; do
+    overflow_campaign=${overflow_spec%% *}
+    overflow_values=${overflow_spec#* }
+    overflow_input=${overflow_values%% *}
+    expect_failure "$overflow_campaign" init --campaign "$overflow_campaign" \
+        --workspace-root "$overflow_root" --available-memory-bytes 1 \
+        --available-disk-bytes 9223372036854775807 \
+        --retained-input-bytes "$overflow_input" --retained-basin-output-bytes 1 \
+        --assembly-memory-ceiling-bytes 1 --assembly-scratch-ceiling-bytes 1 \
+        --assembled-artifact-bytes 1 --active-compile-scratch-bytes 1 \
+        --filesystem-overhead-bytes 1
+    assert_contains "$case_stderr" 'required disk byte sum overflows signed 64-bit range'
+    [[ ! -e "$overflow_root/tdx-hydro-$overflow_campaign" ]] ||
+        die "$overflow_campaign refusal created campaign state"
+done
+
+inverse_assembly_root=$test_tmp/workspaces/inverse-assembly-max
+mkdir "$inverse_assembly_root"
+run_runner init --campaign inverse-assembly-max --workspace-root "$inverse_assembly_root" \
+    --available-memory-bytes 11 --available-disk-bytes 31 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 10 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1 >"$case_stdout"
+jq -e '.sizing.required_disk_bytes == 31 and .sizing.available_disk_bytes == 31' \
+    "$inverse_assembly_root/tdx-hydro-inverse-assembly-max/state/campaign.json" >/dev/null ||
+    die 'inverse assembly maximum total differs'
+expect_failure 'inverse assembly one byte short' init --campaign inverse-assembly-max-short \
+    --workspace-root "$inverse_assembly_root" \
+    --available-memory-bytes 11 --available-disk-bytes 30 --retained-input-bytes 5 \
+    --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+    --assembly-scratch-ceiling-bytes 10 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
+assert_contains "$case_stderr" 'insufficient disk: available 30 bytes; required 31 bytes'
+[[ ! -e "$inverse_assembly_root/tdx-hydro-inverse-assembly-max-short" ]] ||
+    die 'inverse assembly refusal created campaign state'
 pass 'memory, disk, and arithmetic preflight refuse before writes'
 
 selected_id=$(jq -r 'keys[0]' "$inventory")
@@ -613,14 +1732,62 @@ jq '.stages.compile={status:"succeeded",attempts:3,failure_reason:null,diagnosti
 mv "$selected_state.tmp" "$selected_state"
 cp "$selected_state" "$test_tmp/preserved-state.json"
 cp "$campaign_dir/state/campaign.json" "$test_tmp/preserved-campaign.json"
-set -- $(init_args equal "$valid_root")
-run_runner "$@" >"$case_stdout"
+run_runner init --campaign equal --workspace-root "$valid_root" \
+    --available-memory-bytes 00011 --available-disk-bytes 00029 \
+    --retained-input-bytes 0005 --retained-basin-output-bytes 0006 \
+    --assembly-memory-ceiling-bytes 00011 --assembly-scratch-ceiling-bytes 0007 \
+    --assembled-artifact-bytes 0008 --active-compile-scratch-bytes 0009 \
+    --filesystem-overhead-bytes 0001 >"$case_stdout"
 diff -u "$test_tmp/preserved-state.json" "$selected_state"
 expect_failure 'changed contract' init --campaign equal --workspace-root "$valid_root" \
-    --available-memory-bytes 12 --available-disk-bytes 26 --retained-input-bytes 5 \
+    --available-memory-bytes 12 --available-disk-bytes 29 --retained-input-bytes 5 \
     --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
-    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8
+    --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+    --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1
 assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+diff -u "$test_tmp/preserved-state.json" "$selected_state"
+diff -u "$test_tmp/preserved-campaign.json" "$campaign_dir/state/campaign.json"
+expect_failure 'changed retention policy' init --campaign equal --workspace-root "$valid_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000
+assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+for changed_pair in 'active-compile-scratch-bytes 10 30' 'filesystem-overhead-bytes 2 30' \
+    'retained-input-bytes 6 30'; do
+    changed_option=${changed_pair%% *}
+    changed_remainder=${changed_pair#* }
+    changed_value=${changed_remainder%% *}
+    changed_disk=${changed_remainder#* }
+    if [[ "$changed_option" == active-compile-scratch-bytes ]]; then
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes 5 --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes "$changed_value" \
+            --filesystem-overhead-bytes 1
+    elif [[ "$changed_option" == filesystem-overhead-bytes ]]; then
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes 5 --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes 9 \
+            --filesystem-overhead-bytes "$changed_value"
+    else
+        expect_failure "changed $changed_option" init --campaign equal --workspace-root "$valid_root" \
+            --available-memory-bytes 11 --available-disk-bytes "$changed_disk" \
+            --retained-input-bytes "$changed_value" --retained-basin-output-bytes 6 \
+            --assembly-memory-ceiling-bytes 11 --assembly-scratch-ceiling-bytes 7 \
+            --assembled-artifact-bytes 8 --active-compile-scratch-bytes 9 \
+            --filesystem-overhead-bytes 1
+    fi
+    assert_contains "$case_stderr" 'campaign parameters changed; use a new campaign ID'
+done
 diff -u "$test_tmp/preserved-state.json" "$selected_state"
 diff -u "$test_tmp/preserved-campaign.json" "$campaign_dir/state/campaign.json"
 pass 'init converges only for an equivalent contract and preserves basin state'
@@ -746,6 +1913,34 @@ jq '.sizing.available_memory_bytes=1' \
 mv "$sizing_root/campaign.tmp" "$sizing_root/tdx-hydro-equal/state/campaign.json"
 expect_failure 'malformed sizing' status --campaign equal --workspace-root "$sizing_root"
 
+mutate_campaign_state() {
+    local name=$1
+    local filter=$2
+    local root
+    local state
+    root=$(copy_workspace "$name")
+    state=$root/tdx-hydro-equal/state/campaign.json
+    jq "$filter" "$state" >"$root/campaign.tmp"
+    mv "$root/campaign.tmp" "$state"
+    expect_failure "$name" status --campaign equal --workspace-root "$root"
+    assert_contains "$case_stderr" "campaign state is malformed: $state"
+}
+mutate_campaign_state schema-one '.schema_version=1'
+mutate_campaign_state extra-sizing-key '.sizing.extra=1'
+mutate_campaign_state absent-sizing-key 'del(.sizing.active_compile_scratch_bytes)'
+mutate_campaign_state string-sizing '.sizing.active_compile_scratch_bytes="9"'
+mutate_campaign_state fractional-sizing '.sizing.active_compile_scratch_bytes=9.5'
+mutate_campaign_state zero-sizing '.sizing.active_compile_scratch_bytes=0'
+mutate_campaign_state negative-sizing '.sizing.active_compile_scratch_bytes=-1'
+mutate_campaign_state oversized-sizing '.sizing.active_compile_scratch_bytes=9223372036854775808'
+mutate_campaign_state wrong-reclaim-flag '.retention.reclaim_inputs=true'
+mutate_campaign_state wrong-retain-input-flag '.retention.retain_acquired_inputs=false'
+mutate_campaign_state altered-required-total '.sizing.required_disk_bytes=30'
+mutate_campaign_state insufficient-disk '.sizing.available_disk_bytes=28'
+mutate_campaign_state assembly-maximum-drift \
+    '.sizing.assembly_scratch_ceiling_bytes=10 | .sizing.required_disk_bytes=29'
+unset -f mutate_campaign_state
+
 compile_state_root=$(copy_workspace bad-compile-state)
 jq -n '{schema_version:1,fabric_version:"version",extra:true}' \
     >"$compile_state_root/tdx-hydro-equal/state/compile.json"
@@ -773,6 +1968,15 @@ jq -e '.schema_version == 3 and (.stages.compile | keys == ["attempts","diagnost
     die 'shared status fixture lost the v3 compile diagnostic member'
 run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
 assert_contains "$case_stdout" 'inventory_count=62'
+assert_contains "$case_stdout" 'retention_policy=retain-all-through-publication'
+assert_contains "$case_stdout" 'available_disk_bytes=29'
+assert_contains "$case_stdout" 'retained_input_bytes=5'
+assert_contains "$case_stdout" 'active_compile_scratch_bytes=9'
+assert_contains "$case_stdout" 'filesystem_overhead_bytes=1'
+assert_contains "$case_stdout" 'required_disk_bytes=29'
+cp "$case_stdout" "$test_tmp/status-first"
+run_runner status --campaign equal --workspace-root "$valid_root" >"$case_stdout"
+cmp "$test_tmp/status-first" "$case_stdout"
 assert_contains "$case_stdout" 'acquire_basins_pending=62'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=1'
 assert_contains "$case_stdout" 'compile_succeeded=1'
@@ -783,24 +1987,108 @@ assert_contains "$case_stdout" 'assemble_failed=0'
 pass 'status rejects all malformed state and reports deterministic counts'
 
 run_runner --help >"$case_stdout"
-if grep -i 'reclaim' "$case_stdout" >/dev/null; then
-    die 'help exposes an input-reclaim mode'
+assert_contains "$case_stdout" 'retain-all-through-publication'
+assert_contains "$case_stdout" 'reclaim-inputs-after-terminal'
+policy_root=$test_tmp/workspaces/policy-aware
+mkdir "$policy_root"
+set -- $(init_args policy-retain-default "$policy_root")
+run_runner "$@" >"$case_stdout"
+run_runner init --campaign policy-reclaim-equal --workspace-root "$policy_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+expect_failure 'reclaim one byte short' init --campaign policy-reclaim-short \
+    --workspace-root "$policy_root" --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129059 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000
+assert_contains "$case_stderr" \
+    'insufficient disk: available 491737129059 bytes; required 491737129060 bytes'
+[[ ! -e "$policy_root/tdx-hydro-policy-reclaim-short" ]] ||
+    die 'reclaim disk refusal created campaign state'
+run_runner init --campaign policy-reclaim-headroom --workspace-root "$policy_root" \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 560000000000 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+jq -e '
+  .schema_version == 2 and
+  .retention == {
+    policy:"retain-all-through-publication",reclaim_inputs:false,
+    retain_acquired_inputs:true,retain_basin_outputs:true,retain_external_reports:true
+  } and
+  (.sizing | has("retained_input_bytes") and (has("peak_in_flight_download_bytes") | not))
+' "$policy_root/tdx-hydro-policy-retain-default/state/campaign.json" >/dev/null ||
+    die 'default retain-all policy shape differs'
+jq -e '
+  .retention == {
+    policy:"reclaim-inputs-after-terminal",reclaim_inputs:true,
+    retain_acquired_inputs:false,retain_basin_outputs:true,retain_external_reports:true
+  } and
+  .sizing == {
+    available_memory_bytes:30000000000,available_disk_bytes:491737129060,
+    peak_in_flight_download_bytes:44296724480,retained_basin_output_bytes:206220202290,
+    assembly_memory_ceiling_bytes:30000000000,assembly_scratch_ceiling_bytes:206220202290,
+    assembled_artifact_bytes:206220202290,active_compile_scratch_bytes:30000000000,
+    filesystem_overhead_bytes:5000000000,required_memory_bytes:30000000000,
+    required_disk_bytes:491737129060
+  }
+' "$policy_root/tdx-hydro-policy-reclaim-equal/state/campaign.json" >/dev/null ||
+    die 'reclaim policy shape differs'
+jq -e '
+  .sizing.available_disk_bytes == 560000000000 and
+  .sizing.required_disk_bytes == 491737129060 and
+  (.sizing.available_disk_bytes - .sizing.required_disk_bytes) == 68262870940
+' "$policy_root/tdx-hydro-policy-reclaim-headroom/state/campaign.json" >/dev/null ||
+    die 'reclaim headroom model differs'
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+assert_contains "$case_stdout" 'retention_policy=reclaim-inputs-after-terminal'
+assert_contains "$case_stdout" 'peak_in_flight_download_bytes=44296724480'
+if grep -F 'retained_input_bytes=' "$case_stdout" >/dev/null; then
+    die 'reclaim status printed the inactive input term'
 fi
-assert_contains "$campaign_dir/state/campaign.json" '"reclaim_inputs": false'
-assert_contains "$case_stdout" '--retained-input-bytes'
-assert_contains "$case_stdout" '--retained-basin-output-bytes'
-assert_contains "$case_stdout" '--assembly-scratch-ceiling-bytes'
-assert_contains "$case_stdout" '--assembled-artifact-bytes'
-pass 'retain-all sizing has no reclaim interface'
-
-expect_failure 'missing max parallel' acquire --campaign equal --workspace-root "$valid_root"
-expect_failure 'repeated max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 1 --max-parallel 2
-expect_failure 'zero max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 0
-expect_failure 'negative max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel -1
-expect_failure 'nonnumeric max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel x
-expect_failure 'large max parallel' acquire --campaign equal --workspace-root "$valid_root" --max-parallel 63
-expect_failure 'foreign max parallel' status --campaign equal --workspace-root "$valid_root" --max-parallel 1
-pass 'acquire concurrency argument is required and bounded'
+cp "$case_stdout" "$test_tmp/reclaim-status-first"
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+cmp "$test_tmp/reclaim-status-first" "$case_stdout"
+for reclaim_mutation in wrong-peak wrong-input-key wrong-retention-flag; do
+    mutation_root=$test_tmp/workspaces/$reclaim_mutation
+    mkdir "$mutation_root"
+    cp -R "$policy_root/tdx-hydro-policy-reclaim-equal" \
+        "$mutation_root/tdx-hydro-policy-reclaim-equal"
+    mutation_state=$mutation_root/tdx-hydro-policy-reclaim-equal/state/campaign.json
+    case $reclaim_mutation in
+        wrong-peak) mutation_filter='.sizing.peak_in_flight_download_bytes=44296724479' ;;
+        wrong-input-key)
+            mutation_filter='del(.sizing.peak_in_flight_download_bytes) | .sizing.retained_input_bytes=44296724480'
+            ;;
+        wrong-retention-flag) mutation_filter='.retention.retain_acquired_inputs=true' ;;
+    esac
+    jq "$mutation_filter" "$mutation_state" >"$mutation_root/campaign.tmp"
+    mv "$mutation_root/campaign.tmp" "$mutation_state"
+    expect_failure "$reclaim_mutation" status --campaign policy-reclaim-equal \
+        --workspace-root "$mutation_root"
+    assert_contains "$case_stderr" "campaign state is malformed: $mutation_state"
+done
+printf '%s\n' retained >"$policy_root/tdx-hydro-policy-reclaim-equal/downloads/input-fixture"
+run_runner status --campaign policy-reclaim-equal --workspace-root "$policy_root" >"$case_stdout"
+assert_contains "$policy_root/tdx-hydro-policy-reclaim-equal/downloads/input-fixture" retained
+pass 'policy-aware sizing preserves retain-all and sizes reclaim mode'
 
 printf 'SQLite format 3\0fixture\n' >"$test_tmp/geopackage-template"
 mkdir "$test_tmp/transfer-state"
@@ -888,6 +2176,44 @@ maximum=0
 [ "$active" -le "$maximum" ] || printf '%s\n' "$active" >"$HFX_TEST_TRANSFER_STATE/maximum"
 printf 'start %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
+if [ "${HFX_TEST_REDISPATCH_HOLD_KEY-}" = "$key" ] &&
+   [ -d "$HFX_TEST_TRANSFER_STATE/fail-once-$key" ]; then
+    redispatch_wait=0
+    while [ ! -f "${HFX_TEST_REDISPATCH_RELEASE_MARKER:?}" ]; do
+        redispatch_wait=$((redispatch_wait + 1))
+        [ "$redispatch_wait" -lt 1000 ] || exit 97
+        sleep 0.01
+    done
+fi
+if [ -n "${HFX_TEST_PIPELINE_KILL_KEY-}" ] &&
+   [ "$key" = "$HFX_TEST_PIPELINE_KILL_KEY" ] &&
+   mkdir "$HFX_TEST_TRANSFER_STATE/kill-once-$key" 2>/dev/null; then
+    printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/killed-curl.pid"
+    printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/killed-worker.pid"
+    kill -KILL "$PPID"
+    sleep 1
+    exit 98
+fi
+if [ "${HFX_TEST_FATAL_HOLD-}" = 1 ]; then
+    printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/fatal-curl.$$"
+    printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/fatal-worker.$PPID"
+    if [ "$key" = "${HFX_TEST_FATAL_INJECT_KEY:?}" ]; then
+        fatal_attempt=0
+        while [ "$(find "$HFX_TEST_TRANSFER_STATE" -name 'fatal-worker.*' -type f |
+                   wc -l | tr -d ' ')" -lt 2 ]; do
+            fatal_attempt=$((fatal_attempt + 1))
+            [ "$fatal_attempt" -lt 1000 ] || exit 97
+            sleep 0.01
+        done
+        printf '%s\n' malformed >&9
+    fi
+    fatal_attempt=0
+    while [ "$fatal_attempt" -lt 600 ]; do
+        fatal_attempt=$((fatal_attempt + 1))
+        sleep 0.01
+    done
+    exit 97
+fi
 if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
     total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
@@ -906,7 +2232,26 @@ if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
             [ "$rendezvous_deadline" -lt "$rendezvous_limit" ] || exit 95
         done
         campaign_dir=${output%/downloads/*}
-        runner_pid=$(cat "$campaign_dir/state/locks/campaign.lock/owner.pid")
+        owner_file=$campaign_dir/state/locks/campaign.lock/owner.pid
+        runner_pid=$(cat "$owner_file")
+        child_exit_deadline=0
+        child_exited=0
+        while [ "$child_exited" -eq 0 ]; do
+            for pid_file in "$HFX_TEST_TRANSFER_STATE"/worker.*; do
+                [ -f "$pid_file" ] || continue
+                observed_pid=$(cat "$pid_file")
+                if [ "$observed_pid" != "$PPID" ] && ! kill -0 "$observed_pid" 2>/dev/null; then
+                    child_exited=1
+                    break
+                fi
+            done
+            child_exit_deadline=$((child_exit_deadline + 1))
+            [ "$child_exit_deadline" -lt "$rendezvous_limit" ] || exit 95
+            [ "$child_exited" -eq 1 ] || sleep 0.01
+        done
+        [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || exit 95
+        [ "$(cat "$owner_file")" = "$runner_pid" ] || exit 95
+        printf '%s\n' "$runner_pid" >"$HFX_TEST_TRANSFER_STATE/lock-owner-stable"
         kill -TERM "$runner_pid"
         sleep 0.05
         kill -INT "$runner_pid" 2>/dev/null || :
@@ -971,7 +2316,9 @@ if [ -n "$continue_at" ]; then
             ;;
         *) exit 96 ;;
     esac
-elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ]; then
+elif [ "${HFX_TEST_FAIL_KEY-}" = "$key" ] ||
+     { [ "${HFX_TEST_FAIL_ONCE_KEY-}" = "$key" ] &&
+       mkdir "$HFX_TEST_TRANSFER_STATE/fail-once-$key" 2>/dev/null; }; then
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
     [ "${HFX_TEST_LEADING_ZERO_LENGTH-}" != 1 ] || total=0$total
     printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
@@ -997,6 +2344,19 @@ printf 'end %s\n' "$key" >>"$HFX_TEST_TRANSFER_STATE/events"
 rm -r "$mutex"
 exit "$result"
 FAKE_CURL
+sed >"$test_tmp/recording-mkdir" <<'RECORDING_MKDIR'
+#!/bin/bash
+set -eu
+if "${HFX_TEST_REAL_MKDIR:?}" "$@"; then
+    for argument do
+        if [ "$argument" = "${HFX_TEST_REJECTED_LOCK_PATH-}" ]; then
+            : >"${HFX_TEST_REJECTED_LOCK_CREATED:?}"
+        fi
+    done
+else
+    exit $?
+fi
+RECORDING_MKDIR
 sed >"$test_tmp/fake-sha256sum" <<'FAKE_SHA'
 #!/bin/sh
 checksum=$(cksum <"$1")
@@ -1038,6 +2398,40 @@ if [ "${HFX_TEST_INTERRUPT_EMPTY-}" = 1 ] &&
         exit 0
     fi
 fi
+if [ -n "${HFX_TEST_REENTRY_TAMPER-}" ] &&
+    [ ! -e "$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER" ]; then
+    jq_input=${!#}
+    case $jq_input in
+        */state/campaign.json)
+            campaign_dir=${jq_input%/state/campaign.json}
+            lock_path=$campaign_dir/state/locks/campaign.lock
+            if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+                case $HFX_TEST_REENTRY_TAMPER in
+                    live-owner)
+                        printf '%s\n' "${HFX_TEST_COMPETING_PID:?}" >"$lock_path/owner.pid"
+                        ;;
+                    owner-symlink)
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER"
+                        rm "$lock_path/owner.pid"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-owner-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path/owner.pid"
+                        ;;
+                    lock-symlink)
+                        mkdir "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER"
+                        printf '%s\n' "$PPID" \
+                            >"$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER/owner.pid"
+                        rm -r "$lock_path"
+                        ln -s "$HFX_TEST_TRANSFER_STATE/reentry-lock-$HFX_TEST_REENTRY_TAMPER" \
+                            "$lock_path"
+                        ;;
+                    *) exit 96 ;;
+                esac
+                : >"$HFX_TEST_TRANSFER_STATE/reentry-tampered-$HFX_TEST_REENTRY_TAMPER"
+            fi
+            ;;
+    esac
+fi
 exec "${HFX_TEST_REAL_JQ:?}" "$@"
 FAKE_JQ
 sed >"$test_tmp/fake-adapter" <<'FAKE_ADAPTER'
@@ -1047,6 +2441,9 @@ log=${HFX_TEST_ADAPTER_LOG:?}
 command_name=${1-}
 case $command_name in
     build)
+        if [ -n "${HFX_TEST_REDISPATCH_RELEASE_MARKER-}" ]; then
+            : >"$HFX_TEST_REDISPATCH_RELEASE_MARKER"
+        fi
         [ "$#" -eq 13 ] || exit 81
         [ "$2" = --basins ] || exit 82
         basins=$3
@@ -1058,6 +2455,21 @@ case $command_name in
         report=$9
         [ "${10}" = --processing-basin-id ] || exit 82
         basin_id=${11}
+        if [ -n "${HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG-}" ]; then
+            build_mutex=${HFX_TEST_TRANSFER_STATE:?}/mutex
+            build_attempt=0
+            while ! mkdir "$build_mutex" 2>/dev/null; do
+                build_attempt=$((build_attempt + 1))
+                [ "$build_attempt" -lt 1000 ] || exit 95
+                sleep 0.01
+            done
+            build_active=0
+            [ ! -f "$HFX_TEST_TRANSFER_STATE/active" ] ||
+                build_active=$(cat "$HFX_TEST_TRANSFER_STATE/active")
+            printf 'build-active %s %s\n' "$basin_id" "$build_active" \
+                >>"$HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG"
+            rmdir "$build_mutex"
+        fi
         [ "${12}" = --fabric-version ] || exit 82
         fabric_version=${13}
         printf 'build\t--basins\t%s\t--streamnet\t%s\t--out\t%s\t--report\t%s\t--processing-basin-id\t%s\t--fabric-version\t%s\n' \
@@ -1069,6 +2481,13 @@ case $command_name in
         esac
         [ "${out##*/}" = "$basin_id" ] || exit 85
         [ "${report##*/}" = "$basin_id-build-report.json" ] || exit 85
+        if [ "${HFX_TEST_REQUIRE_LOCK_OWNER-}" = 1 ]; then
+            owner_file=${out%/basin-outputs/*}/state/locks/campaign.lock/owner.pid
+            [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || exit 94
+            owner=$(cat "$owner_file")
+            [ "$owner" = "$PPID" ] || exit 94
+            printf '%s\n' "$owner" >"${HFX_TEST_LOCK_OWNER_LOG:?}"
+        fi
         if [ "${HFX_TEST_REQUIRE_CLEARED_DIAGNOSTIC-}" = 1 ]; then
             state=${out%/basin-outputs/*}/state/basins/$basin_id/current.json
             "${HFX_TEST_REAL_JQ:?}" -e '
@@ -1156,6 +2575,52 @@ sed >"$test_tmp/fake-adapter-python" <<'FAKE_ADAPTER_PYTHON'
 #!/bin/bash
 set -eu
 [ "$#" -ge 1 ] || exit 91
+mkfifo_program='import os, sys
+path = sys.argv[1]
+old_umask = os.umask(0)
+try:
+    os.mkfifo(path, 0o600)
+finally:
+    os.umask(old_umask)'
+statvfs_program='import os, sys
+path = sys.argv[1]
+s = os.statvfs(path)
+print(s.f_bavail * s.f_frsize)'
+if [ "$1" = -c ]; then
+    [ "$#" -eq 3 ] || exit 93
+    if [ "$2" = "$mkfifo_program" ]; then
+        [ "$3" = "${HFX_TEST_PIPELINE_COMPLETION_PATH:?}" ] || exit 93
+        mkfifo -m 600 "$3"
+        exit
+    fi
+    if [ "$2" = "$statvfs_program" ]; then
+        [ "$3" = "${HFX_TEST_PIPELINE_CAMPAIGN_DIR:?}" ] || exit 93
+        if [ -n "${HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE-}" ]; then
+            sequence=$HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+            [ -f "$sequence" ] && [ ! -L "$sequence" ] || exit 93
+            sequence_mutex=$sequence.mutex
+            sequence_attempt=0
+            while ! mkdir "$sequence_mutex" 2>/dev/null; do
+                sequence_attempt=$((sequence_attempt + 1))
+                [ "$sequence_attempt" -lt 1000 ] || exit 93
+                sleep 0.01
+            done
+            sequence_value=$(head -n 1 "$sequence")
+            [ -n "$sequence_value" ] || {
+                rmdir "$sequence_mutex"
+                exit 93
+            }
+            tail -n +2 "$sequence" >"$sequence.tmp"
+            mv "$sequence.tmp" "$sequence"
+            rmdir "$sequence_mutex"
+            printf '%s\n' "$sequence_value"
+        else
+            printf '%s\n' "${HFX_TEST_PIPELINE_AVAILABLE_BYTES-44296724480}"
+        fi
+        exit
+    fi
+    exit 93
+fi
 [ "$1" = "${HFX_TEST_ADAPTER_SCRIPT:?}" ] || exit 92
 shift
 if [ "${1-}" = assemble ]; then
@@ -1168,6 +2633,62 @@ if [ "${1-}" = assemble ]; then
 fi
 exec "${HFX_TEST_ADAPTER_STUB:?}" "$@"
 FAKE_ADAPTER_PYTHON
+sed >"$test_tmp/pipeline-mv" <<'PIPELINE_MV'
+#!/bin/bash
+set -eu
+source_path=$1
+destination_path=$2
+if [ "$#" -eq 2 ] &&
+   [ "${HFX_TEST_KILLED_BASIN_ID-}" != "" ] &&
+   [ "$destination_path" = "${HFX_TEST_KILLED_CURRENT_PATH-}" ] &&
+   "${HFX_TEST_REAL_JQ:?}" -e --arg id "$HFX_TEST_KILLED_BASIN_ID" '
+     .processing_basin_id == $id and
+     ([.stages.acquire_basins,.stages.acquire_streamnet] |
+      any(.status == "pending" and
+          .failure_reason == "interrupted before terminal state; reset by recover"))
+   ' "$source_path" >/dev/null 2>&1; then
+    : >"${HFX_TEST_KILLED_PENDING_MARKER:?}"
+    if [ -n "${HFX_TEST_STALE_READY_MARKER-}" ]; then
+        stale_wait=0
+        while [ ! -f "$HFX_TEST_STALE_READY_MARKER" ]; do
+            stale_wait=$((stale_wait + 1))
+            [ "$stale_wait" -lt 1000 ] || exit 97
+            sleep 0.01
+        done
+        sleep 6
+    fi
+fi
+if [ "$#" -eq 2 ] &&
+   [ -n "${HFX_TEST_STALE_CURRENT_PATH-}" ] &&
+   [ "$destination_path" = "$HFX_TEST_STALE_CURRENT_PATH" ] &&
+   "${HFX_TEST_REAL_JQ:?}" -e '
+     [.stages.acquire_basins,.stages.acquire_streamnet] |
+     any(.status == "failed")
+   ' "$source_path" >/dev/null 2>&1 &&
+   mkdir "${HFX_TEST_STALE_READY_MARKER:?}.once" 2>/dev/null; then
+    : >"$HFX_TEST_STALE_READY_MARKER"
+    sleep 4
+fi
+exec "${HFX_TEST_REAL_MV:?}" "$@"
+PIPELINE_MV
+sed >"$test_tmp/pipeline-rm" <<'PIPELINE_RM'
+#!/bin/bash
+set -eu
+last_argument=${!#}
+if [ -n "${HFX_TEST_FATAL_FIFO-}" ] &&
+   [ "$last_argument" = "$HFX_TEST_FATAL_FIFO" ]; then
+    [ -d "${HFX_TEST_FATAL_LOCK:?}" ] || exit 96
+    for pid_file in "${HFX_TEST_TRANSFER_STATE:?}"/fatal-worker.*; do
+        [ -f "$pid_file" ] || continue
+        worker_pid=$(cat "$pid_file")
+        if kill -0 "$worker_pid" 2>/dev/null; then
+            exit 96
+        fi
+    done
+    printf '%s\n' children-reaped-with-lock >"${HFX_TEST_FATAL_CLEANUP_MARKER:?}"
+fi
+exec "${HFX_TEST_REAL_RM:?}" "$@"
+PIPELINE_RM
 sed >"$test_tmp/fake-hfx" <<'FAKE_HFX'
 #!/bin/bash
 set -eu
@@ -1184,8 +2705,9 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"${HFX_TEST_HF
 [ "$6" = text ] || exit 73
 exit 0
 FAKE_HFX
-chmod +x "$test_tmp/fake-curl" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
-    "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx"
+chmod +x "$test_tmp/fake-curl" "$test_tmp/recording-mkdir" "$test_tmp/fake-sha256sum" "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" \
+    "$test_tmp/fake-adapter" "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx" \
+    "$test_tmp/pipeline-mv" "$test_tmp/pipeline-rm"
 export HFX_TDX_CURL=$test_tmp/fake-curl
 export HFX_TDX_SHA256SUM=$test_tmp/fake-sha256sum
 export HFX_TDX_OGRINFO=$test_tmp/fake-ogrinfo
@@ -1201,6 +2723,90 @@ export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
 export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
 export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
 export HFX_TEST_DIFF=$(command -v diff)
+
+run_runner init --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+run_runner init --campaign reclaim-parallel-one --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+run_runner init --campaign reclaim-parallel-four --workspace-root "$valid_root" \
+    --basin 7020000010 --basin 1020000010 --basin 9020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+for rejected_parallel in 5 62; do
+    rm -r "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    snapshot=$test_tmp/reclaim-parallel-$rejected_parallel
+    cp -R "$valid_root/tdx-hydro-reclaim-parallel-reject" "$snapshot"
+    expect_failure "reclaim parallelism $rejected_parallel" acquire \
+        --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+        --max-parallel "$rejected_parallel"
+    assert_contains "$case_stderr" \
+        'hfx: error: option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+    diff -ru "$snapshot" "$valid_root/tdx-hydro-reclaim-parallel-reject"
+    [[ ! -e "$test_tmp/transfer-state/events" ]] ||
+        die 'reclaim parallelism refusal allowed an acquisition worker to start'
+    [[ ! -e "$test_tmp/invocations/curl.log" ]] ||
+        die 'reclaim parallelism refusal invoked the PATH poison curl'
+done
+export HFX_TEST_REAL_MKDIR
+HFX_TEST_REAL_MKDIR=$(command -v mkdir)
+export HFX_TEST_REJECTED_LOCK_PATH=$valid_root/tdx-hydro-reclaim-parallel-reject/state/locks/campaign.lock
+export HFX_TEST_REJECTED_LOCK_CREATED=$test_tmp/rejected-reclaim-lock-created
+export HFX_TDX_MKDIR=$test_tmp/recording-mkdir
+expect_failure 'reclaim parallelism pre-lock ordering' acquire \
+    --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
+    --max-parallel 5
+assert_contains "$case_stderr" \
+    'hfx: error: option --max-parallel must be a base-10 integer from 1 through 4 for retention policy reclaim-inputs-after-terminal'
+[[ ! -e "$HFX_TEST_REJECTED_LOCK_CREATED" ]] ||
+    die 'rejected reclaim parallelism created the campaign lock directory'
+[[ ! -d "$HFX_TEST_REJECTED_LOCK_PATH" ]] ||
+    die 'rejected reclaim parallelism left the campaign lock directory present'
+unset HFX_TDX_MKDIR HFX_TEST_REAL_MKDIR HFX_TEST_REJECTED_LOCK_PATH HFX_TEST_REJECTED_LOCK_CREATED
+pass 'reclaim parallelism refusal occurs before campaign lock creation'
+
+printf '%s\n' \
+    1020000010-basins 1020000010-streamnet \
+    7020000010-basins 7020000010-streamnet \
+    9020000010-basins 9020000010-streamnet >"$test_tmp/expected-reclaim-starts"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-parallel-one --workspace-root "$valid_root" \
+    --max-parallel 1 >"$case_stdout"
+sed -n 's/^start //p' "$test_tmp/transfer-state/events" | sort >"$test_tmp/reclaim-starts"
+diff -u "$test_tmp/expected-reclaim-starts" "$test_tmp/reclaim-starts"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-parallel-four --workspace-root "$valid_root" \
+    --max-parallel 4 >"$case_stdout"
+sed -n 's/^start //p' "$test_tmp/transfer-state/events" | sort >"$test_tmp/reclaim-starts"
+diff -u "$test_tmp/expected-reclaim-starts" "$test_tmp/reclaim-starts"
+pass 'policy-dependent acquisition concurrency preserves retain-all and bounds reclaim'
 
 rm -r "$test_tmp/transfer-state"
 mkdir "$test_tmp/transfer-state"
@@ -1226,6 +2832,191 @@ jq -e -s '
 assert_contains "$case_stdout" 'acquire_basins_succeeded=3'
 assert_contains "$case_stdout" 'acquire_streamnet_succeeded=3'
 pass 'three-basin acquisition schedules only the frozen selection'
+
+named_root=$test_tmp/workspaces/named-compile
+mkdir "$named_root"
+cp -R "$subset_campaign_dir" "$named_root/tdx-hydro-subset"
+named_campaign_dir=$named_root/tdx-hydro-subset
+cp "$named_campaign_dir/state/basins/7020000010/current.json" "$test_tmp/named-702-before"
+cp "$named_campaign_dir/state/basins/9020000010/current.json" "$test_tmp/named-902-before"
+: >"$HFX_TEST_ADAPTER_LOG"
+export HFX_TEST_REQUIRE_LOCK_OWNER=1
+export HFX_TEST_LOCK_OWNER_LOG=$test_tmp/named-lock-owner
+run_runner compile-basin --campaign subset --workspace-root "$named_root" \
+    --basin 1020000010 --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+unset HFX_TEST_REQUIRE_LOCK_OWNER HFX_TEST_LOCK_OWNER_LOG
+[[ -s "$test_tmp/named-lock-owner" ]] || die 'named compile adapter did not observe the runner lock owner'
+[[ ! -d "$named_campaign_dir/state/locks/campaign.lock" ]] ||
+    die 'named compile left its campaign lock behind'
+assert_contains "$case_stdout" 'processing_basin_id=1020000010'
+assert_contains "$case_stdout" 'compile_status=succeeded'
+assert_contains "$case_stdout" 'compile_attempts=1'
+assert_contains "$case_stdout" 'inputs_reclaimed=not-applicable'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 1 ]] ||
+    die 'named compile did not issue exactly one adapter build'
+[[ $(grep '^build' "$HFX_TEST_ADAPTER_LOG" | cut -f11) == 1020000010 ]] ||
+    die 'named compile adapter build targeted another basin'
+cmp "$test_tmp/named-702-before" "$named_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/named-902-before" "$named_campaign_dir/state/basins/9020000010/current.json"
+for untouched_id in 7020000010 9020000010; do
+    jq -e '.stages.compile == {
+      status:"pending",attempts:0,failure_reason:null,diagnostic_report:null
+    }' "$named_campaign_dir/state/basins/$untouched_id/current.json" >/dev/null ||
+        die "named compile changed pending compile state for $untouched_id"
+    [[ ! -e "$named_campaign_dir/basin-outputs/$untouched_id" &&
+        ! -e "$named_campaign_dir/reports/$untouched_id-build-report.json" ]] ||
+        die "named compile created an artifact for $untouched_id"
+done
+if grep -R -F 'acquisition prerequisites are not both succeeded' \
+    "$named_campaign_dir/state/basins" >"$case_stdout"; then
+    die 'named compile manufactured a prerequisite failure'
+fi
+run_runner evidence --campaign subset --workspace-root "$named_root" >"$case_stdout"
+jq -e '
+  .excluded_basins == [] and
+  (.outcomes | map(select(.processing_basin_id == "1020000010"))[0] |
+    .status == "succeeded" and .attempts == 1) and
+  (.outcomes | map(select(.processing_basin_id != "1020000010")) |
+    all(.status == "pending" and .attempts == 0 and .failure_reason == null))
+' "$named_campaign_dir/publication/evidence/outcomes.json" >/dev/null ||
+    die 'named compile evidence manufactured an exclusion or changed pending outcomes'
+cmp "$test_tmp/named-702-before" "$named_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/named-902-before" "$named_campaign_dir/state/basins/9020000010/current.json"
+pass 'compile-basin re-enters its exact owner lock and preserves untouched basin outcomes'
+
+for reentry_tamper in live-owner owner-symlink lock-symlink; do
+    reentry_root=$test_tmp/workspaces/reentry-$reentry_tamper
+    mkdir "$reentry_root"
+    cp -R "$named_campaign_dir" "$reentry_root/tdx-hydro-subset"
+    reentry_campaign_dir=$reentry_root/tdx-hydro-subset
+    reentry_lock=$reentry_campaign_dir/state/locks/campaign.lock
+    cp "$reentry_campaign_dir/state/basins/7020000010/current.json" \
+        "$test_tmp/reentry-$reentry_tamper-current-before"
+    cp "$reentry_campaign_dir/state/compile.json" \
+        "$test_tmp/reentry-$reentry_tamper-compile-before"
+    HFX_TEST_REENTRY_TAMPER=$reentry_tamper HFX_TEST_COMPETING_PID=$$ \
+        HFX_TDX_JQ=$test_tmp/fake-jq \
+        expect_failure "named compile $reentry_tamper re-entry" compile-basin \
+        --campaign subset --workspace-root "$reentry_root" --basin 7020000010 \
+        --fabric-version NGA-TDX-Hydro-20230126
+    case $reentry_tamper in
+        live-owner)
+            [[ $(tail -1 "$case_stderr") == "hfx: error: campaign lock is held by live PID $$" ]] ||
+                die 'named compile live-owner re-entry diagnostic differs'
+            ;;
+        owner-symlink|lock-symlink)
+            [[ $(tail -1 "$case_stderr") == \
+                "hfx: error: campaign lock owner is indeterminate; preserved at $reentry_lock" ]] ||
+                die "named compile $reentry_tamper re-entry diagnostic differs"
+            ;;
+    esac
+    cmp "$test_tmp/reentry-$reentry_tamper-current-before" \
+        "$reentry_campaign_dir/state/basins/7020000010/current.json"
+    cmp "$test_tmp/reentry-$reentry_tamper-compile-before" \
+        "$reentry_campaign_dir/state/compile.json"
+    [[ ! -e "$reentry_campaign_dir/basin-outputs/7020000010" &&
+        ! -e "$reentry_campaign_dir/reports/7020000010-build-report.json" ]] ||
+        die "named compile $reentry_tamper re-entry wrote compile artifacts"
+done
+pass 'compile-basin refuses live-owner and symlink tampering before compile writes'
+
+cleared_repo=$test_tmp/cleared-reentry-repo
+mkdir -p "$cleared_repo/scripts/hetzner"
+ln -s "$repo_root/adapters" "$cleared_repo/adapters"
+sed 's/^    compile_basin_locked "$basin_id"$/    lock_owned=0\
+    takeover_owned=0\
+&/' "$runner" >"$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+chmod +x "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh"
+cleared_root=$test_tmp/workspaces/reentry-cleared
+mkdir "$cleared_root"
+cp -R "$named_campaign_dir" "$cleared_root/tdx-hydro-subset"
+cleared_campaign_dir=$cleared_root/tdx-hydro-subset
+cp "$cleared_campaign_dir/state/basins/7020000010/current.json" \
+    "$test_tmp/reentry-cleared-current-before"
+cp "$cleared_campaign_dir/state/compile.json" "$test_tmp/reentry-cleared-compile-before"
+cleared_status=0
+"$selected_bash" "$cleared_repo/scripts/hetzner/tdx-hydro-campaign.sh" compile-basin \
+    --campaign subset --workspace-root "$cleared_root" --basin 7020000010 \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout" 2>"$case_stderr" ||
+    cleared_status=$?
+[[ "$cleared_status" -ne 0 ]] || die 'named compile with cleared ownership unexpectedly succeeded'
+cleared_lock=$cleared_campaign_dir/state/locks/campaign.lock
+cleared_owner=$(<"$cleared_lock/owner.pid")
+[[ $(tail -1 "$case_stderr") == \
+    "hfx: error: campaign lock is held by live PID $cleared_owner" ]] ||
+    die 'named compile with cleared ownership diagnostic differs'
+cmp "$test_tmp/reentry-cleared-current-before" \
+    "$cleared_campaign_dir/state/basins/7020000010/current.json"
+cmp "$test_tmp/reentry-cleared-compile-before" "$cleared_campaign_dir/state/compile.json"
+[[ ! -e "$cleared_campaign_dir/basin-outputs/7020000010" &&
+    ! -e "$cleared_campaign_dir/reports/7020000010-build-report.json" ]] ||
+    die 'named compile with cleared ownership wrote compile artifacts'
+pass 'compile-basin refuses second lock acquisition after ownership flags are cleared'
+
+jq '.stages.acquire_basins={
+  status:"pending",attempts:0,failure_reason:null,evidence:null
+}' "$named_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/named-pending"
+mv "$test_tmp/named-pending" "$named_campaign_dir/state/basins/7020000010/current.json"
+cp -R "$named_campaign_dir/state" "$test_tmp/named-state-before-refusal"
+expect_failure 'named compile pending prerequisite' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 \
+    --fabric-version NGA-TDX-Hydro-20230126
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: acquisition prerequisites are not both succeeded for 7020000010' ]] ||
+    die 'named compile prerequisite diagnostic differs'
+diff -ru "$test_tmp/named-state-before-refusal" "$named_campaign_dir/state"
+[[ ! -e "$named_campaign_dir/basin-outputs/7020000010" &&
+    ! -e "$named_campaign_dir/reports/7020000010-build-report.json" ]] ||
+    die 'named compile prerequisite refusal created artifacts'
+pass 'compile-basin prerequisite refusal writes no failure or other basin state'
+
+expect_failure 'named compile unknown inventory basin' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 9999999999 --fabric-version version
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: processing basin ID is not in the authoritative inventory: 9999999999' ]] ||
+    die 'named compile authoritative-inventory diagnostic differs'
+expect_failure 'named compile unselected inventory basin' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 1020011530 --fabric-version version
+[[ $(tail -1 "$case_stderr") == \
+    'hfx: error: processing basin ID is not in the frozen campaign selection: 1020011530' ]] ||
+    die 'named compile frozen-selection diagnostic differs'
+pass 'compile-basin validates inventory and frozen selection in an initialized campaign'
+
+named_lock=$named_campaign_dir/state/locks/campaign.lock
+mkdir "$named_lock"
+printf '%s\n' "$$" >"$named_lock/owner.pid"
+cp "$named_lock/owner.pid" "$test_tmp/named-live-owner-before"
+expect_failure 'named compile competing live owner' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 --fabric-version version
+assert_contains "$case_stderr" "campaign lock is held by live PID $$"
+cmp "$test_tmp/named-live-owner-before" "$named_lock/owner.pid"
+rm -r "$named_lock"
+mkdir "$named_lock"
+printf '%s\n' 99999999 >"$named_lock/owner.pid"
+expect_failure 'named compile stale owner prerequisite' compile-basin --campaign subset \
+    --workspace-root "$named_root" --basin 7020000010 --fabric-version version
+assert_contains "$case_stderr" 'acquisition prerequisites are not both succeeded for 7020000010'
+[[ ! -d "$named_lock" ]] || die 'named compile stale takeover left its replacement lock behind'
+pass 'compile-basin preserves competing live owners and converges stale takeover'
+
+progress_root=$test_tmp/workspaces/progress
+mkdir "$progress_root"
+cp -R "$named_campaign_dir" "$progress_root/tdx-hydro-subset"
+progress_dir=$progress_root/tdx-hydro-subset
+mkdir "$progress_dir/state/locks/campaign.lock"
+printf '%s\n' "$$" >"$progress_dir/state/locks/campaign.lock/owner.pid"
+cp -R "$progress_dir" "$test_tmp/progress-baseline"
+run_runner progress --campaign subset --workspace-root "$progress_root" >"$test_tmp/progress-one"
+run_runner progress --campaign subset --workspace-root "$progress_root" >"$test_tmp/progress-two"
+cmp "$test_tmp/progress-one" "$test_tmp/progress-two"
+assert_contains "$test_tmp/progress-one" 'acquire_basins_succeeded=2'
+assert_contains "$test_tmp/progress-one" 'compile_succeeded=1'
+assert_contains "$test_tmp/progress-one" 'compile_pending=2'
+cmp "$test_tmp/progress-baseline/state/locks/campaign.lock/owner.pid" \
+    "$progress_dir/state/locks/campaign.lock/owner.pid"
+diff -ru "$test_tmp/progress-baseline" "$progress_dir"
+rm -r "$progress_dir/state/locks/campaign.lock"
+pass 'progress is deterministic and byte-preserving under a live campaign lock'
 
 : >"$HFX_TEST_ADAPTER_LOG"
 run_runner compile --campaign subset --workspace-root "$subset_root" \
@@ -1433,6 +3224,11 @@ for pid_file in "$test_tmp"/transfer-state/worker.* "$test_tmp"/transfer-state/c
 done
 [[ -e "$test_tmp/transfer-state/signal-owner" ]] ||
     die 'repeated drain TERM did not start its signal coordinator'
+# The rendezvous waits for a real acquire_basin subshell to exit before checking
+# that the parent still owns the operational lock. The source-order check
+# separately enforces the defense-in-depth ownership resets.
+[[ -s "$test_tmp/transfer-state/lock-owner-stable" ]] ||
+    die 'campaign lock did not remain owned by the parent after an acquire_basin child exited'
 drain_campaign_dir=$drain_interrupt_root/tdx-hydro-interrupt-drain
 [[ $(find "$drain_campaign_dir/state/tmp" \
     \( -name '.curl-headers.*' -o -name '.curl-stats.*' \) -type f |
@@ -2009,6 +3805,218 @@ jq -e '
 ' "$compile_validation_state" >/dev/null || die 'validation failure retry did not persist fresh diagnostics'
 pass 'adapter validation failure retains artifacts and refuses overwrite'
 
+reclaim_root=$test_tmp/workspaces/reclaim-base
+mkdir "$reclaim_root"
+run_runner init --campaign reclaim-base --workspace-root "$reclaim_root" \
+    --basin 1020000010 \
+    --retention-policy reclaim-inputs-after-terminal \
+    --available-memory-bytes 30000000000 --available-disk-bytes 491737129060 \
+    --peak-in-flight-download-bytes 44296724480 \
+    --retained-basin-output-bytes 206220202290 \
+    --assembly-memory-ceiling-bytes 30000000000 \
+    --assembly-scratch-ceiling-bytes 206220202290 \
+    --assembled-artifact-bytes 206220202290 \
+    --active-compile-scratch-bytes 30000000000 \
+    --filesystem-overhead-bytes 5000000000 >"$case_stdout"
+reclaim_dir=$reclaim_root/tdx-hydro-reclaim-base
+jq -e '
+  .schema_version == 4 and
+  .retention == {
+    inputs_reclaimed:false,
+    policy:"reclaim-inputs-after-terminal"
+  }
+' "$reclaim_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'reclaim init did not emit the schema-4 retention contract'
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign reclaim-base --workspace-root "$reclaim_root" \
+    --max-parallel 1 >"$case_stdout"
+for reclaim_product in basins streamnet; do
+    [[ -f "$reclaim_dir/downloads/1020000010-$reclaim_product.gpkg" ]] ||
+        die "nonterminal reclaim acquisition removed $reclaim_product"
+done
+jq -e '
+  .stages.compile.status == "pending" and
+  .stages.compile.attempts == 0 and
+  .retention.inputs_reclaimed == false
+' "$reclaim_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'nonterminal reclaim acquisition state differs'
+pass 'reclaim initialization uses schema 4 and acquisition remains nonterminal'
+
+reclaim_ordinary_root=$test_tmp/workspaces/reclaim-ordinary
+mkdir "$reclaim_ordinary_root"
+cp -R "$reclaim_dir" "$reclaim_ordinary_root/tdx-hydro-reclaim-base"
+reclaim_ordinary_dir=$reclaim_ordinary_root/tdx-hydro-reclaim-base
+cp "$reclaim_ordinary_dir/reports/1020000010-basins-acquisition.json" \
+    "$test_tmp/reclaim-ordinary-basins-report"
+cp "$reclaim_ordinary_dir/reports/1020000010-streamnet-acquisition.json" \
+    "$test_tmp/reclaim-ordinary-streamnet-report"
+run_runner compile --campaign reclaim-base --workspace-root "$reclaim_ordinary_root" \
+    --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+for reclaim_product in basins streamnet; do
+    for reclaim_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+        [[ ! -e "$reclaim_ordinary_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" &&
+           ! -L "$reclaim_ordinary_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" ]] ||
+            die "ordinary landed reclaim retained $reclaim_product$reclaim_suffix"
+    done
+done
+jq -e '
+  .schema_version == 4 and
+  .stages.compile.status == "succeeded" and
+  .stages.compile.attempts == 1 and
+  .retention.inputs_reclaimed == true
+' "$reclaim_ordinary_dir/state/basins/1020000010/current.json" >/dev/null ||
+    die 'ordinary landed reclaim lacks its durable schema-4 marker'
+[[ -f "$reclaim_ordinary_dir/basin-outputs/1020000010/catchments.parquet" &&
+   -f "$reclaim_ordinary_dir/basin-outputs/1020000010/graph.parquet" &&
+   -f "$reclaim_ordinary_dir/basin-outputs/1020000010/aux/snap_stems.parquet" &&
+   -f "$reclaim_ordinary_dir/reports/1020000010-build-report.json" ]] ||
+    die 'ordinary landed reclaim removed assembly or diagnostic evidence'
+diff -u "$test_tmp/reclaim-ordinary-basins-report" \
+    "$reclaim_ordinary_dir/reports/1020000010-basins-acquisition.json"
+diff -u "$test_tmp/reclaim-ordinary-streamnet-report" \
+    "$reclaim_ordinary_dir/reports/1020000010-streamnet-acquisition.json"
+pass 'ordinary landed compile reclaims only the exact source pair'
+
+for reclaim_outcome in success build-failure validation-failure; do
+    for reclaim_boundary in \
+        compile-attempt-complete terminal-state basins-input-reclaimed \
+        streamnet-input-reclaimed reclaimed-state; do
+        reclaim_case_root=$test_tmp/workspaces/reclaim-$reclaim_outcome-$reclaim_boundary
+        mkdir "$reclaim_case_root"
+        cp -R "$reclaim_dir" "$reclaim_case_root/tdx-hydro-reclaim-base"
+        reclaim_case_dir=$reclaim_case_root/tdx-hydro-reclaim-base
+        : >"$HFX_TEST_ADAPTER_LOG"
+        : >"$HFX_TEST_HFX_LOG"
+        reclaim_status=0
+        case $reclaim_outcome in
+            success)
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+            build-failure)
+                HFX_TEST_FAIL_BUILD_ID=1020000010 \
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+            validation-failure)
+                HFX_TEST_FAIL_VALIDATE_ID=1020000010 \
+                HFX_TEST_INTERRUPT_AFTER="1020000010:$reclaim_boundary" \
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 \
+                        >"$case_stdout" 2>"$case_stderr" || reclaim_status=$?
+                ;;
+        esac
+        [[ "$reclaim_status" -ne 0 ]] ||
+            die "$reclaim_outcome x $reclaim_boundary interruption unexpectedly succeeded"
+        [[ ! -d "$reclaim_case_dir/state/locks/campaign.lock" ]] ||
+            die "$reclaim_outcome x $reclaim_boundary retained the live campaign lock"
+
+        if [[ -d "$reclaim_case_dir/basin-outputs/1020000010" ]]; then
+            cp -R "$reclaim_case_dir/basin-outputs/1020000010" \
+                "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary"
+            cp "$reclaim_case_dir/reports/1020000010-build-report.json" \
+                "$test_tmp/reclaim-report-$reclaim_outcome-$reclaim_boundary"
+        fi
+        cp "$reclaim_case_dir/reports/1020000010-basins-acquisition.json" \
+            "$test_tmp/reclaim-basins-report-$reclaim_outcome-$reclaim_boundary"
+        cp "$reclaim_case_dir/reports/1020000010-streamnet-acquisition.json" \
+            "$test_tmp/reclaim-streamnet-report-$reclaim_outcome-$reclaim_boundary"
+
+        if [[ "$reclaim_boundary" == compile-attempt-complete ]]; then
+            case $reclaim_outcome in
+                success)
+                    run_runner compile --campaign reclaim-base \
+                        --workspace-root "$reclaim_case_root" \
+                        --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+                build-failure)
+                    HFX_TEST_FAIL_BUILD_ID=1020000010 \
+                        run_runner compile --campaign reclaim-base \
+                            --workspace-root "$reclaim_case_root" \
+                            --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+                validation-failure)
+                    HFX_TEST_FAIL_VALIDATE_ID=1020000010 \
+                        run_runner compile --campaign reclaim-base \
+                            --workspace-root "$reclaim_case_root" \
+                            --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+                    ;;
+            esac
+        else
+            run_runner recover --campaign reclaim-base \
+                --workspace-root "$reclaim_case_root" >"$case_stdout"
+        fi
+
+        reclaim_state=$reclaim_case_dir/state/basins/1020000010/current.json
+        if [[ "$reclaim_boundary" == compile-attempt-complete &&
+              "$reclaim_outcome" != build-failure ]]; then
+            jq -e '
+              .stages.compile.status == "failed" and
+              .stages.compile.attempts == 1 and
+              .stages.compile.failure_reason ==
+                "compile artifact path already exists; retained for inspection" and
+              .retention.inputs_reclaimed == false
+            ' "$reclaim_state" >/dev/null ||
+                die "$reclaim_outcome x $reclaim_boundary did not remain an inspection hold"
+            for reclaim_product in basins streamnet; do
+                [[ -f "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg" ]] ||
+                    die "$reclaim_outcome x $reclaim_boundary removed $reclaim_product final"
+                [[ ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg.partial" &&
+                   ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product.gpkg.partial.json" ]] ||
+                    die "$reclaim_outcome x $reclaim_boundary recreated partial provenance"
+            done
+        else
+            jq -e --arg outcome "$reclaim_outcome" '
+              .retention.inputs_reclaimed == true and
+              .stages.compile.attempts ==
+                (if $outcome == "build-failure" and
+                    .stages.compile.failure_reason == "adapter build failed"
+                 then (if .stages.compile.attempts == 2 then 2 else 1 end)
+                 else 1 end) and
+              (if $outcome == "success"
+               then .stages.compile.status == "succeeded"
+               elif $outcome == "build-failure"
+               then .stages.compile.failure_reason == "adapter build failed"
+               else .stages.compile.failure_reason == "adapter validation failed" end)
+            ' "$reclaim_state" >/dev/null ||
+                die "$reclaim_outcome x $reclaim_boundary did not converge terminal reclaim"
+            for reclaim_product in basins streamnet; do
+                for reclaim_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+                    [[ ! -e "$reclaim_case_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" &&
+                       ! -L "$reclaim_case_dir/downloads/1020000010-$reclaim_product$reclaim_suffix" ]] ||
+                        die "$reclaim_outcome x $reclaim_boundary retained $reclaim_product$reclaim_suffix"
+                done
+            done
+        fi
+        diff -u "$test_tmp/reclaim-basins-report-$reclaim_outcome-$reclaim_boundary" \
+            "$reclaim_case_dir/reports/1020000010-basins-acquisition.json"
+        diff -u "$test_tmp/reclaim-streamnet-report-$reclaim_outcome-$reclaim_boundary" \
+            "$reclaim_case_dir/reports/1020000010-streamnet-acquisition.json"
+        if [[ -d "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary" ]]; then
+            diff -ru "$test_tmp/reclaim-output-$reclaim_outcome-$reclaim_boundary" \
+                "$reclaim_case_dir/basin-outputs/1020000010"
+            diff -u "$test_tmp/reclaim-report-$reclaim_outcome-$reclaim_boundary" \
+                "$reclaim_case_dir/reports/1020000010-build-report.json"
+        fi
+        cp "$reclaim_state" "$test_tmp/reclaim-state-replay"
+        : >"$HFX_TEST_ADAPTER_LOG"
+        run_runner recover --campaign reclaim-base \
+            --workspace-root "$reclaim_case_root" >"$case_stdout"
+        diff -u "$test_tmp/reclaim-state-replay" "$reclaim_state"
+        [[ ! -s "$HFX_TEST_ADAPTER_LOG" ]] ||
+            die "$reclaim_outcome x $reclaim_boundary recover replay invoked adapter"
+    done
+    pass "reclaim interruption matrix converges $reclaim_outcome outcomes"
+done
+
 migration_root=$test_tmp/workspaces/migration
 mkdir "$migration_root"
 cp -R "$acquire_dir" "$migration_root/tdx-hydro-acquire"
@@ -2361,6 +4369,69 @@ for reportable_id in 1020000010 1020011530 1020018110 1020021940; do
         die "diagnostic evidence omits $reportable_id"
 done
 pass 'deterministic acquisition, outcome, and diagnostic evidence is complete and byte-stable'
+
+schema4_evidence_root=$test_tmp/workspaces/schema4-evidence
+mkdir "$schema4_evidence_root"
+cp -R "$evidence_dir" "$schema4_evidence_root/tdx-hydro-evidence"
+schema4_evidence_dir=$schema4_evidence_root/tdx-hydro-evidence
+schema4_evidence_state=$schema4_evidence_dir/state/basins/1020000010/current.json
+jq '
+  .schema_version = 4 |
+  .retention = {
+    inputs_reclaimed:true,
+    policy:"reclaim-inputs-after-terminal"
+  }
+' "$schema4_evidence_state" >"$schema4_evidence_state.tmp"
+mv "$schema4_evidence_state.tmp" "$schema4_evidence_state"
+run_runner evidence --campaign evidence --workspace-root "$schema4_evidence_root" >"$case_stdout"
+diff -u "$test_tmp/expected-acquisition.json" \
+    "$schema4_evidence_dir/publication/evidence/acquisition.json"
+diff -u "$test_tmp/expected-outcomes.json" \
+    "$schema4_evidence_dir/publication/evidence/outcomes.json"
+diff -u "$test_tmp/expected-diagnostics.json" \
+    "$schema4_evidence_dir/publication/evidence/diagnostics.json"
+
+schema4_validation_state=$schema4_evidence_dir/state/basins/1020018110/current.json
+jq '
+  .schema_version = 4 |
+  .retention = {
+    inputs_reclaimed:true,
+    policy:"reclaim-inputs-after-terminal"
+  } |
+  .stages.compile.diagnostic_report = null
+' "$schema4_validation_state" >"$schema4_validation_state.tmp"
+mv "$schema4_validation_state.tmp" "$schema4_validation_state"
+run_runner evidence --campaign evidence --workspace-root "$schema4_evidence_root" >"$case_stdout"
+jq -e '
+  .basins[] |
+  select(.processing_basin_id == "1020018110") |
+  .diagnostics == null and .report_path == null and
+  .unavailable_reason == "adapter validation failed"
+' "$schema4_evidence_dir/publication/evidence/diagnostics.json" >/dev/null ||
+    die 'schema-4 validation failure did not emit the explicit unavailable reason'
+
+for legacy_evidence_version in 1 2; do
+    cp "$evidence_dir/state/basins/1020021940/current.json" \
+        "$schema4_evidence_dir/state/basins/1020021940/current.json"
+    jq --argjson version "$legacy_evidence_version" '
+      .schema_version = $version |
+      if $version == 1 then
+        .stages.acquire_basins |= del(.evidence) |
+        .stages.acquire_streamnet |= del(.evidence) |
+        .stages.compile |= del(.diagnostic_report)
+      else
+        .stages.compile |= del(.diagnostic_report)
+      end
+    ' "$schema4_evidence_dir/state/basins/1020021940/current.json" \
+        >"$schema4_evidence_dir/state/basins/1020021940/current.json.tmp"
+    mv "$schema4_evidence_dir/state/basins/1020021940/current.json.tmp" \
+        "$schema4_evidence_dir/state/basins/1020021940/current.json"
+    expect_failure "schema-$legacy_evidence_version evidence gate" evidence \
+        --campaign evidence --workspace-root "$schema4_evidence_root"
+    assert_contains "$case_stderr" \
+        'legacy basin state requires compile rerun before evidence: 1020021940'
+done
+pass 'schema 3 and 4 evidence matches while legacy schemas retain their refusal'
 
 mkdir "$evidence_dir/downloads/conflict" "$evidence_dir/reports/conflict" "$evidence_dir/basin-outputs/conflict"
 printf '%s\n' download >"$evidence_dir/downloads/conflict/value"
@@ -3049,6 +5120,998 @@ if grep -F 'never-publish' "$aws_log" >/dev/null; then
 fi
 pass 'publication never invokes assembly and never consults adapter or HFX'
 
+pipeline_root=$test_tmp/workspaces/pipeline
+mkdir "$pipeline_root"
+set -- $(reclaim_subset_init_args pipeline "$pipeline_root")
+run_runner "$@" >"$case_stdout"
+pipeline_dir=$pipeline_root/tdx-hydro-pipeline
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$pipeline_dir
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$pipeline_dir/state/tmp/pipeline-completions.fifo
+expect_failure 'pipeline missing max parallel' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --fabric-version fixture-v1
+expect_failure 'pipeline missing fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2
+for invalid_parallel in 0 x 5; do
+    expect_failure "pipeline invalid max parallel $invalid_parallel" pipeline --campaign pipeline \
+        --workspace-root "$pipeline_root" --max-parallel "$invalid_parallel" \
+        --fabric-version fixture-v1
+done
+expect_failure 'pipeline repeated max parallel' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --max-parallel 2 \
+    --fabric-version fixture-v1
+expect_failure 'pipeline repeated fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 \
+    --fabric-version fixture-v1 --fabric-version fixture-v1
+expect_failure 'pipeline control fabric version' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version $'bad\nversion'
+expect_failure 'pipeline option ownership max' status --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2
+assert_contains "$case_stderr" 'option --max-parallel is valid only for acquire, pipeline, or calibrate'
+expect_failure 'pipeline option ownership fabric' status --campaign pipeline \
+    --workspace-root "$pipeline_root" --fabric-version fixture-v1
+assert_contains "$case_stderr" \
+    'option --fabric-version is valid only for compile, compile-basin, pipeline, or calibrate'
+retain_pipeline_root=$test_tmp/workspaces/pipeline-retain
+mkdir "$retain_pipeline_root"
+set -- $(subset_init_args retainpipe "$retain_pipeline_root")
+run_runner "$@" >"$case_stdout"
+expect_failure 'pipeline retain-all policy' pipeline --campaign retainpipe \
+    --workspace-root "$retain_pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+assert_contains "$case_stderr" 'pipeline requires retention policy reclaim-inputs-after-terminal'
+[[ ! -e "$retain_pipeline_root/tdx-hydro-retainpipe/state/pipeline.json" ]] ||
+    die 'retain-all pipeline refusal created scheduler state'
+ln -s "$pipeline_dir" "$pipeline_root/tdx-hydro-symlinkpipe"
+expect_failure 'pipeline symlinked campaign' pipeline --campaign symlinkpipe \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+assert_contains "$case_stderr" \
+    "hfx: error: campaign does not exist safely: $pipeline_root/tdx-hydro-symlinkpipe"
+[[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
+    die 'symlinked pipeline campaign reached lock creation'
+nonexistent_tool=$test_tmp/does-not-exist
+for missing_pipeline_tool in HFX_TDX_CURL HFX_TDX_SHA256SUM HFX_TDX_OD HFX_TDX_OGRINFO; do
+    pipeline_status=0
+    env "$missing_pipeline_tool=$nonexistent_tool" \
+        "$selected_bash" "$runner" pipeline --campaign pipeline \
+        --workspace-root "$pipeline_root" --max-parallel 2 \
+        --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+        pipeline_status=$?
+    [[ "$pipeline_status" -ne 0 ]] || die 'missing pipeline tool unexpectedly succeeded'
+    assert_contains "$case_stderr" "required command '$nonexistent_tool' is not available"
+done
+pipeline_status=0
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 \
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 2 --fabric-version fixture-v1 \
+    >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
+[[ "$pipeline_status" -ne 0 ]] || die 'case 88 projected-capacity accepted pending termination'
+grep -F 'pipeline_durable_unreclaimed=3' "$case_stdout" >/dev/null ||
+    die 'case 89 disk refusal pre-state bounded refusal differs'
+assert_contains "$case_stderr" \
+    'pipeline incomplete: pending=3 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+[[ ! -e "$pipeline_dir/state/locks/campaign.lock" ]] ||
+    die 'pipeline left the campaign lock behind'
+sed -n '/^pipeline_campaign() {$/,/^}$/p' "$runner" >"$test_tmp/pipeline-coordinator"
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_ordered_sweep'
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_completion_create_open'
+assert_contains "$test_tmp/pipeline-coordinator" '( pipeline_acquisition_worker "$basin_id" ) &'
+grep -F 'compile_basin_locked "$pipeline_consumer_basin_id" true' "$test_tmp/pipeline-coordinator" >/dev/null ||
+    die 'case 88 projected-capacity serial consumer is absent'
+assert_contains "$test_tmp/pipeline-coordinator" 'pipeline_sweep_vanished_workers'
+pass 'pipeline refuses pre-state errors and installs scheduler machinery'
+
+pipeline_state=$pipeline_dir/state/pipeline.json
+jq -e '
+  keys == ["basin_ids","basins","fabric_version","max_parallel","schema_version"] and
+  .schema_version == 1 and .fabric_version == "fixture-v1" and .max_parallel == 2 and
+  .basin_ids == ["1020000010","7020000010","9020000010"] and
+  ([.basins[] | keys == ["blocked_reason","status"] and
+    .status == "pending" and .blocked_reason == null] | all)
+' "$pipeline_state" >/dev/null || die 'materialized pipeline document differs'
+[[ $(stat -f '%Lp' "$pipeline_state") == 644 ]] || die 'pipeline state mode differs'
+cp "$pipeline_state" "$test_tmp/pipeline-stable"
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure 'identical pipeline replay remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v1
+cmp "$test_tmp/pipeline-stable" "$pipeline_state"
+expect_failure 'pipeline fabric drift' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 2 --fabric-version fixture-v2
+assert_contains "$case_stderr" 'pipeline parameters changed; use a new campaign ID'
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure 'pipeline max reduction remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+jq -e '.max_parallel == 1' "$pipeline_state" >/dev/null ||
+    die 'pipeline max-parallel reduction was not persisted'
+for pipeline_mutation in malformed extra-key bad-status excessive-acquiring; do
+    mutation_root=$test_tmp/workspaces/pipeline-$pipeline_mutation
+    mkdir "$mutation_root"
+    cp -R "$pipeline_dir" "$mutation_root/tdx-hydro-pipeline"
+    mutation_state=$mutation_root/tdx-hydro-pipeline/state/pipeline.json
+    case $pipeline_mutation in
+        malformed) printf '%s\n' '{' >"$mutation_state" ;;
+        extra-key) jq '.extra=true' "$mutation_state" >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state" ;;
+        bad-status) jq '.basins["1020000010"].status="unknown"' "$mutation_state" >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state" ;;
+        excessive-acquiring)
+            jq '.max_parallel=1 | .basins["1020000010"].status="acquiring" |
+                .basins["7020000010"].status="acquiring"' "$mutation_state" \
+                >"$mutation_state.tmp" && mv "$mutation_state.tmp" "$mutation_state"
+            ;;
+    esac
+    expect_failure "pipeline validator $pipeline_mutation" progress --campaign pipeline \
+        --workspace-root "$mutation_root"
+    assert_contains "$case_stderr" 'pipeline state is malformed:'
+done
+definitions=$test_tmp/pipeline-definitions.sh
+sed '/^if (($# == 1))/,$d' \
+    "$runner" >"$definitions"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$(command -v rm)
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    transition_pipeline_basin 1020000010 ready
+)
+jq -e '.basins["1020000010"] == {status:"ready",blocked_reason:null} and
+  .basins["7020000010"].status == "pending"' "$pipeline_state" >/dev/null ||
+    die 'parent transition did not change exactly one record'
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+pass 'pipeline state is validated, atomic, replayable, and parent-owned'
+
+mkdir "$pipeline_dir/state/locks/campaign.lock"
+printf '%s\n' "$$" >"$pipeline_dir/state/locks/campaign.lock/owner.pid"
+cp -R "$pipeline_dir" "$test_tmp/pipeline-progress-before"
+run_runner progress --campaign pipeline --workspace-root "$pipeline_root" >"$case_stdout"
+inputs_line=$(grep -n '^inputs_reclaimed=' "$case_stdout" | cut -d: -f1)
+pipeline_line=$(grep -n '^pipeline_max_parallel=' "$case_stdout" | cut -d: -f1)
+assembly_line=$(grep -n '^assemble_pending=' "$case_stdout" | cut -d: -f1)
+[[ "$pipeline_line" -eq "$((inputs_line + 1))" && "$assembly_line" -eq "$((pipeline_line + 9))" ]] ||
+    die 'pipeline progress field ordering differs'
+for scheduler_status in pending acquiring ready compiling terminal reclaimed blocked; do
+    assert_contains "$case_stdout" "pipeline_${scheduler_status}="
+done
+diff -ru "$test_tmp/pipeline-progress-before" "$pipeline_dir"
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+for basin_id in 1020000010 7020000010 9020000010; do
+    basin_state=$pipeline_dir/state/basins/$basin_id/current.json
+    jq --arg id "$basin_id" '
+      .stages.acquire_basins={status:"succeeded",attempts:1,failure_reason:null,
+        evidence:{bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",layer_name:($id+"_basins")}} |
+      .stages.acquire_streamnet={status:"succeeded",attempts:1,failure_reason:null,
+        evidence:{bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",layer_name:($id+"_streamnet")}} |
+      .stages.compile={status:"failed",attempts:1,failure_reason:"adapter build failed",diagnostic_report:null} |
+      .retention.inputs_reclaimed=true
+    ' "$basin_state" >"$basin_state.tmp"
+    mv "$basin_state.tmp" "$basin_state"
+done
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+assert_contains "$case_stdout" 'pipeline_durable_unreclaimed=0'
+jq -e '[.basins[].status == "reclaimed"] | all' "$pipeline_state" >/dev/null ||
+    die 'durable reclaimed state did not replace stale scheduler records'
+cp "$pipeline_state" "$test_tmp/pipeline-authoritative-stable"
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+cmp "$test_tmp/pipeline-authoritative-stable" "$pipeline_state"
+pass 'pipeline progress is lock-free and durable basin state stays authoritative'
+
+recovery_state_fixture() {
+    recovery_id=$1
+    recovery_acquire_status=$2
+    recovery_acquire_reason=$3
+    recovery_compile_status=$4
+    recovery_compile_attempts=$5
+    recovery_compile_reason=$6
+    recovery_reclaimed=$7
+    recovery_state=$pipeline_dir/state/basins/$recovery_id/current.json
+    jq --arg id "$recovery_id" --arg acquire_status "$recovery_acquire_status" \
+        --arg acquire_reason "$recovery_acquire_reason" \
+        --arg compile_status "$recovery_compile_status" \
+        --argjson compile_attempts "$recovery_compile_attempts" \
+        --arg compile_reason "$recovery_compile_reason" --argjson reclaimed "$recovery_reclaimed" '
+      def evidence($product): {
+        bytes:1,sha256:("0"*64),sqlite_identity:"53514c69746520666f726d6174203300",
+        layer_name:($id+"_"+$product)
+      };
+      .schema_version=4 |
+      .retention={policy:"reclaim-inputs-after-terminal",inputs_reclaimed:$reclaimed} |
+      .stages.acquire_basins={
+        status:$acquire_status,attempts:1,
+        failure_reason:(if $acquire_reason == "" then null else $acquire_reason end),
+        evidence:(if $acquire_status == "succeeded" then evidence("basins") else null end)
+      } |
+      .stages.acquire_streamnet={
+        status:"succeeded",attempts:1,failure_reason:null,evidence:evidence("streamnet")
+      } |
+      .stages.compile={
+        status:$compile_status,attempts:$compile_attempts,
+        failure_reason:(if $compile_reason == "" then null else $compile_reason end),
+        diagnostic_report:null
+      }
+    ' "$recovery_state" >"$recovery_state.tmp"
+    mv "$recovery_state.tmp" "$recovery_state"
+}
+
+for recovery_id in 1020000010 7020000010 9020000010; do
+    jq --arg id "$recovery_id" '.basins[$id]={status:"pending",blocked_reason:null}' \
+        "$pipeline_state" >"$pipeline_state.tmp"
+    mv "$pipeline_state.tmp" "$pipeline_state"
+done
+jq '.basins["9020000010"].status="compiling"' "$pipeline_state" >"$pipeline_state.tmp"
+mv "$pipeline_state.tmp" "$pipeline_state"
+recovery_state_fixture 1020000010 succeeded '' failed 1 'adapter build failed' true
+recovery_state_fixture 7020000010 succeeded '' failed 1 'adapter build failed' false
+recovery_state_fixture 9020000010 succeeded '' failed 0 \
+    'acquisition prerequisites are not both succeeded' false
+for recovery_product in basins streamnet; do
+    touch "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg" \
+        "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg.partial" \
+        "$pipeline_dir/downloads/7020000010-$recovery_product.gpkg.partial.json"
+done
+sed >"$test_tmp/recovery-rm" <<'RECOVERY_RM'
+#!/bin/sh
+set -eu
+for recovery_path do
+    case $recovery_path in
+        */downloads/7020000010-*)
+            "${HFX_TEST_REAL_JQ:?}" -e '
+              .basins["7020000010"].status == "terminal"
+            ' "${HFX_TEST_RECOVERY_DIR:?}/state/pipeline.json" >/dev/null
+            "${HFX_TEST_REAL_JQ:?}" -e '
+              .retention.inputs_reclaimed == false
+            ' "${HFX_TEST_RECOVERY_DIR:?}/state/basins/7020000010/current.json" >/dev/null
+            printf '%s\n' "$recovery_path" >>"${HFX_TEST_RECOVERY_RM_LOG:?}"
+            ;;
+    esac
+done
+exec "${HFX_TEST_REAL_RM:?}" "$@"
+RECOVERY_RM
+chmod +x "$test_tmp/recovery-rm"
+export HFX_TEST_RECOVERY_DIR=$pipeline_dir
+export HFX_TEST_RECOVERY_RM_LOG=$test_tmp/recovery-rm.log
+HFX_TEST_REAL_RM=$(command -v rm)
+export HFX_TEST_REAL_RM
+export HFX_TDX_RM=$test_tmp/recovery-rm
+: >"$HFX_TEST_ADAPTER_LOG"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$HFX_TDX_RM
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    pipeline_recover_reconstruct_basin 1020000010
+    pipeline_recover_reconstruct_basin 7020000010
+    pipeline_recover_reconstruct_basin 9020000010
+)
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+unset HFX_TDX_RM
+jq -e '
+  .basins["1020000010"].status == "reclaimed" and
+  .basins["7020000010"].status == "reclaimed" and
+  .basins["9020000010"].status == "ready"
+' "$pipeline_state" >/dev/null || die 'ordered rule 1, rule 2, and rule 5 results differ'
+[[ ! -s "$HFX_TEST_ADAPTER_LOG" ]] || die 'eligible recovery invoked the adapter'
+[[ $(wc -l <"$HFX_TEST_RECOVERY_RM_LOG" | tr -d ' ') -eq 6 ]] ||
+    die 'source removal was not observed after the terminal transition'
+for recovery_product in basins streamnet; do
+    for recovery_suffix in .gpkg .gpkg.partial .gpkg.partial.json; do
+        [[ ! -e "$pipeline_dir/downloads/7020000010-$recovery_product$recovery_suffix" ]] ||
+            die 'rule 2 left a source path'
+    done
+done
+definitions=$test_tmp/pipeline-recovery-definitions.sh
+sed '/^if (($# == 1))/,$d' "$runner" >"$definitions"
+cp "$pipeline_dir/state/basins/7020000010/current.json" "$test_tmp/recovery-helper-state"
+for recovery_reason in \
+    'acquisition report is unsafe or malformed; retained for inspection' \
+    'existing final file failed integrity verification; retained for inspection' \
+    'persisted evidence does not match final file; retained for inspection' \
+    'installed final failed integrity verification; retained for inspection'; do
+    jq --arg reason "$recovery_reason" \
+        '.stages.acquire_basins.failure_reason=$reason' \
+        "$test_tmp/recovery-helper-state" >"$pipeline_dir/state/basins/7020000010/current.json"
+    (
+        # shellcheck source=/dev/null
+        source "$definitions"
+        JQ=$(command -v jq)
+        campaign_dir=$pipeline_dir
+        [[ $(reclaim_eligibility 7020000010) == ineligible ]]
+    ) || die "shared eligibility accepted excluded reason: $recovery_reason"
+done
+cp "$test_tmp/recovery-helper-state" "$pipeline_dir/state/basins/7020000010/current.json"
+while IFS='|' read -r recovery_class recovery_reason; do
+    [[ -n "$recovery_class" ]] || continue
+    if [[ "$recovery_reason" == 'interrupted before terminal state; reset by recover' ]]; then
+        recovery_state_fixture 1020000010 pending "$recovery_reason" pending 0 '' false
+    else
+        recovery_state_fixture 1020000010 failed "$recovery_reason" pending 0 '' false
+    fi
+    (
+        # shellcheck source=/dev/null
+        source "$definitions"
+        JQ=$(command -v jq)
+        MV=$(command -v mv)
+        MKDIR=$(command -v mkdir)
+        RM=$(command -v rm)
+        CHMOD=$(command -v chmod)
+        campaign_dir=$pipeline_dir
+        lock_path=$pipeline_dir/state/locks/campaign.lock
+        mkdir "$lock_path"
+        printf '%s\n' "$$" >"$lock_path/owner.pid"
+        lock_owned=1
+        pipeline_recover_reconstruct_basin 1020000010
+    )
+    rm -r "$pipeline_dir/state/locks/campaign.lock"
+    recovery_actual=$(jq -r '.basins["1020000010"].status' "$pipeline_state")
+    [[ "$recovery_actual" == "$recovery_class" ]] ||
+        die "acquisition reason classified $recovery_actual instead of $recovery_class: $recovery_reason"
+    if [[ "$recovery_class" == blocked ]]; then
+        [[ $(jq -r '.basins["1020000010"].blocked_reason' "$pipeline_state") == "$recovery_reason" ]] ||
+            die "blocked acquisition reason changed: $recovery_reason"
+    fi
+done <<'RECOVERY_ACQUISITION_TABLE'
+pending|interrupted before terminal state; reset by recover
+pending|partial changed during ignored-Range continuation
+pending|continuation response failed provenance verification
+pending|transfer failed
+pending|download provenance or size verification failed
+pending|download failed integrity verification
+blocked|acquisition report is unsafe or malformed; retained for inspection
+blocked|existing final file failed integrity verification; retained for inspection
+blocked|persisted evidence does not match final file; retained for inspection
+blocked|partial provenance path is unsafe; retained without traversal
+blocked|installed final failed integrity verification; retained for inspection
+RECOVERY_ACQUISITION_TABLE
+recovery_state_fixture 1020000010 failed 'unknown acquisition failure' pending 0 '' false
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    pipeline_recover_reconstruct_basin 1020000010
+) 2>"$case_stderr" && die 'unknown acquisition reason unexpectedly succeeded'
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+assert_contains "$case_stderr" 'pipeline acquisition classifier rejected failure reason'
+recovery_state_fixture 1020000010 running '' pending 0 '' false
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    campaign_dir=$pipeline_dir
+    classify_pipeline_acquisition_stage 1020000010 acquire_basins
+) >"$case_stdout" 2>"$case_stderr" &&
+    die 'residual running acquisition reached rule 8'
+assert_contains "$case_stderr" 'pipeline acquisition classifier found residual running stage'
+recovery_state_fixture 1020000010 succeeded '' failed 1 'adapter build failed' true
+sed -n '/^compile_basin_core() {$/,/^}$/p' "$runner" >"$test_tmp/recovery-core"
+sed -n '/^compile_basin_locked() {$/,/^}$/p' "$runner" >"$test_tmp/recovery-locked"
+[[ $(grep -Fc '[[ "$defer_reclaim" == false ]]' "$test_tmp/recovery-core") -eq 5 ]] ||
+    die 'deferred reclaim does not gate exactly five core sites'
+assert_contains "$test_tmp/recovery-locked" 'compile_basin_core "$basin_id" "$defer_reclaim"'
+assert_contains "$test_tmp/recovery-core" 'if reconcile_reclaim_basin "$basin_id" true; then'
+assert_contains "$test_tmp/recovery-locked" 'if reconcile_reclaim_basin "$basin_id" true; then'
+recovery_case_83_passed=1
+
+recovery_state_fixture 1020000010 failed 'transfer failed' pending 0 '' false
+recovery_state_fixture 7020000010 failed \
+    'acquisition report is unsafe or malformed; retained for inspection' pending 0 '' false
+recovery_state_fixture 9020000010 succeeded '' pending 1 '' false
+for recovery_id in 1020000010 7020000010; do
+    for recovery_product in basins streamnet; do
+        touch "$pipeline_dir/downloads/$recovery_id-$recovery_product.gpkg"
+    done
+done
+: >"$HFX_TEST_ADAPTER_LOG"
+git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-before"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    MV=$(command -v mv)
+    MKDIR=$(command -v mkdir)
+    RM=$(command -v rm)
+    CHMOD=$(command -v chmod)
+    campaign_dir=$pipeline_dir
+    lock_path=$pipeline_dir/state/locks/campaign.lock
+    mkdir "$lock_path"
+    printf '%s\n' "$$" >"$lock_path/owner.pid"
+    lock_owned=1
+    for recovery_id in 1020000010 7020000010 9020000010; do
+        pipeline_recover_reconstruct_basin "$recovery_id"
+    done
+)
+rm -r "$pipeline_dir/state/locks/campaign.lock"
+jq -e '
+  .basins["1020000010"].status == "pending" and
+  .basins["7020000010"] == {
+    status:"blocked",
+    blocked_reason:"acquisition report is unsafe or malformed; retained for inspection"
+  } and
+  .basins["9020000010"] == {
+    status:"blocked",
+    blocked_reason:"interrupted compile attempt cannot be safely repeated; retained for inspection"
+  }
+' "$pipeline_state" >/dev/null || die 'nonterminal and positive-attempt recovery results differ'
+HFX_TEST_PIPELINE_AVAILABLE_BYTES=0 expect_failure \
+    'blocked recovery remains incomplete' pipeline --campaign pipeline \
+    --workspace-root "$pipeline_root" --max-parallel 1 --fabric-version fixture-v1
+jq -e '.basins["7020000010"].status == "blocked"' "$pipeline_state" >/dev/null ||
+    die 'blocked basin was relabelled by bounded incomplete termination'
+[[ $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) -eq 0 ]] ||
+    die 'positive-attempt recovery repeated a build'
+for recovery_id in 1020000010 7020000010; do
+    for recovery_product in basins streamnet; do
+        [[ -f "$pipeline_dir/downloads/$recovery_id-$recovery_product.gpkg" ]] ||
+            die 'acquisition recovery removed a retained final'
+    done
+done
+for recovery_id in 1020000010 7020000010 9020000010; do
+    recovery_state_fixture "$recovery_id" succeeded '' failed 1 'adapter build failed' true
+    rm -f "$pipeline_dir/downloads/$recovery_id-basins.gpkg" \
+        "$pipeline_dir/downloads/$recovery_id-streamnet.gpkg"
+done
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+cp -R "$pipeline_dir" "$test_tmp/recovery-replay-before"
+run_runner pipeline --campaign pipeline --workspace-root "$pipeline_root" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout"
+diff -ru "$test_tmp/recovery-replay-before" "$pipeline_dir"
+git -C "$repo_root" status --porcelain=v1 >"$test_tmp/recovery-status-after"
+diff -u "$test_tmp/recovery-status-before" "$test_tmp/recovery-status-after"
+recovery_case_84_passed=1
+
+guard_dir=$test_tmp/pipeline-guards
+mkdir -p "$guard_dir/downloads" "$guard_dir/state/tmp"
+for readme_contract in \
+    'pipeline occupancy invariant exceeded: observed <actual> pairs;' \
+    'insufficient pipeline dispatch disk: available <actual> bytes; required' \
+    'state/tmp/pipeline-completions.fifo' \
+    '( pipeline_acquisition_worker "$basin_id" ) &' \
+    '5 * 8,859,344,896 = 44,296,724,480 peak input bytes'; do
+    assert_contains "$SCRIPT_DIR/README.md" "$readme_contract"
+done
+sed -n '/^The authored 600 GB reclaim model is:$/,/^| `560,000,000,000` usable bytes/p' \
+    "$SCRIPT_DIR/README.md" >"$test_tmp/current-authored-model"
+current_authored_hash=$(shasum -a 256 "$test_tmp/current-authored-model" | awk '{print $1}')
+[[ "$current_authored_hash" == 1dc7d7e7574f6e56b980d8f888865b991dbafbb39c1c0a6266187b71c508813b ]] ||
+    die 'authored 600 GB reclaim model changed'
+cp "$repo_root/adapters/tdx-hydro/data/tdx_header_numbers.json" "$guard_dir/state/inventory.json"
+guard_ids=()
+while IFS= read -r guard_id; do
+    guard_ids[${#guard_ids[@]}]=$guard_id
+done < <(jq -r 'keys[0:6][]' "$guard_dir/state/inventory.json")
+[[ ${#guard_ids[@]} -eq 6 ]] || die 'guard fixture does not contain six authoritative IDs'
+jq -n --args '{schema_version:1,basin_ids:$ARGS.positional,
+  basins:($ARGS.positional|map({key:.,value:{status:"pending",blocked_reason:null}})|from_entries),
+  fabric_version:"fixture-v1",max_parallel:4}' -- \
+  ${guard_ids[@]+"${guard_ids[@]}"} >"$guard_dir/state/pipeline.json"
+jq -n --args '{schema_version:1,basin_ids:$ARGS.positional}' -- \
+  ${guard_ids[@]+"${guard_ids[@]}"} >"$guard_dir/state/selection.json"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq)
+    RM=$(command -v rm)
+    ADAPTER_PYTHON=$test_tmp/fake-adapter-python
+    campaign_dir=$guard_dir
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$campaign_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$campaign_dir/state/tmp/pipeline-completions.fifo
+    set_pipeline_status() {
+        "$JQ" --arg id "$1" --arg status "$2" '.basins[$id].status=$status' \
+            "$campaign_dir/state/pipeline.json" >"$campaign_dir/state/tmp/p.json"
+        mv "$campaign_dir/state/tmp/p.json" "$campaign_dir/state/pipeline.json"
+    }
+    clear_guard_sources() {
+        rm -f "$campaign_dir"/downloads/*
+    }
+    suffixes=(basins.gpkg basins.gpkg.partial basins.gpkg.partial.json
+        streamnet.gpkg streamnet.gpkg.partial streamnet.gpkg.partial.json)
+    for suffix in ${suffixes[@]+"${suffixes[@]}"}; do
+        clear_guard_sources
+        path=$campaign_dir/downloads/${guard_ids[0]}-$suffix
+        if [[ "$suffix" == streamnet.gpkg.partial.json ]]; then
+            ln -s "$campaign_dir/missing-target" "$path"
+        else
+            : >"$path"
+        fi
+        pipeline_has_physical_pair "${guard_ids[0]}" ||
+            die "physical predicate missed $suffix"
+        pipeline_count_occupancy
+        [[ "$pipeline_occupancy_count" -eq 1 ]] ||
+            die "physical path counted incorrectly: $suffix"
+    done
+    clear_guard_sources
+    for status in pending acquiring ready compiling terminal reclaimed blocked; do
+        set_pipeline_status "${guard_ids[0]}" "$status"
+        if [[ "$status" == acquiring || "$status" == ready ||
+              "$status" == compiling || "$status" == terminal ]]; then
+            pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+                die "reserving status omitted: $status"
+        elif pipeline_basin_occupies_pair "${guard_ids[0]}"; then
+            die "nonreserving status included: $status"
+        fi
+    done
+    set_pipeline_status "${guard_ids[0]}" blocked
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg.partial"
+    pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+        die 'source-retaining blocked basin was omitted'
+    clear_guard_sources
+    ! pipeline_basin_occupies_pair "${guard_ids[0]}" ||
+        die 'path-free blocked basin was included'
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg"
+    : >"$campaign_dir/downloads/${guard_ids[0]}-streamnet.gpkg.partial"
+    set_pipeline_status "${guard_ids[0]}" ready
+    pipeline_count_occupancy
+    [[ "$pipeline_occupancy_count" -eq 1 ]] ||
+        die 'multiple paths and reserving status counted one ID more than once'
+    clear_guard_sources
+    for index in 0 1 2 3 4 5; do
+        set_pipeline_status "${guard_ids[$index]}" pending
+    done
+    for index in 0 1 2 3 4; do
+        set_pipeline_status "${guard_ids[$index]}" acquiring
+    done
+    pipeline_count_occupancy
+    [[ "$pipeline_occupancy_count" -eq 5 ]] || die 'current occupancy five differs'
+    union_status=0
+    ( set_pipeline_status "${guard_ids[5]}" ready; pipeline_count_occupancy ) \
+        >"$case_stdout" 2>"$case_stderr" || union_status=$?
+    [[ "$union_status" -eq 1 ]] || die 'current occupancy six was not fatal'
+    [[ $(<"$case_stderr") == 'hfx: error: pipeline occupancy invariant exceeded: observed 6 pairs; maximum 5' ]] ||
+        die 'current occupancy-six diagnostic differs'
+    set_pipeline_status "${guard_ids[5]}" pending
+    set_pipeline_status "${guard_ids[4]}" pending
+    pipeline_projected_occupancy_allows "${guard_ids[5]}" ||
+        die 'projected occupancy five was rejected'
+    set_pipeline_status "${guard_ids[4]}" acquiring
+    projected_status=0
+    pipeline_projected_occupancy_allows "${guard_ids[5]}" \
+        >"$case_stdout" 2>"$case_stderr" || projected_status=$?
+    projected_survived=1
+    [[ "$projected_status" -eq 1 && ! -s "$case_stdout" && ! -s "$case_stderr" &&
+       "$projected_survived" -eq 1 ]] || die 'projected occupancy six contract differs'
+    pipeline_projected_occupancy_allows "${guard_ids[0]}" ||
+        die 'already-occupied proposal added another pair'
+    for index in 0 1 2 3 4; do
+        set_pipeline_status "${guard_ids[$index]}" pending
+    done
+    for pair_count in 0 1 2 3 4 5; do
+        clear_guard_sources
+        for ((index = 0; index < pair_count; index++)); do
+            : >"$campaign_dir/downloads/${guard_ids[$index]}-basins.gpkg"
+            : >"$campaign_dir/downloads/${guard_ids[$index]}-streamnet.gpkg"
+        done
+        required=$((44296724480 - pair_count * 8859344896))
+        HFX_TEST_PIPELINE_AVAILABLE_BYTES=$required pipeline_dispatch_disk_guard ||
+            die "disk equality rejected for $pair_count pairs"
+        if ((pair_count < 5)); then
+            disk_status=0
+            HFX_TEST_PIPELINE_AVAILABLE_BYTES=$((required - 1)) \
+                pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+                disk_status=$?
+            disk_survived=1
+            [[ "$disk_status" -eq 1 && ! -s "$case_stdout" &&
+               "$disk_survived" -eq 1 ]] || die 'disk shortfall contract differs'
+            [[ $(<"$case_stderr") == "insufficient pipeline dispatch disk: available $((required - 1)) bytes; required $required bytes" ]] ||
+                die 'disk shortfall diagnostic differs'
+        fi
+    done
+    clear_guard_sources
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg.partial"
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=44296724479 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'partial-only basin received disk credit'
+    clear_guard_sources
+    : >"$campaign_dir/downloads/${guard_ids[0]}-basins.gpkg"
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=44296724479 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'one-final basin received disk credit'
+    for bad_probe in command-failure empty negative nonnumeric multiline overflow; do
+        probe_status=0
+        if [[ "$bad_probe" == command-failure ]]; then
+            ( ADAPTER_PYTHON=false; pipeline_available_bytes ) \
+                >"$case_stdout" 2>"$case_stderr" || probe_status=$?
+        else
+            case $bad_probe in
+                empty) probe_value= ;;
+                negative) probe_value=-1 ;;
+                nonnumeric) probe_value=x ;;
+                multiline) probe_value=$'1\n2' ;;
+                overflow) probe_value=9223372036854775808 ;;
+            esac
+            ( HFX_TEST_PIPELINE_AVAILABLE_BYTES=$probe_value; export HFX_TEST_PIPELINE_AVAILABLE_BYTES
+              pipeline_available_bytes ) >"$case_stdout" 2>"$case_stderr" ||
+                probe_status=$?
+        fi
+        [[ "$probe_status" -eq 1 && ! -s "$case_stdout" ]] ||
+            die "statvfs $bad_probe was not fatal"
+        [[ $(<"$case_stderr") == 'hfx: error: pipeline statvfs probe failed: expected one nonnegative signed-64-bit byte count' ]] ||
+            die "statvfs $bad_probe diagnostic differs"
+    done
+    disk_status=0
+    HFX_TEST_PIPELINE_AVAILABLE_BYTES=00000000000000000001 \
+        pipeline_dispatch_disk_guard >"$case_stdout" 2>"$case_stderr" ||
+        disk_status=$?
+    [[ "$disk_status" -eq 1 ]] || die 'leading-zero probe unexpectedly sufficed'
+    assert_contains "$case_stderr" 'available 1 bytes'
+)
+pass 'pipeline guard counts conservative pairs and exact disk headroom'
+
+completion_dir=$test_tmp/pipeline-completion
+mkdir -p "$completion_dir/state/tmp"
+completion_path=$completion_dir/state/tmp/pipeline-completions.fifo
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    RM=$(command -v rm)
+    ADAPTER_PYTHON=$test_tmp/fake-adapter-python
+    campaign_dir=$completion_dir
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$campaign_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$completion_path
+    pipeline_completion_create_open
+    [[ -p "$completion_path" && ! -L "$completion_path" ]] ||
+        die 'completion path is not a safe named pipe'
+    [[ $(stat -f '%Lp' "$completion_path") == 600 ]] ||
+        die 'completion path mode differs'
+    printf '1020000010\t0\n' >&9
+    read_status=0
+    IFS=$'\t' read -r -u 9 -t 1 completion_id completion_status ||
+        read_status=$?
+    [[ "$read_status" -eq 0 && "$completion_id" == 1020000010 &&
+       "$completion_status" == 0 ]] || die 'bounded completion record differs'
+    pipeline_completion_close_remove
+    [[ ! -e "$completion_path" && ! -L "$completion_path" ]] ||
+        die 'completion path was not removed'
+    mkfifo "$completion_path"
+    pipeline_completion_create_open
+    pipeline_completion_close_remove
+    for unsafe_type in file directory symlink; do
+        target=$completion_dir/state/tmp/target
+        printf preserved >"$target"
+        case $unsafe_type in
+            file) printf preserved >"$completion_path" ;;
+            directory) mkdir "$completion_path" ;;
+            symlink) ln -s "$target" "$completion_path" ;;
+        esac
+        unsafe_status=0
+        ( pipeline_completion_create_open ) >"$case_stdout" 2>"$case_stderr" ||
+            unsafe_status=$?
+        [[ "$unsafe_status" -eq 1 ]] || die "unsafe $unsafe_type path was accepted"
+        [[ $(<"$case_stderr") == "hfx: error: unsafe pipeline completion path: $completion_path; expected a non-symlink named pipe" ]] ||
+            die "unsafe $unsafe_type diagnostic differs"
+        [[ $(<"$target") == preserved ]] || die "unsafe $unsafe_type traversed"
+        case $unsafe_type in
+            file) [[ -f "$completion_path" && $(<"$completion_path") == preserved ]] ||
+                die 'unsafe file changed' ;;
+            directory) [[ -d "$completion_path" ]] || die 'unsafe directory changed' ;;
+            symlink) [[ -L "$completion_path" ]] || die 'unsafe symlink changed' ;;
+        esac
+        case $unsafe_type in
+            directory) rmdir "$completion_path" ;;
+            *) rm "$completion_path" ;;
+        esac
+        rm "$target"
+    done
+)
+pass 'pipeline completion path is safe, mode 0600, and bounded'
+
+run_trap_matrix() {
+    local interpreter=$1
+    local expected_version=$2
+    local observed
+    local matrix_dir=$3
+    observed=$("$interpreter" -c 'printf %s "$BASH_VERSION"')
+    if [[ "$expected_version" == 5.x ]]; then
+        [[ "$observed" == 5.* ]] ||
+            die "Bash-5 trap interpreter mismatch: observed $observed"
+    else
+        [[ "$observed" == "$expected_version" ]] ||
+            die "Bash-3.2 trap interpreter mismatch: observed $observed"
+    fi
+    mkdir -p "$matrix_dir"
+    matrix_status=0
+    "$interpreter" -c 'f(){ trap '\''printf fired >"$1"'\'' EXIT; :; }; f "$1" & p=$!; s=0; wait "$p" || s=$?; exit "$s"' \
+        matrix "$matrix_dir/bare" || matrix_status=$?
+    [[ "$matrix_status" -eq 0 ]] || die "$observed bare background wait failed"
+    if [[ "$expected_version" == 5.x ]]; then
+        [[ $(<"$matrix_dir/bare") == fired ]] ||
+            die "$observed bare background did not fire EXIT"
+    else
+        [[ ! -e "$matrix_dir/bare" ]] ||
+            die "$observed bare background unexpectedly fired EXIT"
+    fi
+    matrix_status=0
+    "$interpreter" -c 'f(){ trap '\''printf fired >"$1"'\'' EXIT; :; }; ( f "$1" ) & p=$!; s=0; wait "$p" || s=$?; exit "$s"' \
+        matrix "$matrix_dir/subshell" || matrix_status=$?
+    [[ "$matrix_status" -eq 0 && $(<"$matrix_dir/subshell") == fired ]] ||
+        die "$observed explicit subshell did not fire EXIT"
+    local_status=0
+    "$interpreter" -c 'set -eu; f(){ local record=$1; trap '\''printf fired >"$record"'\'' EXIT; :; }; f "$1"' \
+        matrix "$matrix_dir/local" >/dev/null 2>&1 || local_status=$?
+    [[ "$local_status" -eq 1 && ! -e "$matrix_dir/local" ]] ||
+        die "$observed local trap contract differs"
+}
+
+run_trap_matrix /bin/bash '3.2.57(1)-release' "$test_tmp/trap-32"
+if [[ -x /opt/homebrew/bin/bash ]]; then
+    run_trap_matrix /opt/homebrew/bin/bash 5.x "$test_tmp/trap-5"
+else
+    printf '%s\n' 'test-tdx-hydro-campaign: SKIP: case 87 Bash-5 empirical arm unavailable' >&2
+fi
+worker_dir=$test_tmp/pipeline-worker
+mkdir -p "$worker_dir/state/tmp"
+for stub_status in 0 7; do
+    worker_shell_status=0
+    HFX_TEST_DEFINITIONS=$definitions \
+    HFX_TEST_PIPELINE_CAMPAIGN_DIR=$worker_dir \
+    HFX_TEST_PIPELINE_COMPLETION_PATH=$worker_dir/state/tmp/pipeline-completions.fifo \
+    HFX_TEST_WORKER_ID=${guard_ids[0]} HFX_TEST_WORKER_STATUS=$stub_status \
+    HFX_TEST_FAKE_PYTHON=$test_tmp/fake-adapter-python \
+    /bin/bash -c '
+      set -Eeuo pipefail
+      IFS=$'\''\n\t'\''
+      source "$HFX_TEST_DEFINITIONS"
+      RM=$(command -v rm)
+      ADAPTER_PYTHON=$HFX_TEST_FAKE_PYTHON
+      campaign_dir=$HFX_TEST_PIPELINE_CAMPAIGN_DIR
+      acquire_basin(){ return "$HFX_TEST_WORKER_STATUS"; }
+      pipeline_completion_create_open
+      worker_status=0
+      ( pipeline_acquisition_worker "$HFX_TEST_WORKER_ID" ) || worker_status=$?
+      read_status=0
+      IFS=$'\''\t'\'' read -r -u 9 -t 1 record_id record_status || read_status=$?
+      printf "%s\t%s\t%s\t%s\n" "$record_id" "$record_status" "$worker_status" "$read_status"
+      pipeline_completion_close_remove
+      exit "$worker_status"
+    ' >"$case_stdout" 2>"$case_stderr" || worker_shell_status=$?
+    [[ "$worker_shell_status" -eq "$stub_status" ]] ||
+        die "worker shell status differs for stub $stub_status"
+    [[ $(<"$case_stdout") == "${guard_ids[0]}"$'\t'"$stub_status"$'\t'"$stub_status"$'\t0' ]] ||
+        die "worker record differs for stub $stub_status"
+done
+pass 'pipeline worker notification obeys Bash 3.2 trap contracts'
+
+scheduler_init() {
+    scheduler_root=$1 scheduler_name=$2
+    shift 2
+    mkdir "$scheduler_root"
+    scheduler_args=(init --campaign "$scheduler_name" --workspace-root "$scheduler_root")
+    for scheduler_id do scheduler_args[${#scheduler_args[@]}]=--basin
+        scheduler_args[${#scheduler_args[@]}]=$scheduler_id
+    done
+    scheduler_args+=(--retention-policy reclaim-inputs-after-terminal
+        --available-memory-bytes 30000000000 --available-disk-bytes 491737129060
+        --peak-in-flight-download-bytes 44296724480 --retained-basin-output-bytes 206220202290
+        --assembly-memory-ceiling-bytes 30000000000 --assembly-scratch-ceiling-bytes 206220202290
+        --assembled-artifact-bytes 206220202290 --active-compile-scratch-bytes 30000000000
+        --filesystem-overhead-bytes 5000000000)
+    run_runner ${scheduler_args[@]+"${scheduler_args[@]}"} >"$case_stdout"
+}
+scheduler_ids=(1020000010 2020000010 3020000010 4020000010 5020000010 7020000010)
+
+scheduler_init "$test_tmp/workspaces/scheduler88" scheduler88 \
+    ${scheduler_ids[@]+"${scheduler_ids[@]}"}
+scheduler88=$test_tmp/workspaces/scheduler88/tdx-hydro-scheduler88
+cp -R "$scheduler88" "$test_tmp/scheduler88-pristine"
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign scheduler88 --workspace-root "$test_tmp/workspaces/scheduler88" \
+    --max-parallel 4 >"$case_stdout"
+for scheduler_index in 2 3 4 5; do
+    scheduler_id=${scheduler_ids[$scheduler_index]}
+    cp "$test_tmp/scheduler88-pristine/state/basins/$scheduler_id/current.json" \
+        "$scheduler88/state/basins/$scheduler_id/current.json"
+    rm -f "$scheduler88/downloads/$scheduler_id-"*
+done
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler88
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler88/state/tmp/pipeline-completions.fifo
+export HFX_TEST_BARRIER_COUNT=4
+export HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG=$test_tmp/scheduler88-build-active
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner pipeline --campaign scheduler88 --workspace-root "$test_tmp/workspaces/scheduler88" \
+    --max-parallel 4 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 88 projected-capacity pipeline failed'
+unset HFX_TEST_BARRIER_COUNT HFX_TEST_PIPELINE_BUILD_ACTIVE_LOG
+jq -e '[.basins[] | .status == "reclaimed" and .blocked_reason == null] | all' \
+    "$scheduler88/state/pipeline.json" >/dev/null ||
+    die 'case 88 projected-capacity final statuses differ'
+[[ $(<"$test_tmp/transfer-state/maximum") -eq 4 &&
+   $(grep -c '^build' "$HFX_TEST_ADAPTER_LOG") -eq 6 &&
+   $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG") -eq 12 ]] ||
+    die "case 88 projected-capacity concurrency or compile counts differ: max=$(<"$test_tmp/transfer-state/maximum") build=$(grep -c '^build' "$HFX_TEST_ADAPTER_LOG" || :) validate=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)"
+awk '$1=="build-active" && $3>0 {found=1} END{exit !found}' \
+    "$test_tmp/scheduler88-build-active" ||
+    die 'case 88 projected-capacity compile did not overlap acquisition'
+[[ ! -e "$HFX_TEST_PIPELINE_COMPLETION_PATH" &&
+   ! -e "$scheduler88/state/locks/campaign.lock" ]] ||
+    die 'case 88 projected-capacity cleanup differs'
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    max_parallel=4
+    pipeline_worker_pids=(11 12 13)
+    ! pipeline_parallel_limit_reached
+    pipeline_worker_pids[3]=14
+    pipeline_parallel_limit_reached
+) || die 'case 88 projected-capacity parallel equality differs'
+scheduler_init "$test_tmp/workspaces/scheduler88fail" scheduler88fail 1020000010
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$test_tmp/workspaces/scheduler88fail/tdx-hydro-scheduler88fail
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/tmp/pipeline-completions.fifo
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+pipeline_status=0
+HFX_TEST_FAIL_KEY=1020000010-basins HFX_TEST_RESUME_MODE=short \
+run_runner pipeline --campaign scheduler88fail \
+    --workspace-root "$test_tmp/workspaces/scheduler88fail" --max-parallel 1 \
+    --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" || pipeline_status=$?
+[[ "$pipeline_status" -ne 0 ]] &&
+    jq -e '.stages.acquire_basins.attempts == 2' \
+        "$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/basins/1020000010/current.json" >/dev/null ||
+    die 'case 88 projected-capacity dispatch exhaustion differs'
+assert_contains "$case_stderr" 'pipeline incomplete: pending=1 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+jq -e '.basins["1020000010"].status == "pending"' "$HFX_TEST_PIPELINE_CAMPAIGN_DIR/state/pipeline.json" >/dev/null ||
+    die 'case 88 projected-capacity exhausted basin changed state'
+pass 'case 88 projected-capacity'
+
+scheduler_init "$test_tmp/workspaces/scheduler89" scheduler89 1020000010 2020000010
+scheduler89=$test_tmp/workspaces/scheduler89/tdx-hydro-scheduler89
+cp -R "$scheduler89" "$test_tmp/scheduler89-pristine"
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+run_runner acquire --campaign scheduler89 --workspace-root "$test_tmp/workspaces/scheduler89" \
+    --max-parallel 2 >"$case_stdout"
+cp "$test_tmp/scheduler89-pristine/state/basins/2020000010/current.json" \
+    "$scheduler89/state/basins/2020000010/current.json"
+rm -f "$scheduler89/downloads/2020000010-"*
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler89
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler89/state/tmp/pipeline-completions.fifo
+sequence=$test_tmp/scheduler89-sequence
+printf '%s\n' 35437379583 44296724480 >"$sequence"
+export HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE=$sequence
+: >"$HFX_TEST_ADAPTER_LOG"
+run_runner pipeline --campaign scheduler89 --workspace-root "$test_tmp/workspaces/scheduler89" \
+    --max-parallel 4 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    die 'case 89 disk refusal pipeline failed'
+unset HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+[[ ! -s "$sequence" ]] || die 'case 89 disk refusal guard-call count differs'
+assert_contains "$case_stderr" 'insufficient pipeline dispatch disk: available 35437379583 bytes; required 35437379584 bytes'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler89/state/pipeline.json" >/dev/null ||
+    die 'case 89 disk refusal final statuses differ'
+pass 'case 89 disk refusal'
+
+scheduler_init "$test_tmp/workspaces/scheduler-no-progress" scheduler-no-progress 1020000010
+scheduler_no_progress=$test_tmp/workspaces/scheduler-no-progress/tdx-hydro-scheduler-no-progress
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler_no_progress
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler_no_progress/state/tmp/pipeline-completions.fifo
+no_progress_sequence=$test_tmp/scheduler-no-progress-sequence
+printf '%s\n' 0 >"$no_progress_sequence"
+export HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE=$no_progress_sequence
+pipeline_status=0
+run_runner pipeline --campaign scheduler-no-progress \
+    --workspace-root "$test_tmp/workspaces/scheduler-no-progress" \
+    --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    pipeline_status=$?
+unset HFX_TEST_PIPELINE_AVAILABLE_SEQUENCE
+[[ "$pipeline_status" -ne 0 && ! -s "$no_progress_sequence" ]] ||
+    die 'no-progress round did not terminate after one refused dispatch'
+assert_contains "$case_stderr" \
+    'pipeline incomplete: pending=1 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0'
+jq -e '.basins["1020000010"] == {status:"pending",blocked_reason:null}' \
+    "$scheduler_no_progress/state/pipeline.json" >/dev/null ||
+    die 'no-progress termination changed the recoverable pending state'
+pass 'pipeline no-progress round terminates through the bounded final-state check'
+
+scheduler_init "$test_tmp/workspaces/scheduler90" scheduler90 1020000010 2020000010
+scheduler90=$test_tmp/workspaces/scheduler90/tdx-hydro-scheduler90
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler90
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler90/state/tmp/pipeline-completions.fifo
+export HFX_TEST_PIPELINE_KILL_KEY=1020000010-basins
+export HFX_TEST_KILLED_BASIN_ID=1020000010
+export HFX_TEST_KILLED_CURRENT_PATH=$scheduler90/state/basins/1020000010/current.json
+export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-pending
+export HFX_TEST_STALE_CURRENT_PATH=$scheduler90/state/basins/2020000010/current.json
+export HFX_TEST_STALE_READY_MARKER=$test_tmp/scheduler90-stale-ready
+export HFX_TEST_REAL_MV=$(command -v mv)
+export HFX_TDX_MV=$test_tmp/pipeline-mv
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+export HFX_TEST_FAIL_ONCE_KEY=2020000010-basins
+export HFX_TEST_REDISPATCH_HOLD_KEY=2020000010-basins
+export HFX_TEST_REDISPATCH_RELEASE_MARKER=$test_tmp/scheduler90-redispatch-release
+run_runner pipeline --campaign scheduler90 --workspace-root "$test_tmp/workspaces/scheduler90" \
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 90 vanished worker and queued completion pipeline failed'
+unset HFX_TEST_PIPELINE_KILL_KEY HFX_TDX_MV HFX_TEST_STALE_CURRENT_PATH \
+    HFX_TEST_STALE_READY_MARKER HFX_TEST_FAIL_ONCE_KEY HFX_TEST_REDISPATCH_HOLD_KEY \
+    HFX_TEST_REDISPATCH_RELEASE_MARKER
+[[ -f "$HFX_TEST_KILLED_PENDING_MARKER" &&
+   -f "$test_tmp/scheduler90-stale-ready" &&
+   $(grep -c '^start 1020000010-basins' "$test_tmp/transfer-state/events") -eq 2 &&
+   $(grep -c '^start 2020000010-basins' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+    die 'case 90 vanished worker, queued completion, or retry differs'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler90/state/pipeline.json" >/dev/null ||
+    die 'case 90 vanished worker queued-completion final statuses differ'
+helper_state=$scheduler90/state/basins/1020000010/current.json
+jq '.retention.inputs_reclaimed=false |
+  .stages.acquire_basins={status:"running",attempts:1,failure_reason:null,evidence:null} |
+  .stages.acquire_streamnet={status:"pending",attempts:0,failure_reason:null,evidence:null} |
+  .stages.compile={status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}' \
+    "$helper_state" >"$helper_state.tmp"
+mv "$helper_state.tmp" "$helper_state"
+jq '.basins["1020000010"]={status:"acquiring",blocked_reason:null}' \
+    "$scheduler90/state/pipeline.json" >"$scheduler90/state/pipeline.json.tmp"
+mv "$scheduler90/state/pipeline.json.tmp" "$scheduler90/state/pipeline.json"
+export HFX_TEST_KILLED_PENDING_MARKER=$test_tmp/scheduler90-helper-pending
+(
+    ( exit 0 ) & helper_pid=$!
+    # shellcheck source=/dev/null
+    source "$definitions"
+    JQ=$(command -v jq); MV=$test_tmp/pipeline-mv
+    MKDIR=$(command -v mkdir); RM=$(command -v rm); CHMOD=$(command -v chmod)
+    campaign_dir=$scheduler90
+    lock_path=$scheduler90/state/locks/campaign.lock
+    mkdir "$lock_path"; printf '%s\n' "$$" >"$lock_path/owner.pid"; lock_owned=1
+    pipeline_selected_basin_ids=(1020000010)
+    pipeline_swept_completion_statuses=("")
+    pipeline_worker_pids=("$helper_pid")
+    pipeline_worker_basin_ids=(1020000010)
+    pipeline_round_reaped=0
+    pipeline_sweep_vanished_workers
+    ((${#pipeline_worker_pids[@]} == 0))
+    [[ -f "$HFX_TEST_KILLED_PENDING_MARKER" ]]
+) || die 'case 90 vanished SIGKILL isolated liveness recovery differs'
+rm -r "$scheduler90/state/locks/campaign.lock"
+(
+    # shellcheck source=/dev/null
+    source "$definitions"
+    pipeline_read_timed_out 1 && pipeline_read_timed_out 142 &&
+        pipeline_read_timed_out 37 && ! pipeline_read_timed_out 0
+) || die 'case 90 vanished SIGKILL timeout classification differs'
+pass 'case 90 sweep tolerates an already-accounted queued completion'
+
+scheduler_init "$test_tmp/workspaces/scheduler91" scheduler91 1020000010 2020000010
+scheduler91=$test_tmp/workspaces/scheduler91/tdx-hydro-scheduler91
+grep -F '        kill -TERM "$cleanup_pid" 2>/dev/null || :' "$runner" >/dev/null || die 'case 91 fatal cleanup child TERM is absent'
+grep -F '        wait "$cleanup_pid" || cleanup_wait_status=$?' "$runner" >/dev/null || die 'case 91 fatal cleanup child wait is absent'
+export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$scheduler91
+export HFX_TEST_PIPELINE_COMPLETION_PATH=$scheduler91/state/tmp/pipeline-completions.fifo
+export HFX_TEST_FATAL_HOLD=1 HFX_TEST_FATAL_INJECT_KEY=1020000010-basins
+export HFX_TEST_FATAL_FIFO=$HFX_TEST_PIPELINE_COMPLETION_PATH
+export HFX_TEST_FATAL_LOCK=$scheduler91/state/locks/campaign.lock
+export HFX_TEST_FATAL_CLEANUP_MARKER=$test_tmp/scheduler91-cleanup
+export HFX_TEST_REAL_RM=$(command -v rm)
+export HFX_TDX_RM=$test_tmp/pipeline-rm
+rm -r "$test_tmp/transfer-state"; mkdir "$test_tmp/transfer-state"
+pipeline_status=0
+run_runner pipeline --campaign scheduler91 --workspace-root "$test_tmp/workspaces/scheduler91" \
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+    pipeline_status=$?
+[[ "$pipeline_status" -ne 0 && $(<"$HFX_TEST_FATAL_CLEANUP_MARKER") == children-reaped-with-lock ]] ||
+    die 'case 91 fatal cleanup ordering differs'
+assert_contains "$case_stderr" 'malformed pipeline completion record: expected selected basin ID and exit status'
+unset HFX_TEST_FATAL_HOLD HFX_TDX_RM HFX_TEST_FATAL_FIFO
+run_runner pipeline --campaign scheduler91 --workspace-root "$test_tmp/workspaces/scheduler91" \
+    --max-parallel 2 --fabric-version fixture-v1 >"$case_stdout" ||
+    die 'case 91 fatal cleanup recovery replay failed'
+jq -e '[.basins[].status == "reclaimed"] | all' "$scheduler91/state/pipeline.json" >/dev/null ||
+    die 'case 91 fatal cleanup replay statuses differ'
+pass 'case 91 fatal cleanup'
+
 for accepted_version in 3.2.0 '3.2.57(1)-release' 4.0 10.1.2; do
     bash_version_at_least_3_2 "$accepted_version" ||
         die "Bash floor predicate rejected $accepted_version"
@@ -3140,6 +6203,22 @@ done
 git -C "$repo_root" status --porcelain=v1 | sed '/^?? pr-body\.md$/d' >"$test_tmp/repository-status-final"
 diff -u "$test_tmp/repository-status-before" "$test_tmp/repository-status-final"
 pass 'poison commands remain uninvoked and repository status preserves only the allowed PR body'
+
+[[ "${recovery_case_83_passed-}" == 1 ]] ||
+    die 'pipeline recovery classification case did not complete'
+pass 'pipeline recovery evaluates eight rules and preserves acquisition terminality'
+[[ "${recovery_case_84_passed-}" == 1 ]] ||
+    die 'pipeline recovery replay case did not complete'
+pass 'pipeline recovery never reacquires or repeats a basin build and replay is stable'
+
+calibration_cohort_case
+calibration_measurement_case
+calibration_replay_case
+calibration_disclosure_case
+calibration_scheduler_shape_case
+checkpoint_schema_case
+checkpoint_stop_case
+checkpoint_progress_case
 
 printf '1..%d\n' "$passed"
 if [[ "$skipped" -eq 0 ]]; then

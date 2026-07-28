@@ -271,60 +271,193 @@ interpreter exits with
 The accepted command forms are:
 
 ```text
-tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] --available-memory-bytes <integer> --available-disk-bytes <integer> --retained-input-bytes <integer> --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer>
+tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>
 tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>
 tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>
+tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>
+tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>
+tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
 ```
 
 `--workspace-root` defaults to `/mnt/hfx/work`, giving campaign directory
-`/mnt/hfx/work/tdx-hydro-<campaign>`. All seven `init` byte values are required,
-positive base-10 integers within the signed 64-bit range. The feasibility
-checks are:
+`/mnt/hfx/work/tdx-hydro-<campaign>`. The retention selector defaults to
+`retain-all-through-publication`. Both policies require available memory and
+disk, retained basin output, assembly memory and scratch ceilings, assembled
+artifact, active compile scratch, and filesystem overhead. Retain-all also
+requires `--retained-input-bytes`; reclaim instead requires the exact frozen
+`--peak-in-flight-download-bytes 44296724480`. Supplying the other policy's
+input term is an error. Every byte value is a positive base-10 integer within
+the signed 64-bit range.
+
+The common calculations are:
 
 ```text
 required_memory_bytes = assembly_memory_ceiling_bytes
-required_disk_bytes = retained_input_bytes
-                    + retained_basin_output_bytes
-                    + assembly_scratch_ceiling_bytes
-                    + assembled_artifact_bytes
+assembly_peak_bytes = max(assembly_scratch_ceiling_bytes, assembled_artifact_bytes)
 available_memory_bytes >= required_memory_bytes
 available_disk_bytes >= required_disk_bytes
 ```
+
+Retain-all calculates:
+
+```text
+required_disk_bytes = retained_input_bytes
+                    + retained_basin_output_bytes
+                    + active_compile_scratch_bytes
+                    + assembly_peak_bytes
+                    + filesystem_overhead_bytes
+```
+
+Reclaim calculates:
+
+```text
+required_disk_bytes = peak_in_flight_download_bytes
+                    + retained_basin_output_bytes
+                    + active_compile_scratch_bytes
+                    + assembly_peak_bytes
+                    + filesystem_overhead_bytes
+```
+
+Assembly builds in a staging directory beside the destination and publishes
+with a same-filesystem replace. Staging and final output are therefore one
+artifact-sized term at a time, so the formula uses the maximum of scratch and
+artifact rather than their sum.
 
 Insufficient capacity is reported as
 `hfx: error: insufficient memory: available <available> bytes; required <required> bytes`
 or
 `hfx: error: insufficient disk: available <available> bytes; required <required> bytes`.
 Re-running `init` for an existing campaign requires the same normalized sizing
-values and the same 62-basin inventory. Changed parameters require a new
-campaign ID.
+values, retention policy, and the same 62-basin inventory. Schema-1 campaign
+state predates this contract and fails closed; use a new campaign ID. Changed
+parameters also require a new campaign ID.
 
-The persisted policy is `retain-all-through-publication`. Acquired final
-GeoPackages, resumable attributable partials, per-basin outputs, and external
-diagnostic reports remain on the campaign volume. Acquisition retains an invalid
-final for inspection. It continues a regular partial only when its sidecar's exact
-identity, URL, strong ETag, byte count, remote total, and SHA-256 validate; otherwise
-it discards a safe ordinary incomplete partial before one complete-file retry.
+Retain-all keeps acquired final GeoPackages, resumable attributable partials,
+per-basin outputs, and external diagnostic reports through publication.
+It accepts acquisition `--max-parallel` from `1` through `62`; the exact common
+range diagnostic remains
+`option --max-parallel must be a base-10 integer from 1 through 62`.
+Use `4` as the polite NGA operating value.
+
+Reclaim policy removes only the exact basins and streamnet source GeoPackages,
+safe acquisition partials, and their provenance sidecars after both acquisitions
+succeed and compile reaches a durable success or an actual adapter build or
+validation hard failure with a positive attempt count. The runner first
+atomically records acquisition evidence, the compile outcome, available
+diagnostics, and the failure reason. It then reclaims the basins product, reclaims
+the streamnet product, and atomically records inputs_reclaimed=true before
+processing another basin. Recovery completes any interruption between those
+boundaries. Missing terminal source files are treated as an interrupted or
+repeated reclaim; unsafe path types fail closed without traversal.
+
+Landed basin outputs and every external diagnostic and acquisition report remain
+on the campaign volume. Assembly requires every landed
+basin-outputs/<processing-basin-id>/catchments.parquet,
+graph.parquet, and aux/snap_stems.parquet across its merge passes, so those files
+are never reclaim targets. Retain-all behavior is unchanged and keeps all acquired
+source artifacts through publication.
+
+Pipeline recovery classifies each acquisition stage from durable state.
+`succeeded` is terminal. `pending`, including the interrupted-stage diagnostic,
+and these five failed reasons are retryable and map to pipeline `pending`:
+
+- `partial changed during ignored-Range continuation`
+- `continuation response failed provenance verification`
+- `transfer failed`
+- `download provenance or size verification failed`
+- `download failed integrity verification`
+
+These five failed reasons map to pipeline `blocked` and retain the exact reason:
+
+- `acquisition report is unsafe or malformed; retained for inspection`
+- `existing final file failed integrity verification; retained for inspection`
+- `persisted evidence does not match final file; retained for inspection`
+- `partial provenance path is unsafe; retained without traversal`
+- `installed final failed integrity verification; retained for inspection`
+
+Recovery preserves a succeeded sibling, safe partial, sidecar, final,
+acquisition report, attempt count, and evidence. It performs no acquisition.
+Unknown failed reasons and residual `running` acquisition stages fail closed
+with an acquisition-specific diagnostic.
+
+The five durable compile failure reasons are `adapter build failed`, `adapter
+validation failed`, `existing compile artifacts failed resume verification;
+retained for inspection`, `compile artifact path already exists; retained for
+inspection`, and `acquisition prerequisites are not both succeeded`. The two
+adapter hard failures are reclaimable after a positive attempt. Both compile
+inspection reasons are blocked. The prerequisite reason at zero attempts
+automatically becomes `ready` once both acquisitions succeed and neither
+managed output nor build-report path exists. Its artifact-present variant is
+blocked with the prerequisite reason unchanged.
+
+A blocked basin retains its source pair and permanently occupies a future pair
+slot until operator remediation. Pipeline completion requires every selected
+basin to become `reclaimed`, so every invocation remains nonzero while a
+selected basin is blocked. Five blocked basins wedge the campaign because no
+remaining pair slot is available while completion still requires every
+selected basin to be reclaimed.
+
+After a compile hard failure has been durably classified and its inputs reclaimed,
+those inputs are not retryable in place. Retrying that basin requires a fresh
+approximately 30-minute acquisition under a separately authorized recovery
+workflow.
+
+```text
+6,979,305,472 + 1,880,039,424 = 8,859,344,896 bytes per source pair
+5 * 8,859,344,896 = 44,296,724,480 peak input bytes
+max_parallel <= 5 - 1
+max_parallel <= 4
+```
+
+It continues a regular partial only when its sidecar's exact identity, URL,
+strong ETag, byte count, remote total, and SHA-256 validate; otherwise it
+discards a safe ordinary incomplete partial before one complete-file retry.
 A resumed acquisition re-verifies every installed final's byte count, SHA-256,
 SQLite identity, layer name, and persisted evidence. A resumed compile re-validates
 each succeeded dataset and external report. Existing failed or conflicting compile
 artifacts are retained for inspection.
 
+`compile` remains the phase-separated whole-effective-set sweep.
+`compile-basin` requires exactly one authoritative processing basin in the
+frozen campaign selection and requires both acquisitions to have succeeded. It
+compiles or resume-verifies only that basin. A prerequisite refusal does not
+write a compile failure for the named basin and never evaluates or writes
+another basin's stage state. A future pipeline must use `compile-basin`
+semantics, not the whole `compile` sweep.
+
+The compile-contract check deliberately has different placement in the two
+entrypoints. `compile` establishes the contract before migration and recovery.
+`compile-basin` establishes it after target-only migration, recovery, and the
+prerequisite check so that a prerequisite refusal remains write-free. As a
+result, a conflicting `compile-basin --fabric-version` may perform migration or
+recovery writes before reporting the conflict, and an unmet prerequisite is
+reported before the fabric-version conflict.
+
+Campaign-lock re-entry is allowed only when the current process already owns
+the safe campaign lock and its regular, non-symlink `owner.pid` matches that
+process. Competing live owners retain the existing refusal, and stale owners
+retain the existing takeover behavior. Forked workers clear inherited
+ownership flags. Bash resets a parent-set `EXIT` trap in an `&` subshell, so
+the ownership reset is defense in depth rather than the only protection.
+
 The runner phases are:
 
 1. `init` creates the fixed campaign layout and records sizing, inventory, and
    retention policy.
-2. `acquire --max-parallel <1-62>` performs bounded parallel work across
-   basins, with products serial within each basin. The runner retains the full
-   range; use `4` as the polite NGA campaign operating policy. It safely continues
-   only a server-honored HTTP range tied to a validated strong ETag.
+2. `acquire` performs bounded parallel work across basins, with products serial
+   within each basin. Retain-all accepts `1..62`; reclaim accepts `1..4`.
+   Use `4` as the polite NGA campaign operating policy. The runner safely
+   continues only a server-honored HTTP range tied to a validated strong ETag.
 3. `compile --fabric-version <value>` invokes one isolated adapter build per
-   basin after both products succeed. It retains
-   `basin-outputs/<basin>` and `reports/<basin>-build-report.json`.
+   basin after both products succeed. In reclaim mode, durable compile success
+   or an actual adapter build or validation hard failure immediately reclaims
+   only that basin's source pair. Outputs and reports remain. Both compile
+   inspection classifications remain unreclaimed.
 4. `evidence` writes deterministic
    `publication/evidence/acquisition.json`,
    `publication/evidence/outcomes.json`, and
@@ -334,14 +467,176 @@ The runner phases are:
    nonempty regular files and uploads the exact persisted inventory; it does
    not invoke assembly or validate dataset semantics.
 
-`status` validates state and prints sizing plus deterministic per-stage counts.
-`recover` changes interrupted `running` stages back to `pending`; `acquire` and
-`compile` also perform the applicable recovery before work. Operational
+`pipeline` is available only for campaigns using
+`reclaim-inputs-after-terminal`. It validates `--max-parallel` from `1..4`
+and persists that JSON number with the nonempty `--fabric-version` and sorted
+effective basin IDs in schema-1 `state/pipeline.json`. Fabric version and
+selected basin IDs are immutable on replay. Max parallel may change within
+`1..4`.
+
+Pipeline records contain `status` and `blocked_reason` with statuses `pending`,
+`acquiring`, `ready`, `compiling`, `terminal`, `reclaimed`, and `blocked`.
+Only the lock-owning parent writes the document. The document is advisory:
+each pass reconstructs every selected record from authoritative durable basin
+state using ordered, first-match recovery rules. Already-reclaimed basins stay
+reclaimed. Eligible terminal outcomes transition to `terminal` before source
+removal and to `reclaimed` afterward. A succeeded compile missing only its
+diagnostic is verification-only. Positive compile attempts are never rebuilt:
+inspection artifacts are blocked, and an attempt without artifacts is blocked
+as an interrupted attempt. Zero-attempt ready work remains `ready`. Incomplete
+acquisition maps to `pending` or `blocked` as listed above. Remaining compile
+contradictions fail closed. Do not hand-edit `state/pipeline.json`.
+
+`status` retains its lock-taking validation semantics and prints sizing plus
+deterministic per-stage counts. Only reclaim mode also prints a deterministic
+reclaimed-input count. When pipeline state exists, status and progress then
+print `pipeline_max_parallel`, `pipeline_fabric_version`, and the seven
+`pipeline_<status>` counts, in that order, before the four assembly counts.
+`progress` renders the same deterministic counts directly from one atomically
+installed pipeline snapshot without locking, migration, recovery,
+reconciliation, or writes.
+
+Pipeline completion requires every selected advisory record and durable basin
+to be reclaimed. Otherwise the command prints durable and scheduler counts and
+returns nonzero after one bounded pass.
+
+Blocked-basin remediation is explicit:
+
+1. Stop campaign commands and confirm the exact campaign lock is absent.
+2. Copy the basin `current.json`, acquisition reports, source files and
+   sidecars, output directory, and build report to external inspection storage.
+3. Determine whether acquisition evidence or a prior adapter invocation can be
+   made canonical without repeating paid work.
+4. For a valid prior compile, restore canonical output and report at the exact
+   managed paths and rerun `pipeline` with the same fabric version and selected
+   set. If the basin is already blocked with a compile reason, use step 6
+   instead.
+5. For acquisition inspection, preserve evidence and move the reason-specific
+   path out before explicitly running `acquire`, then rerun `pipeline`. Move
+   `reports/<id>-<product>-acquisition.json` for an unsafe report; move
+   `downloads/<id>-<product>.gpkg` for existing-final, installed-final, or
+   evidence-mismatch failures; move the exact `.gpkg.partial` or
+   `.gpkg.partial.json` unsafe path for unsafe partial provenance. For evidence
+   mismatch, the final must be moved first because leaving it permits
+   `acquire` to promote a file that disagreed with persisted evidence.
+6. If a second build is consciously authorized, move conflicting output and
+   report paths outside managed campaign paths, run `compile-basin` with the
+   same fabric version as a supervised override, then rerun `pipeline`.
+7. If neither recovery is defensible, abandon the basin in this campaign and
+   use a new campaign ID.
+
+The supervised commands are operator overrides. Automatic pipeline recovery
+never reacquires retained-for-inspection input and never performs a second
+build. `pipeline` runs an acquisition producer at the requested
+`max_parallel`, capped at four by reclaim policy. Workers launch as explicit
+subshells with `( pipeline_acquisition_worker "$basin_id" ) &`. One synchronous
+serial compiler runs in the parent while acquisition workers remain live.
+Phase-separated `acquire`, `compile`, `compile-basin`, `status`, and `progress`
+and retain-all behavior remain unchanged.
+
+The occupancy guard counts distinct effective basin IDs. A basin occupies one
+pair when any final, partial, or partial sidecar source path exists, including a
+dangling symlink, or when its scheduler status is `acquiring`, `ready`,
+`compiling`, or `terminal`. Physical presence wins for every status, including
+`blocked`. A current count above five is corrupt state and fails with
+`hfx: error: pipeline occupancy invariant exceeded: observed <actual> pairs;
+maximum 5`. Projecting a proposed ID returns status 0 at five or fewer and
+status 1 without output when the projection would exceed five. Status 1 is a
+temporary capacity answer, not a campaign failure.
+
+Disk credit is deliberately narrower: one full pair is credited only when both
+installed finals exist. Partial-only and one-final basins receive no credit.
+The guard computes
+`44,296,724,480 - present_pairs * 8,859,344,896` and accepts available bytes
+equal to the result. A one-byte shortfall returns status 1 and emits
+`insufficient pipeline dispatch disk: available <actual> bytes; required
+<required> bytes`. The sizing identities are:
+
+```text
+6,979,305,472 + 1,880,039,424 = 8,859,344,896 bytes per source pair
+5 * 8,859,344,896 = 44,296,724,480 peak input bytes
+max_parallel <= 5 - 1
+max_parallel <= 4
+```
+
+The ephemeral completion transport is
+`state/tmp/pipeline-completions.fifo`, a mode-0600 non-symlink named pipe held
+read-write by the parent on literal descriptor 9. Records are
+`<10-digit-basin-id><TAB><numeric-exit-status><NEWLINE>`. Durable JSON remains
+the source of truth. Bash 3.2 drops a function-installed EXIT trap for a bare
+`function &` invocation, so a future worker launch must use
+`( pipeline_acquisition_worker "$basin_id" ) &`. Variables named by the EXIT
+trap must be non-local because function locals are gone when that trap runs.
+The trap makes exactly one record-write attempt and ignores write failure after
+capturing the true worker status.
+
+The scheduler performs ordered recovery before reconstruction and before every
+occupancy guard. Projected-count and disk-headroom refusals are nonfatal; a
+ready pair can compile and reclaim capacity before the producer retries.
+Descriptor 9 uses one-second timed reads. Every nonzero read result enters the
+liveness sweep because Bash 3.2 returns 1 and Bash 5 returns 142; descriptor 9
+being read-write makes EOF unreachable. `kill -0` can recognize an unreaped
+zombie for one additional bounded round. Both `read` and `wait` nonzero statuses
+are captured under strict mode, and each tracked PID is waited exactly once.
+
+Each basin receives at most two scheduler dispatch attempts and two serial
+consumer attempts per invocation. A scheduler-state snapshot and round dispatch,
+reap, and compile flags terminate a round with no durable change or action
+through the bounded final-state check. A completion already accounted for by
+the liveness sweep is discarded, including after that basin is redispatched.
+Success requires every selected basin to be `reclaimed`. Bounded incomplete
+reporting preserves `pending`, `ready`, and `blocked` states for recovery or
+operator action. Fatal and signal cleanup sends TERM to tracked children, reaps
+each child, and removes the FIFO before releasing the campaign lock.
+
+The planning timing model remains 33-37 hours for acquisition, 16-18 hours for
+serial compilation, and approximately 34-42 hours for the overlapped pipeline.
+These values are planning estimates, not a measured planetary result.
+Operational
 recovery always re-runs the same campaign with the same sizing, inventory,
 parallelism, fabric version, paths, attribution inputs, and scratch prefix.
 Do not sweep resources, enumerate by name pattern or label selector, or perform
 opportunistic cleanup. Inspect and retry only the exact campaign resources and
 retained paths named by the diagnostic.
+
+The authored 600 GB reclaim model is:
+
+```text
+44,296,724,480 peak input bytes
++ 206,220,202,290 retained basin output bytes
++ 30,000,000,000 active compile scratch bytes
++ 206,220,202,290 assembled artifact bytes
++ 5,000,000,000 filesystem overhead bytes
+= 491,737,129,060 required disk bytes
+
+560,000,000,000 - 491,737,129,060 = 68,262,870,940 bytes headroom
+```
+
+This is approximately 492 GB required against approximately 560 GB usable.
+The five-pair peak and active compile scratch do not coincide with assembly,
+but the conservative formula deliberately sums them. Retaining all projected
+source downloads with outputs, compile scratch, assembly, and overhead
+approaches a terabyte and does not fit safely within the account's 1024 GB
+volume quota.
+
+The full model is authored planning, not a measured or verified planetary
+result. Term provenance is:
+
+| Term | Provenance |
+|---|---|
+| `6,530,924,497`, `5,541,794,376`, `5,396,674,014` | Measured compile peak-scratch values for basins `1020000010`, `7020000010`, and `9020000010` in the completed three-basin campaign. |
+| `6,979,305,472`, `1,880,039,424`, `8,859,344,896` | Measured largest source-pair components and their arithmetic sum. |
+| `549,279,383,552`, `206,220,202,290`, `30,000,000,000` | Carried-forward M4-S4 capacity-disclosure terms, not measurements from the three-basin campaign. The retained-download projection is `8,859,344,896 * 62 = 549,279,383,552`. |
+| `206,220,202,290` assembled artifact | Authored conservative assumption. The measured three-basin assembled aggregate is `9,037,936,480`; the authored value is `22.817x` that aggregate versus the count-linear basin multiplier of `20.667x`. |
+| Five pairs, `44,296,724,480` peak, `5,000,000,000` overhead, `491,737,129,060` total | Authored planning choices derived from the stated terms. |
+| `560,000,000,000` usable bytes for a 600 GB volume | Account-model convention, consistent with `140,000,000,000` usable for 150 GB; not a measured filesystem reading for a future planetary volume. |
+
+The completed
+[`RUNBOOK-tdx-hydro-assembly-subset.md`](RUNBOOK-tdx-hydro-assembly-subset.md)
+calls its schema-1 subset command “complete, frozen” and refers to “all seven
+required byte arguments.” Those statements predate schema 2 and remain
+historical. The old command is intentionally not executable with the current
+runner unless the new common fields are supplied.
 
 On the VM, compile defaults to Python `/opt/hfx-geo/bin/python`, adapter script
 `/root/hfx/adapters/tdx-hydro/build_adapter.py`, and validator
@@ -366,7 +661,24 @@ parameters. They document usage and do not authorize provisioning:
   --retained-basin-output-bytes <retained-basin-output-bytes> \
   --assembly-memory-ceiling-bytes <assembly-memory-ceiling-bytes> \
   --assembly-scratch-ceiling-bytes <assembly-scratch-ceiling-bytes> \
-  --assembled-artifact-bytes <assembled-artifact-bytes>
+  --assembled-artifact-bytes <assembled-artifact-bytes> \
+  --active-compile-scratch-bytes <active-compile-scratch-bytes> \
+  --filesystem-overhead-bytes <filesystem-overhead-bytes>
+
+# Reclaim behavior is local and recoverable; paid execution remains gated by the planetary runbook.
+./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-init -- \
+  /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh init \
+  --campaign <campaign> \
+  --retention-policy reclaim-inputs-after-terminal \
+  --available-memory-bytes <available-memory-bytes> \
+  --available-disk-bytes <available-disk-bytes> \
+  --peak-in-flight-download-bytes 44296724480 \
+  --retained-basin-output-bytes <retained-basin-output-bytes> \
+  --assembly-memory-ceiling-bytes <assembly-memory-ceiling-bytes> \
+  --assembly-scratch-ceiling-bytes <assembly-scratch-ceiling-bytes> \
+  --assembled-artifact-bytes <assembled-artifact-bytes> \
+  --active-compile-scratch-bytes <active-compile-scratch-bytes> \
+  --filesystem-overhead-bytes <filesystem-overhead-bytes>
 
 ./scripts/hetzner/launch.sh --campaign <campaign> start --workload tdx-acquire -- \
   /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh acquire \
@@ -591,7 +903,8 @@ Per-connection throughput was erratic. During the paid run a laptop sustained
 about 13 MB/s while the campaign VM received about 1.0 MB/s on its own simultaneous
 connection, showing server headroom and a per-connection constraint. Use
 `--max-parallel 4` as the polite operating policy for separate product files; the
-runner retains its `1..62` accepted range. At four connections sustaining the
+retain-all policy retains its `1..62` accepted range, while reclaim mode accepts
+only `1..4`. At four connections sustaining the
 measured VM rate, roughly 500 GB needs about 35 transfer-hours; allow 36-40 hours
 for a 62-basin acquisition. Do not segment a single file. Observed basin
 GeoPackages were `5.9-7.0 GB` each. The observed stream-network GeoPackage was
@@ -606,6 +919,266 @@ and per-product acquisition reports on the attached volume so retries and transf
 evidence survive disconnects. The smoke script's behavior is separate from the
 campaign runner and remains an all-or-nothing probe.
 
+## Bounded calibration measurement
+
+Calibration measures two fixed, disjoint cohorts through the existing acquisition,
+serial compile, terminal classification, and reclaim pipeline:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh calibrate \
+  --campaign <id> \
+  --workspace-root <path> \
+  --max-parallel <2|4> \
+  --fabric-version <value>
+```
+
+`parallel-2` uses max-parallel 2 and these basin IDs, in order:
+
+```text
+1020011530
+3020003790
+6020006540
+8020008900
+```
+
+`parallel-4` uses max-parallel 4 and these basin IDs, in order:
+
+```text
+2020003440
+4020006940
+7020014250
+9020000010
+```
+
+The campaign must use `reclaim-inputs-after-terminal`. Parallel-2 must be
+measured before parallel-4 starts. Both calls retain one immutable, nonempty,
+control-free fabric version. The final selection is installed once and cannot
+be overwritten. A later full `pipeline` call must use that fabric version and
+the selected max-parallel value.
+
+Before every scheduler entry, calibration requires available bytes of
+`44,296,724,480 + max_parallel * 8,859,344,896`. Parallel-4 therefore requires
+`79,734,104,064` bytes. This reserves the five-pair reclaim guard plus all four
+possible cohort downloads before any worker, attempt, trace, or basin state is
+changed.
+
+The active cohort documents are `state/calibration/parallel-2.json` and
+`state/calibration/parallel-4.json`. Append-only attempt traces are named
+`state/calibration/parallel-<N>-attempt-<attempt>.samples.tsv`. Each sample
+combines resident product lengths with durable evidence bytes for reclaimed
+products, producing a monotone acquired-work counter that survives immediate
+reclaim. The running-maximum clamp defends only against retry regressions.
+Elapsed time sums adjacent intervals within attempts, never gaps between
+calibrate invocations, and the corrected window discloses its attempt numbers.
+If interruption leaves no positive observed full-occupancy duration, retained
+in-attempt raw intervals provide a nonzero fallback with zero compile
+completions, making it explicitly invalid for the spend-abort threshold.
+Completed scheduler snapshots are archived as
+`state/calibration/parallel-<N>-pipeline.json`. A terminal, reclaimed replay
+finalizes retained traces and archives the snapshot without rescheduling.
+
+Each measurement contains `raw.start_timestamp_seconds`,
+`raw.end_timestamp_seconds`, `raw.bytes`, `raw.elapsed_seconds`, `raw.retries`,
+`raw.throughput_bytes_per_second`, all ten `steady_state` fields
+`start_timestamp_seconds`, `end_timestamp_seconds`, `attempts`, `start_bytes`, `end_bytes`,
+`bytes`, `elapsed_seconds`, `throughput_bytes_per_second`,
+`compile_completions`, and `compile_wall_seconds`, plus all six
+`excluded_drain_tail` fields `start_timestamp_seconds`, `end_timestamp_seconds`,
+`start_bytes`, `end_bytes`, `bytes`, and `elapsed_seconds`.
+
+Raw spans the first through last sample, excluding inter-attempt idle time from
+its elapsed seconds. Corrected steady state
+starts at the first configured-full-occupancy sample and ends at the sample
+immediately after the last full-occupancy sample. The excluded drain tail runs
+from that corrected end through raw end. Throughput is integer bytes divided by
+elapsed seconds, in B/s; both denominators and both byte numerators must be
+positive before division. Selection first prefers a cohort with compile
+completions over a structurally incomparable zero-compile cohort. Between
+comparable windows, select 2 when `small >= large`, otherwise select 2 when
+`100 * small >= (100 - 5) * large`, otherwise select 4.
+
+A corrected throughput whose steady_state.compile_completions == 0 is NOT a valid input to the M5-S4 spend-abort threshold.
+M5-S4 must apply the 4,167,474 bytes/second abort test to a cohort whose corrected window contains at least one compile completion.
+When only a zero-compile corrected window is available, M5-S4 must treat the threshold as UNMET rather than met.
+The frozen `selected_throughput_validity` is `compile-observed` if either
+candidate contains a compile, otherwise `no-compile-observed`.
+When the corrected interval falls back to the gap-excluded raw interval, its
+compile count is forced to zero even if compiles occurred. The binding rule
+therefore reports the threshold as UNMET; inspect the disclosed attempts to
+distinguish this conservative fallback from a genuinely zero-compile window.
+
+In the pinned scheduler, parallel-4 dispatches all four in its first round; its
+first reap begins permanent drain, so its corrected window contains zero compile
+completions and zero compile wall seconds by construction. The production run
+overlaps compile with acquisition at both settings. The parallel-4 corrected
+throughput is therefore systematically optimistic, may flip a five-percent
+choice, and may elevate the best value used by M5-S4's `4,167,474` bytes/second
+spend threshold. M5-S4 uses parallel-2 under the pinned scheduler because its
+corrected window contains compile completions.
+
+Every successful calibration prints this final ordered disclosure block. Lines
+for numeric fields appear only after the corresponding cohort is measured:
+
+```text
+calibration_fabric_version=<string>
+calibration_selected_max_parallel=<pending|2|4>
+calibration_selected_throughput_validity=<pending|compile-observed|no-compile-observed>
+calibration_parallel_2_status=<pending|running|measured>
+calibration_parallel_2_raw_start_timestamp_seconds=<integer>
+calibration_parallel_2_raw_end_timestamp_seconds=<integer>
+calibration_parallel_2_raw_bytes=<integer>
+calibration_parallel_2_raw_elapsed_seconds=<integer>
+calibration_parallel_2_raw_retries=<integer>
+calibration_parallel_2_raw_throughput_bytes_per_second=<integer>
+calibration_parallel_2_steady_start_timestamp_seconds=<integer>
+calibration_parallel_2_steady_end_timestamp_seconds=<integer>
+calibration_parallel_2_steady_attempts=<comma-separated integers>
+calibration_parallel_2_steady_start_bytes=<integer>
+calibration_parallel_2_steady_end_bytes=<integer>
+calibration_parallel_2_steady_bytes=<integer>
+calibration_parallel_2_steady_elapsed_seconds=<integer>
+calibration_parallel_2_steady_throughput_bytes_per_second=<integer>
+calibration_parallel_2_steady_compile_completions=<integer>
+calibration_parallel_2_steady_compile_wall_seconds=<integer>
+calibration_parallel_2_drain_start_timestamp_seconds=<integer>
+calibration_parallel_2_drain_end_timestamp_seconds=<integer>
+calibration_parallel_2_drain_start_bytes=<integer>
+calibration_parallel_2_drain_end_bytes=<integer>
+calibration_parallel_2_drain_bytes=<integer>
+calibration_parallel_2_drain_elapsed_seconds=<integer>
+calibration_parallel_4_status=<pending|running|measured>
+calibration_parallel_4_raw_start_timestamp_seconds=<integer>
+calibration_parallel_4_raw_end_timestamp_seconds=<integer>
+calibration_parallel_4_raw_bytes=<integer>
+calibration_parallel_4_raw_elapsed_seconds=<integer>
+calibration_parallel_4_raw_retries=<integer>
+calibration_parallel_4_raw_throughput_bytes_per_second=<integer>
+calibration_parallel_4_steady_start_timestamp_seconds=<integer>
+calibration_parallel_4_steady_end_timestamp_seconds=<integer>
+calibration_parallel_4_steady_attempts=<comma-separated integers>
+calibration_parallel_4_steady_start_bytes=<integer>
+calibration_parallel_4_steady_end_bytes=<integer>
+calibration_parallel_4_steady_bytes=<integer>
+calibration_parallel_4_steady_elapsed_seconds=<integer>
+calibration_parallel_4_steady_throughput_bytes_per_second=<integer>
+calibration_parallel_4_steady_compile_completions=<integer>
+calibration_parallel_4_steady_compile_wall_seconds=<integer>
+calibration_parallel_4_drain_start_timestamp_seconds=<integer>
+calibration_parallel_4_drain_end_timestamp_seconds=<integer>
+calibration_parallel_4_drain_start_bytes=<integer>
+calibration_parallel_4_drain_end_bytes=<integer>
+calibration_parallel_4_drain_bytes=<integer>
+calibration_parallel_4_drain_elapsed_seconds=<integer>
+```
+
+`/bin/date` supplies epoch seconds. It is part of coreutils and is assumed on
+the paid box. This step does not verify that dependency because bootstrap
+scripts and the runbook convergence gate are outside this step's write set.
+The documentation states no real throughput result and no real selected value.
+
+## Expected-terminal checkpoints
+
+Checkpoint controls record cumulative expectations without changing scheduler
+or basin state:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint \
+  --campaign <id> \
+  --workspace-root <path> \
+  --expected-terminal-count <1..62>
+
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+`state/checkpoints.json` is append-only history plus a running/stopped control.
+Expected counts may stay equal or increase. The observed count is the number of
+`reclaimed` records in one atomically installed `state/pipeline.json` snapshot.
+`terminal`, `blocked`, and basin-state records do not add to that count. A met
+entry remains running. A missed entry is installed with stopped state before
+the command inspects the campaign-lock owner or sends TERM.
+
+The monotonic constraint means an operator can never lower a recorded
+expectation for the life of the campaign. Resume plus rerunning `pipeline`
+remains available, and only checkpoint history is monotonic.
+
+`checkpoint` does not take the campaign lock. A live pipeline receives TERM at
+the exact validated owner PID and performs its existing exit-130 worker drain,
+FIFO removal, and lock release. If no live owner exists, stopped state remains
+durable. Repeating the same missed checkpoint retries owner adjudication and
+TERM delivery without appending. Pipeline checks stopped state before lock
+acquisition and again after acquisition before scheduler work.
+
+Resume explicitly:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+Resume changes only checkpoint control fields. It does not start the pipeline,
+rewrite checkpoint entries, relabel a basin, alter attempts or evidence, remove
+durable state, or change calibration. Rerun pipeline separately with its frozen
+parameters. A missed checkpoint, a stopped campaign, an absent pipeline
+snapshot, and a malformed checkpoint document are recoverable states.
+
+If the pipeline snapshot is absent, checkpoint refuses without creating an
+entry. Materialize or resume the existing pipeline, then rerun checkpoint:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh pipeline \
+  --campaign <id> \
+  --workspace-root <path> \
+  --max-parallel <frozen-1-through-4> \
+  --fabric-version <frozen-value>
+scripts/hetzner/tdx-hydro-campaign.sh checkpoint \
+  --campaign <id> \
+  --workspace-root <path> \
+  --expected-terminal-count <1..62>
+```
+
+If `state/checkpoints.json` is malformed or unsafe, `progress` reports the
+condition without hiding the rest of campaign status. Run `checkpoint-resume`.
+It moves the exact rejected directory entry without dereferencing it to the
+first unused `state/checkpoint-recovery/rejected-N.json`, installs a fresh
+running control, and preserves the rejected entry for inspection. Replay after
+an interruption between those operations completes the fresh control install.
+
+The lock-free read command is:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh progress \
+  --campaign <id> \
+  --workspace-root <path>
+```
+
+An absent checkpoint document prints no checkpoint lines. An empty running
+document prints:
+
+```text
+checkpoint_run_state=running
+checkpoint_entry_count=0
+```
+
+A nonempty valid document prints:
+
+```text
+checkpoint_run_state=<running|stopped>
+checkpoint_entry_count=<integer>
+checkpoint_expected_terminal_count=<integer>
+checkpoint_observed_terminal_count=<integer>
+checkpoint_result=<met|missed>
+```
+
+A malformed document prints:
+
+```text
+checkpoint_state=malformed
+checkpoint_recovery=run checkpoint-resume
+```
+
 ## Troubleshooting
 
 | Symptom | Cause | Remedy |
@@ -616,7 +1189,7 @@ campaign runner and remains an all-or-nothing probe.
 | Credential metadata or required variable failure | The installed environment file is absent, unsafe, unloadable, or incomplete. | Correct the operator-managed source, rerun provisioning to reinstall `/etc/pourpoint-hfx.env`, then rerun smoke. |
 | Missing bootstrap state | Required directories, packages, or tools are absent. | Rerun the idempotent bootstrap, then retry launch or smoke. |
 | Duplicate workload session | The exact tmux session already exists. | Use `attach`, `status`, or `tail`; start again after the exact session finishes. |
-| NGA transfer interruption | The response may not honor Range, or the saved partial may lack safe provenance. | The campaign runner continues only a validated strong-ETag 206 response; otherwise it discards the safe partial and performs one clean GET. Use `--max-parallel 4` as operating policy across separate files, never segments of one file; the runner accepts `1..62`. |
+| NGA transfer interruption | The response may not honor Range, or the saved partial may lack safe provenance. | The campaign runner continues only a validated strong-ETag 206 response; otherwise it discards the safe partial and performs one clean GET. Use `--max-parallel 4` as operating policy across separate files, never segments of one file; retain-all accepts `1..62` and reclaim accepts `1..4`. |
 | Safe teardown refusal | Exact-name ownership, labels, IDs, or attachment state failed validation. | Inspect only the exact campaign resource names and labels named by the diagnostic, correct ownership or attachment state, and rerun. |
 
 Scope zero-footprint verification to the current campaign's deterministic
