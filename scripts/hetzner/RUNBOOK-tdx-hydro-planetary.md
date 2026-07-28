@@ -52,6 +52,14 @@ printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be d
 IFS= read -r S3_ENV_FILE
 test -n "$S3_ENV_FILE"
 test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE"
+(
+  set +x
+  set -a
+  source "$S3_ENV_FILE"
+  set +a
+  [[ ${AWS_ACCESS_KEY_ID+x} && -n "${AWS_ACCESS_KEY_ID-}" ]]
+  [[ ${AWS_SECRET_ACCESS_KEY+x} && -n "${AWS_SECRET_ACCESS_KEY-}" ]]
+)
 ```
 
 Immutable campaign choices are one `ccx33`, one 600 GB volume, reclaim-after-terminal retention, at most five physically occupied source pairs, one serial compiler, calibration-selected and then immutable `max-parallel`, EUR 60.00 total, and 72 elapsed hours. The nominal successful-provision clock is conservatively replaced by the earlier provisioning-request origin.
@@ -112,7 +120,7 @@ BEGIN {
 
 Blank, negative, nonnumeric, NaN, infinity, unknown VAT treatment, or unknown outbound terms refuse provisioning.
 
-Define the reusable phase/checkpoint/resume gate after `SERVER_IP` exists. Every remaining range is supplied at its maximum, never minimum. Missing, malformed, or unbounded estimates refuse. Equality refuses.
+Define the reusable phase/checkpoint/resume gate here; deferred expansion means it is called only after `SERVER_IP` exists. Every remaining range is supplied at its maximum, never minimum. Missing, malformed, or unbounded estimates refuse. Equality refuses.
 
 ```bash
 campaign_gate() {
@@ -151,14 +159,14 @@ campaign_gate() {
 
 ```text
 CORRECT, maxima charged: 44 + 12.6 + 2 + 12 + 2 = 72.6 -> REFUSE
-FORBIDDEN, minima:       44 + 12.6 + 2 + 0  + 0 = 58.6
+FORBIDDEN, minima:       44 + 12.6 + 2 + 0  + 2 = 60.6
 
 Whole phase: 2 + 54.6 + 2 + 12 + 2 = 72.6 -> BREACH
-FORBIDDEN:   2 + 54.6 + 2 + 0  + 0 = 60.6
+FORBIDDEN:   2 + 54.6 + 2 + 0  + 2 = 60.6
 break-even overlap penalty: 54 / 42 - 1 = 28.57 percent
 ```
 
-The stated 20-30 percent risk band contains breach. At a missed checkpoint stop dispatch first. Resume only after `campaign_gate` records PASS; otherwise salvage and default-teardown.
+Both 60.6-hour rows are FORBIDDEN because they zero the full-length verification allowance: they permit a resume that a subsequent 12-hour verification pushes past 72 hours. The stated 20-30 percent risk band contains breach. At a missed checkpoint stop dispatch first. Resume only after `campaign_gate` records PASS; otherwise salvage and default-teardown.
 
 ## 4. Read-only exact-name cloud and all-62 inventory preflights
 
@@ -194,6 +202,8 @@ These inspect only exact campaign-name absence. They are not cleanup discovery.
 ## 5. Provisioning, successful-provision timestamp, and hard-teardown watchdog
 
 Install the cleanup functions before provisioning becomes possible. Best-effort salvage must not mask teardown. The exact success line and both array proofs are required before `CLEANUP_COMPLETE=1`.
+
+`provision.sh` has no resource rollback: 17 failure windows can retain created resources, and only four failure paths explicitly announce retention. Any nonzero `provision.sh` exit requires the operator to confirm that the EXIT trap ran the exact-name default teardown and produced the verbatim zero-footprint proof below. Never infer rollback from the provisioning error text.
 
 ```bash
 CLEANUP_RUNNING=0
@@ -257,7 +267,7 @@ The watchdog is idempotent after completed teardown. It is not permission to ret
 
 ```bash
 ./scripts/hetzner/bootstrap.sh --campaign tdx-m5-planetary 2>&1 | tee "$LOCAL_EVIDENCE_DIR/bootstrap.log"
-SERVER_IP=$(jq -er --arg name "$SERVER_NAME" '[.[]|select(.name==$name)] | if length==1 then .[0].public_net.ipv4.ip else error("not exactly one") end' "$LOCAL_EVIDENCE_DIR/preflight-servers.json" 2>/dev/null || hcloud --context pourpoint server list -o json | jq -er --arg name "$SERVER_NAME" '[.[]|select(.name==$name)] | if length==1 then .[0].public_net.ipv4.ip else error("not exactly one") end')
+SERVER_IP=$(hcloud --context pourpoint server list -o json | jq -er --arg name "$SERVER_NAME" '[.[]|select(.name==$name)] | if length==1 then .[0].public_net.ipv4.ip else error("not exactly one") end')
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" 'bash -s' <<REMOTE_REF 2>&1 | tee "$LOCAL_EVIDENCE_DIR/converge.log"
 set -Eeuo pipefail
 set +x
@@ -275,6 +285,11 @@ test -x "\$HFX_TDX_ADAPTER_PYTHON"; test -x "\$HFX_TDX_HFX"
 test -f /root/hfx/adapters/tdx-hydro/build_adapter.py; test ! -L /root/hfx/adapters/tdx-hydro/build_adapter.py
 test -f /etc/pourpoint-hfx.env; test ! -L /etc/pourpoint-hfx.env
 test "\$(stat -c '%U:%G %a' /etc/pourpoint-hfx.env)" = 'root:root 600'
+set -a
+source /etc/pourpoint-hfx.env
+set +a
+[[ \${AWS_ACCESS_KEY_ID+x} && -n "\${AWS_ACCESS_KEY_ID-}" ]]
+[[ \${AWS_SECRET_ACCESS_KEY+x} && -n "\${AWS_SECRET_ACCESS_KEY-}" ]]
 awk '/MemAvailable:/ {exit !(\$2 * 1024 >= 30000000000)}' /proc/meminfo
 OBSERVED_AVAILABLE_DISK_BYTES=\$(df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ')
 [[ "\$OBSERVED_AVAILABLE_DISK_BYTES" =~ ^[0-9]+$ ]]
@@ -282,7 +297,9 @@ test "\$OBSERVED_AVAILABLE_DISK_BYTES" -ge 496737129060
 REMOTE_REF
 ```
 
-The bootstrap is `scripts/hetzner/bootstrap.sh`, not a TDX-specific filename. Its lines 195-212 omit defaults chosen by `HFX_TDX_ADAPTER_PYTHON` and `HFX_TDX_HFX`; therefore the separate Python, release HFX, and adapter checks are mandatory. The adapter bypasses `resolve_command`; a missing script becomes opaque `adapter build failed`.
+The preflight server inventory was required to contain no `SERVER_NAME`, so it cannot supply the new server IP; the post-provision exact-name read above is the sole source. The bootstrap is `scripts/hetzner/bootstrap.sh`, not a TDX-specific filename. Its lines 195-212 omit defaults chosen by `HFX_TDX_ADAPTER_PYTHON` and `HFX_TDX_HFX`; therefore the separate Python, release HFX, and adapter checks are mandatory. The adapter bypasses `resolve_command`; a missing script becomes opaque `adapter build failed`.
+
+After acquisition begins, never rerun `bootstrap.sh`. It performs `reset --hard origin/main` and `cargo build --release` without taking the campaign lock, and can report success after rebuilding the release binary underneath an active compile.
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" 'bash -s' <<'REMOTE_PARITY' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/vm-confirm.log"
@@ -370,8 +387,8 @@ test "$OBSERVED_AVAILABLE_DISK_BYTES" -ge 496737129060
   --assembly-memory-ceiling-bytes 8000000000 --assembly-scratch-ceiling-bytes 206220202290 \
   --assembled-artifact-bytes 206220202290 --active-compile-scratch-bytes 30000000000 \
   --filesystem-overhead-bytes 5000000000
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-init
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-init.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-init || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
 The 5,000,000,000 operational margin is above the true requirement. The passed disk value is observed `df`, not the 560-billion accounting convention, which README line 632 says is not a future measurement.
@@ -410,14 +427,16 @@ Run sequentially, with no overlapping campaign command:
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-calibrate-2 -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh calibrate --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel 2 --fabric-version NGA-TDX-Hydro-20230126
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-2
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-calibrate-2.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-2 || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-calibrate-4 -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh calibrate --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel 4 --fabric-version NGA-TDX-Hydro-20230126
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-4
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-calibrate-4.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-calibrate-4 || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
-Status exit 0 means running; 3 means absent or finished. The canonical log's recorded command exit determines success. Cohort two must compile, terminal-classify, and reclaim before cohort four starts. The synchronous serial consumer at runner lines 2030-2052 selects one ready basin and calls `compile_basin_locked`. `calibrate` releases its lock at 4691-4692 before nested pipeline reacquires it at 1972; start nothing in that window. A premature pipeline produces the misleading selection-mismatch diagnostic; finish calibration instead.
+Status exit 0 means running; 3 means absent or finished. Every status invocation must retain the `|| test "$?" -eq 3` guard: an unguarded documented exit 3 aborts the trapped shell and triggers teardown. The canonical log's recorded command exit determines success for the latest start. Each successful retry truncates that canonical log, so an earlier attempt's exit survives only in its timestamped run log; retain and inspect the named timestamped log before retrying. Cohort two must compile, terminal-classify, and reclaim before cohort four starts. The synchronous serial consumer at runner lines 2030-2052 selects one ready basin and calls `compile_basin_locked`. `calibrate` releases its lock at 4691-4692 before nested pipeline reacquires it at 1972; start nothing in that window. A premature pipeline produces the misleading selection-mismatch diagnostic; finish calibration instead.
+
+`launch.sh tail --log <basename>` executes `tail -n 50 -f` and never returns while the connection remains healthy. The in-line monitoring commands in this trapped shell therefore use the non-blocking, lock-free campaign `progress` command. Run any interactive `launch.sh tail` only from a separate, explicitly labelled shell with none of this runbook's traps installed. Ctrl-C in the trapped runbook shell executes its INT handler, reaches the EXIT cleanup trap, and tears down the campaign; it is not a safe way to stop monitoring here.
 
 Retain calibration JSON, cohorts, attempt traces, archived snapshots, logs, ordered disclosure, and raw/corrected values. Raw is bytes over gap-excluded whole span; resume inflates it; it is disclosure-only. Corrected is `.measurement.steady_state.throughput_bytes_per_second` and is threshold-valid only with `steady_state.compile_completions > 0`. Parallel four has zero by construction. Degenerate corrected intervals force completions to zero, conservatively causing abort; distinguish fallback only using disclosed attempts and traces.
 
@@ -476,8 +495,8 @@ Repeat memory and disk probes immediately before pipeline:
 ```bash
 ssh -o BatchMode=yes "root@$SERVER_IP" "awk '/MemAvailable:/ {exit !(\$2*1024>=30000000000)}' /proc/meminfo && test \"\$(df -B1 --output=avail /mnt/hfx | tail -n1 | tr -d ' ')\" -ge 491737129060"
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-pipeline -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh pipeline --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --max-parallel "$FROZEN_MAX_PARALLEL" --fabric-version NGA-TDX-Hydro-20230126
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-pipeline
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-pipeline.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-pipeline || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
 The acquisition projection is 33-37 hours; serial compilation 16-18 hours; overlapping pipeline approximately 34-42 hours. The overlap figure is unsourced prose at README 592-593 and the largest budget term. M4 instead supplies phase-separated values, 1h48m-2h assembly, and 51-57h serial orientation. CPU saturation and spill writes have an unmeasured 20-30 percent overlap penalty.
@@ -500,6 +519,8 @@ The acquisition projection is 33-37 hours; serial compilation 16-18 hours; overl
 | hour 72 | watchdog default teardown regardless of state |
 
 Hours 2, 44, and 46 have zero internal slack; all 12 reserve hours lie after 46 and must always be charged. Hour-24 threshold derivation:
+
+The temporal gate arguments charge maximum remaining allowances: hour 2 uses 58 hours = 42 pipeline + 2 assembly + 12 verification + 2 teardown; hour 46 uses 14 hours = 12 verification + 2 teardown; hour 58 uses 2 hours = 2 teardown. The checkpoint-resume decomposition is stated at its conditional call below.
 
 ```text
 72 - 2 provision - 2 assembly - 12 verification - 2 teardown = 54 pipeline hours
@@ -540,12 +561,26 @@ checkpoint_run_state=<running|stopped>
 checkpoint_signal=<not-required|sent|no-live-owner>
 ```
 
-The command signals the campaign-lock owner, not specifically the scheduler (lines 1425-1502). `checkpoint` and resume do not lock; dispatch lines 4961-4972 only validate structure. A miss may interrupt any lock owner, but planned checkpoints occur during pipeline. All state writes are atomic and identical argv is recoverable after gate PASS.
+The command signals the campaign-lock owner, not specifically the scheduler (lines 1425-1502). Interruptible lock owners are `acquire`, `compile`, `compile-basin`, `calibrate`, `assemble`, `evidence`, `publish`, `status`, and `recover`. `checkpoint` and resume do not lock; dispatch lines 4961-4972 only validate structure. A miss may interrupt any listed lock owner, but planned checkpoints occur during pipeline. All state writes are atomic and identical argv is recoverable after gate PASS.
 
 ```bash
-campaign_gate checkpoint-resume 28 0
-ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
+checkpoint_result=
+if test "$(grep -Fxc 'checkpoint_result=met' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log")" -eq 1; then checkpoint_result=met; fi
+if test "$(grep -Fxc 'checkpoint_result=missed' "$LOCAL_EVIDENCE_DIR/checkpoint-hour-44.log")" -eq 1; then
+  test -z "$checkpoint_result"
+  checkpoint_result=missed
+fi
+test -n "$checkpoint_result"
+if test "$checkpoint_result" = met; then
+  test "$checkpoint_status" -eq 0
+else
+  test "$checkpoint_status" -eq 1
+  campaign_gate checkpoint-resume 28.6 0
+  ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh checkpoint-resume --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
+fi
 ```
+
+A MET hour-44 checkpoint proceeds directly to section 12 and never runs the resume gate or `checkpoint-resume`. A MISSED hour-44 checkpoint is the designed recoverable outcome, not a campaign failure or teardown trigger; only that branch charges the 28.6-hour maximum of 12.6 hours remaining pipeline, 2 hours assembly, 12 hours verification, and 2 hours teardown before resuming.
 
 Resume does not start pipeline; rerun the exact frozen pipeline argv. Absent snapshot says exactly `hfx: error: pipeline snapshot is absent; run pipeline with the frozen max-parallel and fabric version, then rerun checkpoint`: resume checkpoint control if stopped, rerun pipeline, repeat checkpoint. Malformed output must be retained as `checkpoint_state=malformed` and `checkpoint_recovery=run checkpoint-resume`; resume archives rejection. Hours 2,46,58,60 use `campaign_gate`, never expected count zero.
 
@@ -558,9 +593,13 @@ Ordinary interruption: progress, ensure no live owner, then:
 Then gate and rerun pipeline. Resume re-hashes succeeded finals, so charge I/O. Reclaimed failed basins cannot retry in place; separately authorized reacquisition costs about 30 minutes.
 
 ```bash
+ssh -o BatchMode=yes "root@$SERVER_IP" 'bash -s' <<'REMOTE_PIPELINE_COMPLETE'
+set -Eeuo pipefail
+CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-tdx-m5-planetary
 jq -e '(.basin_ids|length)==62 and (.basin_ids==(.basin_ids|sort|unique)) and (.basins|keys)==.basin_ids and ([.basins[].status|select(.=="reclaimed")]|length)==62' "$CAMPAIGN_DIR/state/pipeline.json"
 test "$(find "$CAMPAIGN_DIR/state/basins" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 62
 test "$(find "$CAMPAIGN_DIR/state/basins" -mindepth 2 -maxdepth 2 -type f -name current.json | wc -l | tr -d ' ')" = 62
+REMOTE_PIPELINE_COMPLETE
 ```
 
 Every authoritative basin needs a durable attempted outcome. Named exclusions are terminal attempts; do not claim complete coverage without 62 compile successes.
@@ -586,7 +625,7 @@ Every authoritative basin needs a durable attempted outcome. Named exclusions ar
 | parking/export unproven | no success; retain only below switches, else teardown |
 | selection mismatch while calibration pending | finish active calibration; do not alter selection |
 | 62-directory diagnostic during cohort | retry progress after writer; never expect four |
-| publish nonzero without `hfx: error:` | assume unguarded `aws s3 cp`; preserve stderr/current.json; convergent retry only below switches |
+| publish nonzero without `hfx: error:` | first suspect a missing or empty exported credential environment; preserve stderr/current.json; correct the environment before any gated retry |
 | opaque adapter build failure | verify script, Python, and HFX exact paths |
 | signal during lock-taking command | exact stale-lock procedure, then gated identical argv |
 | takeover/destination already exists | exact manual recovery below after dead-owner proof |
@@ -597,6 +636,9 @@ Arbitrary adapter failures are not exclusions. A genuine basin fatal surfaces as
 Manual lock recovery uses no glob and no recursive removal. After proving no live campaign process and retaining the exact listing:
 
 ```bash
+ssh -o BatchMode=yes "root@$SERVER_IP" 'bash -s' <<'REMOTE_TAKEOVER_RECOVERY'
+set -Eeuo pipefail
+CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-tdx-m5-planetary
 TAKEOVER_PATH="$CAMPAIGN_DIR/state/locks/campaign.lock.takeover"
 test -d "$TAKEOVER_PATH" && test ! -L "$TAKEOVER_PATH"
 test -f "$TAKEOVER_PATH/owner.pid" && test ! -L "$TAKEOVER_PATH/owner.pid"
@@ -604,6 +646,7 @@ test "$(find "$TAKEOVER_PATH" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
 TAKEOVER_PID=$(cat "$TAKEOVER_PATH/owner.pid"); [[ "$TAKEOVER_PID" =~ ^[0-9]+$ ]]
 ! ps -p "$TAKEOVER_PID" >/dev/null 2>&1
 rm -- "$TAKEOVER_PATH/owner.pid"; rmdir -- "$TAKEOVER_PATH"
+REMOTE_TAKEOVER_RECOVERY
 ```
 
 For `.campaign.lock.stale.<pid>`, manually copy only the exact diagnostic path:
@@ -611,11 +654,17 @@ For `.campaign.lock.stale.<pid>`, manually copy only the exact diagnostic path:
 ```bash
 read -r -p 'Exact stale lock path from diagnostic: ' STALE_LOCK_PATH
 case "$STALE_LOCK_PATH" in "$CAMPAIGN_DIR/state/locks/".campaign.lock.stale.[0-9]*) ;; *) exit 1;; esac
+ssh -o BatchMode=yes "root@$SERVER_IP" 'bash -s' -- "$STALE_LOCK_PATH" <<'REMOTE_STALE_RECOVERY'
+set -Eeuo pipefail
+CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-tdx-m5-planetary
+STALE_LOCK_PATH=$1
+case "$STALE_LOCK_PATH" in "$CAMPAIGN_DIR/state/locks/".campaign.lock.stale.[0-9]*) ;; *) exit 1;; esac
 test -d "$STALE_LOCK_PATH" && test ! -L "$STALE_LOCK_PATH"
 test -f "$STALE_LOCK_PATH/owner.pid" && test ! -L "$STALE_LOCK_PATH/owner.pid"
 test "$(find "$STALE_LOCK_PATH" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
 STALE_PID=$(cat "$STALE_LOCK_PATH/owner.pid"); [[ "$STALE_PID" =~ ^[0-9]+$ ]]; ! ps -p "$STALE_PID" >/dev/null 2>&1
 rm -- "$STALE_LOCK_PATH/owner.pid"; rmdir -- "$STALE_LOCK_PATH"
+REMOTE_STALE_RECOVERY
 ```
 
 Ambiguity means remove nothing and teardown. Escalation-only diagnostics include indeterminate preserved owner/PID; unsafe renamed stale lock; nonregular temporary state; prior durable calibration work; missing/unsafe/malformed/regressed/empty attempt traces; and nonpositive measurement intervals/bytes. Never invent state surgery.
@@ -634,8 +683,8 @@ available=$(df -B1 --output=avail /mnt/hfx | tail -n1 | tr -d ' ')
 [[ "$available" =~ ^[0-9]+$ ]]; test "$available" -ge "$required"
 REMOTE_ASSEMBLY_PREFLIGHT
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-assemble -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh assemble --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-assemble
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-assemble.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-assemble || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 campaign_gate hour-46 14 0
 ```
 
@@ -663,8 +712,8 @@ Generate deterministic evidence before publication and require its acquisition, 
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-evidence -- /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh evidence --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-evidence
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-evidence.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-evidence || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
 ```bash
@@ -679,9 +728,9 @@ cmp "$tracked/NOTICE" /root/hfx/adapters/tdx-hydro/NOTICE
 cmp "$tracked/CITATION.txt" /root/hfx/adapters/tdx-hydro/CITATION.txt
 sha256sum /root/hfx/adapters/tdx-hydro/NOTICE /root/hfx/adapters/tdx-hydro/CITATION.txt > "$C/reports/attribution.sha256"
 REMOTE_ATTR
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-publish -- /bin/bash -c 'set -Eeuo pipefail; set +x; source /etc/pourpoint-hfx.env; exec /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh publish --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --out /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/assembly/dataset --report /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/reports/assembly.json --notice /root/hfx/adapters/tdx-hydro/NOTICE --citation /root/hfx/adapters/tdx-hydro/CITATION.txt --scratch-prefix scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0.3.0'
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-publish
-./scripts/hetzner/launch.sh --campaign tdx-m5-planetary tail --log hfx-tdx-m5-planetary-tdx-publish.log
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary start --workload tdx-publish -- /bin/bash -c 'set -Eeuo pipefail; set +x; set -a; source /etc/pourpoint-hfx.env; set +a; [[ ${AWS_ACCESS_KEY_ID+x} && -n "${AWS_ACCESS_KEY_ID-}" ]]; [[ ${AWS_SECRET_ACCESS_KEY+x} && -n "${AWS_SECRET_ACCESS_KEY-}" ]]; exec /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh publish --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work --out /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/assembly/dataset --report /mnt/hfx/work/tdx-hydro-tdx-m5-planetary/reports/assembly.json --notice /root/hfx/adapters/tdx-hydro/NOTICE --citation /root/hfx/adapters/tdx-hydro/CITATION.txt --scratch-prefix scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0.3.0'
+./scripts/hetzner/launch.sh --campaign tdx-m5-planetary status --workload tdx-publish || test "$?" -eq 3
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh progress --campaign tdx-m5-planetary --workspace-root /mnt/hfx/work
 ```
 
 Publication predicates at `ab1e3c2:scripts/hetzner/tdx-hydro-campaign.sh:3836-3851` are exact:
@@ -713,7 +762,11 @@ After parking, silently source only `/etc/pourpoint-hfx.env`, download exact key
 ssh -o BatchMode=yes "root@$SERVER_IP" 'bash -s' <<'REMOTE_PARK_PROOF' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/parking-proof.log"
 set -Eeuo pipefail
 set +x
+set -a
 source /etc/pourpoint-hfx.env
+set +a
+[[ ${AWS_ACCESS_KEY_ID+x} && -n "${AWS_ACCESS_KEY_ID-}" ]]
+[[ ${AWS_SECRET_ACCESS_KEY+x} && -n "${AWS_SECRET_ACCESS_KEY-}" ]]
 tmp=$(mktemp -d)
 trap 'rm -r -- "$tmp"' EXIT
 aws s3 cp s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0.3.0/NOTICE "$tmp/NOTICE" --endpoint-url https://fsn1.your-objectstorage.com --region fsn1 --only-show-errors
@@ -746,6 +799,8 @@ campaign_gate hour-58 2 0
 
 Use further explicit source paths to export all workload/validation logs, scratch inventory, attribution proof, 62 basin records, acquisition/diagnostic/assembly reports, checkpoint history/recovery, calibration traces/cohorts/snapshots, pipeline/compile/assembly/publication contracts, and off-VM timestamps, price, gates, watchdog, revision, bootstrap, parity, capacity, and inventory evidence. Never copy a broad parent containing credentials. Verify every required local file. Evidence documents must cover exactly the 62 IDs, every attempt, and named exclusions.
 
+`LOCAL_EVIDENCE_DIR` resolves to `$PWD/tdx-m5-planetary-evidence`; when the runbook starts at the repository root, these `scp` operations create a large untracked directory inside the git working tree. Keep it untracked and account for local disk capacity.
+
 ## 16. Mandatory default teardown, hour-60 target, hour-72 hard ceiling, and exact-name zero-footprint proof
 
 The explicit success path invokes the same cleanup:
@@ -767,6 +822,22 @@ hfx: campaign tdx-m5-planetary has zero Hetzner footprint: server hfx-build-tdx-
 ```
 
 Then it independently retains exact-name server and volume lists and proves both filtered arrays empty. These three proofs apply on success, abort, failure, refusal, signal, watchdog, and every exit. README's sanctioned-pause keep-volume example is stale for this node. Teardown's exact mutation and proof are at `ab1e3c2:scripts/hetzner/teardown.sh:247-330`.
+
+### Post-teardown orphan visibility boundary
+
+The verbatim proof and the two filtered arrays cover only the exact server and volume names. They cannot detect orphaned snapshots, floating IPs, primary IPs, firewalls, SSH keys, or any resource created under a mistyped campaign name. `provision.sh` creates the server with default networking, without `--without-ipv4`, so the server receives an implicit billable Primary IPv4 that the two-name proof does not verify.
+
+After teardown, retain these read-only project inventories as evidence. Compare every row with the operator's accounted project inventory. If any row is unaccounted for, ESCALATE; never use these listings to drive deletion.
+
+```bash
+hcloud --context pourpoint image list --type snapshot -o json > "$LOCAL_EVIDENCE_DIR/post-teardown-snapshots.json"
+hcloud --context pourpoint floating-ip list -o json > "$LOCAL_EVIDENCE_DIR/post-teardown-floating-ips.json"
+hcloud --context pourpoint primary-ip list -o json > "$LOCAL_EVIDENCE_DIR/post-teardown-primary-ips.json"
+hcloud --context pourpoint firewall list -o json > "$LOCAL_EVIDENCE_DIR/post-teardown-firewalls.json"
+hcloud --context pourpoint ssh-key list -o json > "$LOCAL_EVIDENCE_DIR/post-teardown-ssh-keys.json"
+```
+
+These commands are read-only listings, not cleanup discovery. They authorize no mutation. Any corrective deletion requires a separate escalation and an exact resource identity; glob, prefix, label-selector, and wildcard deletion remain forbidden.
 
 Target zero footprint by hour 60. At hour 72 default teardown runs regardless of state. On teardown failure preserve diagnostics, inspect only exact campaign names, rerun default teardown, and keep watchdog armed. After normal proof:
 
