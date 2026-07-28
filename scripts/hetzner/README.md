@@ -919,6 +919,163 @@ and per-product acquisition reports on the attached volume so retries and transf
 evidence survive disconnects. The smoke script's behavior is separate from the
 campaign runner and remains an all-or-nothing probe.
 
+## Bounded calibration measurement
+
+Calibration measures two fixed, disjoint cohorts through the existing acquisition,
+serial compile, terminal classification, and reclaim pipeline:
+
+```bash
+scripts/hetzner/tdx-hydro-campaign.sh calibrate \
+  --campaign <id> \
+  --workspace-root <path> \
+  --max-parallel <2|4> \
+  --fabric-version <value>
+```
+
+`parallel-2` uses max-parallel 2 and these basin IDs, in order:
+
+```text
+1020011530
+3020003790
+6020006540
+8020008900
+```
+
+`parallel-4` uses max-parallel 4 and these basin IDs, in order:
+
+```text
+2020003440
+4020006940
+7020014250
+9020000010
+```
+
+The campaign must use `reclaim-inputs-after-terminal`. Parallel-2 must be
+measured before parallel-4 starts. Both calls retain one immutable, nonempty,
+control-free fabric version. The final selection is installed once and cannot
+be overwritten. A later full `pipeline` call must use that fabric version and
+the selected max-parallel value.
+
+Before every scheduler entry, calibration requires available bytes of
+`44,296,724,480 + max_parallel * 8,859,344,896`. Parallel-4 therefore requires
+`79,734,104,064` bytes. This reserves the five-pair reclaim guard plus all four
+possible cohort downloads before any worker, attempt, trace, or basin state is
+changed.
+
+The active cohort documents are `state/calibration/parallel-2.json` and
+`state/calibration/parallel-4.json`. Append-only attempt traces are named
+`state/calibration/parallel-<N>-attempt-<attempt>.samples.tsv`. Each sample
+combines resident product lengths with durable evidence bytes for reclaimed
+products, producing a monotone acquired-work counter that survives immediate
+reclaim. The running-maximum clamp defends only against retry regressions.
+Elapsed time sums adjacent intervals within attempts, never gaps between
+calibrate invocations, and the corrected window discloses its attempt numbers.
+If interruption leaves no positive observed full-occupancy duration, retained
+in-attempt raw intervals provide a nonzero fallback with zero compile
+completions, making it explicitly invalid for the spend-abort threshold.
+Completed scheduler snapshots are archived as
+`state/calibration/parallel-<N>-pipeline.json`. A terminal, reclaimed replay
+finalizes retained traces and archives the snapshot without rescheduling.
+
+Each measurement contains `raw.start_timestamp_seconds`,
+`raw.end_timestamp_seconds`, `raw.bytes`, `raw.elapsed_seconds`, `raw.retries`,
+`raw.throughput_bytes_per_second`, all ten `steady_state` fields
+`start_timestamp_seconds`, `end_timestamp_seconds`, `attempts`, `start_bytes`, `end_bytes`,
+`bytes`, `elapsed_seconds`, `throughput_bytes_per_second`,
+`compile_completions`, and `compile_wall_seconds`, plus all six
+`excluded_drain_tail` fields `start_timestamp_seconds`, `end_timestamp_seconds`,
+`start_bytes`, `end_bytes`, `bytes`, and `elapsed_seconds`.
+
+Raw spans the first through last sample, excluding inter-attempt idle time from
+its elapsed seconds. Corrected steady state
+starts at the first configured-full-occupancy sample and ends at the sample
+immediately after the last full-occupancy sample. The excluded drain tail runs
+from that corrected end through raw end. Throughput is integer bytes divided by
+elapsed seconds, in B/s; both denominators and both byte numerators must be
+positive before division. Selection first prefers a cohort with compile
+completions over a structurally incomparable zero-compile cohort. Between
+comparable windows, select 2 when `small >= large`, otherwise select 2 when
+`100 * small >= (100 - 5) * large`, otherwise select 4.
+
+A corrected throughput whose steady_state.compile_completions == 0 is NOT a valid input to the M5-S4 spend-abort threshold.
+M5-S4 must apply the 4,167,474 bytes/second abort test to a cohort whose corrected window contains at least one compile completion.
+When only a zero-compile corrected window is available, M5-S4 must treat the threshold as UNMET rather than met.
+The frozen `selected_throughput_validity` is `compile-observed` if either
+candidate contains a compile, otherwise `no-compile-observed`.
+When the corrected interval falls back to the gap-excluded raw interval, its
+compile count is forced to zero even if compiles occurred. The binding rule
+therefore reports the threshold as UNMET; inspect the disclosed attempts to
+distinguish this conservative fallback from a genuinely zero-compile window.
+
+In the pinned scheduler, parallel-4 dispatches all four in its first round; its
+first reap begins permanent drain, so its corrected window contains zero compile
+completions and zero compile wall seconds by construction. The production run
+overlaps compile with acquisition at both settings. The parallel-4 corrected
+throughput is therefore systematically optimistic, may flip a five-percent
+choice, and may elevate the best value used by M5-S4's `4,167,474` bytes/second
+spend threshold. M5-S4 uses parallel-2 under the pinned scheduler because its
+corrected window contains compile completions.
+
+Every successful calibration prints this final ordered disclosure block. Lines
+for numeric fields appear only after the corresponding cohort is measured:
+
+```text
+calibration_fabric_version=<string>
+calibration_selected_max_parallel=<pending|2|4>
+calibration_selected_throughput_validity=<pending|compile-observed|no-compile-observed>
+calibration_parallel_2_status=<pending|running|measured>
+calibration_parallel_2_raw_start_timestamp_seconds=<integer>
+calibration_parallel_2_raw_end_timestamp_seconds=<integer>
+calibration_parallel_2_raw_bytes=<integer>
+calibration_parallel_2_raw_elapsed_seconds=<integer>
+calibration_parallel_2_raw_retries=<integer>
+calibration_parallel_2_raw_throughput_bytes_per_second=<integer>
+calibration_parallel_2_steady_start_timestamp_seconds=<integer>
+calibration_parallel_2_steady_end_timestamp_seconds=<integer>
+calibration_parallel_2_steady_attempts=<comma-separated integers>
+calibration_parallel_2_steady_start_bytes=<integer>
+calibration_parallel_2_steady_end_bytes=<integer>
+calibration_parallel_2_steady_bytes=<integer>
+calibration_parallel_2_steady_elapsed_seconds=<integer>
+calibration_parallel_2_steady_throughput_bytes_per_second=<integer>
+calibration_parallel_2_steady_compile_completions=<integer>
+calibration_parallel_2_steady_compile_wall_seconds=<integer>
+calibration_parallel_2_drain_start_timestamp_seconds=<integer>
+calibration_parallel_2_drain_end_timestamp_seconds=<integer>
+calibration_parallel_2_drain_start_bytes=<integer>
+calibration_parallel_2_drain_end_bytes=<integer>
+calibration_parallel_2_drain_bytes=<integer>
+calibration_parallel_2_drain_elapsed_seconds=<integer>
+calibration_parallel_4_status=<pending|running|measured>
+calibration_parallel_4_raw_start_timestamp_seconds=<integer>
+calibration_parallel_4_raw_end_timestamp_seconds=<integer>
+calibration_parallel_4_raw_bytes=<integer>
+calibration_parallel_4_raw_elapsed_seconds=<integer>
+calibration_parallel_4_raw_retries=<integer>
+calibration_parallel_4_raw_throughput_bytes_per_second=<integer>
+calibration_parallel_4_steady_start_timestamp_seconds=<integer>
+calibration_parallel_4_steady_end_timestamp_seconds=<integer>
+calibration_parallel_4_steady_attempts=<comma-separated integers>
+calibration_parallel_4_steady_start_bytes=<integer>
+calibration_parallel_4_steady_end_bytes=<integer>
+calibration_parallel_4_steady_bytes=<integer>
+calibration_parallel_4_steady_elapsed_seconds=<integer>
+calibration_parallel_4_steady_throughput_bytes_per_second=<integer>
+calibration_parallel_4_steady_compile_completions=<integer>
+calibration_parallel_4_steady_compile_wall_seconds=<integer>
+calibration_parallel_4_drain_start_timestamp_seconds=<integer>
+calibration_parallel_4_drain_end_timestamp_seconds=<integer>
+calibration_parallel_4_drain_start_bytes=<integer>
+calibration_parallel_4_drain_end_bytes=<integer>
+calibration_parallel_4_drain_bytes=<integer>
+calibration_parallel_4_drain_elapsed_seconds=<integer>
+```
+
+`/bin/date` supplies epoch seconds. It is part of coreutils and is assumed on
+the paid box. This step does not verify that dependency because bootstrap
+scripts and the runbook convergence gate are outside this step's write set.
+The documentation states no real throughput result and no real selected value.
+
 ## Troubleshooting
 
 | Symptom | Cause | Remedy |
