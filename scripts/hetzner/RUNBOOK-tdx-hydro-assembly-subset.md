@@ -12,7 +12,7 @@ requires VM-native confirmation after bootstrap and before acquisition or
 compile (`adapters/tdx-hydro/GEOPANDAS-HILBERT-PARITY.md:1-11,25-30,70-74,
 92-98`). Assembly wiring from PR #169 and the basin-subset contract from PR
 #170 are present at immutable ref
-`8a614e72f989420dccb84c1f7f2ca28043a36a63`. That ref also contains the VM
+`43a98aff8c15a1a196f47b10217ad2f5553b6611`. That ref also contains the VM
 dependency contract from PR #173, which installs and verifies `jq` and the full
 runner command surface; the historical `ccx43` upsize and 60,000,000,000-byte
 memory gates from PR #174; correctly rounded manifest float parsing through
@@ -52,8 +52,8 @@ set +x
 CAMPAIGN=tdx-m4-subset
 SERVER_NAME=hfx-build-tdx-m4-subset
 VOLUME_NAME=hfx-build-tdx-m4-subset-data
-GROUND_TRUTH_REF=8a614e72f989420dccb84c1f7f2ca28043a36a63
-MILESTONE_BRANCH=pce/tdx-hydro-planetary-compile-and-assembly/milestone-4
+GROUND_TRUTH_REF=43a98aff8c15a1a196f47b10217ad2f5553b6611
+MILESTONE_BRANCH=main
 VOLUME_SIZE_GB=150
 RUN_UTC=$(date -u +%Y%m%dT%H%M%SZ)
 LOCAL_EVIDENCE_DIR="/Users/nicolaslazaro/Desktop/work/hfx-campaign-evidence/$CAMPAIGN/$RUN_UTC"
@@ -128,16 +128,19 @@ evidence. The weighted three-basin multiplier is therefore
 | Assembly scratch | One full real-byte output staging allowance plus the measured M3 scratch ceiling, rounded up | `20,000,000,000` |
 | Assembled output | Same weighted real dataset basis as retained outputs with 31.7 percent headroom | `15,000,000,000` |
 
-The runner's required disk formula is retained inputs plus retained basin
-outputs plus assembly scratch plus assembled artifact
+The runner's required disk formula at the pinned revision is the policy input
+reserve, plus retained basin outputs, plus the active compile-scratch reserve,
+plus the assembly peak, plus filesystem overhead, where the assembly peak is the
+GREATER of assembly scratch and the assembled artifact rather than their sum
 (`scripts/hetzner/tdx-hydro-campaign.sh`). It is
-`40,000,000,000 + 15,000,000,000 + 20,000,000,000 + 15,000,000,000 =
-90,000,000,000` bytes. Add the one active per-basin compile-scratch reserve:
-`90,000,000,000 + 30,000,000,000 = 120,000,000,000` bytes. A 150 GB decimal
-volume is expected to expose at least `140,000,000,000` usable bytes after
-filesystem overhead, so the frozen total fits with
-`140,000,000,000 - 120,000,000,000 = 20,000,000,000` bytes remaining for logs,
-reports, and estimation error.
+`40,000,000,000 + 15,000,000,000 + 30,000,000,000 +
+max(20,000,000,000, 15,000,000,000) + 5,000,000,000 = 110,000,000,000` bytes.
+A 150 GB decimal volume is expected to expose at least `140,000,000,000` usable
+bytes, so the frozen total fits with
+`140,000,000,000 - 110,000,000,000 = 30,000,000,000` bytes remaining for logs,
+reports, and estimation error. Running `status` after `init` must report
+`required_disk_bytes=110000000000`; a different value means the sizing
+arguments or the runner formula have drifted and the run must not proceed.
 
 The `ccx33` has 8 vCPU and a 32 GB memory class. Freeze
 `30,000,000,000` bytes as available memory after operating-system reserve and
@@ -153,8 +156,10 @@ Acquisition remains uncertain because NGA has no HTTP range support and
 the campaign VM measured about 1.0 MB/s per connection
 (`scripts/hetzner/README.md`).
 
-This is the complete, frozen init command. It contains all seven required byte
-arguments and the three selected basins:
+This is the complete, frozen init command. It contains all nine required byte
+arguments and the three selected basins. The declared sizing sums to
+`110,000,000,000` required bytes against the declared `140,000,000,000`
+available, verified locally against the pinned revision before provisioning:
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign tdx-m4-subset start --workload tdx-init -- \
@@ -170,7 +175,9 @@ arguments and the three selected basins:
   --retained-basin-output-bytes 15000000000 \
   --assembly-memory-ceiling-bytes 8000000000 \
   --assembly-scratch-ceiling-bytes 20000000000 \
-  --assembled-artifact-bytes 15000000000
+  --assembled-artifact-bytes 15000000000 \
+  --active-compile-scratch-bytes 30000000000 \
+  --filesystem-overhead-bytes 5000000000
 ```
 
 Do not run it until provisioning, bootstrap, immutable-ref convergence,
@@ -711,3 +718,30 @@ Confirm the included allowance and overage terms in the console before
 provisioning. If current prices make either the expected total exceed EUR 3.00
 materially or the 24-hour worst case approach EUR 10.00, abort before
 provisioning and obtain renewed authorization.
+
+## 13. Revision note: single-shot acquisition smoke test (2026-07-29)
+
+The pinned ref moved from `8a614e72f989420dccb84c1f7f2ca28043a36a63` to
+`43a98aff8c15a1a196f47b10217ad2f5553b6611`, ten runner commits later, so this
+campaign now exercises the landed M5 machinery and, specifically, the
+single-shot acquisition path from PR #194.
+
+PR #194 deleted acquisition resume outright. The NGA endpoint has no range
+support, so there is no sidecar, `If-Range`, HTTP 206, continuation, or
+range-ignored restart machinery. Every retry restarts at byte zero. A success
+requires HTTP 200, a positive `Content-Length`, and exact equality between that
+value and the downloaded file size. A present ETag is tolerated as optional
+metadata; its normal absence is accepted. Completeness never depends on ETag.
+
+That path has never run a real multi-basin campaign. This three-basin run is
+its bounded proof before the paid 62-basin campaign is authorized to start.
+
+`init` gained two required byte arguments in M5, so the previously frozen
+seven-argument command would have been refused after provisioning. The declared
+sizing is now `40,000,000,000 + 15,000,000,000 + 30,000,000,000 +
+max(20,000,000,000, 15,000,000,000) + 5,000,000,000 = 110,000,000,000` required
+against `140,000,000,000` available, confirmed locally against the pinned
+revision before any resource was created.
+
+The exact-name prohibitions, the EUR 10.00 ceiling, and mandatory teardown with
+the verbatim zero-footprint proof are unchanged.
