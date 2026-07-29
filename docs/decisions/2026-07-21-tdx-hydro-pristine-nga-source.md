@@ -62,6 +62,21 @@ The endpoint has no HTTP range support. A `Range: bytes=0-0` request returned
 all-or-nothing. A single file cannot be resumed or transferred in segmented
 aria2-style parts.
 
+Subsequent supplied campaign evidence recorded this complete response header
+block:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Content-Length: 2853949440
+Content-Disposition: attachment; filename="TDX_streamnet_1020011530_01.gpkg"
+```
+
+The response has no `ETag`, `Accept-Ranges`, or `Content-Range`. NGA ignores a
+Range request and returns HTTP 200 with the complete body and full
+`Content-Length`. This evidence was supplied to this decision update; no new
+live endpoint probe was performed as part of the update.
+
 Every request from the VM returned 200 with real payload bytes. No geo-blocking
 was observed from the Hetzner fsn1 network.
 
@@ -96,6 +111,17 @@ distribution within roughly a day of transfer time. Per-file parallelism is
 the feasible acquisition strategy. Per-file segmentation and resume are
 unavailable because the endpoint has no range support, so an interrupted
 multi-GB download restarts from zero.
+
+The campaign acquisition contract is therefore single-shot and all-or-nothing.
+Every retry starts at byte zero. The acquisition path has no sidecar,
+`If-Range`, continuation, HTTP 206, or range-ignored restart machinery. A
+successful response requires HTTP 200, a positive `Content-Length`, and exact
+equality between that value and the downloaded file size. The unchanged
+post-download checks then require bounded positive size, valid SHA-256
+evidence, exact SQLite magic, and one layer reported by `ogrinfo`, both before
+and after atomic installation. Completeness and endpoint provenance never
+depend on ETag. A present ETag is tolerated as optional response metadata, but
+the endpoint's normal absence of ETag is accepted.
 
 ### Conclusion and cleanup
 
