@@ -424,6 +424,7 @@ calibration_prepare_workers() {
     export HFX_TEST_HASH_MODE=
     export HFX_TEST_OGR_MODE=
     export HFX_TEST_RESUME_MODE=
+    export HFX_TEST_OMIT_ETAG=
     export HFX_TEST_LOWERCASE_HEADERS=
     export HFX_TEST_LEADING_ZERO_LENGTH=
     export HFX_TEST_REDISPATCH_HOLD_KEY=
@@ -2217,7 +2218,12 @@ fi
 if [ "${HFX_TEST_INTERRUPT_DRAIN-}" = 1 ]; then
     total=$(wc -c <"${HFX_TEST_GPKG_TEMPLATE:?}" | tr -d ' ')
     head -c 18 "$HFX_TEST_GPKG_TEMPLATE" >"$output"
-    printf 'HTTP/1.1 200 OK\r\nETag: \"fixture-v1\"\r\nContent-Length: %s\r\n\r\n' "$total" >"$headers"
+    if [ "${HFX_TEST_OMIT_ETAG-}" = 1 ]; then
+        printf 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %s\r\nContent-Disposition: attachment; filename="%s.gpkg"\r\n\r\n' \
+            "$total" "$key" >"$headers"
+    else
+        printf 'HTTP/1.1 200 OK\r\nETag: \"fixture-v1\"\r\nContent-Length: %s\r\n\r\n' "$total" >"$headers"
+    fi
     printf 'http_status=200\nnetwork_bytes=18\ntime_total_seconds=1.25\naverage_bytes_per_second=14\n'
     printf '%s\n' "$$" >"$HFX_TEST_TRANSFER_STATE/curl.$$"
     printf '%s\n' "$PPID" >"$HFX_TEST_TRANSFER_STATE/worker.$PPID"
@@ -2331,8 +2337,13 @@ else
         printf v2x >>"$output"
         header_etag='"fixture-v2"'
     fi
-    printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
-        "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    if [ "${HFX_TEST_OMIT_ETAG-}" = 1 ]; then
+        printf 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n%s: %s\r\nContent-Disposition: attachment; filename="%s.gpkg"\r\n\r\n' \
+            "$header_name_length" "$total" "$key" >"$headers"
+    else
+        printf 'HTTP/1.1 200 OK\r\n%s: %s\r\n%s: %s\r\n\r\n' \
+            "$header_name_etag" "$header_etag" "$header_name_length" "$total" >"$headers"
+    fi
     printf 'http_status=200\nnetwork_bytes=%s\ntime_total_seconds=1.25\naverage_bytes_per_second=20\n' "$total"
     result=0
 fi
@@ -3334,6 +3345,36 @@ run_runner acquire --campaign serial --workspace-root "$serial_root" --max-paral
     wc -l | tr -d ' ') == 0 ]] ||
     die 'serial acquisition left a report writer temporary'
 pass 'maximum parallel one remains strictly serial'
+
+no_etag_root=$test_tmp/workspaces/no-etag
+mkdir "$no_etag_root"
+cp -R "$subset_campaign_dir" "$no_etag_root/tdx-hydro-subset"
+no_etag_dir=$no_etag_root/tdx-hydro-subset
+no_etag_id=1020000010
+no_etag_state=$no_etag_dir/state/basins/$no_etag_id/current.json
+no_etag_final=$no_etag_dir/downloads/$no_etag_id-basins.gpkg
+no_etag_report=$no_etag_dir/reports/$no_etag_id-basins-acquisition.json
+rm -f "$no_etag_final" "$no_etag_final.partial" "$no_etag_final.partial.json" "$no_etag_report"
+jq '.stages.acquire_basins={status:"failed",attempts:1,failure_reason:"fixture",evidence:null}' \
+    "$no_etag_state" >"$no_etag_state.tmp"
+mv "$no_etag_state.tmp" "$no_etag_state"
+rm -r "$test_tmp/transfer-state"
+mkdir "$test_tmp/transfer-state"
+HFX_TEST_OMIT_ETAG=1 \
+    run_runner acquire --campaign subset --workspace-root "$no_etag_root" --max-parallel 4 \
+    >"$case_stdout" 2>"$case_stderr"
+jq -e '.stages.acquire_basins.status == "succeeded"' "$no_etag_state" >/dev/null ||
+    die "complete HTTP 200 no-ETag acquisition was rejected: stage_reason=$(jq -r '.stages.acquire_basins.failure_reason' "$no_etag_state"); final_exists=$([[ -f "$no_etag_final" ]] && printf yes || printf no); $(<"$case_stderr")"
+[[ -f "$no_etag_final" ]] ||
+    die 'complete HTTP 200 no-ETag acquisition did not install its final'
+cmp "$no_etag_final" "$HFX_TEST_GPKG_TEMPLATE" >/dev/null ||
+    die 'complete HTTP 200 no-ETag acquisition changed the fixture bytes'
+jq -e '.transfers | last |
+  .http_status == 200 and .result == "succeeded"' "$no_etag_report" >/dev/null ||
+    die 'complete HTTP 200 no-ETag acquisition report differs'
+grep -F -- '--continue-at' "$test_tmp/transfer-state/events" >/dev/null 2>&1 &&
+    die 'complete HTTP 200 no-ETag acquisition supplied continuation arguments'
+pass 'complete NGA-shaped HTTP 200 without ETag installs through acquire_product'
 
 failure_root=$test_tmp/workspaces/failure
 mkdir "$failure_root"
