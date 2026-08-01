@@ -1,0 +1,47 @@
+{
+  "stated": {
+    "gates": {
+      "format": "cargo fmt --check",
+      "lint": "cargo clippy --workspace --all-targets -- -D warnings",
+      "typecheck": "cargo check --workspace --all-targets",
+      "test": "cargo test --workspace",
+      "build": "cargo build --workspace"
+    },
+    "version_policy": "NONE",
+    "branches": {
+      "default": "main",
+      "milestone": "pce/{vision}/milestone-{milestone}",
+      "step": "pce/{vision}/m{milestone}-s{step}"
+    },
+    "pull_requests": {
+      "step_base": "MILESTONE",
+      "milestone_base": "DEFAULT",
+      "merge_method": "SQUASH"
+    },
+    "workflows": [
+      {
+        "workflow": "ci.yml",
+        "stand_in": {
+          "kind": "COMMAND",
+          "command": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build -p hfx-cli"
+        }
+      },
+      {
+        "workflow": "docs.yml",
+        "stand_in": {
+          "kind": "COMMAND",
+          "command": "make docs"
+        }
+      }
+    ]
+  },
+  "appendable": {
+    "environment_hazards": [
+      "GDAL must be installed and discoverable via gdal-config; crates/hfx-cli depends on the gdal crate and fails to build without it."
+    ],
+    "gate_orderings": [
+      "The ci.yml conformance job runs the built validator over conformance/valid/* and examples/tiny/ expecting exit 0, and over conformance/invalid/* expecting exit 1. It is not covered by the five stated gates; run it via the ci.yml stand-in when touching validator behavior or fixtures."
+    ],
+    "lockfile_rules": []
+  }
+}
