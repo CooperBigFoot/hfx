@@ -81,6 +81,12 @@ PARTIAL_SNAP_B = [
     (200, 720_000_203, 0.0, 0.0, 15.0),
     (1, 720_000_204, -170.0, -20.0, 22.0),
 ]
+EXTENSION_RUN = [
+    (730_000_301, 10.0, 10.0, [], 8.0, 8.0),
+]
+EXTENSION_SNAP = [
+    (900, 730_000_301, 10.0, 10.0, 8.0),
+]
 
 # Captured from commit a902eec after the psutil-only lock operation and before
 # the streaming compiler refactor.
@@ -2477,6 +2483,75 @@ class AssemblyTests(unittest.TestCase):
                     (root / "reversed" / name).read_bytes(),
                 )
 
+    def test_partial_assembly_function_contract(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            extension = root / "extension"
+            partial = root / "partial"
+            write_assembly_fixture(first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A)
+            build_adapter.assemble_hfx(
+                [first], partial, created_at=datetime.now(timezone.utc)
+            )
+            write_assembly_fixture(
+                extension, "7020021430", EXTENSION_RUN, EXTENSION_SNAP
+            )
+            cases = [
+                (
+                    {"partial_input_root": partial},
+                    "--partial-input and --partial-roster must be supplied together",
+                ),
+                (
+                    {"partial_basin_roster": ("7020000010",)},
+                    "--partial-input and --partial-roster must be supplied together",
+                ),
+                (
+                    {
+                        "partial_input_root": partial,
+                        "partial_basin_roster": (),
+                    },
+                    "partial basin roster must be nonempty",
+                ),
+                (
+                    {
+                        "partial_input_root": partial,
+                        "partial_basin_roster": ("9999999999",),
+                    },
+                    "partial basin roster entry at index 0 is not an authoritative basin ID",
+                ),
+                (
+                    {
+                        "partial_input_root": partial,
+                        "partial_basin_roster": (
+                            "7020000010",
+                            "7020000010",
+                        ),
+                    },
+                    "duplicate partial basin roster entry 7020000010",
+                ),
+            ]
+            for index, (arguments, message) in enumerate(cases):
+                with self.subTest(index=index):
+                    output = root / f"invalid-direct-{index}"
+                    with self.assertRaises(ValueError) as raised:
+                        build_adapter.assemble_hfx(
+                            [extension],
+                            output,
+                            created_at=datetime.now(timezone.utc),
+                            **arguments,
+                        )
+                    self.assertIn(message, str(raised.exception))
+                    self.assertFalse(output.exists())
+                    BuildCliTests.assert_no_temporary_entries(self, root)
+            with self.assertRaisesRegex(ValueError, "unique after resolution"):
+                build_adapter.assemble_hfx(
+                    [partial],
+                    root / "alias",
+                    created_at=datetime.now(timezone.utc),
+                    partial_input_root=partial,
+                    partial_basin_roster=("7020000010",),
+                )
+
     def test_complete_coverage_assembly(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2760,6 +2835,306 @@ class AssemblyCliTests(unittest.TestCase):
         self.assertIn(message, str(raised.exception))
         self.assertEqual(list(output.iterdir()), [])
         BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def write_partial_extension_fixtures(self, root: Path) -> tuple[Path, Path]:
+        first = root / "first"
+        partial = root / "partial"
+        extension = root / "extension"
+        write_assembly_fixture(first, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A)
+        build_adapter.assemble_hfx(
+            [first],
+            partial,
+            created_at=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            json.loads((partial / "manifest.json").read_text())["region"],
+            "tdx-hydro-partial-e5f495f48145",
+        )
+        write_assembly_fixture(extension, "7020021430", EXTENSION_RUN, EXTENSION_SNAP)
+        return partial, extension
+
+    def assert_partial_extension_rejected(
+        self, arguments: list[str], output: Path, message: str
+    ) -> None:
+        with self.assertRaises(ValueError) as raised:
+            main(arguments)
+        self.assertIn(message, str(raised.exception))
+        self.assertFalse(output.exists())
+        BuildCliTests.assert_no_temporary_entries(self, output.parent)
+
+    def test_assemble_cli_extends_verified_partial_dataset(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            partial, extension = self.write_partial_extension_fixtures(root)
+            self.assertEqual(
+                json.loads((partial / "manifest.json").read_text())["bbox"],
+                [
+                    -170.10000610351562,
+                    -80.0999984741211,
+                    0.10000000149011612,
+                    0.10000000149011612,
+                ],
+            )
+            self.assertEqual(
+                json.loads((extension / "manifest.json").read_text())["bbox"],
+                [
+                    9.899999618530273,
+                    9.899999618530273,
+                    10.100000381469727,
+                    10.100000381469727,
+                ],
+            )
+            roster = root / "roster.json"
+            roster.write_bytes(b'[\n  "7020000010"\n]\n')
+            with (
+                chdir(root),
+                patch.object(
+                    build_adapter,
+                    "_utc_now",
+                    return_value=datetime(2026, 7, 23, 12, 34, 56, tzinfo=timezone.utc),
+                ),
+            ):
+                return_code = main(
+                    [
+                        "assemble",
+                        "--partial-input",
+                        partial.name,
+                        "--partial-roster",
+                        roster.name,
+                        "--input",
+                        extension.name,
+                        "--out",
+                        "extended",
+                    ]
+                )
+            dataset = root / "extended"
+            self.assertEqual(return_code, 0)
+            expected_ids = [
+                710_000_101,
+                710_000_102,
+                710_000_103,
+                730_000_301,
+            ]
+            catchments = pq.read_table(dataset / "catchments.parquet")
+            graph = pq.read_table(dataset / "graph.parquet")
+            snap = pq.read_table(dataset / "aux" / "snap_stems.parquet")
+            self.assertEqual(catchments["id"].to_pylist(), expected_ids)
+            self.assertEqual(graph["id"].to_pylist(), expected_ids)
+            self.assertEqual(
+                graph["upstream_ids"].to_pylist(),
+                [[], [710_000_101], [710_000_102], []],
+            )
+            self.assertEqual(snap["id"].to_pylist(), list(range(1, 5)))
+            self.assertEqual(snap["unit_id"].to_pylist(), expected_ids)
+            self.assertEqual(set(snap["unit_id"].to_pylist()), set(expected_ids))
+            manifest = json.loads((dataset / "manifest.json").read_text())
+            self.assertEqual(
+                manifest,
+                {
+                    "adapter_version": "0.1.0",
+                    "auxiliary": [
+                        {
+                            "schema": "hfx.aux.snap.v2",
+                            "artifacts": {"snap": "aux/snap_stems.parquet"},
+                            "metadata": {
+                                "name": "stems",
+                                "description": (
+                                    "Native TDX-Hydro LineString reaches for "
+                                    "polygon-bearing level 0 drainage units."
+                                ),
+                                "references_levels": [0],
+                                "weight_semantics": (
+                                    "Drainage-area weight equals inclusive "
+                                    "DSContArea in km2; higher values indicate "
+                                    "stronger drainage dominance."
+                                ),
+                            },
+                        }
+                    ],
+                    "bbox": [
+                        -170.10000610351562,
+                        -80.0999984741211,
+                        10.100000381469727,
+                        10.100000381469727,
+                    ],
+                    "created_at": "2026-07-23T12:34:56+00:00",
+                    "crs": "EPSG:4326",
+                    "fabric_name": "tdx_hydro",
+                    "fabric_version": "synthetic-2026.07",
+                    "format_version": "0.3.0",
+                    "has_up_area": True,
+                    "region": "tdx-hydro-partial-8b0e8bc9e4bf",
+                    "topology": "tree",
+                    "unit_count": 4,
+                },
+            )
+            self.assertEqual(
+                manifest["bbox"],
+                [
+                    -170.10000610351562,
+                    -80.0999984741211,
+                    10.100000381469727,
+                    10.100000381469727,
+                ],
+            )
+            self.assertNotEqual(
+                manifest["bbox"],
+                [
+                    -170.10000610351562,
+                    -80.0999984741211,
+                    0.10000000149011612,
+                    0.10000000149011612,
+                ],
+            )
+            self.assertNotEqual(
+                manifest["bbox"],
+                [
+                    9.899999618530273,
+                    9.899999618530273,
+                    10.100000381469727,
+                    10.100000381469727,
+                ],
+            )
+            catchment_schema, graph_write_schema = merge_fixture_schemas()
+            graph_read_schema = pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("level", pa.int16(), nullable=False),
+                    pa.field(
+                        "upstream_ids",
+                        pa.list_(pa.field("element", pa.int64(), nullable=True)),
+                        nullable=False,
+                    ),
+                    pa.field("bbox_minx", pa.float32(), nullable=False),
+                    pa.field("bbox_miny", pa.float32(), nullable=False),
+                    pa.field("bbox_maxx", pa.float32(), nullable=False),
+                    pa.field("bbox_maxy", pa.float32(), nullable=False),
+                ]
+            )
+            self.assertTrue(
+                catchments.schema.equals(catchment_schema, check_metadata=True)
+            )
+            self.assertTrue(graph.schema.equals(graph_read_schema, check_metadata=True))
+            self.assertIsNone(graph.schema.metadata)
+            self.assertIsNone(graph_write_schema.metadata)
+            self.assertTrue(
+                snap.schema.equals(assembly_snap_schema(), check_metadata=True)
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "catchments.parquet"), target_version="1.1"
+                ).is_valid
+            )
+            self.assertTrue(
+                validate_geoparquet(
+                    str(dataset / "aux" / "snap_stems.parquet"),
+                    target_version="1.1",
+                ).is_valid
+            )
+            source_root = Path(__file__).parent
+            for name in ("NOTICE", "CITATION.txt"):
+                self.assertEqual(
+                    (dataset / name).read_bytes(),
+                    (source_root / name).read_bytes(),
+                )
+                text = (dataset / name).read_text()
+                self.assertIn("TDX-Hydro", text)
+                self.assertIn("National Geospatial-Intelligence Agency", text)
+            validate_assembled_manifest(dataset / "manifest.json")
+            validate_with_release_hfx(dataset)
+            BuildCliTests.assert_no_temporary_entries(self, root)
+
+    def test_assemble_cli_rejects_invalid_partial_rosters(self) -> None:
+        cases = [
+            (
+                '[\n  "9999999999"\n]\n',
+                "partial basin roster entry at index 0 is not an authoritative basin ID",
+            ),
+            (
+                '[\n  "7020014250"\n]\n',
+                "partial manifest region 'tdx-hydro-partial-e5f495f48145' "
+                "does not match roster label tdx-hydro-partial-483165340444",
+            ),
+            (
+                '[\n  "7020000010",\n  "7020000010"\n]\n',
+                "duplicate partial basin roster entry 7020000010",
+            ),
+            (
+                '{\n  "basins": [\n    "7020000010"\n  ]\n}\n',
+                "partial basin roster must be one nonempty JSON array",
+            ),
+        ]
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (roster_text, message) in enumerate(cases):
+                with self.subTest(index=index):
+                    case_root = root / f"case-{index}"
+                    case_root.mkdir()
+                    partial, extension = self.write_partial_extension_fixtures(
+                        case_root
+                    )
+                    roster = case_root / "roster.json"
+                    roster.write_text(roster_text, encoding="utf-8")
+                    output = case_root / "output"
+                    self.assert_partial_extension_rejected(
+                        [
+                            "assemble",
+                            "--partial-input",
+                            str(partial),
+                            "--partial-roster",
+                            str(roster),
+                            "--input",
+                            str(extension),
+                            "--out",
+                            str(output),
+                        ],
+                        output,
+                        message,
+                    )
+
+    def test_assemble_cli_rejects_partial_overlap_and_unpaired_options(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            partial, extension = self.write_partial_extension_fixtures(root)
+            roster = root / "roster.json"
+            roster.write_bytes(b'[\n  "7020000010"\n]\n')
+            overlap = root / "overlap"
+            write_assembly_fixture(overlap, "7020000010", MERGE_RUN_A, PARTIAL_SNAP_A)
+            overlap_output = root / "overlap-output"
+            self.assert_partial_extension_rejected(
+                [
+                    "assemble",
+                    "--partial-input",
+                    str(partial),
+                    "--partial-roster",
+                    str(roster),
+                    "--input",
+                    str(overlap),
+                    "--out",
+                    str(overlap_output),
+                ],
+                overlap_output,
+                "manifest region 7020000010 overlaps partial basin roster",
+            )
+            for index, partial_arguments in enumerate(
+                (
+                    ["--partial-input", str(partial)],
+                    ["--partial-roster", str(roster)],
+                )
+            ):
+                output = root / f"unpaired-{index}"
+                self.assert_partial_extension_rejected(
+                    [
+                        "assemble",
+                        *partial_arguments,
+                        "--input",
+                        str(extension),
+                        "--out",
+                        str(output),
+                    ],
+                    output,
+                    "--partial-input and --partial-roster must be supplied together",
+                )
 
     def test_assemble_cli_publishes_and_validates_partial_dataset(self) -> None:
         with TemporaryDirectory() as temporary:
