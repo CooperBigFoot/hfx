@@ -3055,16 +3055,29 @@ write_compile_stage() {
     local status=$2
     local attempts=$3
     local reason=$4
-    local diagnostic_report=${5-null}
+    local diagnostic_report_file=${5-}
     local current=$campaign_dir/state/basins/$basin_id/current.json
     local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
-    "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" \
-        --argjson diagnostic_report "$diagnostic_report" '
-        .stages.compile.status = $status |
-        .stages.compile.attempts = $attempts |
-        .stages.compile.failure_reason = (if $reason == "" then null else $reason end) |
-        .stages.compile.diagnostic_report = $diagnostic_report
-    ' "$current" >"$temporary"
+    if [[ -n "$diagnostic_report_file" ]]; then
+        "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" \
+            --arg path "reports/$basin_id-build-report.json" \
+            --slurpfile diagnostic_report "$diagnostic_report_file" '
+            .stages.compile.status = $status |
+            .stages.compile.attempts = $attempts |
+            .stages.compile.failure_reason = (if $reason == "" then null else $reason end) |
+            .stages.compile.diagnostic_report = {
+              path: $path,
+              diagnostics: $diagnostic_report[0].diagnostics
+            }
+        ' "$current" >"$temporary"
+    else
+        "$JQ" --arg status "$status" --arg reason "$reason" --argjson attempts "$attempts" '
+            .stages.compile.status = $status |
+            .stages.compile.attempts = $attempts |
+            .stages.compile.failure_reason = (if $reason == "" then null else $reason end) |
+            .stages.compile.diagnostic_report = null
+        ' "$current" >"$temporary"
+    fi
     atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
 }
 
@@ -3089,13 +3102,12 @@ establish_compile_contract() {
     atomic_install "$temporary" "$contract" validate_compile_json
 }
 
-diagnostic_report_json=
+diagnostic_report_file=
 verify_compile_report() {
     local basin_id=$1
     local output=$2
     local report=$3
     local resolved_output
-    local diagnostics
     [[ -d "$output" && ! -L "$output" ]] || return 1
     [[ -f "$report" && ! -L "$report" && -s "$report" ]] || return 1
     resolved_output=$(cd -P "$output" && pwd -P) || return 1
@@ -3107,9 +3119,7 @@ verify_compile_report() {
         .build_identity.dataset_root == $dataset_root and
         (.diagnostics | type == "object")
     ' "$report" >/dev/null 2>&1 || return 1
-    diagnostics=$("$JQ" -cS '.diagnostics' "$report") || return 1
-    diagnostic_report_json=$("$JQ" -cnS --arg path "reports/$basin_id-build-report.json" \
-        --argjson diagnostics "$diagnostics" '{path:$path,diagnostics:$diagnostics}') || return 1
+    diagnostic_report_file=$report
 }
 
 verify_compile_artifacts() {
@@ -3191,7 +3201,7 @@ reconcile_reclaim_basin() {
                 hfx_die "reclaimed basin source artifact remains for $basin_id: $retained_path; move that exact path out of downloads, then rerun recover"
         done
         if [[ "$verify_success" == true && "$compile_status" == succeeded ]]; then
-            diagnostic_report_json=
+            diagnostic_report_file=
             verify_compile_artifacts "$basin_id" "$output" "$report" ||
                 hfx_die "reclaimed compile artifacts failed verification for $basin_id; restore retained output and report, then rerun compile"
         fi
@@ -3202,7 +3212,7 @@ reconcile_reclaim_basin() {
 
     if [[ "$compile_status" == succeeded ]]; then
         if [[ "$verify_success" == true ]]; then
-            diagnostic_report_json=
+            diagnostic_report_file=
             verify_compile_artifacts "$basin_id" "$output" "$report" ||
                 hfx_die "compile artifacts failed verification before reclaim for $basin_id"
         else
@@ -3253,10 +3263,10 @@ compile_basin_core() {
     report=$campaign_dir/reports/$basin_id-build-report.json
 
     if [[ "$compile_status" == succeeded ]]; then
-        diagnostic_report_json=
+        diagnostic_report_file=
         if verify_compile_artifacts "$basin_id" "$output" "$report"; then
             if [[ $("$JQ" -r '.stages.compile.diagnostic_report == null' "$current") == true ]]; then
-                write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+                write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_file"
                 if [[ "$defer_reclaim" == false ]] &&
                     reconcile_reclaim_basin "$basin_id" true; then
                     :
@@ -3266,16 +3276,16 @@ compile_basin_core() {
         fi
         write_compile_stage "$basin_id" failed "$attempts" \
             'existing compile artifacts failed resume verification; retained for inspection' \
-            "${diagnostic_report_json:-null}"
+            "$diagnostic_report_file"
         return
     fi
 
     if [[ -e "$output" || -L "$output" || -e "$report" || -L "$report" ]]; then
-        diagnostic_report_json=
+        diagnostic_report_file=
         verify_compile_report "$basin_id" "$output" "$report" || :
         write_compile_stage "$basin_id" failed "$attempts" \
             'compile artifact path already exists; retained for inspection' \
-            "${diagnostic_report_json:-null}"
+            "$diagnostic_report_file"
         return
     fi
 
@@ -3288,11 +3298,11 @@ compile_basin_core() {
         --report "$report" \
         --processing-basin-id "$basin_id" \
         --fabric-version "$fabric_version"; then
-        diagnostic_report_json=
+        diagnostic_report_file=
         verify_compile_report "$basin_id" "$output" "$report" || :
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
         write_compile_stage "$basin_id" failed "$attempts" 'adapter build failed' \
-            "${diagnostic_report_json:-null}"
+            "$diagnostic_report_file"
         interrupt_reclaim_boundary "$basin_id" terminal-state
         if [[ "$defer_reclaim" == false ]] &&
             reconcile_reclaim_basin "$basin_id" true; then
@@ -3300,7 +3310,7 @@ compile_basin_core() {
         fi
         return
     fi
-    diagnostic_report_json=
+    diagnostic_report_file=
     if ! verify_compile_report "$basin_id" "$output" "$report"; then
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
         write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed'
@@ -3313,7 +3323,7 @@ compile_basin_core() {
     fi
     if ! "$ADAPTER_PYTHON" "$ADAPTER_SCRIPT" validate "$output" --hfx-binary "$HFX"; then
         interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_json"
+        write_compile_stage "$basin_id" failed "$attempts" 'adapter validation failed' "$diagnostic_report_file"
         interrupt_reclaim_boundary "$basin_id" terminal-state
         if [[ "$defer_reclaim" == false ]] &&
             reconcile_reclaim_basin "$basin_id" true; then
@@ -3322,7 +3332,7 @@ compile_basin_core() {
         return
     fi
     interrupt_reclaim_boundary "$basin_id" compile-attempt-complete
-    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_json"
+    write_compile_stage "$basin_id" succeeded "$attempts" '' "$diagnostic_report_file"
     interrupt_reclaim_boundary "$basin_id" terminal-state
     if [[ "$defer_reclaim" == false ]] &&
         reconcile_reclaim_basin "$basin_id" true; then
