@@ -3564,6 +3564,12 @@ def _build_compact_topology(
     short_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     near_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     endpoint_proven = 0
+    connected_matches: list[list[tuple[int, int]] | None] = [
+        None
+    ] * len(stream_native_ids)
+    connected_current_indexes: list[list[int] | None] = [
+        None
+    ] * len(stream_native_ids)
     for row in np.flatnonzero(downstream_rows >= 0):
         successor = int(downstream_rows[row])
         current_candidates = (0,) if degenerate[row] else (0, 1)
@@ -3584,11 +3590,7 @@ def _build_compact_topology(
                 f"{int(stream_native_ids[successor])} is non-coincident"
             )
         current_indexes = sorted({current for current, _ in matches})
-        if len(current_indexes) == 1:
-            current_index = current_indexes[0]
-            if not degenerate[row]:
-                endpoint_proven += 1
-        else:
+        if len(current_indexes) > 1:
             separation = math.dist(endpoints[row, 0], endpoints[row, 1])
             if separation > 2.0 * tolerance:
                 raise ValueError(
@@ -3597,6 +3599,109 @@ def _build_compact_topology(
                     f"{int(stream_native_ids[successor])} is reach-side ambiguous: "
                     "both current endpoints coincide within tolerance but endpoint "
                     f"separation {separation} exceeds near-degenerate limit {2.0 * tolerance}"
+                )
+        connected_matches[row] = matches
+        connected_current_indexes[row] = current_indexes
+
+    for row_value in topology_order[::-1]:
+        row = int(row_value)
+        successor = int(downstream_rows[row])
+        if successor < 0:
+            continue
+        matches = connected_matches[row]
+        current_indexes = connected_current_indexes[row]
+        if matches is None or current_indexes is None:
+            raise RuntimeError(
+                "internal compact-topology match state is missing for native LINKNO "
+                f"{int(stream_native_ids[row])} and downstream LINKNO "
+                f"{int(stream_native_ids[successor])}"
+            )
+        if len(current_indexes) == 1:
+            current_index = current_indexes[0]
+            if not degenerate[row]:
+                endpoint_proven += 1
+        else:
+            current_id = int(stream_native_ids[row])
+            successor_id = int(stream_native_ids[successor])
+            current_area = float(up_area_km2[row])
+            successor_area = float(up_area_km2[successor])
+            if current_area == successor_area:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                    "source vertex order: DSContArea evidence is tied at "
+                    f"{current_area!r} km2"
+                )
+            if current_area > successor_area:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} contradicts "
+                    "source vertex order: upstream DSContArea "
+                    f"{current_area!r} km2 exceeds downstream DSContArea "
+                    f"{successor_area!r} km2"
+                )
+            if degenerate[successor]:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                    "source vertex order: downstream-nondecreasing DSContArea "
+                    f"{current_area!r} km2 -> {successor_area!r} km2 does not "
+                    "distinguish the successor endpoint side"
+                )
+            if downstream_rows[successor] < 0:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                    "source vertex order: downstream-nondecreasing DSContArea "
+                    f"{current_area!r} km2 -> {successor_area!r} km2 cannot determine "
+                    f"the upstream endpoint of root successor LINKNO {successor_id}"
+                )
+            if np.isnan(downstream_endpoints[successor]).any():
+                raise RuntimeError(
+                    "internal compact-topology orientation is missing for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id}"
+                )
+            successor_downstream_index = next(
+                (
+                    index
+                    for index in (0, 1)
+                    if np.array_equal(
+                        endpoints[successor, index],
+                        downstream_endpoints[successor],
+                    )
+                ),
+                -1,
+            )
+            if successor_downstream_index < 0:
+                raise RuntimeError(
+                    "internal compact-topology orientation is invalid for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id}"
+                )
+            successor_upstream_index = 1 - successor_downstream_index
+            source_successor_indexes = sorted(
+                {
+                    successor_index
+                    for matched_current, successor_index in matches
+                    if matched_current == 1
+                }
+            )
+            if source_successor_indexes == [successor_downstream_index]:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} contradicts "
+                    "source vertex order: downstream-nondecreasing DSContArea "
+                    f"{current_area!r} km2 -> {successor_area!r} km2 identifies "
+                    f"successor endpoint {successor_upstream_index} as upstream, but "
+                    "source endpoint 1 matches successor downstream endpoint "
+                    f"{successor_downstream_index}"
+                )
+            if source_successor_indexes != [successor_upstream_index]:
+                raise ValueError(
+                    "orientation proof for native LINKNO "
+                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                    "source vertex order: downstream-nondecreasing DSContArea "
+                    f"{current_area!r} km2 -> {successor_area!r} km2 does not "
+                    "distinguish the successor endpoint side"
                 )
             current_index = 1
             near_resolved[row] = True
@@ -3653,6 +3758,31 @@ def _build_compact_topology(
                     f"{predecessor_ids} match both root endpoints but endpoint "
                     f"separation {separation} exceeds near-degenerate limit {2.0 * tolerance}"
                 )
+            root_area = float(up_area_km2[row])
+            predecessors = sorted(
+                (
+                    int(stream_native_ids[predecessor]),
+                    int(predecessor),
+                )
+                for predecessor in predecessor_rows[
+                    predecessor_offsets[row] : predecessor_offsets[row + 1]
+                ]
+            )
+            for predecessor_id, predecessor in predecessors:
+                predecessor_area = float(up_area_km2[predecessor])
+                if predecessor_area == root_area:
+                    raise ValueError(
+                        f"orientation proof for root LINKNO {native_id} cannot use "
+                        "source vertex order: DSContArea evidence is tied with "
+                        f"predecessor LINKNO {predecessor_id} at {root_area!r} km2"
+                    )
+                if predecessor_area > root_area:
+                    raise ValueError(
+                        f"orientation proof for root LINKNO {native_id} contradicts "
+                        "source vertex order: predecessor LINKNO "
+                        f"{predecessor_id} DSContArea {predecessor_area!r} km2 "
+                        f"exceeds root DSContArea {root_area!r} km2"
+                    )
             downstream_endpoints[row] = endpoints[row, 1]
             near_resolved[row] = True
         else:

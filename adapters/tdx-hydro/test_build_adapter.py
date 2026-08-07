@@ -4278,6 +4278,90 @@ class BuildCliTests(unittest.TestCase):
             "--fabric-version", self.fabric_version,
         ]
 
+    def three_reach_near_degenerate_frames(
+        self,
+    ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
+        polygon_100 = Polygon([
+            (0.998, -0.005), (1.002, -0.005), (1.002, 0.005),
+            (0.998, 0.005), (0.998, -0.005),
+        ])
+        polygon_200 = Polygon([
+            (0.998, -0.00000005), (1.002, -0.00000005),
+            (1.002, 0.00000005), (0.998, 0.00000005),
+            (0.998, -0.00000005),
+        ])
+        polygon_300 = Polygon([
+            (0.998, -0.005), (1.012, -0.005), (1.012, 0.005),
+            (0.998, 0.005), (0.998, -0.005),
+        ])
+        geod = Geod(ellps="WGS84")
+        area_100_km2 = abs(geod.geometry_area_perimeter(polygon_100)[0]) / 1_000_000
+        area_200_km2 = abs(geod.geometry_area_perimeter(polygon_200)[0]) / 1_000_000
+        area_300_km2 = abs(geod.geometry_area_perimeter(polygon_300)[0]) / 1_000_000
+        area_200_upstream_km2 = area_100_km2 + area_200_km2
+        area_300_upstream_km2 = (
+            area_100_km2 + area_200_km2 + area_300_km2
+        )
+        basins = gpd.GeoDataFrame(
+            {"streamID": [300, 200, 100], "label": ["root", "middle", "upstream"]},
+            geometry=[polygon_300, polygon_200, polygon_100],
+            crs="EPSG:4326",
+        )
+        streamnet = gpd.GeoDataFrame(
+            {
+                "LINKNO": [300, 200, 100],
+                "DSLINKNO": [-1, 300, 200],
+                "DSContArea": [
+                    area_300_upstream_km2,
+                    area_200_upstream_km2,
+                    area_100_km2,
+                ],
+                "label": ["root", "middle", "upstream"],
+            },
+            geometry=[
+                LineString([(0.9992, 0.0), (1.01, 0.0)]),
+                LineString([(1.0008, 0.0), (0.9992, 0.0)]),
+                LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+            ],
+            crs="EPSG:4326",
+        )
+        return basins, streamnet, area_100_km2, area_200_km2
+
+    def indeterminate_root_frames(
+        self,
+    ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
+        polygon_100 = Polygon([
+            (0.0, -0.005), (0.01, -0.005), (0.01, 0.005),
+            (0.0, 0.005), (0.0, -0.005),
+        ])
+        polygon_200 = Polygon([
+            (0.0092, -0.00000005), (0.0108, -0.00000005),
+            (0.0108, 0.00000005), (0.0092, 0.00000005),
+            (0.0092, -0.00000005),
+        ])
+        geod = Geod(ellps="WGS84")
+        area_100_km2 = abs(geod.geometry_area_perimeter(polygon_100)[0]) / 1_000_000
+        area_200_km2 = abs(geod.geometry_area_perimeter(polygon_200)[0]) / 1_000_000
+        basins = gpd.GeoDataFrame(
+            {"streamID": [200, 100], "label": ["root", "predecessor"]},
+            geometry=[polygon_200, polygon_100],
+            crs="EPSG:4326",
+        )
+        streamnet = gpd.GeoDataFrame(
+            {
+                "LINKNO": [200, 100],
+                "DSLINKNO": [-1, 200],
+                "DSContArea": [area_100_km2 + area_200_km2, area_100_km2],
+                "label": ["root", "predecessor"],
+            },
+            geometry=[
+                LineString([(0.0092, 0.0), (0.0108, 0.0)]),
+                LineString([(0.0, 0.0), (0.01, 0.0)]),
+            ],
+            crs="EPSG:4326",
+        )
+        return basins, streamnet, area_100_km2, area_200_km2
+
     def test_build_cli_prefixes_null_basin_geometry_error(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -4569,6 +4653,251 @@ class BuildCliTests(unittest.TestCase):
                     for message in messages
                 )
             )
+
+    def test_build_cli_accepts_reach_side_near_degenerate_area_agreement(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(
+                root, *self.three_reach_near_degenerate_frames()[:2]
+            )
+            output = root / "output"
+            report = root / "report.json"
+            self.assertEqual(
+                main(self.build_args(basins_path, streamnet_path, output, report)),
+                0,
+            )
+            catchments = pq.read_table(output / "catchments.parquet")
+            outlets = {
+                linkno: (lon, lat)
+                for linkno, lon, lat in zip(
+                    catchments["id"].to_pylist(),
+                    catchments["outlet_lon"].to_pylist(),
+                    catchments["outlet_lat"].to_pylist(),
+                    strict=True,
+                )
+            }
+            self.assertEqual(
+                outlets,
+                {
+                    710000100: (1.0008, 0.0),
+                    710000200: (0.9992, 0.0),
+                    710000300: (1.01, 0.0),
+                },
+            )
+            diagnostics = json.loads(report.read_text())["diagnostics"]["streamnet"]
+            self.assertEqual(
+                diagnostics["reach_side_near_degenerate_resolved_reach_count"], 1
+            )
+            self.assertEqual(
+                diagnostics[
+                    "reach_side_near_degenerate_resolved_reach_native_linknos"
+                ],
+                [100],
+            )
+
+    def test_build_cli_rejects_tied_reach_side_near_degenerate_area(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, area_100_km2, area_200_km2 = (
+                self.three_reach_near_degenerate_frames()
+            )
+            streamnet.loc[streamnet["LINKNO"] == 100, "DSContArea"] = (
+                area_100_km2 + area_200_km2
+            )
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
+                "cannot use source vertex order: DSContArea evidence is tied at "
+                "0.4923678063937605 km2",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+
+    def test_build_cli_rejects_contradictory_reach_side_near_degenerate_area(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, area_100_km2, area_200_km2 = (
+                self.three_reach_near_degenerate_frames()
+            )
+            streamnet.loc[streamnet["LINKNO"] == 100, "DSContArea"] = (
+                area_100_km2 + 2.0 * area_200_km2
+            )
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
+                "contradicts source vertex order: upstream DSContArea "
+                "0.49237273002259435 km2 exceeds downstream DSContArea "
+                "0.4923678063937605 km2",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+
+    def test_build_cli_rejects_backwards_near_degenerate_reach(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = self.three_reach_near_degenerate_frames()
+            clean_source = root / "clean-source"
+            clean_source.mkdir()
+            clean_paths = write_pair(clean_source, basins, streamnet)
+            clean_output = root / "clean-output"
+            clean_report = root / "clean-report.json"
+            self.assertEqual(
+                main(self.build_args(*clean_paths, clean_output, clean_report)), 0
+            )
+            clean_catchments = pq.read_table(clean_output / "catchments.parquet")
+            clean_outlets = dict(
+                zip(
+                    clean_catchments["id"].to_pylist(),
+                    zip(
+                        clean_catchments["outlet_lon"].to_pylist(),
+                        clean_catchments["outlet_lat"].to_pylist(),
+                        strict=True,
+                    ),
+                    strict=True,
+                )
+            )
+            self.assertEqual(clean_outlets[710000100], (1.0008, 0.0))
+            self.assertEqual(
+                json.loads(clean_report.read_text())["diagnostics"]["streamnet"][
+                    "reach_side_near_degenerate_resolved_reach_native_linknos"
+                ],
+                [100],
+            )
+
+            reversed_basins = basins.copy(deep=True)
+            reversed_streamnet = streamnet.copy(deep=True)
+            reversed_streamnet.loc[
+                reversed_streamnet["LINKNO"] == 100, "geometry"
+            ] = LineString([(1.0008, 0.0), (0.9992, 0.0)])
+            reversed_source = root / "reversed-source"
+            reversed_source.mkdir()
+            reversed_paths = write_pair(
+                reversed_source, reversed_basins, reversed_streamnet
+            )
+            reversed_output = root / "reversed-output"
+            reversed_report = root / "reversed-report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(
+                    self.build_args(
+                        *reversed_paths, reversed_output, reversed_report
+                    )
+                )
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
+                "contradicts source vertex order: downstream-nondecreasing DSContArea "
+                "0.4923628827649266 km2 -> 0.4923678063937605 km2 identifies "
+                "successor endpoint 0 as upstream, but source endpoint 1 matches "
+                "successor downstream endpoint 1",
+            )
+            self.assertFalse(reversed_output.exists())
+            self.assertFalse(reversed_report.exists())
+            self.assertTrue(clean_output.exists())
+            self.assertTrue(clean_report.exists())
+
+    def test_build_cli_rejects_near_degenerate_reach_with_unoriented_root(
+        self,
+    ) -> None:
+        polygon_100 = Polygon([
+            (0.00, 0.00), (0.01, 0.00), (0.01, 0.01),
+            (0.00, 0.01), (0.00, 0.00),
+        ])
+        polygon_200 = Polygon([
+            (0.01, 0.00), (0.02, 0.00), (0.02, 0.01),
+            (0.01, 0.01), (0.01, 0.00),
+        ])
+        geod = Geod(ellps="WGS84")
+        area_100_km2 = abs(geod.geometry_area_perimeter(polygon_100)[0]) / 1_000_000
+        area_200_km2 = abs(geod.geometry_area_perimeter(polygon_200)[0]) / 1_000_000
+        basins = gpd.GeoDataFrame(
+            {"streamID": [200, 100], "label": ["root", "upstream"]},
+            geometry=[polygon_200, polygon_100],
+            crs="EPSG:4326",
+        )
+        streamnet = gpd.GeoDataFrame(
+            {
+                "LINKNO": [200, 100],
+                "DSLINKNO": [-1, 200],
+                "DSContArea": [area_100_km2 + area_200_km2, area_100_km2],
+                "label": ["root", "upstream"],
+            },
+            geometry=[
+                LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+                LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+            ],
+            crs="EPSG:4326",
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
+                "cannot use source vertex order: downstream-nondecreasing DSContArea "
+                "1.2309072049932537 km2 -> 2.4618144099865074 km2 cannot determine "
+                "the upstream endpoint of root successor LINKNO 200",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+
+    def test_build_cli_rejects_tied_indeterminate_root_area(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, area_100_km2, _ = self.indeterminate_root_frames()
+            streamnet["DSContArea"] = [area_100_km2, area_100_km2]
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for root LINKNO 200 cannot use source vertex order: "
+                "DSContArea evidence is tied with predecessor LINKNO 100 at "
+                "1.2309072095546951 km2",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+
+    def test_build_cli_rejects_contradictory_indeterminate_root_area(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, area_100_km2, area_200_km2 = (
+                self.indeterminate_root_frames()
+            )
+            streamnet["DSContArea"] = [
+                area_100_km2,
+                area_100_km2 + area_200_km2,
+            ]
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                str(raised.exception),
+                "orientation proof for root LINKNO 200 contradicts source vertex order: "
+                "predecessor LINKNO 100 DSContArea 1.230909179006228 km2 exceeds "
+                "root DSContArea 1.2309072095546951 km2",
+            )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
 
     def test_build_cli_reports_short_successor_and_near_degenerate_root_resolution(
         self,
