@@ -1,6 +1,8 @@
 # GRIT planetary D8 ships under a successor prefix; hfx-v0.3.0 is frozen
 
-**Status:** Accepted
+**Status:** Superseded
+
+**Superseded by:** [2026-08-07-grit-v0-3-0-authority-driven-manifest.md](2026-08-07-grit-v0-3-0-authority-driven-manifest.md)
 
 **Date:** 2026-07-24
 
