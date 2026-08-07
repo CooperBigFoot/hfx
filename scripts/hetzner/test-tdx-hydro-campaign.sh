@@ -36,7 +36,7 @@ if [ "${HFX_TEST_GLOBAL_WATCHDOG_CHILD-}" != 1 ]; then
     /bin/bash "$watchdog_script" "$@" &
     watchdog_pid=$!
     watchdog_attempt=0
-    while [ "$watchdog_attempt" -lt 1800 ]; do
+    while [ "$watchdog_attempt" -lt 2400 ]; do
         watchdog_live=0
         for watchdog_job in $(jobs -pr); do
             [ "$watchdog_job" != "$watchdog_pid" ] || watchdog_live=1
@@ -45,7 +45,7 @@ if [ "${HFX_TEST_GLOBAL_WATCHDOG_CHILD-}" != 1 ]; then
         watchdog_attempt=$((watchdog_attempt + 1))
         sleep 1
     done
-    if [ "$watchdog_attempt" -lt 1800 ]; then
+    if [ "$watchdog_attempt" -lt 2400 ]; then
         watchdog_status=0
         wait "$watchdog_pid" || watchdog_status=$?
         exit "$watchdog_status"
@@ -63,7 +63,7 @@ if [ "${HFX_TEST_GLOBAL_WATCHDOG_CHILD-}" != 1 ]; then
     done
     [ "$watchdog_live" -eq 0 ] || kill -KILL "$watchdog_pid" 2>/dev/null || :
     wait "$watchdog_pid" 2>/dev/null || :
-    printf '%s\n' 'test-tdx-hydro-campaign: error: global timeout after 1800 seconds' >&2
+    printf '%s\n' 'test-tdx-hydro-campaign: error: global timeout after 2400 seconds' >&2
     exit 1
 fi
 
@@ -188,14 +188,27 @@ mark_compile_succeeded() {
 
 write_expected_assembly_argv() {
     local campaign_dir=$1
+    local mode=${2-legacy}
+    local included_id=${3-7020000010}
     HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/expected-assembly-argv
     export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
-    printf '%s\n' \
-        assemble \
-        --input "$campaign_dir/basin-outputs/1020000010" \
-        --input "$campaign_dir/basin-outputs/7020000010" \
-        --out "$campaign_dir/assembly/dataset" \
-        >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+    if [[ "$mode" == legacy ]]; then
+        printf '%s\n' assemble \
+            --input "$campaign_dir/basin-outputs/1020000010" \
+            --input "$campaign_dir/basin-outputs/7020000010" \
+            --out "$campaign_dir/assembly/dataset" >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+    else
+        printf '%s\n' assemble --partial-input "$partial_fabric_root" \
+            --partial-roster "$partial_fabric_roster" \
+            --input "$campaign_dir/basin-outputs/$included_id" \
+            --out "$campaign_dir/assembly/dataset" >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
+    fi
+}
+
+extension_options() {
+    printf '%s\n' --partial-fabric "$partial_fabric_root" \
+        --partial-fabric-roster "$partial_fabric_roster" \
+        --exclude-control-basin 1020000010
 }
 
 write_assembly_state_fixture() {
@@ -203,6 +216,19 @@ write_assembly_state_fixture() {
     local status=$2
     local attempts=$3
     local reason=$4
+    local mode=${5-legacy}
+    if [[ "$mode" == extension ]]; then
+        jq -n --arg status "$status" --argjson attempts "$attempts" --arg reason "$reason" \
+            --arg fabric_root "$partial_fabric_root" --arg roster "$partial_fabric_roster" '{
+          schema_version:2,status:$status,attempts:$attempts,
+          failure_reason:(if $reason == "" then null else $reason end),
+          fabric_root:$fabric_root,fabric_roster_path:$roster,
+          fabric_basin_ids:["1020000010"],excluded_control_basin_id:"1020000010",
+          included_basin_ids:["7020000010"],included_dataset_paths:["basin-outputs/7020000010"],
+          output_path:"assembly/dataset",report_path:"reports/assembly.json"
+        }' >"$campaign_dir/state/assembly.json"
+        return
+    fi
     jq -n --arg status "$status" --argjson attempts "$attempts" --arg reason "$reason" '{
       schema_version:1,
       status:$status,
@@ -284,6 +310,13 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir "$test_tmp/fake-bin" "$test_tmp/invocations" "$test_tmp/workspaces"
+mkdir -p "$test_tmp/fixtures/partial-fabric/aux"
+partial_fabric_root=$(cd -P "$test_tmp/fixtures/partial-fabric" && pwd -P)
+for partial_file in catchments.parquet graph.parquet manifest.json aux/snap_stems.parquet; do
+    printf '%s\n' fixture >"$partial_fabric_root/$partial_file"
+done
+printf '%s\n' '["1020000010"]' >"$test_tmp/fixtures/partial-fabric-roster.json"
+partial_fabric_roster=$(cd -P "$test_tmp/fixtures" && pwd -P)/partial-fabric-roster.json
 if [[ -n "${HFX_TEST_MUTATION_FROM-}" ]]; then
     [[ $(grep -Fxc -- "$HFX_TEST_MUTATION_FROM" "$runner") -eq 1 ]] ||
         die 'mutation anchor must occur exactly once'
@@ -1186,7 +1219,7 @@ assert_contains "$case_stdout" 'tdx-hydro-campaign.sh compile-basin --campaign <
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>'
-assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]'
+assert_contains "$case_stdout" 'tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>] [--partial-fabric <dataset-root> --partial-fabric-roster <json-file> --exclude-control-basin <processing-basin-id>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]'
 assert_contains "$case_stdout" 'tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>'
 pass 'sole help arguments succeed'
@@ -1249,6 +1282,35 @@ expect_failure 'foreign fabric version' status --campaign compile --workspace-ro
     --fabric-version version
 expect_failure 'fabric version on assemble' assemble --campaign compile --workspace-root "$argument_root" \
     --fabric-version version
+for extension_option in --partial-fabric --partial-fabric-roster --exclude-control-basin; do
+    expect_failure "$extension_option scope" status --campaign scope --workspace-root "$argument_root" \
+        "$extension_option" value
+    assert_contains "$case_stderr" "option $extension_option is valid only for assemble"
+    expect_failure "$extension_option repeated" assemble --campaign repeat --workspace-root "$argument_root" \
+        "$extension_option" value "$extension_option" value
+    assert_contains "$case_stderr" "option $extension_option may not be repeated"
+    expect_failure "$extension_option missing value" assemble --campaign missing --workspace-root "$argument_root" \
+        "$extension_option"
+    assert_contains "$case_stderr" "option $extension_option requires a value"
+    expect_failure "$extension_option option value" assemble --campaign missing --workspace-root "$argument_root" \
+        "$extension_option" --campaign
+    assert_contains "$case_stderr" "option $extension_option requires a value"
+done
+expect_failure 'partial fabric missing roster' assemble --campaign incomplete --workspace-root "$argument_root" \
+    --partial-fabric /tmp/fabric --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'option --partial-fabric-roster is required when --partial-fabric is supplied'
+expect_failure 'partial fabric missing control' assemble --campaign incomplete --workspace-root "$argument_root" \
+    --partial-fabric /tmp/fabric --partial-fabric-roster /tmp/roster
+assert_contains "$case_stderr" 'option --exclude-control-basin is required when --partial-fabric is supplied'
+expect_failure 'roster without partial fabric' assemble --campaign incomplete --workspace-root "$argument_root" \
+    --partial-fabric-roster /tmp/roster
+assert_contains "$case_stderr" 'option --partial-fabric is required when --partial-fabric-roster or --exclude-control-basin is supplied'
+expect_failure 'control without partial fabric' assemble --campaign incomplete --workspace-root "$argument_root" \
+    --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'option --partial-fabric is required when --partial-fabric-roster or --exclude-control-basin is supplied'
+expect_failure 'malformed control' assemble --campaign incomplete --workspace-root "$argument_root" \
+    --partial-fabric /tmp/fabric --partial-fabric-roster /tmp/roster --exclude-control-basin 12
+assert_contains "$case_stderr" "invalid excluded control basin ID '12'; expected an authoritative 10-digit ID"
 expect_failure 'empty retention policy' init --campaign arguments --workspace-root "$argument_root" \
     --retention-policy ''
 expect_failure 'option-shaped retention policy' init --campaign arguments --workspace-root "$argument_root" \
@@ -1642,6 +1704,12 @@ jq -e '. == {
   output_path:"assembly/dataset",
   report_path:"reports/assembly.json"
 }' "$campaign_dir/state/assembly.json" >/dev/null || die 'initial assembly state differs'
+for compatibility_command in status progress evidence recover; do
+    cp "$campaign_dir/state/assembly.json" "$test_tmp/schema-one-$compatibility_command-before"
+    run_runner "$compatibility_command" --campaign equal --workspace-root "$valid_root" >"$case_stdout"
+    cmp "$test_tmp/schema-one-$compatibility_command-before" "$campaign_dir/state/assembly.json"
+done
+pass 'schema-1 assembly state remains byte-identical through read-only and recovery commands'
 if grep -F '7020000010' "$runner" >/dev/null; then
     die 'runner contains a transcribed processing-basin ID'
 fi
@@ -2528,6 +2596,13 @@ case $command_name in
     assemble)
         assemble_arguments=("$@")
         shift
+        if [ "${1-}" = --partial-input ]; then
+            [ "$#" -ge 6 ] || exit 89
+            [ -d "$2" ] && [ ! -L "$2" ] || exit 89
+            [ "$3" = --partial-roster ] || exit 89
+            [ -f "$4" ] && [ ! -L "$4" ] && [ -s "$4" ] || exit 89
+            shift 4
+        fi
         input_count=0
         while [ "$#" -gt 2 ]; do
             [ "$1" = --input ] || exit 89
@@ -3021,18 +3096,40 @@ jq '.stages.compile={
 }' "$subset_campaign_dir/state/basins/7020000010/current.json" >"$test_tmp/subset-failed"
 mv "$test_tmp/subset-failed" "$subset_campaign_dir/state/basins/7020000010/current.json"
 mark_compile_succeeded "$subset_campaign_dir" 1020011530
+mkdir -p "$test_tmp/fixtures/subset-partial-fabric/aux"
+subset_partial_fabric_root=$(cd -P "$test_tmp/fixtures/subset-partial-fabric" && pwd -P)
+for partial_file in catchments.parquet graph.parquet manifest.json aux/snap_stems.parquet; do
+    printf '%s\n' fixture >"$subset_partial_fabric_root/$partial_file"
+done
+printf '%s\n' '["1020000010"]' >"$test_tmp/fixtures/subset-partial-fabric-roster.json"
+subset_partial_fabric_roster=$(cd -P "$test_tmp/fixtures" && pwd -P)/subset-partial-fabric-roster.json
 HFX_TEST_EXPECTED_ASSEMBLY_ARGV=$test_tmp/subset-assembly-argv
 export HFX_TEST_EXPECTED_ASSEMBLY_ARGV
 printf '%s\n' \
     assemble \
-    --input "$subset_campaign_dir/basin-outputs/1020000010" \
+    --partial-input "$subset_partial_fabric_root" \
+    --partial-roster "$subset_partial_fabric_roster" \
     --input "$subset_campaign_dir/basin-outputs/9020000010" \
     --out "$subset_campaign_dir/assembly/dataset" >"$HFX_TEST_EXPECTED_ASSEMBLY_ARGV"
-run_runner assemble --campaign subset --workspace-root "$subset_root" >"$case_stdout"
-jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+run_runner assemble --campaign subset --workspace-root "$subset_root" \
+    --partial-fabric "$subset_partial_fabric_root" \
+    --partial-fabric-roster "$subset_partial_fabric_roster" \
+    --exclude-control-basin 1020000010 >"$case_stdout"
+jq -e --arg root "$subset_partial_fabric_root" --arg roster "$subset_partial_fabric_roster" '. == {
+  schema_version:2,status:"succeeded",attempts:1,failure_reason:null,
+  fabric_root:$root,fabric_roster_path:$roster,fabric_basin_ids:["1020000010"],
+  excluded_control_basin_id:"1020000010",included_basin_ids:["9020000010"],
+  included_dataset_paths:["basin-outputs/9020000010"],output_path:"assembly/dataset",
+  report_path:"reports/assembly.json"
+}' \
     "$subset_campaign_dir/state/assembly.json" >/dev/null ||
     die 'subset assembly state admitted a failed or unselected basin'
-jq -e '.input_basin_ids == ["1020000010","9020000010"]' \
+jq -e --arg root "$subset_partial_fabric_root" --arg roster "$subset_partial_fabric_roster" '. == {
+  schema_version:2,campaign:"subset",fabric_root:$root,fabric_roster_path:$roster,
+  fabric_basin_ids:["1020000010"],excluded_control_basin_id:"1020000010",
+  included_basin_ids:["9020000010"],included_dataset_paths:["basin-outputs/9020000010"],
+  output_path:"assembly/dataset"
+}' \
     "$subset_campaign_dir/reports/assembly.json" >/dev/null ||
     die 'subset assembly report admitted a failed or unselected basin'
 pass 'compile and assemble remain scoped to the frozen selection'
@@ -4158,6 +4255,30 @@ jq -e --arg campaign equal '
     die 'runner-owned assembly report was placed beneath the dataset'
 pass 'assembly succeeds with exact sorted repeated-input argv and external report'
 
+assembly_extension_root=$(new_assembly_workspace assembly-extension-success)
+assembly_extension_dir=$assembly_extension_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_extension_dir" 7020000010
+mark_compile_succeeded "$assembly_extension_dir" 1020000010
+write_expected_assembly_argv "$assembly_extension_dir" extension
+set -- $(extension_options)
+run_runner assemble --campaign equal --workspace-root "$assembly_extension_root" "$@" >"$case_stdout"
+jq -e --arg root "$partial_fabric_root" --arg roster "$partial_fabric_roster" '. == {
+  schema_version:2,status:"succeeded",attempts:1,failure_reason:null,
+  fabric_root:$root,fabric_roster_path:$roster,fabric_basin_ids:["1020000010"],
+  excluded_control_basin_id:"1020000010",included_basin_ids:["7020000010"],
+  included_dataset_paths:["basin-outputs/7020000010"],output_path:"assembly/dataset",
+  report_path:"reports/assembly.json"
+}' "$assembly_extension_dir/state/assembly.json" >/dev/null || die 'extension state differs'
+jq -e --arg root "$partial_fabric_root" --arg roster "$partial_fabric_roster" '. == {
+  schema_version:2,campaign:"equal",fabric_root:$root,fabric_roster_path:$roster,
+  fabric_basin_ids:["1020000010"],excluded_control_basin_id:"1020000010",
+  included_basin_ids:["7020000010"],included_dataset_paths:["basin-outputs/7020000010"],
+  output_path:"assembly/dataset"
+}' "$assembly_extension_dir/reports/assembly.json" >/dev/null || die 'extension report differs'
+[[ ! -e "$assembly_extension_dir/assembly/dataset/1020000010" ]] ||
+    die 'extension assembly included the control output'
+pass 'partial-fabric extension succeeds with complete schema-2 provenance'
+
 for rejected_verb in assemble assembly; do
     literal_status=0
     "$test_tmp/fake-hfx" "$rejected_verb" --strict --sample-pct 100 --format text \
@@ -4185,16 +4306,111 @@ diff -u "$test_tmp/assembly-empty-state-before" "$assembly_empty_dir/state/assem
     die 'empty assembly created a staging entry'
 pass 'assembly refuses an empty compiled-basin selection without mutation'
 
+assembly_preflight_root=$(new_assembly_workspace assembly-extension-preflight)
+assembly_preflight_dir=$assembly_preflight_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_preflight_dir" 1020000010
+mark_compile_succeeded "$assembly_preflight_dir" 7020000010
+cp "$assembly_preflight_dir/state/assembly.json" "$test_tmp/extension-preflight-state-before"
+preflight_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+preflight_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+printf '%s\n' fixture >"$test_tmp/fixtures/partial-fabric-file"
+mkdir "$test_tmp/fixtures/empty-roster-directory"
+: >"$test_tmp/fixtures/empty-roster.json"
+ln -s "$partial_fabric_root" "$test_tmp/fixtures/partial-fabric-link"
+ln -s "$partial_fabric_roster" "$test_tmp/fixtures/partial-roster-link"
+for malformed_name in not-json empty unsorted duplicate unknown; do
+    case $malformed_name in
+        not-json) malformed_bytes=not-json ;;
+        empty) malformed_bytes='[]' ;;
+        unsorted) malformed_bytes='["7020000010","1020000010"]' ;;
+        duplicate) malformed_bytes='["1020000010","1020000010"]' ;;
+        unknown) malformed_bytes='["9999999999"]' ;;
+    esac
+    printf '%s\n' "$malformed_bytes" >"$test_tmp/fixtures/roster-$malformed_name.json"
+done
+expect_failure 'relative partial fabric' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+    --partial-fabric relative --partial-fabric-roster "$partial_fabric_roster" --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'option --partial-fabric must be an absolute path'
+for unsafe_root in "$test_tmp/fixtures/missing-fabric" "$test_tmp/fixtures/partial-fabric-file" \
+    "$test_tmp/fixtures/partial-fabric-link"; do
+    expect_failure 'unsafe partial fabric' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+        --partial-fabric "$unsafe_root" --partial-fabric-roster "$partial_fabric_roster" --exclude-control-basin 1020000010
+    assert_contains "$case_stderr" "partial fabric root is not a safe directory: $unsafe_root"
+done
+expect_failure 'relative partial roster' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster relative --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'option --partial-fabric-roster must be an absolute path'
+for unsafe_roster in "$test_tmp/fixtures/missing-roster" "$test_tmp/fixtures/empty-roster.json" \
+    "$test_tmp/fixtures/empty-roster-directory" "$test_tmp/fixtures/partial-roster-link"; do
+    expect_failure 'unsafe partial roster' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+        --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$unsafe_roster" --exclude-control-basin 1020000010
+    assert_contains "$case_stderr" "partial fabric roster is not a safe nonempty regular file: $unsafe_roster"
+done
+for malformed_name in not-json empty unsorted duplicate unknown; do
+    malformed_roster=$(cd -P "$test_tmp/fixtures" && pwd -P)/roster-$malformed_name.json
+    expect_failure "malformed roster $malformed_name" assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+        --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$malformed_roster" --exclude-control-basin 1020000010
+    assert_contains "$case_stderr" "partial fabric roster is malformed: $malformed_roster"
+done
+cmp "$test_tmp/extension-preflight-state-before" "$assembly_preflight_dir/state/assembly.json"
+[[ ! -e "$assembly_preflight_dir/reports/assembly.json" && ! -e "$assembly_preflight_dir/assembly/dataset" ]] ||
+    die 'extension preflight refusal created an artifact'
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$preflight_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$preflight_hfx_lines" ]] ||
+    die 'extension preflight refusal invoked adapter or HFX'
+pass 'extension path and roster preflight refusals are mutation-free'
+
+expect_failure 'control absent inventory' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" --exclude-control-basin 9999999999
+assert_contains "$case_stderr" 'excluded control basin is not in the authoritative inventory: 9999999999'
+assembly_selection_root=$test_tmp/workspaces/assembly-control-selection
+mkdir "$assembly_selection_root"
+set -- $(subset_init_args control-selection "$assembly_selection_root")
+run_runner "$@" >"$case_stdout"
+printf '%s\n' '["1020011530"]' >"$test_tmp/fixtures/unselected-control-roster.json"
+expect_failure 'control absent frozen selection' assemble --campaign control-selection \
+    --workspace-root "$assembly_selection_root" --partial-fabric "$partial_fabric_root" \
+    --partial-fabric-roster "$test_tmp/fixtures/unselected-control-roster.json" \
+    --exclude-control-basin 1020011530
+assert_contains "$case_stderr" 'excluded control basin is not in the frozen campaign selection: 1020011530'
+printf '%s\n' '["7020000010"]' >"$test_tmp/fixtures/control-absent-roster.json"
+expect_failure 'control absent roster' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$test_tmp/fixtures/control-absent-roster.json" \
+    --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'excluded control basin is not in the partial fabric roster: 1020000010'
+assembly_pending_root=$(new_assembly_workspace assembly-control-pending)
+expect_failure 'control compile pending' assemble --campaign equal --workspace-root "$assembly_pending_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'excluded control basin compile status is not succeeded: 1020000010'
+
+assembly_no_new_root=$(new_assembly_workspace assembly-no-new)
+assembly_no_new_dir=$assembly_no_new_root/tdx-hydro-equal
+mark_compile_succeeded "$assembly_no_new_dir" 1020000010
+cp "$assembly_no_new_dir/state/assembly.json" "$test_tmp/assembly-no-new-before"
+expect_failure 'extension has no new basin' assemble --campaign equal --workspace-root "$assembly_no_new_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'assembly requires at least one successful non-excluded basin absent from the partial fabric roster'
+cmp "$test_tmp/assembly-no-new-before" "$assembly_no_new_dir/state/assembly.json"
+
+printf '%s\n' '["1020000010","7020000010"]' >"$test_tmp/fixtures/control-and-new-roster.json"
+control_and_new_roster=$(cd -P "$test_tmp/fixtures" && pwd -P)/control-and-new-roster.json
+expect_failure 'compiled roster resident basin' assemble --campaign equal --workspace-root "$assembly_preflight_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$control_and_new_roster" \
+    --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'compiled basin is already present in partial fabric roster and is not the excluded control: 7020000010'
+pass 'extension control and new-basin selection refusals are deterministic'
+
 assembly_adopt_root=$(new_assembly_workspace assembly-adopt)
 assembly_adopt_dir=$assembly_adopt_root/tdx-hydro-equal
 mark_compile_succeeded "$assembly_adopt_dir" 7020000010
 mark_compile_succeeded "$assembly_adopt_dir" 1020000010
-write_assembly_state_fixture "$assembly_adopt_dir" running 1 ''
 create_assembly_dataset_fixture "$assembly_adopt_dir/assembly/dataset"
-run_runner recover --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
 adopt_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
 adopt_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
-run_runner assemble --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+write_assembly_state_fixture "$assembly_adopt_dir" running 1 '' extension
+run_runner recover --campaign equal --workspace-root "$assembly_adopt_root" >"$case_stdout"
+set -- $(extension_options)
+run_runner assemble --campaign equal --workspace-root "$assembly_adopt_root" "$@" >"$case_stdout"
 [[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$adopt_assemble_before" ]] ||
     die 'attributable adoption invoked assemble'
 [[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((adopt_validate_before + 1)) ]] ||
@@ -4228,10 +4444,12 @@ assembly_retry_root=$(new_assembly_workspace assembly-retry)
 assembly_retry_dir=$assembly_retry_root/tdx-hydro-equal
 mark_compile_succeeded "$assembly_retry_dir" 7020000010
 mark_compile_succeeded "$assembly_retry_dir" 1020000010
-write_expected_assembly_argv "$assembly_retry_dir"
+write_expected_assembly_argv "$assembly_retry_dir" extension
 cp -R "$assembly_retry_dir/state/basins" "$test_tmp/retry-basins-before"
 HFX_TEST_FAIL_ASSEMBLY=1 expect_failure 'injected assembly failure' \
-    assemble --campaign equal --workspace-root "$assembly_retry_root"
+    assemble --campaign equal --workspace-root "$assembly_retry_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
 jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "adapter assembly failed"' \
     "$assembly_retry_dir/state/assembly.json" >/dev/null
 [[ ! -e "$assembly_retry_dir/assembly/dataset" &&
@@ -4239,7 +4457,8 @@ jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "adapter as
     die 'adapter assembly failure left a dataset or report'
 diff -ru "$test_tmp/retry-basins-before" "$assembly_retry_dir/state/basins"
 retry_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
-run_runner assemble --campaign equal --workspace-root "$assembly_retry_root" >"$case_stdout"
+set -- $(extension_options)
+run_runner assemble --campaign equal --workspace-root "$assembly_retry_root" "$@" >"$case_stdout"
 [[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((retry_assemble_before + 1)) ]] ||
     die 'assembly retry did not issue exactly one fresh assemble vector'
 jq -e '.status == "succeeded" and .attempts == 2' "$assembly_retry_dir/state/assembly.json" >/dev/null
@@ -4249,12 +4468,13 @@ assembly_stage_root=$(new_assembly_workspace assembly-stage)
 assembly_stage_dir=$assembly_stage_root/tdx-hydro-equal
 mark_compile_succeeded "$assembly_stage_dir" 7020000010
 mark_compile_succeeded "$assembly_stage_dir" 1020000010
-write_assembly_state_fixture "$assembly_stage_dir" running 1 ''
+write_assembly_state_fixture "$assembly_stage_dir" running 1 '' extension
 mkdir "$assembly_stage_dir/assembly/.dataset.tmp-interrupted"
 printf '%s\n' keep >"$assembly_stage_dir/assembly/unrelated"
 run_runner recover --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
-write_expected_assembly_argv "$assembly_stage_dir"
-run_runner assemble --campaign equal --workspace-root "$assembly_stage_root" >"$case_stdout"
+write_expected_assembly_argv "$assembly_stage_dir" extension
+set -- $(extension_options)
+run_runner assemble --campaign equal --workspace-root "$assembly_stage_root" "$@" >"$case_stdout"
 [[ ! -e "$assembly_stage_dir/assembly/.dataset.tmp-interrupted" ]] ||
     die 'attributable interrupted staging was not removed'
 [[ $(<"$assembly_stage_dir/assembly/unrelated") == keep ]] ||
@@ -4262,37 +4482,41 @@ run_runner assemble --campaign equal --workspace-root "$assembly_stage_root" >"$
 jq -e '.status == "succeeded" and .attempts == 2' "$assembly_stage_dir/state/assembly.json" >/dev/null
 pass 'recover removes only attributable adapter staging before retry'
 
-cp "$assembly_success_dir/reports/assembly.json" "$test_tmp/assembly-success-report-before"
-success_attempts_before=$(jq -r '.attempts' "$assembly_success_dir/state/assembly.json")
+cp "$assembly_extension_dir/reports/assembly.json" "$test_tmp/assembly-success-report-before"
+success_attempts_before=$(jq -r '.attempts' "$assembly_extension_dir/state/assembly.json")
 success_assemble_before=$(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :)
 success_validate_before=$(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :)
-run_runner assemble --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+set -- $(extension_options)
+run_runner assemble --campaign equal --workspace-root "$assembly_extension_root" "$@" >"$case_stdout"
 [[ $(grep -c '^assemble' "$HFX_TEST_ADAPTER_LOG" || :) -eq "$success_assemble_before" ]] ||
     die 'succeeded assembly resume invoked assemble'
 [[ $(grep -c '^validate' "$HFX_TEST_ADAPTER_LOG" || :) -eq $((success_validate_before + 1)) ]] ||
     die 'succeeded assembly resume did not validate exactly once'
-[[ $(jq -r '.attempts' "$assembly_success_dir/state/assembly.json") -eq "$success_attempts_before" ]] ||
+[[ $(jq -r '.attempts' "$assembly_extension_dir/state/assembly.json") -eq "$success_attempts_before" ]] ||
     die 'succeeded assembly resume incremented attempts'
-diff -u "$test_tmp/assembly-success-report-before" "$assembly_success_dir/reports/assembly.json"
-run_runner status --campaign equal --workspace-root "$assembly_success_root" >"$case_stdout"
+diff -u "$test_tmp/assembly-success-report-before" "$assembly_extension_dir/reports/assembly.json"
+run_runner status --campaign equal --workspace-root "$assembly_extension_root" >"$case_stdout"
 assert_contains "$case_stdout" 'assemble_pending=0'
 assert_contains "$case_stdout" 'assemble_running=0'
 assert_contains "$case_stdout" 'assemble_succeeded=1'
 assert_contains "$case_stdout" 'assemble_failed=0'
 assembly_changed_root=$test_tmp/workspaces/assembly-changed
 mkdir "$assembly_changed_root"
-cp -R "$assembly_success_dir" "$assembly_changed_root/tdx-hydro-equal"
+cp -R "$assembly_extension_dir" "$assembly_changed_root/tdx-hydro-equal"
 assembly_changed_dir=$assembly_changed_root/tdx-hydro-equal
-mark_compile_succeeded "$assembly_changed_dir" 1020011530
+mark_compile_succeeded "$assembly_changed_dir" 9020000010
 changed_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
 changed_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
 expect_failure 'changed succeeded assembly input set' \
-    assemble --campaign equal --workspace-root "$assembly_changed_root"
+    assemble --campaign equal --workspace-root "$assembly_changed_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
 assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
 jq -e '
   .status == "failed" and .attempts == 1 and
   .failure_reason == "existing succeeded assembly failed resume verification; retained for inspection" and
-  .input_basin_ids == ["1020000010","7020000010"]
+  .fabric_basin_ids == ["1020000010"] and .included_basin_ids == ["7020000010"] and
+  .included_dataset_paths == ["basin-outputs/7020000010"]
 ' "$assembly_changed_dir/state/assembly.json" >/dev/null
 [[ -d "$assembly_changed_dir/assembly/dataset" &&
    -f "$assembly_changed_dir/reports/assembly.json" ]] ||
@@ -4300,16 +4524,109 @@ jq -e '
 [[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$changed_adapter_lines" &&
    $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$changed_hfx_lines" ]] ||
     die 'changed succeeded input set invoked adapter or HFX'
+
+mkdir -p "$test_tmp/fixtures/second-partial-fabric/aux"
+drift_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
+drift_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
+second_partial_fabric_root=$(cd -P "$test_tmp/fixtures/second-partial-fabric" && pwd -P)
+for partial_file in catchments.parquet graph.parquet manifest.json aux/snap_stems.parquet; do
+    printf '%s\n' fixture >"$second_partial_fabric_root/$partial_file"
+done
+printf '%s\n' '["1020000010"]' >"$test_tmp/fixtures/second-partial-roster.json"
+second_partial_fabric_roster=$(cd -P "$test_tmp/fixtures" && pwd -P)/second-partial-roster.json
+for drift_kind in root roster; do
+    drift_root=$test_tmp/workspaces/assembly-drift-$drift_kind
+    mkdir "$drift_root"
+    cp -R "$assembly_extension_dir" "$drift_root/tdx-hydro-equal"
+    drift_dir=$drift_root/tdx-hydro-equal
+    cp "$drift_dir/state/assembly.json" "$test_tmp/drift-$drift_kind-expected"
+    jq '.status="failed" | .failure_reason="existing succeeded assembly failed resume verification; retained for inspection"' \
+        "$test_tmp/drift-$drift_kind-expected" >"$test_tmp/drift-$drift_kind-failed"
+    if [[ "$drift_kind" == root ]]; then
+        requested_root=$second_partial_fabric_root
+        requested_roster=$partial_fabric_roster
+    else
+        requested_root=$partial_fabric_root
+        requested_roster=$second_partial_fabric_roster
+    fi
+    expect_failure "$drift_kind provenance drift" assemble --campaign equal --workspace-root "$drift_root" \
+        --partial-fabric "$requested_root" --partial-fabric-roster "$requested_roster" \
+        --exclude-control-basin 1020000010
+    assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
+    jq -S . "$drift_dir/state/assembly.json" >"$test_tmp/drift-$drift_kind-actual"
+    jq -S . "$test_tmp/drift-$drift_kind-failed" >"$test_tmp/drift-$drift_kind-failed-sorted"
+    diff -u "$test_tmp/drift-$drift_kind-failed-sorted" "$test_tmp/drift-$drift_kind-actual"
+done
+
+control_drift_root=$test_tmp/workspaces/assembly-drift-control
+mkdir "$control_drift_root"
+cp -R "$assembly_extension_dir" "$control_drift_root/tdx-hydro-equal"
+control_drift_dir=$control_drift_root/tdx-hydro-equal
+mark_compile_succeeded "$control_drift_dir" 9020000010
+jq '.stages.compile={status:"failed",attempts:1,failure_reason:"adapter validation failed",diagnostic_report:null}' \
+    "$control_drift_dir/state/basins/1020000010/current.json" >"$test_tmp/control-drift-basin"
+mv "$test_tmp/control-drift-basin" "$control_drift_dir/state/basins/1020000010/current.json"
+jq --arg roster "$control_and_new_roster" '
+  .fabric_roster_path=$roster | .fabric_basin_ids=["1020000010","7020000010"] |
+  .included_basin_ids=["9020000010"] | .included_dataset_paths=["basin-outputs/9020000010"]
+' "$control_drift_dir/state/assembly.json" >"$test_tmp/control-drift-state"
+mv "$test_tmp/control-drift-state" "$control_drift_dir/state/assembly.json"
+jq --arg roster "$control_and_new_roster" '
+  .fabric_roster_path=$roster | .fabric_basin_ids=["1020000010","7020000010"] |
+  .included_basin_ids=["9020000010"] | .included_dataset_paths=["basin-outputs/9020000010"]
+' "$control_drift_dir/reports/assembly.json" >"$test_tmp/control-drift-report"
+mv "$test_tmp/control-drift-report" "$control_drift_dir/reports/assembly.json"
+expect_failure 'control-only provenance drift' assemble --campaign equal --workspace-root "$control_drift_root" \
+    --partial-fabric "$partial_fabric_root" \
+    --partial-fabric-roster "$control_and_new_roster" \
+    --exclude-control-basin 7020000010
+assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
+jq -e '
+  .status == "failed" and .attempts == 1 and
+  .failure_reason == "existing succeeded assembly failed resume verification; retained for inspection" and
+  .fabric_basin_ids == ["1020000010","7020000010"] and
+  .excluded_control_basin_id == "1020000010" and .included_basin_ids == ["9020000010"]
+' "$control_drift_dir/state/assembly.json" >/dev/null || die 'control-only drift state differs'
+
+roster_content_root=$test_tmp/workspaces/assembly-drift-roster-content
+mkdir "$roster_content_root"
+cp -R "$assembly_extension_dir" "$roster_content_root/tdx-hydro-equal"
+cp "$partial_fabric_roster" "$test_tmp/original-partial-roster"
+printf '%s\n' '["1020000010","1020011530"]' >"$partial_fabric_roster"
+expect_failure 'roster content provenance drift' assemble --campaign equal --workspace-root "$roster_content_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
+assert_contains "$case_stderr" 'existing succeeded assembly failed resume verification; retained for inspection'
+mv "$test_tmp/original-partial-roster" "$partial_fabric_roster"
+
+malformed_tuple_root=$test_tmp/workspaces/assembly-malformed-tuple
+mkdir "$malformed_tuple_root"
+cp -R "$assembly_extension_dir" "$malformed_tuple_root/tdx-hydro-equal"
+malformed_tuple_dir=$malformed_tuple_root/tdx-hydro-equal
+jq '.included_dataset_paths=["basin-outputs/9020000010"]' \
+    "$malformed_tuple_dir/state/assembly.json" >"$test_tmp/malformed-tuple"
+mv "$test_tmp/malformed-tuple" "$malformed_tuple_dir/state/assembly.json"
+cp "$malformed_tuple_dir/state/assembly.json" "$test_tmp/malformed-tuple-before"
+expect_failure 'malformed persisted extension tuple' assemble --campaign equal --workspace-root "$malformed_tuple_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
+assert_contains "$case_stderr" "assembly state is malformed: $malformed_tuple_dir/state/assembly.json"
+cmp "$test_tmp/malformed-tuple-before" "$malformed_tuple_dir/state/assembly.json"
+[[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$drift_adapter_lines" &&
+   $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$drift_hfx_lines" ]] ||
+    die 'extension provenance drift invoked adapter or HFX'
 pass 'succeeded assembly resumes by verification without report or attempt mutation'
 
 assembly_invalid_root=$(new_assembly_workspace assembly-invalid)
 assembly_invalid_dir=$assembly_invalid_root/tdx-hydro-equal
 mark_compile_succeeded "$assembly_invalid_dir" 7020000010
 mark_compile_succeeded "$assembly_invalid_dir" 1020000010
-write_expected_assembly_argv "$assembly_invalid_dir"
+write_expected_assembly_argv "$assembly_invalid_dir" extension
 cp -R "$assembly_invalid_dir/state/basins" "$test_tmp/invalid-basins-before"
 HFX_TEST_FAIL_ASSEMBLY_VALIDATE=1 expect_failure 'post-assembly validation failure' \
-    assemble --campaign equal --workspace-root "$assembly_invalid_root"
+    assemble --campaign equal --workspace-root "$assembly_invalid_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
 assert_contains "$case_stderr" 'assembled dataset validation failed; retained for inspection'
 jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "assembled dataset validation failed; retained for inspection"' \
     "$assembly_invalid_dir/state/assembly.json" >/dev/null
@@ -4319,7 +4636,9 @@ jq -e '.status == "failed" and .attempts == 1 and .failure_reason == "assembled 
 diff -ru "$test_tmp/invalid-basins-before" "$assembly_invalid_dir/state/basins"
 invalid_adapter_lines=$(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ')
 invalid_hfx_lines=$(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ')
-expect_failure 'post-validation artifact rerun' assemble --campaign equal --workspace-root "$assembly_invalid_root"
+expect_failure 'post-validation artifact rerun' assemble --campaign equal --workspace-root "$assembly_invalid_root" \
+    --partial-fabric "$partial_fabric_root" --partial-fabric-roster "$partial_fabric_roster" \
+    --exclude-control-basin 1020000010
 assert_contains "$case_stderr" 'assembly dataset exists without attributable interrupted or succeeded state; retained for inspection'
 [[ $(wc -l <"$HFX_TEST_ADAPTER_LOG" | tr -d ' ') -eq "$invalid_adapter_lines" &&
    $(wc -l <"$HFX_TEST_HFX_LOG" | tr -d ' ') -eq "$invalid_hfx_lines" ]] ||
@@ -4332,7 +4651,7 @@ if grep -Ev $'/assembly/dataset\t--strict\t--sample-pct\t100\t--format\ttext$' \
     "$test_tmp/assembly-hfx-delta" >"$case_stdout"; then
     die 'assembly HFX delta contains a non-validation vector'
 fi
-[[ $(wc -l <"$test_tmp/assembly-hfx-delta" | tr -d ' ') -eq 5 ]] ||
+[[ $(wc -l <"$test_tmp/assembly-hfx-delta" | tr -d ' ') -eq 6 ]] ||
     die 'assembly cases produced an unexpected HFX validation count'
 if grep -Ev '^(build|validate|assemble)[[:space:]]' "$HFX_TEST_ADAPTER_LOG" >"$case_stdout"; then
     die 'adapter log contains an unknown command after assembly cases'
