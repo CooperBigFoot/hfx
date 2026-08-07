@@ -1,21 +1,35 @@
-GRIT D8 upload runbook self-test
-=================================
-PASS: scope accepts keys beneath TARGET_PREFIX
-PASS: scope out-of-prefix destination aborts: merit/0.2.0/manifest.json
-PASS: scope out-of-prefix destination aborts: grit/1.0.0/manifest.json
-PASS: membership accepts six exact paths and rejects unrelated paths
-PASS: gating requires execute plus publish-manifest
-PASS: enumeration yields six deterministic operations, one skip, and manifest last
+GRIT HFX v0.3.0 manifest runbook self-test
+PASS: canonical authority package accepted
+PASS: candidate manifest byte drift rejected
+PASS: former manifest byte drift rejected
+PASS: prerequisite identity inventory drift rejected before planning
+PASS: exact target accepts grit/hfx-v0.3.0/manifest.json
+PASS: non-manifest and literal successor-prefix negative-fixture destinations rejected
+PASS: extra COG and attribution operations rejected
+PASS: non-final manifest ordering rejected
+PASS: publication source substitution rejected
+PASS: rollback source substitution rejected
+PASS: default dry-run made zero remote-copy calls
+PASS: execute and action combinations require exactly one explicit action
+PASS: publication confirmation rejects rollback, empty, and corrupt phrases
+PASS: rollback confirmation rejects publication, empty, and corrupt phrases
+PASS: rollback selects 1132 bytes sha256 0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4
 self-test OK
-
-GRIT D8 manifest amendment dry-run
-====================================
-upload-r2-grit-d8.sh dry-run (zero AWS calls made):
-target prefix: grit/hfx-v0.3.0/   profile: upstream-r2   staging: <STAGING>
-DRY-RUN: aws s3 cp <STAGING>/CITATION.txt s3://basin-delineations-public/grit/hfx-v0.3.0/CITATION.txt
-DRY-RUN: aws s3 cp <STAGING>/NOTICE s3://basin-delineations-public/grit/hfx-v0.3.0/NOTICE
-DRY-RUN: aws s3 cp <STAGING>/README.md s3://basin-delineations-public/grit/hfx-v0.3.0/README.md
-DRY-RUN: aws s3 cp <STAGING>/aux/d8/flow_acc.tif s3://basin-delineations-public/grit/hfx-v0.3.0/aux/d8/flow_acc.tif
-DRY-RUN: aws s3 cp <STAGING>/aux/d8/flow_dir.tif s3://basin-delineations-public/grit/hfx-v0.3.0/aux/d8/flow_dir.tif
-DRY-RUN: aws s3 cp <STAGING>/manifest.json s3://basin-delineations-public/grit/hfx-v0.3.0/manifest.json   GATED: requires --execute --publish-manifest after ticket #45 release
-6 operations; zero uploads. Manifest publication requires --execute --publish-manifest.
+GRIT HFX v0.3.0 publication dry-run (zero AWS calls made)
+authority: hosting/grit-hfx-v0.3.0
+candidate: manifest.json 1426 bytes sha256 02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c
+former: manifest.former.json 1132 bytes sha256 0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4
+prerequisites: 7 exact inventory entries; COG live evidence is Content-Length plus ETag only
+flow_dir: Content-Length 50686516478 ETag "bc48d1013cf6908fb44c325dd2ad10ab-1511"; historical recorded sha256 eace32b63c4bc09e8172f03cce6dacfbf09a86c6b51c42b50c6cccd498d4d656 (not live-verified)
+flow_acc: Content-Length 205069870081 ETag "49eab3942a26036aa49e72ea33a1b724-6112"; historical recorded sha256 30f16ba3238085289d87e72f3386fa152da7e9b56063f5d610422d20a79fc98b (not live-verified)
+PLAN 1/1 (manifest only; manifest last): hosting/grit-hfx-v0.3.0/manifest.json -> s3://basin-delineations-public/grit/hfx-v0.3.0/manifest.json application/json
+1 operation; zero AWS calls; zero mutations.
+GRIT HFX v0.3.0 rollback dry-run (zero AWS calls made)
+authority: hosting/grit-hfx-v0.3.0
+candidate: manifest.json 1426 bytes sha256 02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c
+former: manifest.former.json 1132 bytes sha256 0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4
+prerequisites: 7 exact inventory entries; COG live evidence is Content-Length plus ETag only
+flow_dir: Content-Length 50686516478 ETag "bc48d1013cf6908fb44c325dd2ad10ab-1511"; historical recorded sha256 eace32b63c4bc09e8172f03cce6dacfbf09a86c6b51c42b50c6cccd498d4d656 (not live-verified)
+flow_acc: Content-Length 205069870081 ETag "49eab3942a26036aa49e72ea33a1b724-6112"; historical recorded sha256 30f16ba3238085289d87e72f3386fa152da7e9b56063f5d610422d20a79fc98b (not live-verified)
+PLAN 1/1 (manifest only; manifest last): hosting/grit-hfx-v0.3.0/manifest.former.json -> s3://basin-delineations-public/grit/hfx-v0.3.0/manifest.json application/json
+1 operation; zero AWS calls; zero mutations.
