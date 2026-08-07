@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "dataset": "grit-hfx-v0.3.0",
+  "base_url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/",
+  "source_ref": "c1b19aec580ad13af8235ee6037e0b9b5081933d",
+  "cross_repository_evidence_ref": "6f12abf2f7d47a31d7c1a4cdee99e30db7400bb6",
+  "recorded_on": "2026-08-07",
+  "observer": "orchestrator",
+  "executor_network_model": "offline_zero_requests",
+  "candidate_provenance": {
+    "origin": "accepted_planetary_build",
+    "accepted_build_started_at": "2026-07-21T16:41:05Z",
+    "accepted_build_ended_at": "2026-07-21T21:05:25Z",
+    "created_at": "2026-07-21T21:05:12Z",
+    "public_former_created_at": "2026-06-29T20:08:11Z",
+    "derivation": "former_fields_with_accepted_build_created_at_then_pinned_d8_amendment",
+    "measured_field_difference": "created_at_only",
+    "serialization": "json.dumps(manifest, indent=2) + newline",
+    "direct_public_former_amendment": {
+      "bytes": 1426,
+      "sha256": "fb79355f85f8a52ff7d693c0152aec2262c96ff7e59a3bc9357993a8e0c6a3e1",
+      "matches_candidate": false
+    },
+    "discrimination": [
+      {
+        "created_at": "2026-07-21T21:05:11Z",
+        "sha256_prefix": "0eeda73b",
+        "matches_candidate": false
+      },
+      {
+        "created_at": "2026-07-21T21:05:12Z",
+        "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c",
+        "matches_candidate": true
+      },
+      {
+        "created_at": "2026-07-21T21:05:13Z",
+        "sha256_prefix": "b345d904",
+        "matches_candidate": false
+      }
+    ]
+  },
+  "observed_transfer": {
+    "total_body_bytes": 12048,
+    "cog_body_bytes": 0,
+    "full_cog_sha256_bytes_forbidden": 255756386559
+  },
+  "objects": [
+    {
+      "role": "candidate_manifest",
+      "authority_path": "manifest.json",
+      "hosted_key": "manifest.json",
+      "identity": {
+        "bytes": 1426,
+        "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c",
+        "sha256_basis": "computed_from_authority_bytes"
+      },
+      "verification_strength": "full_sha256",
+      "hosted_observation": null
+    },
+    {
+      "role": "former_manifest",
+      "authority_path": "manifest.former.json",
+      "hosted_key": "manifest.json",
+      "identity": {
+        "bytes": 1132,
+        "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4",
+        "sha256_basis": "computed_from_embedded_bytes_and_orchestrator_full_body"
+      },
+      "verification_strength": "full_sha256",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "GET_full_body",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manifest.json",
+        "http_status": 200,
+        "content_length": null,
+        "etag": null,
+        "last_modified": null,
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 1132,
+        "body_sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4",
+        "matches_authority_bytes": true,
+        "claim": "full_body_sha256_measured"
+      }
+    },
+    {
+      "role": "hosted_cog",
+      "authority_path": null,
+      "hosted_key": "aux/d8/flow_dir.tif",
+      "identity": {
+        "bytes": 50686516478,
+        "sha256": "eace32b63c4bc09e8172f03cce6dacfbf09a86c6b51c42b50c6cccd498d4d656",
+        "sha256_basis": "recorded_historical_build_identity_at_source_ref"
+      },
+      "verification_strength": "content_length_and_etag_only",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "HEAD_only",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/aux/d8/flow_dir.tif",
+        "http_status": 200,
+        "content_length": 50686516478,
+        "etag": "\"bc48d1013cf6908fb44c325dd2ad10ab-1511\"",
+        "last_modified": "Wed, 22 Jul 2026 16:16:52 GMT",
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 0,
+        "body_sha256": null,
+        "matches_recorded_size": true,
+        "matches_recorded_sha256": null,
+        "claim": "content_length_and_etag_only"
+      }
+    },
+    {
+      "role": "hosted_cog",
+      "authority_path": null,
+      "hosted_key": "aux/d8/flow_acc.tif",
+      "identity": {
+        "bytes": 205069870081,
+        "sha256": "30f16ba3238085289d87e72f3386fa152da7e9b56063f5d610422d20a79fc98b",
+        "sha256_basis": "recorded_historical_build_identity_at_source_ref"
+      },
+      "verification_strength": "content_length_and_etag_only",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "HEAD_only",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/aux/d8/flow_acc.tif",
+        "http_status": 200,
+        "content_length": 205069870081,
+        "etag": "\"49eab3942a26036aa49e72ea33a1b724-6112\"",
+        "last_modified": "Wed, 22 Jul 2026 16:04:21 GMT",
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 0,
+        "body_sha256": null,
+        "matches_recorded_size": true,
+        "matches_recorded_sha256": null,
+        "claim": "content_length_and_etag_only"
+      }
+    },
+    {
+      "role": "hosted_attribution",
+      "authority_path": "NOTICE",
+      "hosted_key": "NOTICE",
+      "identity": {
+        "bytes": 1454,
+        "sha256": "eac224bf0b70b1494e5abd89f80079d665150ea744a2f730593f7216ca223db3",
+        "sha256_basis": "computed_from_authority_bytes_and_orchestrator_full_body"
+      },
+      "verification_strength": "full_sha256",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "GET_full_body",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/NOTICE",
+        "http_status": 200,
+        "content_length": null,
+        "etag": null,
+        "last_modified": null,
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 1454,
+        "body_sha256": "eac224bf0b70b1494e5abd89f80079d665150ea744a2f730593f7216ca223db3",
+        "matches_authority_bytes": true,
+        "claim": "full_body_sha256_measured"
+      }
+    },
+    {
+      "role": "hosted_attribution",
+      "authority_path": "CITATION.txt",
+      "hosted_key": "CITATION.txt",
+      "identity": {
+        "bytes": 2495,
+        "sha256": "8c7bf86a5962bf42282bbfd401226773601c2551f79685bad9be68d3b41363ac",
+        "sha256_basis": "computed_from_authority_bytes_and_orchestrator_full_body"
+      },
+      "verification_strength": "full_sha256",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "GET_full_body",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/CITATION.txt",
+        "http_status": 200,
+        "content_length": null,
+        "etag": null,
+        "last_modified": null,
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 2495,
+        "body_sha256": "8c7bf86a5962bf42282bbfd401226773601c2551f79685bad9be68d3b41363ac",
+        "matches_authority_bytes": true,
+        "claim": "full_body_sha256_measured"
+      }
+    },
+    {
+      "role": "hosted_attribution",
+      "authority_path": "README.md",
+      "hosted_key": "README.md",
+      "identity": {
+        "bytes": 17601,
+        "sha256": "4edd32a056a3631b538ba54f872345a4448d44afe37ecc641472a348a1085f82",
+        "sha256_basis": "computed_from_authority_bytes_at_source_ref"
+      },
+      "verification_strength": "local_and_hosted_full_sha256_distinct",
+      "hosted_observation": {
+        "observed_on": "2026-08-07",
+        "observer": "orchestrator",
+        "method": "GET_full_body",
+        "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/README.md",
+        "http_status": 200,
+        "content_length": null,
+        "etag": null,
+        "last_modified": null,
+        "provider_checksum_sha256": null,
+        "transferred_body_bytes": 6967,
+        "body_sha256": "2b86e8278996aa7540359e6b397c0a042f90c827e9c61730c81fca9eb3e63e56",
+        "matches_authority_bytes": false,
+        "claim": "full_body_sha256_measured"
+      }
+    }
+  ]
+}
