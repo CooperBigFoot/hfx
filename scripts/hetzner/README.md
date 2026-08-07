@@ -279,10 +279,29 @@ tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric
 tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>
 tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>
-tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>]
+tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>] [--partial-fabric <dataset-root> --partial-fabric-roster <json-file> --exclude-control-basin <processing-basin-id>]
 tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
 ```
+
+`assemble` keeps its per-basin legacy mode when no extension options are
+supplied. Supplying `--partial-fabric` selects extension mode and also requires
+an absolute `--partial-fabric-roster` JSON file and one
+`--exclude-control-basin` from the frozen campaign selection. The roster is a
+nonempty sorted unique array of authoritative processing-basin IDs. It remains
+an assembly input and is not written into the HFX manifest.
+
+The excluded control basin must occur in the supplied roster and must have a
+durable successful compile. Extension mode passes the partial fabric once,
+omits that control output, and passes only successful selected basin outputs
+absent from the roster as repeated adapter inputs. Assembly evidence records
+the canonical fabric root, canonical roster path, complete constituent roster,
+excluded control, and the IDs and campaign-relative paths of included new
+basins. Resume accepts an existing result only when that complete provenance
+is unchanged.
+
+The extension command is local and performs no provisioning, NGA transfer, or
+S3 operation. `publish` remains a separate explicit command.
 
 `--workspace-root` defaults to `/mnt/hfx/work`, giving campaign directory
 `/mnt/hfx/work/tdx-hydro-<campaign>`. The retention selector defaults to
@@ -355,12 +374,11 @@ processing another basin. Recovery completes any interruption between those
 boundaries. Missing terminal source files are treated as an interrupted or
 repeated reclaim; unsafe path types fail closed without traversal.
 
-Landed basin outputs and every external diagnostic and acquisition report remain
-on the campaign volume. Assembly requires every landed
-basin-outputs/<processing-basin-id>/catchments.parquet,
-graph.parquet, and aux/snap_stems.parquet across its merge passes, so those files
-are never reclaim targets. Retain-all behavior is unchanged and keeps all acquired
-source artifacts through publication.
+Legacy assembly reads every successful landed
+`basin-outputs/<processing-basin-id>` root. Extension assembly also reads the
+supplied partial-fabric dataset and only the successful, non-excluded new basin
+roots named in its persisted provenance. Landed basin outputs are never reclaim
+targets.
 
 Pipeline recovery classifies each acquisition stage from durable state.
 `succeeded` is terminal. `pending`, including the interrupted-stage diagnostic,
