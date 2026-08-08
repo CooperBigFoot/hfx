@@ -4696,7 +4696,7 @@ class BuildCliTests(unittest.TestCase):
             geometry=[
                 LineString([(0.9992, 0.0), (1.01, 0.0)]),
                 LineString([(1.0008, 0.0), (0.9992, 0.0)]),
-                LineString([(0.9992, 0.0), (1.0008, 0.0)]),
+                LineString([(0.9984703, 0.0), (1.0008, 0.0)]),
             ],
             crs="EPSG:4326",
         )
@@ -5155,7 +5155,7 @@ class BuildCliTests(unittest.TestCase):
             reversed_streamnet = streamnet.copy(deep=True)
             reversed_streamnet.loc[
                 reversed_streamnet["LINKNO"] == 100, "geometry"
-            ] = LineString([(1.0008, 0.0), (0.9992, 0.0)])
+            ] = LineString([(1.0008, 0.0), (0.9984703, 0.0)])
             reversed_source = root / "reversed-source"
             reversed_source.mkdir()
             reversed_paths = write_pair(
@@ -5181,6 +5181,38 @@ class BuildCliTests(unittest.TestCase):
             self.assertFalse(reversed_report.exists())
             self.assertTrue(clean_output.exists())
             self.assertTrue(clean_report.exists())
+
+    def test_build_cli_rejects_reach_side_ambiguity_beyond_widened_bound(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = self.three_reach_near_degenerate_frames()
+            streamnet.loc[streamnet["LINKNO"] == 300, "geometry"] = LineString(
+                [(1.0, 0.0), (1.01, 0.0)]
+            )
+            streamnet.loc[streamnet["LINKNO"] == 200, "geometry"] = LineString(
+                [(1.0021, 0.0), (1.0, 0.0)]
+            )
+            streamnet.loc[streamnet["LINKNO"] == 100, "geometry"] = LineString(
+                [(0.9990001, 0.0), (1.0021, 0.0)]
+            )
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            with self.assertRaises(ValueError) as raised:
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                (str(raised.exception), output.exists(), report.exists()),
+                (
+                    "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
+                    "is reach-side ambiguous: both current endpoints coincide within "
+                    "tolerance but endpoint separation 0.0030999000000000443 exceeds "
+                    "near-degenerate limit 0.003",
+                    False,
+                    False,
+                ),
+            )
 
     def test_build_cli_rejects_near_degenerate_reach_with_unoriented_root(
         self,
@@ -5249,6 +5281,40 @@ class BuildCliTests(unittest.TestCase):
             )
             self.assertFalse(output.exists())
             self.assertFalse(report.exists())
+
+    def test_build_cli_keeps_indeterminate_root_limit_at_two_tolerances(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = self.indeterminate_root_frames()
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output = root / "output"
+            report = root / "report.json"
+            measured_distances = [0.0092, 0.0108, 0.0008, 0.0008, 0.0021]
+            with patch("build_adapter.math.dist", side_effect=measured_distances):
+                with self.assertRaises(ValueError) as raised:
+                    main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertEqual(
+                (
+                    getattr(
+                        build_adapter,
+                        "NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER",
+                        None,
+                    ),
+                    str(raised.exception),
+                    output.exists(),
+                    report.exists(),
+                ),
+                (
+                    3.0,
+                    "orientation proof for root LINKNO 200 is reach-side ambiguous: "
+                    "predecessors (100,) match both root endpoints but endpoint separation "
+                    "0.0021 exceeds near-degenerate limit 0.002",
+                    False,
+                    False,
+                ),
+            )
 
     def test_build_cli_rejects_contradictory_indeterminate_root_area(self) -> None:
         with TemporaryDirectory() as temp_dir:
