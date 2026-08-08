@@ -2451,6 +2451,9 @@ def _merge_snap_stems(
 
 def _checked_assembly_manifests(
     roots: Sequence[Path],
+    *,
+    partial_input_root: Path | None = None,
+    partial_basin_roster: Sequence[str] | None = None,
 ) -> tuple[str, int, list[str], list[list[float]]]:
     crosswalk = load_header_crosswalk()
     fabric_version: str | None = None
@@ -2497,11 +2500,30 @@ def _checked_assembly_manifests(
         elif version != fabric_version:
             raise ValueError(f"{root}: incompatible fabric_version")
         region = manifest.get("region")
-        if not isinstance(region, str) or not region.isdigit() or region not in crosswalk:
-            raise ValueError(f"{root}: unknown manifest region")
-        if region in regions:
-            raise ValueError(f"{root}: duplicate manifest region {region}")
-        regions.append(region)
+        if root == partial_input_root:
+            assert partial_basin_roster is not None
+            joined = ",".join(sorted(partial_basin_roster))
+            digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+            expected_region = f"tdx-hydro-partial-{digest}"
+            if not isinstance(region, str) or region != expected_region:
+                raise ValueError(
+                    f"{root}: partial manifest region {region!r} does not match "
+                    f"roster label {expected_region}"
+                )
+        else:
+            if (
+                not isinstance(region, str)
+                or not region.isdigit()
+                or region not in crosswalk
+            ):
+                raise ValueError(f"{root}: unknown manifest region")
+            if partial_basin_roster is not None and region in partial_basin_roster:
+                raise ValueError(
+                    f"{root}: manifest region {region} overlaps partial basin roster"
+                )
+            if region in regions:
+                raise ValueError(f"{root}: duplicate manifest region {region}")
+            regions.append(region)
         count = manifest.get("unit_count")
         if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
             raise ValueError(f"{root}: invalid manifest unit_count")
@@ -2549,7 +2571,9 @@ def _checked_assembly_manifests(
             raise ValueError(f"{root}: incompatible auxiliary declaration")
     if fabric_version is None:
         raise AssertionError("validated manifests did not provide fabric_version")
-    return fabric_version, total_units, regions, bboxes
+    if partial_basin_roster is not None:
+        regions.extend(partial_basin_roster)
+    return fabric_version, total_units, sorted(regions), bboxes
 
 
 def _atomic_bytes(destination: Path, content: bytes) -> None:
@@ -2667,6 +2691,8 @@ def assemble_hfx(
     input_batch_size: int = MERGE_INPUT_BATCH_SIZE,
     row_group_min: int = ROW_GROUP_MIN,
     row_group_max: int = ROW_GROUP_MAX,
+    partial_input_root: Path | None = None,
+    partial_basin_roster: Sequence[str] | None = None,
 ) -> AssemblyResult:
     """Assemble and atomically publish checked basin datasets."""
     if created_at.tzinfo is None or created_at.utcoffset() is None:
@@ -2677,9 +2703,43 @@ def assemble_hfx(
         raise ValueError("row_group_min must be positive")
     if row_group_max < row_group_min:
         raise ValueError("row_group_max must be at least row_group_min")
-    roots = tuple(Path(root).expanduser().resolve() for root in input_dataset_roots)
-    if not roots:
+    if (partial_input_root is None) != (partial_basin_roster is None):
+        raise ValueError(
+            "--partial-input and --partial-roster must be supplied together"
+        )
+    crosswalk = load_header_crosswalk()
+    checked_partial_roster: tuple[str, ...] | None = None
+    if partial_basin_roster is not None:
+        if not partial_basin_roster:
+            raise ValueError("partial basin roster must be nonempty")
+        checked_entries: list[str] = []
+        seen: set[str] = set()
+        for index, basin_id in enumerate(partial_basin_roster):
+            if not isinstance(basin_id, str) or basin_id not in crosswalk:
+                raise ValueError(
+                    "partial basin roster entry at index "
+                    f"{index} is not an authoritative basin ID"
+                )
+            if basin_id in seen:
+                raise ValueError(f"duplicate partial basin roster entry {basin_id}")
+            checked_entries.append(basin_id)
+            seen.add(basin_id)
+        checked_partial_roster = tuple(checked_entries)
+    ordinary_roots = tuple(
+        Path(root).expanduser().resolve() for root in input_dataset_roots
+    )
+    if not ordinary_roots:
         raise ValueError("at least one input dataset root is required")
+    resolved_partial_root = (
+        Path(partial_input_root).expanduser().resolve()
+        if partial_input_root is not None
+        else None
+    )
+    roots = (
+        (resolved_partial_root, *ordinary_roots)
+        if resolved_partial_root is not None
+        else ordinary_roots
+    )
     if len(roots) != len(set(roots)):
         raise ValueError("input dataset roots must be unique after resolution")
     output_root = Path(output_root).expanduser().resolve(strict=False)
@@ -2698,7 +2758,11 @@ def assemble_hfx(
             f"{output_root.parent}: output parent must be an existing directory"
         )
 
-    fabric_version, unit_count, regions, bboxes = _checked_assembly_manifests(roots)
+    fabric_version, unit_count, regions, bboxes = _checked_assembly_manifests(
+        roots,
+        partial_input_root=resolved_partial_root,
+        partial_basin_roster=checked_partial_roster,
+    )
     for root in roots:
         _validate_snap_references(root, input_batch_size)
 
@@ -5207,12 +5271,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
     )
+    assemble_parser.add_argument("--partial-input", type=Path)
+    assemble_parser.add_argument("--partial-roster", type=Path)
     assemble_parser.add_argument("--out", required=True, type=Path)
     return parser
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _load_partial_basin_roster(roster_path: Path) -> tuple[str, ...]:
+    path = Path(roster_path).expanduser()
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{path}: invalid partial basin roster") from error
+    if not path.is_file():
+        raise ValueError(f"{path}: invalid partial basin roster")
+    try:
+        roster = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{path}: invalid partial basin roster") from error
+    if not isinstance(roster, list) or not roster:
+        raise ValueError(
+            f"{path}: partial basin roster must be one nonempty JSON array"
+        )
+    crosswalk = load_header_crosswalk()
+    checked: list[str] = []
+    seen: set[str] = set()
+    for index, basin_id in enumerate(roster):
+        if not isinstance(basin_id, str) or basin_id not in crosswalk:
+            raise ValueError(
+                f"{path}: partial basin roster entry at index {index} "
+                "is not an authoritative basin ID"
+            )
+        if basin_id in seen:
+            raise ValueError(f"{path}: duplicate partial basin roster entry {basin_id}")
+        checked.append(basin_id)
+        seen.add(basin_id)
+    return tuple(checked)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5231,10 +5329,21 @@ def main(argv: list[str] | None = None) -> int:
             created_at=created_at,
         )
     elif arguments.command == "assemble":
+        if (arguments.partial_input is None) != (arguments.partial_roster is None):
+            raise ValueError(
+                "--partial-input and --partial-roster must be supplied together"
+            )
+        partial_basin_roster = (
+            _load_partial_basin_roster(arguments.partial_roster)
+            if arguments.partial_roster is not None
+            else None
+        )
         assemble_hfx(
             arguments.inputs,
             arguments.out,
             created_at=_utc_now(),
+            partial_input_root=arguments.partial_input,
+            partial_basin_roster=partial_basin_roster,
         )
     else:
         validate_dataset(arguments.dataset, hfx_binary=arguments.hfx_binary)
