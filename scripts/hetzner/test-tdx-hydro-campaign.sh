@@ -1211,6 +1211,336 @@ case ${HFX_TEST_FOCUS-} in
     *) die "unknown HFX_TEST_FOCUS: $HFX_TEST_FOCUS" ;;
 esac
 
+write_compatibility_inventory() {
+    cat >"$1" <<'EOF'
+{
+  "1020000010": "11",
+  "1020011530": "12",
+  "1020018110": "13",
+  "1020021940": "14",
+  "1020027430": "15",
+  "1020034170": "16",
+  "1020035180": "17",
+  "1020040190": "18",
+  "2020000010": "21",
+  "2020003440": "22",
+  "2020018240": "23",
+  "2020024230": "24",
+  "2020033490": "25",
+  "2020041390": "26",
+  "2020057170": "27",
+  "2020065840": "28",
+  "2020071190": "29",
+  "3020000010": "31",
+  "3020003790": "32",
+  "3020005240": "33",
+  "3020008670": "34",
+  "3020009320": "35",
+  "3020024310": "36",
+  "4020000010": "41",
+  "4020006940": "42",
+  "4020015090": "43",
+  "4020024190": "44",
+  "4020034510": "45",
+  "4020050210": "46",
+  "4020050220": "47",
+  "4020050290": "48",
+  "4020050470": "49",
+  "5020000010": "51",
+  "5020015660": "52",
+  "5020037270": "53",
+  "5020049720": "54",
+  "5020054880": "55",
+  "5020055870": "56",
+  "5020082270": "57",
+  "6020000010": "61",
+  "6020006540": "62",
+  "6020008320": "63",
+  "6020014330": "64",
+  "6020017370": "65",
+  "6020021870": "66",
+  "6020029280": "67",
+  "7020000010": "71",
+  "7020014250": "72",
+  "7020021430": "73",
+  "7020024600": "74",
+  "7020038340": "75",
+  "7020046750": "76",
+  "7020047840": "77",
+  "7020065090": "78",
+  "8020000010": "81",
+  "8020008900": "82",
+  "8020010700": "83",
+  "8020020760": "84",
+  "8020022890": "85",
+  "8020032840": "86",
+  "8020044560": "87",
+  "9020000010": "91"
+}
+EOF
+}
+
+create_compatibility_workspace() {
+    local root=$1
+    local campaign_name=$2
+    local basin_version=$3
+    local campaign_dir=$root/tdx-hydro-$campaign_name
+    local basin_id
+    mkdir -p "$campaign_dir/downloads" "$campaign_dir/basin-outputs" \
+        "$campaign_dir/reports" "$campaign_dir/assembly" "$campaign_dir/assembly/scratch" \
+        "$campaign_dir/publication" "$campaign_dir/state" "$campaign_dir/state/basins" \
+        "$campaign_dir/state/locks" "$campaign_dir/state/tmp"
+    write_compatibility_inventory "$campaign_dir/state/inventory.json"
+    cat >"$campaign_dir/state/selection.json" <<'EOF'
+{
+  "schema_version": 1,
+  "basin_ids": [
+    "1020000010"
+  ]
+}
+EOF
+    if [[ "$basin_version" == 4 ]]; then
+        cat >"$campaign_dir/state/campaign.json" <<EOF
+{
+  "schema_version": 2,
+  "campaign": "$campaign_name",
+  "inventory": {
+    "source": "adapters/tdx-hydro/data/tdx_header_numbers.json",
+    "count": 62
+  },
+  "retention": {
+    "policy": "reclaim-inputs-after-terminal",
+    "reclaim_inputs": true,
+    "retain_acquired_inputs": false,
+    "retain_basin_outputs": true,
+    "retain_external_reports": true
+  },
+  "sizing": {
+    "available_memory_bytes": 30000000000,
+    "available_disk_bytes": 491737129060,
+    "peak_in_flight_download_bytes": 44296724480,
+    "retained_basin_output_bytes": 206220202290,
+    "assembly_memory_ceiling_bytes": 30000000000,
+    "assembly_scratch_ceiling_bytes": 206220202290,
+    "assembled_artifact_bytes": 206220202290,
+    "active_compile_scratch_bytes": 30000000000,
+    "filesystem_overhead_bytes": 5000000000,
+    "required_memory_bytes": 30000000000,
+    "required_disk_bytes": 491737129060
+  }
+}
+EOF
+    else
+        cat >"$campaign_dir/state/campaign.json" <<EOF
+{
+  "schema_version": 2,
+  "campaign": "$campaign_name",
+  "inventory": {
+    "source": "adapters/tdx-hydro/data/tdx_header_numbers.json",
+    "count": 62
+  },
+  "retention": {
+    "policy": "retain-all-through-publication",
+    "reclaim_inputs": false,
+    "retain_acquired_inputs": true,
+    "retain_basin_outputs": true,
+    "retain_external_reports": true
+  },
+  "sizing": {
+    "available_memory_bytes": 11,
+    "available_disk_bytes": 29,
+    "retained_input_bytes": 5,
+    "retained_basin_output_bytes": 6,
+    "assembly_memory_ceiling_bytes": 11,
+    "assembly_scratch_ceiling_bytes": 7,
+    "assembled_artifact_bytes": 8,
+    "active_compile_scratch_bytes": 9,
+    "filesystem_overhead_bytes": 1,
+    "required_memory_bytes": 11,
+    "required_disk_bytes": 29
+  }
+}
+EOF
+    fi
+    while IFS= read -r basin_id; do
+        mkdir "$campaign_dir/state/basins/$basin_id"
+        if [[ "$basin_version" == 4 ]]; then
+            jq -n --arg basin_id "$basin_id" '{
+              schema_version:4,processing_basin_id:$basin_id,
+              retention:{inputs_reclaimed:false,policy:"reclaim-inputs-after-terminal"},
+              stages:{
+                acquire_basins:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+                acquire_streamnet:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+                compile:{status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
+              }
+            }' >"$campaign_dir/state/basins/$basin_id/current.json"
+        else
+            jq -n --arg basin_id "$basin_id" '{
+              schema_version:3,processing_basin_id:$basin_id,
+              stages:{
+                acquire_basins:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+                acquire_streamnet:{status:"pending",attempts:0,failure_reason:null,evidence:null},
+                compile:{status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
+              }
+            }' >"$campaign_dir/state/basins/$basin_id/current.json"
+        fi
+    done < <(jq -r 'keys[]' "$campaign_dir/state/inventory.json")
+}
+
+compatibility_case() {
+    local basin_version=$1
+    local campaign_name=$2
+    local label=$3
+    local root=$test_tmp/workspaces/$campaign_name
+    local campaign_dir=$root/tdx-hydro-$campaign_name
+    local basin_id
+    mkdir "$root"
+    create_compatibility_workspace "$root" "$campaign_name" "$basin_version"
+    cp -R "$campaign_dir" "$test_tmp/$campaign_name.before"
+    run_runner status --campaign "$campaign_name" --workspace-root "$root" >"$case_stdout" ||
+        die "$label compatibility status failed"
+    assert_contains "$case_stdout" 'selected_basin_count=1'
+    [[ "$basin_version" != 4 ]] || assert_contains "$case_stdout" 'inputs_reclaimed=0'
+    [[ $(grep -c '_exhausted=' "$case_stdout" || :) -eq 0 ]] ||
+        die "$label compatibility status added exhaustion output"
+    diff -ru "$test_tmp/$campaign_name.before" "$campaign_dir"
+    rm -rf "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    export HFX_TEST_FAIL_KEY= HFX_TEST_FAIL_ONCE_KEY=
+    run_runner acquire --campaign "$campaign_name" --workspace-root "$root" \
+        --max-parallel 1 --product-attempt-ceiling 1 >"$case_stdout" 2>"$case_stderr" || {
+        sed 's/^/compatibility acquire: /' "$case_stderr" >&2
+        die "$label bounded acquire failed"
+    }
+    jq -e --argjson version "$basin_version" '
+      .schema_version == 5 and .acquisition.product_attempt_ceiling == 1 and
+      .stages.acquire_basins.status == "succeeded" and
+      .stages.acquire_streamnet.status == "succeeded" and
+      (if $version == 4 then
+        .retention == {inputs_reclaimed:false,policy:"reclaim-inputs-after-terminal"}
+       else has("retention") | not end)
+    ' "$campaign_dir/state/basins/1020000010/current.json" >/dev/null ||
+        die "$label bounded conversion differs"
+    while IFS= read -r basin_id; do
+        [[ "$basin_id" == 1020000010 ]] && continue
+        cmp "$test_tmp/$campaign_name.before/state/basins/$basin_id/current.json" \
+            "$campaign_dir/state/basins/$basin_id/current.json"
+    done < <(jq -r 'keys[]' "$campaign_dir/state/inventory.json")
+    cmp "$test_tmp/$campaign_name.before/state/campaign.json" "$campaign_dir/state/campaign.json"
+    cmp "$test_tmp/$campaign_name.before/state/inventory.json" "$campaign_dir/state/inventory.json"
+    cmp "$test_tmp/$campaign_name.before/state/selection.json" "$campaign_dir/state/selection.json"
+    pass "$label compatibility loads unchanged and converts only selected state"
+}
+
+pipeline_absence_regression_case() {
+    local root=$test_tmp/workspaces/legacy-pipeline-control
+    local campaign_dir=$root/tdx-hydro-legacy-pipeline-control
+    local pipeline_status=0
+    mkdir "$root"
+    create_compatibility_workspace "$root" legacy-pipeline-control 4
+    rm -rf "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    export HFX_TEST_TRANSFER_STATE=$test_tmp/transfer-state
+    export HFX_TEST_PIPELINE_CAMPAIGN_DIR=$campaign_dir
+    export HFX_TEST_PIPELINE_COMPLETION_PATH=$campaign_dir/state/tmp/pipeline-completions.fifo
+    export HFX_TEST_PIPELINE_AVAILABLE_BYTES=79734104064
+    export HFX_TEST_FAIL_KEY=1020000010-basins
+    export HFX_TEST_FAIL_ONCE_KEY=
+    run_runner pipeline --campaign legacy-pipeline-control --workspace-root "$root" \
+        --max-parallel 1 --fabric-version fixture-v1 >"$case_stdout" 2>"$case_stderr" ||
+        pipeline_status=$?
+    if ! { [[ "$pipeline_status" -ne 0 ]] &&
+        [[ $(grep -c '^start 1020000010-basins$' "$test_tmp/transfer-state/events" || :) -eq 2 ]] &&
+        [[ $(jq -r '.stages.acquire_basins.attempts' "$campaign_dir/state/basins/1020000010/current.json") -eq 2 ]] &&
+        [[ $(jq -r '.basins["1020000010"].status' "$campaign_dir/state/pipeline.json") == pending ]] &&
+        grep -Fqx -- 'hfx: error: pipeline incomplete: pending=1 acquiring=0 ready=0 compiling=0 terminal=0 reclaimed=0 blocked=0' "$case_stderr"; }; then
+        sed 's/^/pipeline absence: /' "$case_stderr" >&2
+        die 'pipeline absence regression: expected two fresh basins attempts, attempts=2, pending scheduler, and exact incomplete diagnostic'
+    fi
+    unset HFX_TEST_FAIL_KEY
+    pass 'pipeline absence regression preserves two unbounded dispatch attempts'
+}
+
+run_mutation_discriminator() {
+    local mutation_name=$1
+    local mutation_case=$2
+    local mutation_from=$3
+    local mutation_to=$4
+    local mutation_expected_failure=$5
+    local mutation_output=$test_tmp/$mutation_case.mutation-output
+    [[ $(grep -Fxc -- "$mutation_from" "$runner") -eq 1 ]] ||
+        die "$mutation_name anchor does not occur exactly once"
+    if HFX_TEST_MUTATION_CHILD=1 \
+        HFX_TEST_MUTATION_CASE="$mutation_case" \
+        HFX_TEST_MUTATION_FROM="$mutation_from" \
+        HFX_TEST_MUTATION_TO="$mutation_to" \
+        /bin/bash "$SCRIPT_DIR/test-tdx-hydro-campaign.sh" \
+        >"$mutation_output" 2>&1; then
+        die "$mutation_name unexpectedly survived"
+    fi
+    grep -Fqx -- "$mutation_expected_failure" "$mutation_output" ||
+        die "$mutation_name did not fail at its named compatibility assertion"
+    [[ $(grep -Fxc -- "$mutation_expected_failure" "$mutation_output") -eq 1 ]] ||
+        die "$mutation_name did not emit its named assertion exactly once"
+    [[ $(grep -F 'test-tdx-hydro-campaign: error:' "$mutation_output" | head -n 1) == \
+        "$mutation_expected_failure" ]] ||
+        die "$mutation_name did not emit its named assertion first"
+}
+
+# Install the existing local-only mock block early so compatibility status is the
+# first runner invocation and its bounded arm can still use inspected transfers.
+sed -n "/^printf 'SQLite format 3/,/^export HFX_TEST_DIFF=/p" "$0" >"$test_tmp/early-fake-setup"
+[[ -s "$test_tmp/early-fake-setup" ]] || die 'early fake setup extraction was empty'
+source "$test_tmp/early-fake-setup"
+
+if [[ "${HFX_TEST_MUTATION_CHILD-}" != 1 ]]; then
+    run_mutation_discriminator \
+        'schema-version-3 rejection mutation' schema-version-3 \
+        '    (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 4 or .schema_version == 5) and' \
+        '    (.schema_version == 1 or .schema_version == 2 or .schema_version == 4 or .schema_version == 5) and' \
+        'test-tdx-hydro-campaign: error: schema-version-3 compatibility status failed'
+    run_mutation_discriminator \
+        'schema-version-4 rejection mutation' schema-version-4 \
+        '    (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 4 or .schema_version == 5) and' \
+        '    (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 5) and' \
+        'test-tdx-hydro-campaign: error: schema-version-4 compatibility status failed'
+    run_mutation_discriminator \
+        'legacy pipeline bounded-routing mutation' legacy-pipeline \
+        '    acquire_basin "$basin_id"' \
+        '    acquire_basin_bounded "$basin_id"' \
+        'test-tdx-hydro-campaign: error: pipeline absence regression: expected two fresh basins attempts, attempts=2, pending scheduler, and exact incomplete diagnostic'
+fi
+
+case ${HFX_TEST_MUTATION_CASE-} in
+    schema-version-3)
+        compatibility_case 3 legacy-v3-campaign schema-version-3
+        ;;
+    schema-version-4)
+        compatibility_case 4 legacy-reclaim-campaign schema-version-4
+        ;;
+    legacy-pipeline)
+        pipeline_absence_regression_case
+        ;;
+    '')
+        compatibility_case 3 legacy-v3-campaign schema-version-3
+        compatibility_case 4 legacy-reclaim-campaign schema-version-4
+        compatibility_case 3 legacy-campaign existing-campaign-json
+        pipeline_absence_regression_case
+        ;;
+    *) die "unknown HFX_TEST_MUTATION_CASE: $HFX_TEST_MUTATION_CASE" ;;
+esac
+
+# The ordinary suite below owns a fresh instance of the same mock block.
+rm -rf "$test_tmp/transfer-state" "$test_tmp/geopackage-template" \
+    "$test_tmp/fake-curl" "$test_tmp/recording-mkdir" "$test_tmp/fake-sha256sum" \
+    "$test_tmp/fake-ogrinfo" "$test_tmp/fake-jq" "$test_tmp/fake-adapter" \
+    "$test_tmp/fake-adapter-python" "$test_tmp/fake-hfx" "$test_tmp/pipeline-mv" \
+    "$test_tmp/pipeline-rm"
+unset HFX_TDX_CURL HFX_TDX_SHA256SUM HFX_TDX_OGRINFO HFX_TDX_ADAPTER_PYTHON \
+    HFX_TDX_HFX HFX_TEST_TRANSFER_STATE HFX_TEST_GPKG_TEMPLATE HFX_TEST_REAL_JQ \
+    HFX_TEST_ADAPTER_LOG HFX_TEST_ADAPTER_SCRIPT HFX_TEST_ADAPTER_STUB HFX_TEST_HFX_LOG \
+    HFX_TEST_HFX_STATUS_LOG HFX_TEST_DIFF HFX_TEST_FAIL_KEY HFX_TEST_FAIL_ONCE_KEY
+
 run_runner -h >"$case_stdout"
 run_runner --help >"$case_stdout"
 assert_contains "$case_stdout" 'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>'
@@ -2794,6 +3124,346 @@ export HFX_TEST_ADAPTER_STUB=$test_tmp/fake-adapter
 export HFX_TEST_HFX_LOG=$test_tmp/invocations/hfx.log
 export HFX_TEST_HFX_STATUS_LOG=$test_tmp/invocations/hfx-status.log
 export HFX_TEST_DIFF=$(command -v diff)
+
+new_bounded_campaign() {
+    local name=$1
+    local root=$test_tmp/workspaces/$name
+    mkdir "$root"
+    run_runner init --campaign "$name" --workspace-root "$root" --basin 1020000010 \
+        --available-memory-bytes 11 --available-disk-bytes 29 --retained-input-bytes 5 \
+        --retained-basin-output-bytes 6 --assembly-memory-ceiling-bytes 11 \
+        --assembly-scratch-ceiling-bytes 7 --assembled-artifact-bytes 8 \
+        --active-compile-scratch-bytes 9 --filesystem-overhead-bytes 1 >"$case_stdout"
+    bounded_root=$root
+    bounded_dir=$root/tdx-hydro-$name
+}
+
+reset_bounded_transfers() {
+    rm -rf "$test_tmp/transfer-state"
+    mkdir "$test_tmp/transfer-state"
+    export HFX_TEST_TRANSFER_STATE=$test_tmp/transfer-state
+    export HFX_TEST_FAIL_KEY=
+    export HFX_TEST_FAIL_ONCE_KEY=
+    export HFX_TEST_HASH_MODE=
+    export HFX_TEST_OGR_MODE=
+    export HFX_TEST_EMIT_ETAG=
+    export HFX_TEST_TRANSFER_SHAPE=
+    export HFX_TEST_TRANSFER_SHAPE_KEY=
+    export HFX_TEST_LOWERCASE_HEADERS=
+    export HFX_TEST_LEADING_ZERO_LENGTH=
+}
+
+bounded_acquisition_case() {
+    local invalid
+    local command_name
+    local state
+    local report
+    local before_events
+    local mutation_filter
+    local mutation_name
+    local mutation_root
+
+    new_bounded_campaign bounded-cli
+    assert_contains <(run_runner --help) \
+        'tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer> [--product-attempt-ceiling <positive-integer>]'
+    expect_failure 'missing product ceiling value' acquire --campaign bounded-cli \
+        --workspace-root "$bounded_root" --max-parallel 1 --product-attempt-ceiling
+    assert_contains "$case_stderr" 'option --product-attempt-ceiling requires a value'
+    expect_failure 'repeated product ceiling' acquire --campaign bounded-cli \
+        --workspace-root "$bounded_root" --max-parallel 1 \
+        --product-attempt-ceiling 1 --product-attempt-ceiling 1
+    assert_contains "$case_stderr" 'option --product-attempt-ceiling may not be repeated'
+    for invalid in 0 01 -1 x 9223372036854775808; do
+        expect_failure "invalid product ceiling $invalid" acquire --campaign bounded-cli \
+            --workspace-root "$bounded_root" --max-parallel 1 --product-attempt-ceiling "$invalid"
+        assert_contains "$case_stderr" \
+            'option --product-attempt-ceiling must be a canonical positive signed-64-bit integer'
+    done
+    for command_name in init status recover compile compile-basin progress pipeline calibrate \
+        checkpoint checkpoint-resume assemble evidence publish; do
+        expect_failure "product ceiling ownership $command_name" "$command_name" \
+            --campaign bounded-cli --workspace-root "$bounded_root" --product-attempt-ceiling 1
+        assert_contains "$case_stderr" 'option --product-attempt-ceiling is valid only for acquire'
+    done
+    cp -R "$bounded_dir" "$test_tmp/bounded-cli.before"
+    reset_bounded_transfers
+    expect_failure 'bounded max parallel five' acquire --campaign bounded-cli \
+        --workspace-root "$bounded_root" --max-parallel 5 --product-attempt-ceiling 1
+    assert_contains "$case_stderr" \
+        'option --max-parallel must be a base-10 integer from 1 through 4 when --product-attempt-ceiling is supplied'
+    diff -ru "$test_tmp/bounded-cli.before" "$bounded_dir"
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'bounded CLI refusal started a transfer'
+    [[ ! -e "$bounded_dir/state/locks/campaign.lock" ]] || die 'bounded CLI refusal created a lock'
+    pass 'bounded CLI ownership validation and pre-lock concurrency are exact'
+
+    new_bounded_campaign bounded-success
+    reset_bounded_transfers
+    run_runner acquire --campaign bounded-success --workspace-root "$bounded_root" \
+        --max-parallel 1 --product-attempt-ceiling 2 >"$case_stdout" 2>"$case_stderr"
+    state=$bounded_dir/state/basins/1020000010/current.json
+    jq -e '
+      .schema_version == 5 and .acquisition == {product_attempt_ceiling:2} and
+      ([.stages.acquire_basins,.stages.acquire_streamnet] | all(
+        .status == "succeeded" and .attempts == 1 and .failure_reason == null and
+        .evidence.bytes == 24 and
+        .evidence.sha256 == "00000000000000000000000000000000000000000000000000000000bcb2f999" and
+        .evidence.sqlite_identity == "53514c69746520666f726d6174203300")) and
+      .stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
+    ' "$state" >/dev/null || die 'bounded inspected success state differs'
+    [[ $(grep -c '^start 1020000010-' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+        die 'bounded inspected success transfer count differs'
+    [[ ! -s "$HFX_TEST_ADAPTER_LOG" && ! -s "$HFX_TEST_HFX_LOG" ]] ||
+        die 'bounded inspected success invoked compile tools'
+    for report in "$bounded_dir"/reports/1020000010-*-acquisition.json; do
+        jq -e '.schema_version == 1 and .retry_count == 0 and (.transfers | length) == 1 and
+          .transfers[0] == {attempt:1,mode:"fresh",http_status:200,network_bytes:24,
+            time_total_seconds:1.25,average_bytes_per_second:20,result:"succeeded"}' \
+            "$report" >/dev/null || die 'bounded one-transfer report differs'
+    done
+    pass 'bounded inspected success records exact evidence and reports'
+
+    new_bounded_campaign bounded-adopt-at-ceiling
+    state=$bounded_dir/state/basins/1020000010/current.json
+    jq '.schema_version=5 | .acquisition={product_attempt_ceiling:2} |
+      .stages.acquire_basins.attempts=2 | .stages.acquire_streamnet.attempts=2' \
+        "$state" >"$state.tmp"
+    mv "$state.tmp" "$state"
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-basins.gpkg"
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-streamnet.gpkg"
+    reset_bounded_transfers
+    run_runner acquire --campaign bounded-adopt-at-ceiling --workspace-root "$bounded_root" \
+        --max-parallel 1 >"$case_stdout" 2>"$case_stderr"
+    jq -e '[.stages.acquire_basins,.stages.acquire_streamnet] |
+      all(.status == "succeeded" and .attempts == 2 and .evidence.bytes == 24)' \
+        "$state" >/dev/null || die 'valid finals at the ceiling were not inspected and adopted'
+    [[ ! -e "$test_tmp/transfer-state/events" ]] ||
+        die 'valid finals at the ceiling started a transfer'
+    pass 'bounded acquisition inspects valid finals before exhausting a stage'
+
+    new_bounded_campaign bounded-retry-success
+    reset_bounded_transfers
+    export HFX_TEST_FAIL_ONCE_KEY=1020000010-basins
+    run_runner acquire --campaign bounded-retry-success --workspace-root "$bounded_root" \
+        --max-parallel 1 --product-attempt-ceiling 2 >"$case_stdout" 2>"$case_stderr"
+    state=$bounded_dir/state/basins/1020000010/current.json
+    jq -e '.stages.acquire_basins == {
+      status:"succeeded",attempts:2,failure_reason:null,evidence:{bytes:24,
+      sha256:"00000000000000000000000000000000000000000000000000000000bcb2f999",
+      sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"1020000010-basins"}}
+    ' "$state" >/dev/null || die 'bounded retry-success stage differs'
+    report=$bounded_dir/reports/1020000010-basins-acquisition.json
+    jq -e '. == {schema_version:1,processing_basin_id:"1020000010",product:"basins",retry_count:1,
+      transfers:[
+        {attempt:1,mode:"fresh",http_status:200,network_bytes:18,time_total_seconds:1.25,average_bytes_per_second:14,result:"curl_failed"},
+        {attempt:2,mode:"fresh",http_status:200,network_bytes:24,time_total_seconds:1.25,average_bytes_per_second:20,result:"succeeded"}]}' \
+        "$report" >/dev/null || die 'bounded retry-success report differs'
+    [[ $(grep -c '^start 1020000010-basins$' "$test_tmp/transfer-state/events") -eq 2 ]] ||
+        die 'bounded retry-success did not make two fresh attempts'
+    [[ ! -e "$bounded_dir/downloads/1020000010-basins.gpkg.partial" &&
+       ! -e "$bounded_dir/downloads/1020000010-basins.gpkg.partial.json" ]] ||
+        die 'bounded retry-success retained a partial'
+    pass 'bounded retry succeeds on attempt two with a durable per-attempt report'
+
+    new_bounded_campaign bounded-exhaustion
+    reset_bounded_transfers
+    export HFX_TEST_FAIL_KEY=1020000010-basins
+    run_runner acquire --campaign bounded-exhaustion --workspace-root "$bounded_root" \
+        --max-parallel 1 --product-attempt-ceiling 2 >"$case_stdout" 2>"$case_stderr"
+    state=$bounded_dir/state/basins/1020000010/current.json
+    jq -e '. == {schema_version:5,processing_basin_id:"1020000010",
+      acquisition:{product_attempt_ceiling:2},stages:{
+        acquire_basins:{status:"exhausted",attempts:2,
+          failure_reason:"product attempt ceiling exhausted; retryable acquisition did not succeed",evidence:null},
+        acquire_streamnet:{status:"succeeded",attempts:1,failure_reason:null,evidence:{bytes:24,
+          sha256:"00000000000000000000000000000000000000000000000000000000bcb2f999",
+          sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"1020000010-streamnet"}},
+        compile:{status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}}}' \
+        "$state" >/dev/null || die 'bounded partial-success exhaustion state differs'
+    jq -e '. == {schema_version:1,processing_basin_id:"1020000010",product:"basins",retry_count:1,
+      transfers:[
+        {attempt:1,mode:"fresh",http_status:200,network_bytes:18,time_total_seconds:1.25,average_bytes_per_second:14,result:"curl_failed"},
+        {attempt:2,mode:"fresh",http_status:200,network_bytes:18,time_total_seconds:1.25,average_bytes_per_second:14,result:"curl_failed"}]}' \
+        "$bounded_dir/reports/1020000010-basins-acquisition.json" >/dev/null ||
+        die 'bounded exhaustion report differs'
+    jq -e '. == {schema_version:1,processing_basin_id:"1020000010",product:"streamnet",retry_count:0,
+      transfers:[{attempt:1,mode:"fresh",http_status:200,network_bytes:24,
+        time_total_seconds:1.25,average_bytes_per_second:20,result:"succeeded"}]}' \
+        "$bounded_dir/reports/1020000010-streamnet-acquisition.json" >/dev/null ||
+        die 'bounded exhaustion sibling report differs'
+    [[ $(grep -Fxc 'hfx: acquisition product=1020000010-basins status=exhausted retry_count=1 last_network_bytes=18 last_time_total_seconds=1.25 last_average_bytes_per_second=14' "$case_stderr") -eq 1 ]] ||
+        die 'bounded exhaustion terminal summary differs'
+    run_runner status --campaign bounded-exhaustion --workspace-root "$bounded_root" \
+        >"$test_tmp/bounded-exhaustion.status"
+    cat >"$test_tmp/bounded-exhaustion.expected-status" <<'EOF'
+campaign=bounded-exhaustion
+inventory_count=62
+selected_basin_count=1
+unselected_basin_count=61
+retention_policy=retain-all-through-publication
+available_memory_bytes=11
+available_disk_bytes=29
+retained_input_bytes=5
+retained_basin_output_bytes=6
+assembly_memory_ceiling_bytes=11
+assembly_scratch_ceiling_bytes=7
+assembled_artifact_bytes=8
+active_compile_scratch_bytes=9
+filesystem_overhead_bytes=1
+required_memory_bytes=11
+required_disk_bytes=29
+acquire_basins_pending=0
+acquire_basins_running=0
+acquire_basins_succeeded=0
+acquire_basins_failed=0
+acquire_basins_exhausted=1
+acquire_streamnet_pending=0
+acquire_streamnet_running=0
+acquire_streamnet_succeeded=1
+acquire_streamnet_failed=0
+acquire_streamnet_exhausted=0
+compile_pending=1
+compile_running=0
+compile_succeeded=0
+compile_failed=0
+assemble_pending=1
+assemble_running=0
+assemble_succeeded=0
+assemble_failed=0
+EOF
+    diff -u "$test_tmp/bounded-exhaustion.expected-status" "$test_tmp/bounded-exhaustion.status"
+    [[ ! -e "$bounded_dir/downloads/1020000010-basins.gpkg" &&
+       ! -e "$bounded_dir/downloads/1020000010-basins.gpkg.partial" &&
+       ! -e "$bounded_dir/downloads/1020000010-basins.gpkg.partial.json" ]] ||
+        die 'bounded exhaustion installed or retained basins data'
+    cmp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-streamnet.gpkg"
+    cp -R "$bounded_dir" "$test_tmp/bounded-exhaustion.before-rerun"
+    before_events=$(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ')
+    run_runner acquire --campaign bounded-exhaustion --workspace-root "$bounded_root" \
+        --max-parallel 1 >"$case_stdout" 2>"$case_stderr"
+    [[ $(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ') -eq "$before_events" ]] ||
+        die 'stored-ceiling rerun transferred data'
+    diff -ru "$test_tmp/bounded-exhaustion.before-rerun" "$bounded_dir"
+    run_runner acquire --campaign bounded-exhaustion --workspace-root "$bounded_root" \
+        --max-parallel 1 --product-attempt-ceiling 2 >"$case_stdout" 2>"$case_stderr"
+    [[ $(wc -l <"$test_tmp/transfer-state/events" | tr -d ' ') -eq "$before_events" ]] ||
+        die 'explicit fixed-ceiling rerun transferred data'
+    diff -ru "$test_tmp/bounded-exhaustion.before-rerun" "$bounded_dir"
+    expect_failure 'changed bounded ceiling' acquire --campaign bounded-exhaustion \
+        --workspace-root "$bounded_root" --max-parallel 1 --product-attempt-ceiling 3
+    assert_contains "$case_stderr" 'product attempt ceiling changed; use a new campaign ID'
+    diff -ru "$test_tmp/bounded-exhaustion.before-rerun" "$bounded_dir"
+    pass 'partial success exhaustion status reruns and fixed ceiling are durable'
+
+    mutation_root=$test_tmp/workspaces/bounded-lower-existing
+    mkdir "$mutation_root"
+    create_compatibility_workspace "$mutation_root" bounded-lower-existing 3
+    state=$mutation_root/tdx-hydro-bounded-lower-existing/state/basins/1020000010/current.json
+    jq '.stages.acquire_basins={status:"failed",attempts:3,
+      failure_reason:"transfer interrupted; retry from byte zero",evidence:null}' "$state" >"$state.tmp"
+    mv "$state.tmp" "$state"
+    cp -R "$mutation_root/tdx-hydro-bounded-lower-existing" "$test_tmp/bounded-lower.before"
+    expect_failure 'ceiling below existing attempts' acquire --campaign bounded-lower-existing \
+        --workspace-root "$mutation_root" --max-parallel 1 --product-attempt-ceiling 2
+    assert_contains "$case_stderr" \
+        'product attempt ceiling 2 is below existing attempt count 3 for 1020000010-basins'
+    diff -ru "$test_tmp/bounded-lower.before" "$mutation_root/tdx-hydro-bounded-lower-existing"
+    pass 'bounded preflight refuses changed and lower ceilings without partial conversion'
+
+    mutation_root=$test_tmp/workspaces/bounded-mixed
+    mkdir "$mutation_root"
+    create_compatibility_workspace "$mutation_root" bounded-mixed 3
+    jq '.basin_ids=["1020000010","1020011530"]' \
+        "$mutation_root/tdx-hydro-bounded-mixed/state/selection.json" >"$mutation_root/selection.tmp"
+    mv "$mutation_root/selection.tmp" \
+        "$mutation_root/tdx-hydro-bounded-mixed/state/selection.json"
+    state=$mutation_root/tdx-hydro-bounded-mixed/state/basins/1020000010/current.json
+    jq '.schema_version=5 | .acquisition={product_attempt_ceiling:2}' "$state" >"$state.tmp"
+    mv "$state.tmp" "$state"
+    cp -R "$mutation_root/tdx-hydro-bounded-mixed" "$test_tmp/bounded-mixed.before"
+    reset_bounded_transfers
+    expect_failure 'incomplete bounded conversion' acquire --campaign bounded-mixed \
+        --workspace-root "$mutation_root" --max-parallel 1
+    assert_contains "$case_stderr" \
+        'bounded acquisition conversion is incomplete; rerun acquire with --product-attempt-ceiling 2'
+    diff -ru "$test_tmp/bounded-mixed.before" "$mutation_root/tdx-hydro-bounded-mixed"
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'mixed conversion refusal transferred data'
+    run_runner acquire --campaign bounded-mixed --workspace-root "$mutation_root" --max-parallel 1 \
+        --product-attempt-ceiling 2 >"$case_stdout" 2>"$case_stderr"
+    jq -e -s 'all(.[]; .schema_version == 5 and .acquisition.product_attempt_ceiling == 2)' \
+        "$mutation_root/tdx-hydro-bounded-mixed/state/basins/1020000010/current.json" \
+        "$mutation_root/tdx-hydro-bounded-mixed/state/basins/1020011530/current.json" >/dev/null ||
+        die 'explicit ceiling did not complete mixed conversion'
+
+    mutation_root=$test_tmp/workspaces/bounded-conflict
+    mkdir "$mutation_root"
+    cp -R "$test_tmp/bounded-mixed.before" "$mutation_root/tdx-hydro-bounded-mixed"
+    state=$mutation_root/tdx-hydro-bounded-mixed/state/basins/1020011530/current.json
+    jq '.schema_version=5 | .acquisition={product_attempt_ceiling:3}' "$state" >"$state.tmp"
+    mv "$state.tmp" "$state"
+    cp -R "$mutation_root/tdx-hydro-bounded-mixed" "$test_tmp/bounded-conflict.before"
+    expect_failure 'conflicting selected ceilings' acquire --campaign bounded-mixed \
+        --workspace-root "$mutation_root" --max-parallel 1
+    assert_contains "$case_stderr" \
+        'selected basin product attempt ceilings differ; use a new campaign ID'
+    diff -ru "$test_tmp/bounded-conflict.before" "$mutation_root/tdx-hydro-bounded-mixed"
+    pass 'incomplete and conflicting selected ceiling sets fail before workers'
+
+    cp -R "$test_tmp/workspaces/legacy-reclaim-campaign/tdx-hydro-legacy-reclaim-campaign" \
+        "$test_tmp/bounded-fence.before"
+    reset_bounded_transfers
+    expect_failure 'bounded pipeline fence' pipeline --campaign legacy-reclaim-campaign \
+        --workspace-root "$test_tmp/workspaces/legacy-reclaim-campaign" --max-parallel 1 \
+        --fabric-version fixture-v1
+    assert_contains "$case_stderr" 'bounded acquisition state requires the acquire subcommand'
+    expect_failure 'bounded calibrate fence' calibrate --campaign legacy-reclaim-campaign \
+        --workspace-root "$test_tmp/workspaces/legacy-reclaim-campaign" --max-parallel 2 \
+        --fabric-version fixture-v1
+    assert_contains "$case_stderr" 'bounded acquisition state requires the acquire subcommand'
+    diff -ru "$test_tmp/bounded-fence.before" \
+        "$test_tmp/workspaces/legacy-reclaim-campaign/tdx-hydro-legacy-reclaim-campaign"
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'bounded pipeline fence transferred data'
+    pass 'pipeline and calibrate fence bounded state before work'
+
+    run_runner status --campaign bounded-exhaustion --workspace-root "$bounded_root" >"$case_stdout"
+    for mutation_name in outer acquisition stage evidence compile wrong-reason below above exhausted-evidence succeeded-no-evidence version-six; do
+        mutation_root=$test_tmp/workspaces/schema-$mutation_name
+        mkdir "$mutation_root"
+        cp -R "$bounded_dir" "$mutation_root/tdx-hydro-bounded-exhaustion"
+        state=$mutation_root/tdx-hydro-bounded-exhaustion/state/basins/1020000010/current.json
+        case $mutation_name in
+            outer) mutation_filter='.extra=true' ;;
+            acquisition) mutation_filter='.acquisition.extra=true' ;;
+            stage) mutation_filter='.stages.acquire_basins.extra=true' ;;
+            evidence) mutation_filter='.stages.acquire_streamnet.evidence.extra=true' ;;
+            compile) mutation_filter='.stages.compile.extra=true' ;;
+            wrong-reason) mutation_filter='.stages.acquire_basins.failure_reason="wrong"' ;;
+            below) mutation_filter='.stages.acquire_basins.attempts=1' ;;
+            above) mutation_filter='.stages.acquire_basins.attempts=3' ;;
+            exhausted-evidence) mutation_filter='.stages.acquire_basins.evidence={}' ;;
+            succeeded-no-evidence) mutation_filter='.stages.acquire_streamnet.evidence=null' ;;
+            version-six) mutation_filter='.schema_version=6' ;;
+        esac
+        jq "$mutation_filter" "$state" >"$state.tmp"
+        mv "$state.tmp" "$state"
+        expect_failure "schema exactness $mutation_name" status --campaign bounded-exhaustion \
+            --workspace-root "$mutation_root"
+        assert_contains "$case_stderr" "basin state is malformed for 1020000010: $state"
+    done
+    mutation_root=$test_tmp/workspaces/schema-retention
+    mkdir "$mutation_root"
+    cp -R "$test_tmp/workspaces/legacy-reclaim-campaign/tdx-hydro-legacy-reclaim-campaign" \
+        "$mutation_root/tdx-hydro-legacy-reclaim-campaign"
+    state=$mutation_root/tdx-hydro-legacy-reclaim-campaign/state/basins/1020000010/current.json
+    jq '.retention.extra=true' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+    expect_failure 'schema exactness retention' status --campaign legacy-reclaim-campaign \
+        --workspace-root "$mutation_root"
+    assert_contains "$case_stderr" "basin state is malformed for 1020000010: $state"
+    sed -n '/^acquire_basin_bounded() {$/,/^}$/p' "$runner" >"$case_stdout"
+    [[ $(grep -c 'RM' "$case_stdout" || :) -eq 0 ]] || die 'bounded basin wrapper contains an RM call'
+    pass 'version-5 schema exactness and bounded no-deletion shape fail closed'
+}
+
+bounded_acquisition_case
 
 run_runner init --campaign reclaim-parallel-reject --workspace-root "$valid_root" \
     --basin 7020000010 --basin 1020000010 --basin 9020000010 \
