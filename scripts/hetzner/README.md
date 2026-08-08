@@ -10,6 +10,8 @@ teardown.
 
 Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md) and [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md).
 
+Operator runbook: [acquire the seven absent TDX-Hydro basins plus the frozen control](RUNBOOK-tdx-hydro-seven-basin-acquisition.md) (acquisition only).
+
 The scripts in this directory compose one lifecycle and remain independently
 runnable. Campaign identifiers use 1-32 lowercase letters, digits, or hyphens
 and begin with a letter or digit. The deterministic resource names are
