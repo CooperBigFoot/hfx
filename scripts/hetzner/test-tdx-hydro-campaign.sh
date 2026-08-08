@@ -2497,6 +2497,7 @@ case $command_name in
             --arg basin_id "$basin_id" \
             --arg fabric_version "$fabric_version" \
             --arg dataset_root "$dataset_root" \
+            --arg large_diagnostics_id "${HFX_TEST_LARGE_DIAGNOSTICS_ID-}" \
             '{
               build_identity:{
                 processing_basin_id:$basin_id,
@@ -2506,7 +2507,13 @@ case $command_name in
                 adapter_version:"0.1.0",
                 dataset_root:$dataset_root
               },
-              diagnostics:{}
+              diagnostics:(
+                if $large_diagnostics_id == $basin_id then {
+                  fixture_metric: 7,
+                  oversized_native_ids: [range(0; 250000)],
+                  completion_marker: "diagnostics-complete"
+                } else {} end
+              )
             }' >"$report"
         ;;
     validate)
@@ -3712,6 +3719,65 @@ if grep -E 'assemble|assembly' "$HFX_TEST_ADAPTER_LOG" "$HFX_TEST_HFX_LOG" >/dev
     die 'compile invoked assembly'
 fi
 pass 'complete compile command report and validation contract lands every basin'
+
+large_diagnostics_root=$test_tmp/workspaces/large-diagnostics
+mkdir "$large_diagnostics_root"
+cp -R "$acquire_dir" "$large_diagnostics_root/tdx-hydro-acquire"
+large_diagnostics_dir=$large_diagnostics_root/tdx-hydro-acquire
+large_diagnostics_id=$(jq -r 'keys[0]' "$inventory")
+[[ "$large_diagnostics_id" == 1020000010 ]] || die 'first inventory basin differs'
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+HFX_TEST_LARGE_DIAGNOSTICS_ID=1020000010 \
+    run_runner compile-basin --campaign acquire --workspace-root "$large_diagnostics_root" \
+        --basin 1020000010 --fabric-version NGA-TDX-Hydro-20230126 >"$case_stdout"
+large_diagnostics_report=$large_diagnostics_dir/reports/1020000010-build-report.json
+large_diagnostics_output=$large_diagnostics_dir/basin-outputs/1020000010
+large_diagnostics_state=$large_diagnostics_dir/state/basins/1020000010/current.json
+diagnostics_bytes=$(jq -c '.diagnostics' "$large_diagnostics_report" | wc -c | tr -d ' ')
+host_arg_max=$(getconf ARG_MAX)
+[[ "$diagnostics_bytes" -gt 131072 && "$diagnostics_bytes" -gt "$host_arg_max" ]] ||
+    die "oversized diagnostics measured $diagnostics_bytes bytes; expected more than Linux MAX_ARG_STRLEN 131072 and host ARG_MAX $host_arg_max"
+jq -e --slurpfile report "$large_diagnostics_report" '
+  .stages.compile == {
+    status: "succeeded",
+    attempts: 1,
+    failure_reason: null,
+    diagnostic_report: {
+      path: "reports/1020000010-build-report.json",
+      diagnostics: $report[0].diagnostics
+    }
+  } and
+  .stages.compile.diagnostic_report.diagnostics == $report[0].diagnostics and
+  $report[0].diagnostics == {
+    fixture_metric: 7,
+    oversized_native_ids: [range(0; 250000)],
+    completion_marker: "diagnostics-complete"
+  }
+' "$large_diagnostics_state" >/dev/null ||
+    die 'oversized diagnostics state differs from the complete source report'
+[[ -f "$large_diagnostics_report" && ! -L "$large_diagnostics_report" ]] ||
+    die 'oversized diagnostics source report is not a regular file'
+[[ -d "$large_diagnostics_output" && ! -L "$large_diagnostics_output" ]] ||
+    die 'oversized diagnostics output is not a directory'
+printf 'build\t--basins\t%s\t--streamnet\t%s\t--out\t%s\t--report\t%s\t--processing-basin-id\t%s\t--fabric-version\t%s\n' \
+    "$large_diagnostics_dir/downloads/1020000010-basins.gpkg" \
+    "$large_diagnostics_dir/downloads/1020000010-streamnet.gpkg" \
+    "$large_diagnostics_output" "$large_diagnostics_report" 1020000010 \
+    NGA-TDX-Hydro-20230126 >"$test_tmp/expected-large-diagnostics-adapter.log"
+printf 'validate\t%s\t--hfx-binary\t%s\n' \
+    "$large_diagnostics_output" "$test_tmp/fake-hfx" \
+    >>"$test_tmp/expected-large-diagnostics-adapter.log"
+printf '%s\t--strict\t--sample-pct\t100\t--format\ttext\n' \
+    "$large_diagnostics_output" >"$test_tmp/expected-large-diagnostics-hfx.log"
+diff -u "$test_tmp/expected-large-diagnostics-adapter.log" "$HFX_TEST_ADAPTER_LOG"
+diff -u "$test_tmp/expected-large-diagnostics-hfx.log" "$HFX_TEST_HFX_LOG"
+if grep -F 'adapter validation failed' "$large_diagnostics_state" >/dev/null; then
+    die 'oversized diagnostics compile was relabeled adapter validation failed'
+fi
+: >"$HFX_TEST_ADAPTER_LOG"
+: >"$HFX_TEST_HFX_LOG"
+pass 'oversized compile diagnostics cross verification and state persistence through files'
 
 cp -R "$compile_dir/basin-outputs" "$test_tmp/compile-outputs-before"
 cp -R "$compile_dir/reports" "$test_tmp/compile-reports-before"
