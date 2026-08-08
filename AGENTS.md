@@ -100,3 +100,12 @@ Releases are intentional, maintainer-driven events:
 - **Human-tagged.** `v*` git tags are created by a human maintainer at release time. Agents never create or push tags.
 - **CHANGELOG'd.** Every release ships with notes in the root `CHANGELOG.md` describing what changed since the previous release.
 - **Two version tracks.** The SPEC track (`format_version`, currently `0.3.0`) and the TOOLKIT track (the lockstep `hfx`/`hfx-cli` workspace crates, which own the `v*` tags) evolve independently. See `docs/spec/versioning.md` for the full two-track policy and the spec-to-toolkit mapping table.
+
+<!-- BEGIN SYNCED DOCTRINE; source-sha256=59e37fd6b3dbab27530822e6956da51bb7ae76b637e3638530f99a8b4db9038d -->
+Four rules. They are one design stance seen four ways: a module means one thing, receives exactly what it needs, in types that cannot lie, and dies rather than guess.
+
+1. **A module means one thing.**
+2. **It receives exactly what it needs.**
+3. **Its types cannot lie.**
+4. **It dies rather than guess.**
+<!-- END SYNCED DOCTRINE -->
