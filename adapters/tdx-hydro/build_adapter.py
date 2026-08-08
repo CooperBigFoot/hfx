@@ -63,6 +63,7 @@ COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
 DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO = 1_000.0
 DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING = 1.0
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
+NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER = 3.0
 SNAP_BBOX_EPSILON = 1e-4
 COMPILE_BATCH_SIZE = 4_096
 COMPILE_MERGE_FAN_IN = 32
@@ -3586,6 +3587,9 @@ def _build_compact_topology(
     endpoint_tolerance: float,
 ) -> _CompactTopology:
     tolerance = _positive_finite_tolerance(endpoint_tolerance)
+    non_root_reach_side_ambiguity_limit = (
+        NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER * tolerance
+    )
     polygon_positions = np.searchsorted(stream_native_ids, basin_native_ids)
     if (
         np.any(polygon_positions == len(stream_native_ids))
@@ -3656,13 +3660,13 @@ def _build_compact_topology(
         current_indexes = sorted({current for current, _ in matches})
         if len(current_indexes) > 1:
             separation = math.dist(endpoints[row, 0], endpoints[row, 1])
-            if separation > 2.0 * tolerance:
+            if separation > non_root_reach_side_ambiguity_limit:
                 raise ValueError(
                     "orientation proof for native LINKNO "
                     f"{int(stream_native_ids[row])} and downstream LINKNO "
                     f"{int(stream_native_ids[successor])} is reach-side ambiguous: "
                     "both current endpoints coincide within tolerance but endpoint "
-                    f"separation {separation} exceeds near-degenerate limit {2.0 * tolerance}"
+                    f"separation {separation} exceeds near-degenerate limit {non_root_reach_side_ambiguity_limit}"
                 )
         connected_matches[row] = matches
         connected_current_indexes[row] = current_indexes
