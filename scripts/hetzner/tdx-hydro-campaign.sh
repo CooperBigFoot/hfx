@@ -61,7 +61,7 @@ usage() {
         'Usage: tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>' \
         '       tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]' \
         '       tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]' \
-        '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>' \
+        '       tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer> [--product-attempt-ceiling <positive-integer>]' \
         '       tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>' \
         '       tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>' \
         '       tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]' \
@@ -462,6 +462,14 @@ validate_basin_json() {
                 (.failure_reason == null or .failure_reason == "interrupted before terminal state; reset by recover") and
                 .evidence == null
             else false end;
+        def valid_v5_acquire($ceiling):
+            type == "object" and
+            keys == ["attempts","evidence","failure_reason","status"] and
+            (.attempts | type == "number" and . == floor and . >= 0 and . <= $ceiling) and
+            if .status == "exhausted" then
+                .attempts == $ceiling and .evidence == null and
+                .failure_reason == "product attempt ceiling exhausted; retryable acquisition did not succeed"
+            else valid_v2_acquire end;
         def valid_v4_terminal:
             (.stages.acquire_basins.status == "succeeded") and
             (.stages.acquire_streamnet.status == "succeeded") and
@@ -476,10 +484,12 @@ validate_basin_json() {
               (.stages.compile.diagnostic_report == null or
                (.stages.compile.diagnostic_report | valid_diagnostic))));
         type == "object" and
-        (if .schema_version == 4
-         then keys == ["processing_basin_id","retention","schema_version","stages"]
-         else keys == ["processing_basin_id","schema_version","stages"] end) and
-        (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 4) and
+        (if .schema_version == 4 or (.schema_version == 5 and has("retention"))
+         then keys == ["acquisition","processing_basin_id","retention","schema_version","stages"] -
+              (if .schema_version == 4 then ["acquisition"] else [] end)
+         else keys == ["acquisition","processing_basin_id","schema_version","stages"] -
+              (if .schema_version == 5 then [] else ["acquisition"] end) end) and
+    (.schema_version == 1 or .schema_version == 2 or .schema_version == 3 or .schema_version == 4 or .schema_version == 5) and
         .processing_basin_id == $basin_id and
         (.stages | type == "object" and
             keys == ["acquire_basins","acquire_streamnet","compile"]) and
@@ -495,7 +505,7 @@ validate_basin_json() {
             (.stages.compile | valid_v3_compile) and
             (.stages.acquire_basins | valid_v2_acquire) and
             (.stages.acquire_streamnet | valid_v2_acquire)
-        else
+        elif .schema_version == 4 then
             (.retention | type == "object" and
              keys == ["inputs_reclaimed","policy"] and
              (.inputs_reclaimed | type == "boolean") and
@@ -504,6 +514,20 @@ validate_basin_json() {
             (.stages.acquire_basins | valid_v2_acquire) and
             (.stages.acquire_streamnet | valid_v2_acquire) and
             (if .retention.inputs_reclaimed then valid_v4_terminal else true end)
+        else
+            (.acquisition | type == "object" and keys == ["product_attempt_ceiling"] and
+             (.product_attempt_ceiling | type == "number" and . == floor and . >= 1 and . <= $max_i64)) and
+            (.acquisition.product_attempt_ceiling as $ceiling |
+            (if has("retention") then
+                (.retention | type == "object" and
+                 keys == ["inputs_reclaimed","policy"] and
+                 (.inputs_reclaimed | type == "boolean") and
+                 .policy == "reclaim-inputs-after-terminal") and
+                (if .retention.inputs_reclaimed then valid_v4_terminal else true end)
+             else true end) and
+            (.stages.compile | valid_v3_compile) and
+            (.stages.acquire_basins | valid_v5_acquire($ceiling)) and
+            (.stages.acquire_streamnet | valid_v5_acquire($ceiling)))
         end
     ' "$file" >/dev/null 2>&1 || hfx_die "basin state is malformed for $basin_id: $file"
 }
@@ -701,7 +725,7 @@ reclaimed_source_must_be_absent() {
 
 validate_reclaimed_sources_absent() {
     local basin_id=$1
-    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed' "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
+    if [[ $("$JQ" -r '(.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed' "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
         pipeline_source_basin_id=$basin_id
         for_each_pipeline_source_path "$basin_id" reclaimed_source_must_be_absent
     fi
@@ -952,7 +976,7 @@ calibration_first_start_valid() {
     fi
     while IFS= read -r basin_id; do
         "$JQ" -e '
-          .schema_version == 4 and .retention.inputs_reclaimed == false and
+          (.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == false and
           (.stages.acquire_basins == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
           (.stages.acquire_streamnet == {status:"pending",attempts:0,failure_reason:null,evidence:null}) and
           (.stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null})
@@ -1254,7 +1278,7 @@ calibration_compute_measurement() {
 calibration_terminal_reclaimed() {
     local basin_id
     while IFS= read -r basin_id; do
-        "$JQ" -e '.schema_version == 4 and .retention.inputs_reclaimed == true and
+        "$JQ" -e '(.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == true and
             (.stages.compile.status == "succeeded" or .stages.compile.status == "failed")' \
             "$campaign_dir/state/basins/$basin_id/current.json" >/dev/null || return 1
     done < <(effective_basin_ids)
@@ -1637,6 +1661,7 @@ print_status() {
     local status
     local basin_id
     local selected_count
+    local selected_has_version_5=0
     local state_files=()
     printf 'campaign=%s\n' "$campaign"
     printf 'inventory_count=62\n'
@@ -1644,6 +1669,11 @@ print_status() {
         state_files[${#state_files[@]}]=$campaign_dir/state/basins/$basin_id/current.json
     done < <(effective_basin_ids)
     selected_count=${#state_files[@]}
+    if ((selected_count > 0)) &&
+        "$JQ" -e -s 'any(.[]; .schema_version == 5)' \
+            ${state_files[@]+"${state_files[@]}"} >/dev/null; then
+        selected_has_version_5=1
+    fi
     if [[ -f "$campaign_dir/state/selection.json" && ! -L "$campaign_dir/state/selection.json" ]]; then
         printf 'selected_basin_count=%s\n' "$selected_count"
         printf 'unselected_basin_count=%s\n' "$((62 - selected_count))"
@@ -1660,11 +1690,17 @@ print_status() {
                 print_zero_count
             fi
         done
+        if ((selected_has_version_5 == 1)) && [[ "$stage" != compile ]]; then
+            printf '%s_exhausted=' "$stage"
+            "$JQ" -s --arg stage "$stage" \
+                '[.[].stages[$stage].status | select(. == "exhausted")] | length' \
+                ${state_files[@]+"${state_files[@]}"}
+        fi
     done
     if [[ $("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json") == reclaim-inputs-after-terminal ]]; then
         printf 'inputs_reclaimed='
         if (( ${#state_files[@]} > 0 )); then
-            "$JQ" -s '[.[] | select(.schema_version == 4 and .retention.inputs_reclaimed == true)] | length' \
+            "$JQ" -s '[.[] | select((.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == true)] | length' \
                 ${state_files[@]+"${state_files[@]}"}
         else
             print_zero_count
@@ -2023,6 +2059,7 @@ pipeline_campaign() {
     acquire_campaign_lock
     checkpoint_require_pipeline_running
     validate_workspace_state
+    reject_bounded_acquisition_state
     locked_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
     [[ "$locked_policy" == "$acquire_retention_policy" ]] ||
         hfx_die 'campaign retention policy changed while acquiring the campaign lock'
@@ -2187,7 +2224,7 @@ pipeline_unreclaimed_count() {
     local basin_id
     local count=0
     while IFS= read -r basin_id; do
-        if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+        if [[ $("$JQ" -r '(.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == true' \
             "$campaign_dir/state/basins/$basin_id/current.json") != true ]]; then
             count=$((count + 1))
         fi
@@ -2424,7 +2461,7 @@ pipeline_finish_terminal() {
     transition_pipeline_basin "$basin_id" terminal
     reconcile_reclaim_basin "$basin_id" true ||
         hfx_die "pipeline terminal basin was not reclaimable: $basin_id"
-    [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+    [[ $("$JQ" -r '(.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == true' \
         "$campaign_dir/state/basins/$basin_id/current.json") == true ]] ||
         hfx_die "pipeline reclaim did not persist terminal state: $basin_id"
     validate_reclaimed_sources_absent "$basin_id"
@@ -2433,7 +2470,7 @@ pipeline_finish_terminal() {
 
 pipeline_rule_1() {
     local basin_id=$1
-    if [[ $("$JQ" -r '.schema_version == 4 and .retention.inputs_reclaimed == true' \
+    if [[ $("$JQ" -r '(.schema_version == 4 or (.schema_version == 5 and has("retention"))) and .retention.inputs_reclaimed == true' \
         "$campaign_dir/state/basins/$basin_id/current.json") == true ]]; then
         validate_reclaimed_sources_absent "$basin_id"
         transition_pipeline_basin "$basin_id" reclaimed
@@ -2815,6 +2852,7 @@ migrate_basin_state() {
     local temporary
     local policy
     local target_version
+    local current_version
     policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
     if [[ "$policy" == reclaim-inputs-after-terminal ]]; then
         target_version=4
@@ -2822,7 +2860,12 @@ migrate_basin_state() {
         target_version=3
     fi
     current=$campaign_dir/state/basins/$basin_id/current.json
-    if [[ $("$JQ" -r '.schema_version' "$current") != "$target_version" ]]; then
+    current_version=$("$JQ" -r '.schema_version' "$current")
+    migrated_basin_original_version=$current_version
+    if [[ "$current_version" == 5 ]]; then
+        return
+    fi
+    if [[ "$current_version" != "$target_version" ]]; then
         temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
         "$JQ" --argjson target_version "$target_version" --arg policy "$policy" '
                 .schema_version as $version |
@@ -2851,6 +2894,113 @@ migrate_basin_states() {
     while IFS= read -r basin_id; do
         migrate_basin_state "$basin_id"
     done < <(effective_basin_ids)
+}
+
+selected_bounded_state_exists() {
+    local basin_id
+    while IFS= read -r basin_id; do
+        if [[ $("$JQ" -r '.schema_version' \
+            "$campaign_dir/state/basins/$basin_id/current.json") == 5 ]]; then
+            return 0
+        fi
+    done < <(effective_basin_ids)
+    return 1
+}
+
+reject_bounded_acquisition_state() {
+    if selected_bounded_state_exists; then
+        hfx_die 'bounded acquisition state requires the acquire subcommand'
+    fi
+}
+
+convert_basin_to_bounded_state() {
+    local basin_id=$1
+    local ceiling=$2
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local temporary=$campaign_dir/state/basins/$basin_id/.current.json.tmp.$$
+    "$JQ" --argjson ceiling "$ceiling" '
+      .schema_version = 5 |
+      .acquisition = {product_attempt_ceiling:$ceiling}
+    ' "$current" >"$temporary"
+    atomic_install "$temporary" "$current" validate_basin_json "$basin_id"
+}
+
+prepare_bounded_acquisition() {
+    local basin_id
+    local current
+    local version
+    local stored=
+    local ceiling
+    local stage
+    local product
+    local attempts
+    local selected_count=0
+    local version_5_count=0
+    local stored_differs_requested=0
+    bounded_acquisition_active=0
+
+    if ((product_attempt_ceiling_seen == 0)); then
+        while IFS= read -r basin_id; do
+            selected_count=$((selected_count + 1))
+            migrate_basin_state "$basin_id"
+            if [[ "$migrated_basin_original_version" == 5 ]]; then
+                version_5_count=$((version_5_count + 1))
+                current=$campaign_dir/state/basins/$basin_id/current.json
+                ceiling=$("$JQ" -r '.acquisition.product_attempt_ceiling' "$current")
+                if [[ -n "$stored" && "$stored" != "$ceiling" ]]; then
+                    hfx_die 'selected basin product attempt ceilings differ; use a new campaign ID'
+                fi
+                stored=$ceiling
+            fi
+        done < <(effective_basin_ids)
+        if ((version_5_count == 0)); then
+            return 0
+        fi
+        if ((version_5_count != selected_count)); then
+            hfx_die "bounded acquisition conversion is incomplete; rerun acquire with --product-attempt-ceiling $stored"
+        fi
+        product_attempt_ceiling=$stored
+        bounded_acquisition_active=1
+        return
+    fi
+
+    while IFS= read -r basin_id; do
+        selected_count=$((selected_count + 1))
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        version=$("$JQ" -r '.schema_version' "$current")
+        if [[ "$version" == 5 ]]; then
+            version_5_count=$((version_5_count + 1))
+            ceiling=$("$JQ" -r '.acquisition.product_attempt_ceiling' "$current")
+            if [[ -n "$stored" && "$stored" != "$ceiling" ]]; then
+                hfx_die 'selected basin product attempt ceilings differ; use a new campaign ID'
+            fi
+            stored=$ceiling
+            if ((product_attempt_ceiling_seen == 1)) && [[ "$ceiling" != "$product_attempt_ceiling" ]]; then
+                stored_differs_requested=1
+            fi
+        fi
+        if ((product_attempt_ceiling_seen == 1)); then
+            for product in basins streamnet; do
+                stage=acquire_$product
+                attempts=$("$JQ" -r --arg stage "$stage" '.stages[$stage].attempts' "$current")
+                if ((attempts > product_attempt_ceiling)); then
+                    hfx_die "product attempt ceiling $product_attempt_ceiling is below existing attempt count $attempts for $basin_id-$product"
+                fi
+            done
+        fi
+    done < <(effective_basin_ids)
+
+    ((stored_differs_requested == 0)) ||
+        hfx_die 'product attempt ceiling changed; use a new campaign ID'
+
+    while IFS= read -r basin_id; do
+        current=$campaign_dir/state/basins/$basin_id/current.json
+        if [[ $("$JQ" -r '.schema_version' "$current") != 5 ]]; then
+            migrate_basin_state "$basin_id"
+            convert_basin_to_bounded_state "$basin_id" "$product_attempt_ceiling"
+        fi
+    done < <(effective_basin_ids)
+    bounded_acquisition_active=1
 }
 
 recover_running_stages_for_basin() {
@@ -3344,7 +3494,8 @@ reconcile_reclaim_basin() {
     [[ $("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json") == reclaim-inputs-after-terminal ]] ||
         return 1
     schema_version=$("$JQ" -r '.schema_version' "$current")
-    [[ "$schema_version" == 4 ]] || return 1
+    [[ "$schema_version" == 4 ||
+       ("$schema_version" == 5 && $("$JQ" -r 'has("retention")' "$current") == true) ]] || return 1
     compile_status=$("$JQ" -r '.stages.compile.status' "$current")
 
     if [[ $("$JQ" -r '.retention.inputs_reclaimed' "$current") == true ]]; then
@@ -3505,7 +3656,7 @@ print_basin_compile_status() {
     "$JQ" -r '
       "compile_status=\(.stages.compile.status)",
       "compile_attempts=\(.stages.compile.attempts)",
-      (if .schema_version == 4
+      (if .schema_version == 4 or (.schema_version == 5 and has("retention"))
        then "inputs_reclaimed=\(.retention.inputs_reclaimed)"
        else "inputs_reclaimed=not-applicable" end)
     ' "$current"
@@ -4381,6 +4532,7 @@ acquire_product() {
     local current=$campaign_dir/state/basins/$basin_id/current.json
     local final=$campaign_dir/downloads/$basin_id-$product.gpkg
     local partial=$final.partial
+    local partial_sidecar=$partial.json
     local headers=$campaign_dir/state/tmp/.curl-headers.$basin_id.$product.$$
     local stats=$campaign_dir/state/tmp/.curl-stats.$basin_id.$product.$$
     local report=$campaign_dir/reports/$basin_id-$product-acquisition.json
@@ -4436,6 +4588,14 @@ acquire_product() {
             return
         fi
         "$RM" -- "$partial"
+    fi
+    if ((bounded_acquisition_active == 1)) && [[ -e "$partial_sidecar" || -L "$partial_sidecar" ]]; then
+        if [[ ! -f "$partial_sidecar" || -L "$partial_sidecar" ]]; then
+            fail_product "$basin_id" "$stage" "$attempts" 'partial path is unsafe; retained without traversal'
+            emit_acquisition_summary "$basin_id" "$product" failed "$report"
+            return
+        fi
+        "$RM" -- "$partial_sidecar"
     fi
 
     attempts=$((attempts + 1))
@@ -4508,6 +4668,67 @@ acquire_basin() {
     acquire_product "$basin_id" streamnet
 }
 
+bounded_retryable_failure() {
+    case $1 in
+        'transfer interrupted; retry from byte zero'|\
+        'download provenance or size verification failed'|\
+        'download failed integrity verification') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+acquire_product_bounded() {
+    local basin_id=$1
+    local product=$2
+    local stage=acquire_$product
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    local final=$campaign_dir/downloads/$basin_id-$product.gpkg
+    local report=$campaign_dir/reports/$basin_id-$product-acquisition.json
+    local status
+    local attempts
+    local reason
+    while :; do
+        status=$("$JQ" -r --arg stage "$stage" '.stages[$stage].status' "$current")
+        attempts=$("$JQ" -r --arg stage "$stage" '.stages[$stage].attempts' "$current")
+        reason=$("$JQ" -r --arg stage "$stage" '.stages[$stage].failure_reason // ""' "$current")
+        if [[ "$status" == exhausted ]]; then
+            [[ ! -e "$final" && ! -L "$final" ]] ||
+                hfx_die "exhausted acquisition has an unexpected final file: $final"
+            return
+        fi
+        if [[ -e "$final" || -L "$final" ]]; then
+            acquire_product "$basin_id" "$product"
+            return
+        fi
+        if [[ "$status" == succeeded ]]; then
+            return
+        fi
+        if ((attempts == product_attempt_ceiling)) &&
+            { [[ "$status" == pending ]] ||
+              { [[ "$status" == failed ]] && bounded_retryable_failure "$reason"; }; }; then
+            write_acquire_stage "$basin_id" "$stage" exhausted "$attempts" \
+                'product attempt ceiling exhausted; retryable acquisition did not succeed' null
+            emit_acquisition_summary "$basin_id" "$product" exhausted "$report"
+            return
+        fi
+        if [[ "$status" == failed ]] && ! bounded_retryable_failure "$reason"; then
+            return
+        fi
+        acquire_product "$basin_id" "$product"
+    done
+}
+
+acquire_basin_bounded() {
+    lock_owned=0
+    takeover_owned=0
+    local basin_id=$1
+    local current=$campaign_dir/state/basins/$basin_id/current.json
+    [[ $("$JQ" -r '.schema_version' "$current") == 5 ]] ||
+        hfx_die "bounded acquisition requires basin schema version 5: $basin_id"
+    acquire_product_bounded "$basin_id" basins
+    acquire_product_bounded "$basin_id" streamnet
+}
+
 worker_pids=()
 worker_failure=0
 wait_oldest_worker() {
@@ -4546,12 +4767,16 @@ acquire_campaign() {
     locked_retention_policy=$("$JQ" -r '.retention.policy' "$campaign_dir/state/campaign.json")
     [[ "$locked_retention_policy" == "$acquire_retention_policy" ]] ||
         hfx_die 'campaign retention policy changed while acquiring the campaign lock'
-    migrate_basin_states
+    prepare_bounded_acquisition
     recover_running_stages true
     validate_workspace_state
     trap interrupt_acquisition INT TERM
     while IFS= read -r basin_id; do
-        acquire_basin "$basin_id" &
+        if ((bounded_acquisition_active == 1)); then
+            acquire_basin_bounded "$basin_id" &
+        else
+            acquire_basin "$basin_id" &
+        fi
         worker_pids[${#worker_pids[@]}]=$!
         if ((${#worker_pids[@]} >= max_parallel)); then
             wait_oldest_worker
@@ -4583,6 +4808,7 @@ calibrate_campaign() {
     OGRINFO=$(resolve_command HFX_TDX_OGRINFO ogrinfo)
     acquire_campaign_lock
     validate_workspace_state
+    reject_bounded_acquisition_state
     if [[ ! -e "$state" && ! -L "$state" ]]; then
         if [[ "$max_parallel" == 2 ]]; then
             calibration_first_start_valid "$HFX_TDX_CALIBRATION_PARALLEL_2_IDS" ||
@@ -4717,6 +4943,9 @@ calibration_active=0
 calibration_compile_basin=
 max_parallel=
 max_parallel_seen=0
+product_attempt_ceiling=
+product_attempt_ceiling_seen=0
+bounded_acquisition_active=0
 fabric_version=
 fabric_version_seen=0
 expected_terminal_count=
@@ -4744,11 +4973,11 @@ basin_ids=()
 while (($# > 0)); do
     option=$1
     case $option in
-        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--fabric-version|--expected-terminal-count|--out|--report|--notice|--citation|--scratch-prefix|--partial-fabric|--partial-fabric-roster|--exclude-control-basin)
+        --campaign|--workspace-root|--basin|--retention-policy|--available-memory-bytes|--available-disk-bytes|--retained-input-bytes|--peak-in-flight-download-bytes|--retained-basin-output-bytes|--assembly-memory-ceiling-bytes|--assembly-scratch-ceiling-bytes|--assembled-artifact-bytes|--active-compile-scratch-bytes|--filesystem-overhead-bytes|--max-parallel|--product-attempt-ceiling|--fabric-version|--expected-terminal-count|--out|--report|--notice|--citation|--scratch-prefix|--partial-fabric|--partial-fabric-roster|--exclude-control-basin)
             shift
             (($# > 0)) && [[ -n "$1" ]] || usage_error "option $option requires a value"
             if [[ "$1" == -* ]] &&
-                ! [[ "$option" == --max-parallel && "$1" =~ ^-[0-9]+$ ]]; then
+                ! [[ ("$option" == --max-parallel || "$option" == --product-attempt-ceiling) && "$1" =~ ^-[0-9]+$ ]]; then
                 usage_error "option $option requires a value"
             fi
             value=$1
@@ -4784,6 +5013,14 @@ while (($# > 0)); do
             ((max_parallel_seen == 0)) || usage_error 'option --max-parallel may not be repeated'
             max_parallel_seen=1
             max_parallel=$value
+            ;;
+        --product-attempt-ceiling)
+            [[ "$subcommand" == acquire ]] ||
+                usage_error 'option --product-attempt-ceiling is valid only for acquire'
+            ((product_attempt_ceiling_seen == 0)) ||
+                usage_error 'option --product-attempt-ceiling may not be repeated'
+            product_attempt_ceiling_seen=1
+            product_attempt_ceiling=$value
             ;;
         --fabric-version)
             [[ "$subcommand" == compile || "$subcommand" == compile-basin || "$subcommand" == pipeline || "$subcommand" == calibrate ]] ||
@@ -4863,6 +5100,17 @@ done
 ((campaign_seen == 1)) || usage_error 'option --campaign is required'
 validate_campaign "$campaign"
 validate_workspace_root "$workspace_root"
+
+if ((product_attempt_ceiling_seen == 1)); then
+    if [[ ! "$product_attempt_ceiling" =~ ^[1-9][0-9]*$ ]] ||
+        [[ ${#product_attempt_ceiling} -gt 19 ]] ||
+        [[ ${#product_attempt_ceiling} -eq 19 && "$product_attempt_ceiling" > "$HFX_TDX_MAX_I64" ]]; then
+        usage_error 'option --product-attempt-ceiling must be a canonical positive signed-64-bit integer'
+    fi
+    if ((max_parallel_seen == 0)) || [[ ! "$max_parallel" =~ ^[1-4]$ ]]; then
+        usage_error 'option --max-parallel must be a base-10 integer from 1 through 4 when --product-attempt-ceiling is supplied'
+    fi
+fi
 
 if ((partial_fabric_seen == 1)); then
     ((partial_fabric_roster_seen == 1)) ||

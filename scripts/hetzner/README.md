@@ -274,11 +274,12 @@ The accepted command forms are:
 tdx-hydro-campaign.sh init --campaign <id> [--workspace-root <path>] [--basin <processing-basin-id>]... [--retention-policy <retain-all-through-publication|reclaim-inputs-after-terminal>] --available-memory-bytes <integer> --available-disk-bytes <integer> (--retained-input-bytes <integer> | --peak-in-flight-download-bytes 44296724480) --retained-basin-output-bytes <integer> --assembly-memory-ceiling-bytes <integer> --assembly-scratch-ceiling-bytes <integer> --assembled-artifact-bytes <integer> --active-compile-scratch-bytes <integer> --filesystem-overhead-bytes <integer>
 tdx-hydro-campaign.sh status --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh recover --campaign <id> [--workspace-root <path>]
-tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer>
+tdx-hydro-campaign.sh acquire --campaign <id> [--workspace-root <path>] --max-parallel <integer> [--product-attempt-ceiling <positive-integer>]
 tdx-hydro-campaign.sh compile --campaign <id> [--workspace-root <path>] --fabric-version <value>
 tdx-hydro-campaign.sh compile-basin --campaign <id> [--workspace-root <path>] --basin <processing-basin-id> --fabric-version <value>
 tdx-hydro-campaign.sh progress --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh pipeline --campaign <id> [--workspace-root <path>] --max-parallel <integer> --fabric-version <value>
+tdx-hydro-campaign.sh calibrate --campaign <id> [--workspace-root <path>] --max-parallel <2|4> --fabric-version <value>
 tdx-hydro-campaign.sh assemble --campaign <id> [--workspace-root <path>] [--partial-fabric <dataset-root> --partial-fabric-roster <json-file> --exclude-control-basin <processing-basin-id>]
 tdx-hydro-campaign.sh evidence --campaign <id> [--workspace-root <path>]
 tdx-hydro-campaign.sh publish --campaign <id> [--workspace-root <path>] --out <dataset-dir> --report <path> --notice <path> --citation <path> --scratch-prefix <prefix>
@@ -363,6 +364,60 @@ range diagnostic remains
 `option --max-parallel must be a base-10 integer from 1 through 62`.
 Use `4` as the polite NGA operating value.
 
+Direct `acquire` optionally accepts
+`--product-attempt-ceiling <positive-integer>`. The value must be canonical
+base 10 in the inclusive signed 64-bit range from `1` through
+`9223372036854775807`. Supplying it also limits `--max-parallel` to `1..4` for
+either retention policy. The option belongs only to direct `acquire` and is
+never persisted in `campaign.json` or `selection.json`.
+
+The ceiling is cumulative for each selected processing basin product. Each
+`basins` product and each `streamnet` product has its own fixed count. It is
+neither a per-basin ceiling nor a per-invocation ceiling. Every retry is a
+fresh byte-zero GET because NGA has no range support. Acquisition reports keep
+schema version 1 and atomically append one complete transfer object after each
+attempt.
+
+Supplying the ceiling converts selected basin state to schema version 5 after
+a complete read-only preflight. A retain-all state has the exact outer members
+`acquisition`, `processing_basin_id`, `schema_version`, and `stages`. A reclaim
+state also has `retention`, with the existing exact policy and
+`inputs_reclaimed` members. `acquisition` contains only
+`product_attempt_ceiling`. Compile retains the schema-version-3 and
+schema-version-4 shape. Acquisition stages retain `attempts`, `evidence`,
+`failure_reason`, and `status`.
+
+An inspected `succeeded` acquisition has a positive attempt count, null
+failure reason, and complete byte count, SHA-256, SQLite identity, and layer
+evidence. An `exhausted` acquisition has the ceiling attempt count, null
+evidence, and exact reason
+`product attempt ceiling exhausted; retryable acquisition did not succeed`.
+The two states are mechanically distinct. A retryable failure at the ceiling
+is atomically changed to `exhausted`. Inspection failures remain `failed` for
+operator review, and the sibling product still runs.
+
+The stored ceiling is fixed for the campaign's selected basins. A later direct
+`acquire` may omit the option after every selected basin has schema version 5
+with the same ceiling. Repeating the same explicit ceiling is also idempotent.
+An interrupted mixed conversion requires the explicit stored ceiling to
+finish. Changed or conflicting ceilings require a new campaign ID.
+
+Version-5 status adds `acquire_basins_exhausted` immediately after the existing
+basins failed count and `acquire_streamnet_exhausted` immediately after the
+existing streamnet failed count. Compile retains its four statuses. The
+terminal acquisition summary uses `status=exhausted`. Status output for basin
+schema versions 1 through 4 remains unchanged.
+
+Bounded direct acquisition performs acquisition and inspection only. It does
+not compile, reclaim inputs, assemble, delete artifacts, publish, invoke AWS,
+or write S3 objects. Schema versions 3 and 4 and campaign schema version 2
+remain accepted unchanged. Without the option and without selected version-5
+state, cumulative attempts remain unlimited and direct acquire keeps exactly
+one attempt per product per dispatch and invocation. No finite default exists.
+Pipeline and calibration keep their existing dispatch behavior for schema
+versions 1 through 4. Both refuse selected version-5 state before transfer,
+adapter resolution, compile, or reclaim.
+
 Reclaim policy removes only the exact basins and streamnet source GeoPackages,
 safe acquisition partials, and their provenance sidecars after both acquisitions
 succeed and compile reaches a durable success or an actual adapter build or
@@ -382,11 +437,9 @@ targets.
 
 Pipeline recovery classifies each acquisition stage from durable state.
 `succeeded` is terminal. `pending`, including the interrupted-stage diagnostic,
-and these five failed reasons are retryable and map to pipeline `pending`:
+and these three failed reasons are retryable and map to pipeline `pending`:
 
-- `partial changed during ignored-Range continuation`
-- `continuation response failed provenance verification`
-- `transfer failed`
+- `transfer interrupted; retry from byte zero`
 - `download provenance or size verification failed`
 - `download failed integrity verification`
 
@@ -395,7 +448,7 @@ These five failed reasons map to pipeline `blocked` and retain the exact reason:
 - `acquisition report is unsafe or malformed; retained for inspection`
 - `existing final file failed integrity verification; retained for inspection`
 - `persisted evidence does not match final file; retained for inspection`
-- `partial provenance path is unsafe; retained without traversal`
+- `partial path is unsafe; retained without traversal`
 - `installed final failed integrity verification; retained for inspection`
 
 Recovery preserves a succeeded sibling, safe partial, sidecar, final,
@@ -432,10 +485,8 @@ max_parallel <= 5 - 1
 max_parallel <= 4
 ```
 
-It continues a regular partial only when its sidecar's exact identity, URL,
-strong ETag, byte count, remote total, and SHA-256 validate; otherwise it
-discards a safe ordinary incomplete partial before one complete-file retry.
-A resumed acquisition re-verifies every installed final's byte count, SHA-256,
+It discards a safe ordinary incomplete partial before each fresh complete-file
+attempt. A resumed acquisition re-verifies every installed final's byte count, SHA-256,
 SQLite identity, layer name, and persisted evidence. A resumed compile re-validates
 each succeeded dataset and external report. Existing failed or conflicting compile
 artifacts are retained for inspection.
@@ -469,8 +520,8 @@ The runner phases are:
    retention policy.
 2. `acquire` performs bounded parallel work across basins, with products serial
    within each basin. Retain-all accepts `1..62`; reclaim accepts `1..4`.
-   Use `4` as the polite NGA campaign operating policy. The runner safely
-   continues only a server-honored HTTP range tied to a validated strong ETag.
+   Use `4` as the polite NGA campaign operating policy. Product attempts are
+   fresh byte-zero transfers.
 3. `compile --fabric-version <value>` invokes one isolated adapter build per
    basin after both products succeed. In reclaim mode, durable compile success
    or an actual adapter build or validation hard failure immediately reclaims
