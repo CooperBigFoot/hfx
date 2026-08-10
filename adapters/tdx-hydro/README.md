@@ -308,8 +308,58 @@ of root successor LINKNO 1104039` in the reverse-topological loop. The later
 `successor_conflict` ordering is historical-campaign context; the acquired
 feature does not reach that branch.
 
-The command never compiles, writes, uploads, contacts NGA, or reads S3. Real
-verdict output is intentionally absent from this change.
+The command never compiles, writes, uploads, contacts NGA, or reads S3. The
+canonical generated ledger is
+[`seven-basin-verdicts.json`](seven-basin-verdicts.json), preserved byte-for-byte
+from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
+`adapter.git_revision` value
+`bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
+under which the seven processing basins are absent. The adjudicator at commit
+`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
+
+The acquired geometry sources and fixed feature identities are:
+
+- `salvage/downloads/1020018110-basins.gpkg`, `streamID 9`
+- `salvage/downloads/2020003440-streamnet.gpkg`, `LINKNO 148956` and its
+  `DSLINKNO` successor
+- `salvage/downloads/2020071190-streamnet.gpkg`, root `LINKNO 1104039` and every
+  feature whose `DSLINKNO` is `1104039`
+
+The transfer sources pair each historical state with the later acquired state
+and products:
+
+- `mirror/state/basins/2020065840/current.json` with
+  `salvage/state/basins/2020065840/current.json`,
+  `salvage/downloads/2020065840-basins.gpkg`, and
+  `salvage/downloads/2020065840-streamnet.gpkg`
+- `mirror/state/basins/4020050470/current.json` with
+  `salvage/state/basins/4020050470/current.json`,
+  `salvage/downloads/4020050470-basins.gpkg`, and
+  `salvage/downloads/4020050470-streamnet.gpkg`
+- `mirror/state/basins/5020049720/current.json` with
+  `salvage/state/basins/5020049720/current.json`,
+  `salvage/downloads/5020049720-basins.gpkg`, and
+  `salvage/downloads/5020049720-streamnet.gpkg`
+- `mirror/state/basins/6020000010/current.json` with
+  `salvage/state/basins/6020000010/current.json`,
+  `salvage/downloads/6020000010-basins.gpkg`, and
+  `salvage/downloads/6020000010-streamnet.gpkg`
+
+The ledger records every raw measurement consumed by the adjudicators and is
+the single verdict authority. The duplicate record's machine-readable
+`derivation` object supplies its preconditions, consistency rule, branches, and
+selected branch. For the non-root record, `adapter strictness` applies exactly
+when `endpoint_separation <= non_root_near_degenerate_limit`, `DSContArea <
+successor_DSContArea`, and any emitted tolerance match has
+`current_endpoint_index == 1`; every other measured combination yields `source
+defect`. For the root record, `adapter strictness` applies exactly when
+`endpoint_separation <= root_near_degenerate_limit` and every emitted
+predecessor `DSContArea` is less than the root `DSContArea`; every other measured
+combination yields `source defect`. For a transfer record, validated exhaustion
+of exactly one historical product plus successful later acquisition identities
+for both products yields `transfer failure`.
+
+Both evidence trees remained read-only, and no bulk evidence is committed.
 
 ## Campaign notes
 
