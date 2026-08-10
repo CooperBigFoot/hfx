@@ -275,6 +275,92 @@ The underlying Rust command is
 `catchments.parquet` and `aux/snap_stems.parquet` as GeoParquet 1.1 and verifies
 that `graph.parquet` has the expected non-GeoParquet classification.
 
+## Local basin adjudication
+
+The adapter can deterministically adjudicate the seven absent TDX-Hydro
+processing basins from two local, read-only evidence trees:
+
+```bash
+uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py adjudicate \
+  --acquired-evidence-root tdx-m5-seven-acquire-evidence \
+  --historical-evidence-root tdx-m5-planetary-evidence
+```
+
+The fixed processing-basin order is `1020018110`, `2020003440`, `2020065840`,
+`2020071190`, `4020050470`, `5020049720`, and `6020000010`. Acquired products
+and state are resolved without discovery at
+`salvage/downloads/<processing-basin-id>-{basins,streamnet}.gpkg` and
+`salvage/state/basins/<processing-basin-id>/current.json`. Historical state is
+resolved at `mirror/state/basins/<processing-basin-id>/current.json`.
+
+Source-defect and adapter-strictness verdicts come only from acquired source
+geometry, never a preserved traceback. A transfer-failure verdict comes from
+the historical campaign exhaustion record, with a later clean acquisition
+supplying resolution evidence. Missing, unsafe, malformed, or mismatched
+evidence refuses the complete result before stdout receives any JSON. A
+successful run emits one canonical, seven-item JSON document to stdout and has
+no output-file option.
+
+The adjudication reproduces adapter version `0.1.0` at git revision
+`bca87d8adb0651d130bde9c7dfcf3947427cfa24`. For processing basin `2020071190`,
+the governing pinned-adapter refusal is `cannot determine the upstream endpoint
+of root successor LINKNO 1104039` in the reverse-topological loop. The later
+`successor_conflict` ordering is historical-campaign context; the acquired
+feature does not reach that branch.
+
+The command never compiles, writes, uploads, contacts NGA, or reads S3. The
+canonical generated ledger is
+[`seven-basin-verdicts.json`](seven-basin-verdicts.json), preserved byte-for-byte
+from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
+`adapter.git_revision` value
+`bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
+under which the seven processing basins are absent. The adjudicator at commit
+`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
+
+The acquired geometry sources and fixed feature identities are:
+
+- `salvage/downloads/1020018110-basins.gpkg`, `streamID 9`
+- `salvage/downloads/2020003440-streamnet.gpkg`, `LINKNO 148956` and its
+  `DSLINKNO` successor
+- `salvage/downloads/2020071190-streamnet.gpkg`, root `LINKNO 1104039` and every
+  feature whose `DSLINKNO` is `1104039`
+
+The transfer sources pair each historical state with the later acquired state
+and products:
+
+- `mirror/state/basins/2020065840/current.json` with
+  `salvage/state/basins/2020065840/current.json`,
+  `salvage/downloads/2020065840-basins.gpkg`, and
+  `salvage/downloads/2020065840-streamnet.gpkg`
+- `mirror/state/basins/4020050470/current.json` with
+  `salvage/state/basins/4020050470/current.json`,
+  `salvage/downloads/4020050470-basins.gpkg`, and
+  `salvage/downloads/4020050470-streamnet.gpkg`
+- `mirror/state/basins/5020049720/current.json` with
+  `salvage/state/basins/5020049720/current.json`,
+  `salvage/downloads/5020049720-basins.gpkg`, and
+  `salvage/downloads/5020049720-streamnet.gpkg`
+- `mirror/state/basins/6020000010/current.json` with
+  `salvage/state/basins/6020000010/current.json`,
+  `salvage/downloads/6020000010-basins.gpkg`, and
+  `salvage/downloads/6020000010-streamnet.gpkg`
+
+The ledger records every raw measurement consumed by the adjudicators and is
+the single verdict authority. The duplicate record's machine-readable
+`derivation` object supplies its preconditions, consistency rule, branches, and
+selected branch. For the non-root record, `adapter strictness` applies exactly
+when `endpoint_separation <= non_root_near_degenerate_limit`, `DSContArea <
+successor_DSContArea`, and any emitted tolerance match has
+`current_endpoint_index == 1`; every other measured combination yields `source
+defect`. For the root record, `adapter strictness` applies exactly when
+`endpoint_separation <= root_near_degenerate_limit` and every emitted
+predecessor `DSContArea` is less than the root `DSContArea`; every other measured
+combination yields `source defect`. For a transfer record, validated exhaustion
+of exactly one historical product plus successful later acquisition identities
+for both products yields `transfer failure`.
+
+Both evidence trees remained read-only, and no bulk evidence is committed.
+
 ## Campaign notes
 
 The processing basin `7020000010` pilot ran on 2026-07-22 from VM

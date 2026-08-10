@@ -19,6 +19,7 @@ from collections import Counter, deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
@@ -33,7 +34,7 @@ import psutil
 from geoparquet_io.core.validate import validate_geoparquet
 from pyproj import Geod
 from shapely import from_wkb, get_coordinates, set_coordinates
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiPolygon, Polygon
 
 
 CROSSWALK_PATH = Path(__file__).parent / "data" / "tdx_header_numbers.json"
@@ -72,6 +73,74 @@ COMPILE_MEMORY_SAMPLE_INTERVAL_MS = 50
 _COMPILE_SCRATCH_EVENT_OBSERVER: (
     Callable[[str, dict[str, int], int], None] | None
 ) = None
+
+ABSENT_PROCESSING_BASIN_IDS = (
+    "1020018110",
+    "2020003440",
+    "2020065840",
+    "2020071190",
+    "4020050470",
+    "5020049720",
+    "6020000010",
+)
+GEOMETRY_ADJUDICATION_IDS = ("1020018110", "2020003440", "2020071190")
+TRANSFER_ADJUDICATION_IDS = (
+    "2020065840",
+    "4020050470",
+    "5020049720",
+    "6020000010",
+)
+ADJUDICATION_CONTROL_ID = "7020000010"
+ADJUDICATED_ADAPTER_GIT_REVISION = "bca87d8adb0651d130bde9c7dfcf3947427cfa24"
+SQLITE3_IDENTITY_HEX = "53514c69746520666f726d6174203300"
+HISTORICAL_TRANSFER_FAILURE_REASON = "transfer interrupted; retry from byte zero"
+DUPLICATE_STREAM_ID = 9
+AMBIGUOUS_NON_ROOT_LINKNO = 148956
+CONFLICTING_ROOT_LINKNO = 1104039
+
+
+class BasinVerdict(Enum):
+    """The exhaustive classifications for absent TDX-Hydro processing basins."""
+
+    SOURCE_DEFECT = "source defect"
+    ADAPTER_STRICTNESS = "adapter strictness"
+    TRANSFER_FAILURE = "transfer failure"
+
+
+class AdjudicationEvidenceKind(Enum):
+    """The authoritative evidence family used for a basin verdict."""
+
+    ACQUIRED_SOURCE_GEOMETRY = "acquired source geometry"
+    HISTORICAL_TRANSFER_WITH_RESOLUTION = (
+        "historical transfer record with later acquisition resolution"
+    )
+
+
+@dataclass(frozen=True)
+class AcquiredProduct:
+    processing_basin_id: str
+    product: str
+    path: Path
+    layer_name: str
+    byte_count: int
+    sha256: str
+    attempts: int
+
+
+@dataclass(frozen=True)
+class HistoricalExhaustion:
+    processing_basin_id: str
+    failed_product: str
+    attempts: int
+    failure_reason: str
+
+
+@dataclass(frozen=True)
+class AdjudicationVerdict:
+    processing_basin_id: str
+    verdict: BasinVerdict
+    evidence_kind: AdjudicationEvidenceKind
+    evidence: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -5248,6 +5317,435 @@ def validate_dataset(
     _assert_geoparquet_result(snap_path, snap_result)
 
 
+def _resolved_real_directory(path: Path, basin_id: str, label: str) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_symlink() or not expanded.is_dir():
+        raise ValueError(f"{basin_id} {label} directory is missing or unsafe: {expanded}")
+    try:
+        return expanded.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{basin_id} {label} directory is missing or unsafe: {expanded}") from error
+
+
+def _fixed_directory(parent: Path, name: str, basin_id: str, label: str) -> Path:
+    path = parent / name
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"{basin_id} {label} directory is missing or unsafe: {path}")
+    return path
+
+
+def _acquired_paths(root: Path, basin_id: str) -> tuple[Path, Path, Path]:
+    root = _resolved_real_directory(root, basin_id, "acquired evidence root")
+    salvage = _fixed_directory(root, "salvage", basin_id, "acquired salvage")
+    downloads = _fixed_directory(salvage, "downloads", basin_id, "acquired downloads")
+    state = _fixed_directory(salvage, "state", basin_id, "acquired state")
+    states = _fixed_directory(state, "basins", basin_id, "acquired state basins")
+    basin_state = _fixed_directory(states, basin_id, basin_id, "acquired processing basin state")
+    return (
+        downloads / f"{basin_id}-basins.gpkg",
+        downloads / f"{basin_id}-streamnet.gpkg",
+        basin_state / "current.json",
+    )
+
+
+def _historical_state_path(root: Path, basin_id: str) -> Path:
+    root = _resolved_real_directory(root, basin_id, "historical evidence root")
+    mirror = _fixed_directory(root, "mirror", basin_id, "historical mirror")
+    state = _fixed_directory(mirror, "state", basin_id, "historical state")
+    states = _fixed_directory(state, "basins", basin_id, "historical state basins")
+    return _fixed_directory(states, basin_id, basin_id, "historical processing basin") / "current.json"
+
+
+def _read_json_object(path: Path, basin_id: str, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{basin_id} {label} is missing: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{basin_id} {label} is malformed: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{basin_id} {label} is malformed: {path}")
+    return value
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and value == value.lower() and all(c in "0123456789abcdef" for c in value)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _parse_acquired_product(root: Path, basin_id: str, product: str) -> AcquiredProduct:
+    basins_path, streamnet_path, state_path = _acquired_paths(root, basin_id)
+    path = basins_path if product == "basins" else streamnet_path
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{basin_id} acquired source data is missing for {product}: {path}")
+    state = _read_json_object(state_path, basin_id, "acquired state")
+    if state.get("processing_basin_id") != basin_id:
+        raise ValueError(f"{basin_id} acquired state basin identity mismatch: {state_path}")
+    acquisition, stages = state.get("acquisition"), state.get("stages")
+    if state.get("schema_version") != 5 or not isinstance(acquisition, dict) or acquisition.get("product_attempt_ceiling") != 3 or not isinstance(stages, dict):
+        raise ValueError(f"{basin_id} {product} acquired state mismatch: {state_path}")
+    stage = stages.get(f"acquire_{product}")
+    if not isinstance(stage, dict):
+        raise ValueError(f"{basin_id} {product} acquired state mismatch: {state_path}")
+    attempts, evidence = stage.get("attempts"), stage.get("evidence")
+    if stage.get("status") != "succeeded" or not _is_int(attempts) or not 1 <= attempts <= 3 or stage.get("failure_reason") is not None or not isinstance(evidence, dict) or set(evidence) != {"bytes", "layer_name", "sha256", "sqlite_identity"}:
+        raise ValueError(f"{basin_id} {product} acquired state mismatch: {state_path}")
+    try:
+        layers = [str(name) for name in pyogrio.list_layers(path)[:, 0].tolist()]
+        with path.open("rb") as handle:
+            header = handle.read(16).hex()
+        byte_count, sha256 = path.stat().st_size, _file_sha256(path)
+    except Exception as error:
+        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}") from error
+    if not _is_int(evidence.get("bytes")) or evidence["bytes"] != byte_count or not _valid_sha256(evidence.get("sha256")) or evidence["sha256"] != sha256 or evidence.get("sqlite_identity") != SQLITE3_IDENTITY_HEX or header != SQLITE3_IDENTITY_HEX or len(layers) != 1 or evidence.get("layer_name") != layers[0]:
+        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}")
+    return AcquiredProduct(basin_id, product, path, layers[0], byte_count, sha256, attempts)
+
+
+def _read_adjudication_features(product: AcquiredProduct, columns: Sequence[str], where: str) -> gpd.GeoDataFrame:
+    try:
+        frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), where=where)
+    except Exception as error:
+        raise ValueError(f"{product.processing_basin_id} {product.product} acquired source is malformed: {product.path}") from error
+    if not isinstance(frame, gpd.GeoDataFrame) or frame.crs is None:
+        raise ValueError(f"{product.processing_basin_id} {product.product} acquired source is malformed: {product.path}")
+    if frame.crs.to_epsg() != 4326:
+        try:
+            frame = frame.to_crs(CRS)
+        except Exception as error:
+            raise ValueError(f"{product.processing_basin_id} {product.product} CRS does not resolve to {CRS}: {product.path}") from error
+    if frame.crs is None or frame.crs.to_epsg() != 4326:
+        raise ValueError(f"{product.processing_basin_id} {product.product} CRS does not resolve to {CRS}: {product.path}")
+    return frame
+
+
+def _polygon_coordinates(geometry: object, label: str) -> list[object]:
+    if not isinstance(geometry, (Polygon, MultiPolygon)) or geometry.is_empty or geometry.has_z:
+        raise ValueError(f"{label} must be a non-empty two-dimensional Polygon or MultiPolygon")
+    if isinstance(geometry, Polygon):
+        return [[[float(x), float(y)] for x, y in ring.coords] for ring in [geometry.exterior, *geometry.interiors]]
+    return [_polygon_coordinates(polygon, label) for polygon in geometry.geoms]
+
+
+def _coordinates_are_finite(geometry: Polygon | MultiPolygon) -> bool:
+    return bool(np.isfinite(get_coordinates(geometry)).all())
+
+
+def _geometry_is_valid(geometry: Polygon | MultiPolygon) -> bool:
+    return bool(geometry.is_valid)
+
+
+def _line_endpoints(geometry: object, label: str) -> list[list[float]]:
+    if geometry is None or geometry.is_empty or geometry.has_z or not isinstance(geometry, LineString) or len(geometry.coords) < 2:
+        raise ValueError(f"{label} must be a healthy two-dimensional LineString")
+    return [[float(value) for value in geometry.coords[index]] for index in (0, -1)]
+
+
+def _positive_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a finite positive float")
+    checked = float(value)
+    if not math.isfinite(checked) or checked <= 0.0:
+        raise ValueError(f"{label} must be a finite positive float")
+    return checked
+
+
+def _limit_classification(value: float, limit: float) -> str:
+    return "inside" if value < limit else "on" if value == limit else "outside"
+
+
+def _distance_records(first: list[list[float]], second: list[list[float]], first_name: str, second_name: str) -> list[dict[str, object]]:
+    return [{f"{first_name}_endpoint_index": i, f"{second_name}_endpoint_index": j, "distance_degrees": math.dist(a, b)} for i, a in enumerate(first) for j, b in enumerate(second)]
+
+
+def _derive_duplicate_verdict(
+    spatially_equal: bool,
+    coordinate_sequences_equal: bool,
+) -> tuple[BasinVerdict, str]:
+    if type(spatially_equal) is not bool or type(coordinate_sequences_equal) is not bool:
+        raise ValueError("duplicate geometry measurements must be booleans")
+    if not spatially_equal and coordinate_sequences_equal:
+        raise ValueError(
+            "duplicate geometry measurements are inconsistent: coordinate sequence equality requires spatial equality"
+        )
+    if (spatially_equal, coordinate_sequences_equal) == (True, True):
+        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
+    if (spatially_equal, coordinate_sequences_equal) == (True, False):
+        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
+    if (spatially_equal, coordinate_sequences_equal) == (False, False):
+        return BasinVerdict.SOURCE_DEFECT, "different_ground"
+    raise ValueError("duplicate geometry measurements do not determine a verdict")
+
+
+def _adjudicate_duplicate(root: Path) -> AdjudicationVerdict:
+    basin_id = "1020018110"
+    product = _parse_acquired_product(root, basin_id, "basins")
+    rows = _read_adjudication_features(product, ["streamID"], f"streamID = {DUPLICATE_STREAM_ID}")
+    if len(rows) != 2:
+        raise ValueError(f"{basin_id} required streamID {DUPLICATE_STREAM_ID} feature identity mismatch: expected 2, found {len(rows)}")
+    geometries = rows.geometry.tolist()
+    coordinates = [_polygon_coordinates(value, f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry") for value in geometries]
+    coordinate_sequences_finite = [_coordinates_are_finite(value) for value in geometries]
+    if not all(coordinate_sequences_finite):
+        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must have finite coordinates")
+    geometries_valid = [_geometry_is_valid(value) for value in geometries]
+    if not all(geometries_valid):
+        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must be valid")
+    spatially_equal = bool(geometries[0].equals(geometries[1]))
+    coordinate_sequences_equal = coordinates[0] == coordinates[1]
+    verdict, selected_branch = _derive_duplicate_verdict(
+        spatially_equal,
+        coordinate_sequences_equal,
+    )
+    return AdjudicationVerdict(
+        basin_id,
+        verdict,
+        AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY,
+        {
+            "streamID": DUPLICATE_STREAM_ID,
+            "features": [{"coordinates": value} for value in coordinates],
+            "coordinate_sequences_finite": coordinate_sequences_finite,
+            "geometries_valid": geometries_valid,
+            "spatially_equal": spatially_equal,
+            "coordinate_sequences_equal": coordinate_sequences_equal,
+            "source": {"bytes": product.byte_count, "layer_name": product.layer_name, "sha256": product.sha256},
+            "derivation": {
+                "rule_id": "duplicate-ground-equality-v1",
+                "inputs": [
+                    "coordinate_sequences_finite",
+                    "geometries_valid",
+                    "spatially_equal",
+                    "coordinate_sequences_equal",
+                ],
+                "required_preconditions": {
+                    "coordinate_sequences_finite": coordinate_sequences_finite,
+                    "geometries_valid": geometries_valid,
+                },
+                "consistency_requirement": {
+                    "coordinate_sequences_equal_implies": "spatially_equal",
+                },
+                "branches": [
+                    {
+                        "branch": "same_ground",
+                        "spatially_equal": True,
+                        "verdict": "adapter strictness",
+                    },
+                    {
+                        "branch": "different_ground",
+                        "spatially_equal": False,
+                        "coordinate_sequences_equal": False,
+                        "verdict": "source defect",
+                    },
+                ],
+                "selected_branch": selected_branch,
+            },
+        },
+    )
+
+
+def _adjudicate_non_root(root: Path) -> AdjudicationVerdict:
+    basin_id = "2020003440"
+    product = _parse_acquired_product(root, basin_id, "streamnet")
+    rows = _read_adjudication_features(product, ["LINKNO", "DSLINKNO", "DSContArea"], f"LINKNO = {AMBIGUOUS_NON_ROOT_LINKNO}")
+    if len(rows) != 1:
+        raise ValueError(f"{basin_id} required LINKNO {AMBIGUOUS_NON_ROOT_LINKNO} feature identity mismatch: expected 1, found {len(rows)}")
+    current = rows.iloc[0]
+    downstream = int(current["DSLINKNO"])
+    successors = _read_adjudication_features(product, ["LINKNO", "DSLINKNO", "DSContArea"], f"LINKNO = {downstream}")
+    if len(successors) != 1:
+        raise ValueError(f"{basin_id} downstream LINKNO {downstream} feature identity mismatch: expected 1, found {len(successors)}")
+    successor = successors.iloc[0]
+    endpoints = _line_endpoints(current.geometry, f"{basin_id} current reach")
+    successor_endpoints = _line_endpoints(successor.geometry, f"{basin_id} successor reach")
+    separation = math.dist(*endpoints)
+    distances = _distance_records(endpoints, successor_endpoints, "current", "successor")
+    matches = [value for value in distances if value["distance_degrees"] <= DEFAULT_ENDPOINT_TOLERANCE]
+    if {value["current_endpoint_index"] for value in matches} != {0, 1}:
+        raise ValueError(f"{basin_id} required LINKNO {AMBIGUOUS_NON_ROOT_LINKNO} reach-side ambiguity identity mismatch: tolerance matches do not use both current endpoint indexes")
+    if separation <= 0.002:
+        raise ValueError(f"{basin_id} required LINKNO {AMBIGUOUS_NON_ROOT_LINKNO} reach-side ambiguity identity mismatch: separation is inside or on old limit 0.002")
+    current_area = _positive_float(current["DSContArea"], f"{basin_id} current DSContArea")
+    successor_area = _positive_float(successor["DSContArea"], f"{basin_id} successor DSContArea")
+    verdict = BasinVerdict.ADAPTER_STRICTNESS if separation <= 0.003 and current_area < successor_area and any(value["current_endpoint_index"] == 1 for value in matches) else BasinVerdict.SOURCE_DEFECT
+    return AdjudicationVerdict(
+        basin_id, verdict, AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY,
+        {
+            "LINKNO": AMBIGUOUS_NON_ROOT_LINKNO, "DSLINKNO": downstream,
+            "endpoints": endpoints, "successor_endpoints": successor_endpoints,
+            "endpoint_distances": distances, "tolerance_matches": matches,
+            "endpoint_separation": separation, "endpoint_tolerance": 0.001,
+            "old_near_degenerate_limit": 0.002, "non_root_near_degenerate_limit": 0.003,
+            "old_limit_classification": _limit_classification(separation, 0.002),
+            "non_root_limit_classification": _limit_classification(separation, 0.003),
+            "DSContArea": current_area, "successor_DSContArea": successor_area,
+        },
+    )
+
+
+def _adjudicate_root(root_path: Path) -> AdjudicationVerdict:
+    basin_id = "2020071190"
+    product = _parse_acquired_product(root_path, basin_id, "streamnet")
+    roots = _read_adjudication_features(product, ["LINKNO", "DSLINKNO", "DSContArea"], f"LINKNO = {CONFLICTING_ROOT_LINKNO}")
+    if len(roots) != 1:
+        raise ValueError(f"{basin_id} required root LINKNO {CONFLICTING_ROOT_LINKNO} feature identity mismatch: expected 1, found {len(roots)}")
+    root = roots.iloc[0]
+    if int(root["DSLINKNO"]) != -1:
+        raise ValueError(f"{basin_id} required root LINKNO {CONFLICTING_ROOT_LINKNO} feature identity mismatch: DSLINKNO is not -1")
+    predecessors = _read_adjudication_features(product, ["LINKNO", "DSLINKNO", "DSContArea"], f"DSLINKNO = {CONFLICTING_ROOT_LINKNO}")
+    if len(predecessors) != 2 or predecessors["LINKNO"].nunique() != 2:
+        raise ValueError(f"{basin_id} required root LINKNO {CONFLICTING_ROOT_LINKNO} conflict identity mismatch: expected exactly two unique predecessors")
+    predecessors = predecessors.sort_values("LINKNO", kind="stable")
+    root_endpoints = _line_endpoints(root.geometry, f"{basin_id} root")
+    root_separation = math.dist(*root_endpoints)
+    items: list[dict[str, object]] = []
+    areas: list[float] = []
+    definite = spanning = 0
+    for _, predecessor in predecessors.iterrows():
+        linkno = int(predecessor["LINKNO"])
+        endpoints = _line_endpoints(predecessor.geometry, f"{basin_id} predecessor LINKNO {linkno}")
+        separation = math.dist(*endpoints)
+        distances = _distance_records(endpoints, root_endpoints, "predecessor", "root")
+        candidates = [value for value in distances if value["distance_degrees"] <= 0.001]
+        root_indexes = {value["root_endpoint_index"] for value in candidates}
+        classification = "indeterminate"
+        if len(root_indexes) == 1:
+            definite += 1
+            classification = "definite"
+        elif root_indexes == {0, 1}:
+            spanning += 1
+            classification = "spanning"
+        area = _positive_float(predecessor["DSContArea"], f"{basin_id} predecessor LINKNO {linkno} DSContArea")
+        areas.append(area)
+        item: dict[str, object] = {
+            "LINKNO": linkno, "DSContArea": area, "endpoints": endpoints,
+            "endpoint_separation": separation, "endpoint_distances_to_root": distances,
+            "tolerance_candidates": candidates, "candidate_classification": classification,
+        }
+        if classification == "definite":
+            item["definite_root_endpoint_index"] = next(iter(root_indexes))
+        if classification == "spanning":
+            item["endpoint_tolerance_classification"] = _limit_classification(separation, 0.001)
+            item["non_root_limit_classification"] = _limit_classification(separation, 0.003)
+        items.append(item)
+    if definite == 0:
+        raise ValueError(f"{basin_id} required root LINKNO {CONFLICTING_ROOT_LINKNO} conflict identity mismatch: expected at least one definite predecessor")
+    if spanning == 0:
+        raise ValueError(f"{basin_id} required root LINKNO {CONFLICTING_ROOT_LINKNO} conflict identity mismatch: expected at least one predecessor whose tolerance candidates span both root endpoints")
+    root_area = _positive_float(root["DSContArea"], f"{basin_id} root DSContArea")
+    verdict = BasinVerdict.ADAPTER_STRICTNESS if root_separation <= 0.002 and all(value < root_area for value in areas) else BasinVerdict.SOURCE_DEFECT
+    return AdjudicationVerdict(
+        basin_id, verdict, AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY,
+        {
+            "LINKNO": CONFLICTING_ROOT_LINKNO, "endpoints": root_endpoints,
+            "endpoint_separation": root_separation, "endpoint_tolerance": 0.001,
+            "root_near_degenerate_limit": 0.002,
+            "root_limit_classification": _limit_classification(root_separation, 0.002),
+            "DSContArea": root_area, "predecessors": items,
+            "governing_pinned_adapter_refusal": "cannot determine the upstream endpoint of root successor LINKNO 1104039",
+        },
+    )
+
+
+def _parse_historical_exhaustion(root: Path, basin_id: str) -> HistoricalExhaustion:
+    path = _historical_state_path(root, basin_id)
+    state = _read_json_object(path, basin_id, "historical campaign record")
+    if state.get("processing_basin_id") != basin_id:
+        raise ValueError(f"{basin_id} historical campaign basin identity mismatch: {path}")
+    stages = state.get("stages")
+    if set(state) != {"processing_basin_id", "retention", "schema_version", "stages"} or state.get("schema_version") != 4 or state.get("retention") != {"inputs_reclaimed": False, "policy": "reclaim-inputs-after-terminal"} or not isinstance(stages, dict) or set(stages) != {"acquire_basins", "acquire_streamnet", "compile"} or stages.get("compile") != {"attempts": 0, "diagnostic_report": None, "failure_reason": None, "status": "pending"}:
+        raise ValueError(f"{basin_id} historical campaign record shape mismatch: {path}")
+    failed: list[str] = []
+    for product in ("basins", "streamnet"):
+        stage = stages.get(f"acquire_{product}")
+        if not isinstance(stage, dict) or set(stage) != {"attempts", "evidence", "failure_reason", "status"}:
+            raise ValueError(f"{basin_id} historical acquisition exhaustion mismatch for {product}: {path}")
+        if stage.get("status") == "failed":
+            if stage.get("attempts") != 2 or stage.get("evidence") is not None or stage.get("failure_reason") != HISTORICAL_TRANSFER_FAILURE_REASON:
+                raise ValueError(f"{basin_id} historical acquisition exhaustion mismatch for {product}: {path}")
+            failed.append(product)
+            continue
+        evidence = stage.get("evidence")
+        layer = "basins" if product == "basins" else f"TDX_streamnet_{basin_id}_01"
+        if stage.get("status") != "succeeded" or not _is_int(stage.get("attempts")) or stage["attempts"] < 1 or stage.get("failure_reason") is not None or not isinstance(evidence, dict) or set(evidence) != {"bytes", "layer_name", "sha256", "sqlite_identity"} or not _is_int(evidence.get("bytes")) or evidence["bytes"] <= 0 or evidence.get("layer_name") != layer or not _valid_sha256(evidence.get("sha256")) or evidence.get("sqlite_identity") != SQLITE3_IDENTITY_HEX:
+            raise ValueError(f"{basin_id} historical acquisition exhaustion mismatch for {product}: {path}")
+    if len(failed) != 1:
+        raise ValueError(f"{basin_id} historical acquisition exhaustion mismatch: exactly one product must have failed")
+    return HistoricalExhaustion(basin_id, failed[0], 2, HISTORICAL_TRANSFER_FAILURE_REASON)
+
+
+def _adjudicate_transfer(acquired_root: Path, historical_root: Path, basin_id: str) -> AdjudicationVerdict:
+    exhaustion = _parse_historical_exhaustion(historical_root, basin_id)
+    products = [_parse_acquired_product(acquired_root, basin_id, product) for product in ("basins", "streamnet")]
+    return AdjudicationVerdict(
+        basin_id, BasinVerdict.TRANSFER_FAILURE,
+        AdjudicationEvidenceKind.HISTORICAL_TRANSFER_WITH_RESOLUTION,
+        {
+            "historical_failed_product": exhaustion.failed_product,
+            "historical_attempts": exhaustion.attempts,
+            "historical_failure_reason": exhaustion.failure_reason,
+            "later_acquisition": [{"product": value.product, "bytes": value.byte_count, "sha256": value.sha256, "attempts": value.attempts} for value in products],
+        },
+    )
+
+
+def _serialized_verdict(value: AdjudicationVerdict) -> dict[str, object]:
+    return {"processing_basin_id": value.processing_basin_id, "verdict": value.verdict.value, "evidence_kind": value.evidence_kind.value, "evidence": value.evidence}
+
+
+def _validate_adjudication_result(verdicts: Sequence[object]) -> None:
+    if len(verdicts) != 7:
+        raise ValueError("adjudication must contain exactly seven verdicts")
+    values = [_serialized_verdict(value) if isinstance(value, AdjudicationVerdict) else value for value in verdicts]
+    if not all(isinstance(value, dict) for value in values):
+        raise ValueError("adjudication processing basin IDs must equal the seven absent IDs exactly once")
+    ids = [value.get("processing_basin_id") for value in values]
+    if tuple(ids) != ABSENT_PROCESSING_BASIN_IDS or len(set(ids)) != 7:
+        raise ValueError("adjudication processing basin IDs must equal the seven absent IDs exactly once")
+    allowed = {value.value for value in BasinVerdict}
+    for value in values:
+        basin_id = str(value["processing_basin_id"])
+        if value.get("verdict") not in allowed or "unadjudicated" in value or "unadjudicated" in value.values():
+            raise ValueError(f"adjudication verdict for {basin_id} is missing or invalid")
+        expected = AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY.value if basin_id in GEOMETRY_ADJUDICATION_IDS else AdjudicationEvidenceKind.HISTORICAL_TRANSFER_WITH_RESOLUTION.value
+        if value.get("evidence_kind") != expected:
+            raise ValueError(f"adjudication evidence kind is invalid for {basin_id}")
+
+
+def adjudicate_basins(acquired_evidence_root: Path, historical_evidence_root: Path) -> dict[str, object]:
+    """Adjudicate seven absent processing basins from checked local evidence.
+
+    Raises:
+        ValueError: Required evidence is absent, unsafe, malformed, or inconsistent.
+    """
+    by_id = {
+        "1020018110": _adjudicate_duplicate(acquired_evidence_root),
+        "2020003440": _adjudicate_non_root(acquired_evidence_root),
+        "2020071190": _adjudicate_root(acquired_evidence_root),
+    }
+    for basin_id in TRANSFER_ADJUDICATION_IDS:
+        by_id[basin_id] = _adjudicate_transfer(acquired_evidence_root, historical_evidence_root, basin_id)
+    verdicts = [by_id[basin_id] for basin_id in ABSENT_PROCESSING_BASIN_IDS]
+    _validate_adjudication_result(verdicts)
+    return {
+        "adapter": {"adapter_version": ADAPTER_VERSION, "git_revision": ADJUDICATED_ADAPTER_GIT_REVISION},
+        "endpoint_tolerance": DEFAULT_ENDPOINT_TOLERANCE,
+        "schema_version": 1,
+        "verdicts": [_serialized_verdict(value) for value in verdicts],
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the TDX-Hydro adapter command-line parser."""
     parser = argparse.ArgumentParser()
@@ -5278,6 +5776,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     assemble_parser.add_argument("--partial-input", type=Path)
     assemble_parser.add_argument("--partial-roster", type=Path)
     assemble_parser.add_argument("--out", required=True, type=Path)
+    adjudicate_parser = subparsers.add_parser("adjudicate")
+    adjudicate_parser.add_argument(
+        "--acquired-evidence-root", required=True, type=Path
+    )
+    adjudicate_parser.add_argument(
+        "--historical-evidence-root", required=True, type=Path
+    )
     return parser
 
 
@@ -5349,6 +5854,12 @@ def main(argv: list[str] | None = None) -> int:
             partial_input_root=arguments.partial_input,
             partial_basin_roster=partial_basin_roster,
         )
+    elif arguments.command == "adjudicate":
+        result = adjudicate_basins(
+            arguments.acquired_evidence_root,
+            arguments.historical_evidence_root,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
     else:
         validate_dataset(arguments.dataset, hfx_binary=arguments.hfx_binary)
     return 0
