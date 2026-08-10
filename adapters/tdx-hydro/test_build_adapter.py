@@ -5790,20 +5790,740 @@ class BasinAdjudicationTests(unittest.TestCase):
     def test_duplicate_stream_id_extracts_both_coordinate_sequences(self) -> None:
         with TemporaryDirectory() as temp_dir:
             acquired, historical = make_adjudication_fixture(Path(temp_dir))
+            state_path = acquired / "salvage/state/basins/1020018110/current.json"
+            state = json.loads(state_path.read_text())
+            acquire_basins_evidence = state["stages"]["acquire_basins"]["evidence"]
             verdict, evidence = self.evidence(self.run_fixture(acquired, historical), "1020018110")
             first = [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
             second = [[[2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0], [2.0, 0.0]]]
+            self.assertEqual(evidence["streamID"], 9)
             self.assertEqual([value["coordinates"] for value in evidence["features"]], [first, second])
+            self.assertEqual(evidence["coordinate_sequences_finite"], [True, True])
+            self.assertEqual(evidence["geometries_valid"], [True, True])
             self.assertIs(evidence["spatially_equal"], False)
             self.assertIs(evidence["coordinate_sequences_equal"], False)
             self.assertEqual(verdict["verdict"], "source defect")
+            self.assertEqual(
+                evidence["source"],
+                {
+                    "bytes": acquire_basins_evidence["bytes"],
+                    "layer_name": acquire_basins_evidence["layer_name"],
+                    "sha256": acquire_basins_evidence["sha256"],
+                },
+            )
+            self.assertEqual(
+                evidence["derivation"],
+                {
+                    "rule_id": "duplicate-ground-equality-v1",
+                    "inputs": [
+                        "coordinate_sequences_finite",
+                        "geometries_valid",
+                        "spatially_equal",
+                        "coordinate_sequences_equal",
+                    ],
+                    "required_preconditions": {
+                        "coordinate_sequences_finite": [True, True],
+                        "geometries_valid": [True, True],
+                    },
+                    "consistency_requirement": {
+                        "coordinate_sequences_equal_implies": "spatially_equal",
+                    },
+                    "branches": [
+                        {
+                            "branch": "same_ground",
+                            "spatially_equal": True,
+                            "verdict": "adapter strictness",
+                        },
+                        {
+                            "branch": "different_ground",
+                            "spatially_equal": False,
+                            "coordinate_sequences_equal": False,
+                            "verdict": "source defect",
+                        },
+                    ],
+                    "selected_branch": "different_ground",
+                },
+            )
+            self.assertEqual(
+                [type(value) for value in evidence["coordinate_sequences_finite"]],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [type(value) for value in evidence["geometries_valid"]],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [
+                    type(value)
+                    for value in evidence["derivation"]["required_preconditions"][
+                        "coordinate_sequences_finite"
+                    ]
+                ],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [
+                    type(value)
+                    for value in evidence["derivation"]["required_preconditions"][
+                        "geometries_valid"
+                    ]
+                ],
+                [bool, bool],
+            )
             basins, streamnet = adjudication_frames("1020018110")
             basins.loc[1, "geometry"] = basins.loc[0, "geometry"]
             write_adjudication_pair(acquired, "1020018110", basins, streamnet)
-            _, evidence = self.evidence(self.run_fixture(acquired, historical), "1020018110")
+            state = json.loads(state_path.read_text())
+            acquire_basins_evidence = state["stages"]["acquire_basins"]["evidence"]
+            verdict, evidence = self.evidence(self.run_fixture(acquired, historical), "1020018110")
+            self.assertEqual(evidence["streamID"], 9)
             self.assertEqual([value["coordinates"] for value in evidence["features"]], [first, first])
+            self.assertEqual(evidence["coordinate_sequences_finite"], [True, True])
+            self.assertEqual(evidence["geometries_valid"], [True, True])
             self.assertIs(evidence["spatially_equal"], True)
             self.assertIs(evidence["coordinate_sequences_equal"], True)
+            self.assertEqual(verdict["verdict"], "adapter strictness")
+            self.assertEqual(
+                evidence["source"],
+                {
+                    "bytes": acquire_basins_evidence["bytes"],
+                    "layer_name": acquire_basins_evidence["layer_name"],
+                    "sha256": acquire_basins_evidence["sha256"],
+                },
+            )
+            self.assertEqual(
+                evidence["derivation"],
+                {
+                    "rule_id": "duplicate-ground-equality-v1",
+                    "inputs": [
+                        "coordinate_sequences_finite",
+                        "geometries_valid",
+                        "spatially_equal",
+                        "coordinate_sequences_equal",
+                    ],
+                    "required_preconditions": {
+                        "coordinate_sequences_finite": [True, True],
+                        "geometries_valid": [True, True],
+                    },
+                    "consistency_requirement": {
+                        "coordinate_sequences_equal_implies": "spatially_equal",
+                    },
+                    "branches": [
+                        {
+                            "branch": "same_ground",
+                            "spatially_equal": True,
+                            "verdict": "adapter strictness",
+                        },
+                        {
+                            "branch": "different_ground",
+                            "spatially_equal": False,
+                            "coordinate_sequences_equal": False,
+                            "verdict": "source defect",
+                        },
+                    ],
+                    "selected_branch": "same_ground",
+                },
+            )
+            self.assertEqual(
+                [type(value) for value in evidence["coordinate_sequences_finite"]],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [type(value) for value in evidence["geometries_valid"]],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [
+                    type(value)
+                    for value in evidence["derivation"]["required_preconditions"][
+                        "coordinate_sequences_finite"
+                    ]
+                ],
+                [bool, bool],
+            )
+            self.assertEqual(
+                [
+                    type(value)
+                    for value in evidence["derivation"]["required_preconditions"][
+                        "geometries_valid"
+                    ]
+                ],
+                [bool, bool],
+            )
+
+    def test_duplicate_verdict_derivation_from_synthetic_geometry(self) -> None:
+        first = Polygon(
+            [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        )
+        same_ground = Polygon(
+            [(2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0), (2.0, 0.0)]
+        )
+        different_ground = Polygon(
+            [(3.0, 0.0), (5.0, 0.0), (5.0, 2.0), (3.0, 2.0), (3.0, 0.0)]
+        )
+        identical = Polygon(
+            [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
+        )
+
+        measurements = (
+            bool(first.equals(same_ground)),
+            build_adapter._polygon_coordinates(first, "first")
+            == build_adapter._polygon_coordinates(same_ground, "same_ground"),
+        )
+        self.assertEqual(measurements, (True, False))
+        self.assertEqual(
+            build_adapter._derive_duplicate_verdict(*measurements),
+            (build_adapter.BasinVerdict.ADAPTER_STRICTNESS, "same_ground"),
+        )
+
+        measurements = (
+            bool(first.equals(different_ground)),
+            build_adapter._polygon_coordinates(first, "first")
+            == build_adapter._polygon_coordinates(different_ground, "different_ground"),
+        )
+        self.assertEqual(measurements, (False, False))
+        self.assertEqual(
+            build_adapter._derive_duplicate_verdict(*measurements),
+            (build_adapter.BasinVerdict.SOURCE_DEFECT, "different_ground"),
+        )
+
+        measurements = (
+            bool(first.equals(identical)),
+            build_adapter._polygon_coordinates(first, "first")
+            == build_adapter._polygon_coordinates(identical, "identical"),
+        )
+        self.assertEqual(measurements, (True, True))
+        self.assertEqual(
+            build_adapter._derive_duplicate_verdict(*measurements),
+            (build_adapter.BasinVerdict.ADAPTER_STRICTNESS, "same_ground"),
+        )
+
+    def test_duplicate_measurement_seams_feed_evidence(self) -> None:
+        product = build_adapter.AcquiredProduct(
+            processing_basin_id="1020018110",
+            product="basins",
+            path=Path("/synthetic/1020018110-basins.gpkg"),
+            layer_name="basins",
+            byte_count=123,
+            sha256="a" * 64,
+            attempts=1,
+        )
+        basins, _ = adjudication_frames("1020018110")
+        geometries = basins.geometry.tolist()
+        with (
+            patch("build_adapter._parse_acquired_product", return_value=product),
+            patch("build_adapter._read_adjudication_features", return_value=basins),
+            patch("build_adapter._coordinates_are_finite", return_value=True) as coordinates_are_finite,
+            patch("build_adapter._geometry_is_valid", return_value=True) as geometry_is_valid,
+        ):
+            verdict = build_adapter._adjudicate_duplicate(Path("/synthetic/acquired"))
+
+        self.assertEqual(coordinates_are_finite.call_count, 2)
+        self.assertEqual(coordinates_are_finite.call_args_list, [
+            unittest.mock.call(geometries[0]),
+            unittest.mock.call(geometries[1]),
+        ])
+        self.assertIs(coordinates_are_finite.call_args_list[0].args[0], geometries[0])
+        self.assertIs(coordinates_are_finite.call_args_list[1].args[0], geometries[1])
+        self.assertEqual(geometry_is_valid.call_count, 2)
+        self.assertEqual(geometry_is_valid.call_args_list, [
+            unittest.mock.call(geometries[0]),
+            unittest.mock.call(geometries[1]),
+        ])
+        self.assertIs(geometry_is_valid.call_args_list[0].args[0], geometries[0])
+        self.assertIs(geometry_is_valid.call_args_list[1].args[0], geometries[1])
+        self.assertEqual(verdict.evidence["coordinate_sequences_finite"], [True, True])
+        self.assertEqual(verdict.evidence["geometries_valid"], [True, True])
+        self.assertIs(
+            verdict.evidence["coordinate_sequences_finite"][0],
+            coordinates_are_finite.return_value,
+        )
+        self.assertIs(
+            verdict.evidence["coordinate_sequences_finite"][1],
+            coordinates_are_finite.return_value,
+        )
+        self.assertIs(
+            verdict.evidence["geometries_valid"][0],
+            geometry_is_valid.return_value,
+        )
+        self.assertIs(
+            verdict.evidence["geometries_valid"][1],
+            geometry_is_valid.return_value,
+        )
+        self.assertEqual(
+            verdict.evidence["derivation"]["required_preconditions"],
+            {
+                "coordinate_sequences_finite": [True, True],
+                "geometries_valid": [True, True],
+            },
+        )
+        self.assertIs(
+            verdict.evidence["coordinate_sequences_finite"],
+            verdict.evidence["derivation"]["required_preconditions"][
+                "coordinate_sequences_finite"
+            ],
+        )
+        self.assertIs(
+            verdict.evidence["geometries_valid"],
+            verdict.evidence["derivation"]["required_preconditions"][
+                "geometries_valid"
+            ],
+        )
+        self.assertEqual(
+            [type(value) for value in verdict.evidence["coordinate_sequences_finite"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [type(value) for value in verdict.evidence["geometries_valid"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in verdict.evidence["derivation"]["required_preconditions"][
+                    "coordinate_sequences_finite"
+                ]
+            ],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in verdict.evidence["derivation"]["required_preconditions"][
+                    "geometries_valid"
+                ]
+            ],
+            [bool, bool],
+        )
+
+    def test_duplicate_orchestration_derives_both_verdicts(self) -> None:
+        root = Path("/synthetic/acquired")
+        product = build_adapter.AcquiredProduct(
+            processing_basin_id="1020018110",
+            product="basins",
+            path=Path("/synthetic/1020018110-basins.gpkg"),
+            layer_name="basins",
+            byte_count=123,
+            sha256="a" * 64,
+            attempts=1,
+        )
+        first = [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+        second = [[[2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0], [2.0, 0.0]]]
+
+        disjoint_basins, _ = adjudication_frames("1020018110")
+        with (
+            patch("build_adapter._parse_acquired_product", return_value=product) as parse,
+            patch("build_adapter._read_adjudication_features", return_value=disjoint_basins) as read,
+        ):
+            disjoint = build_adapter._adjudicate_duplicate(root)
+        parse.assert_called_once_with(root, "1020018110", "basins")
+        read.assert_called_once_with(product, ["streamID"], "streamID = 9")
+        self.assertEqual(disjoint.processing_basin_id, "1020018110")
+        self.assertIs(disjoint.evidence_kind, build_adapter.AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY)
+        self.assertEqual(
+            disjoint.evidence["source"],
+            {
+                "bytes": 123,
+                "layer_name": "basins",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        )
+        self.assertEqual(
+            [value["coordinates"] for value in disjoint.evidence["features"]],
+            [first, second],
+        )
+        self.assertEqual(disjoint.evidence["coordinate_sequences_finite"], [True, True])
+        self.assertEqual(disjoint.evidence["geometries_valid"], [True, True])
+        self.assertIs(disjoint.evidence["spatially_equal"], False)
+        self.assertIs(disjoint.evidence["coordinate_sequences_equal"], False)
+        self.assertIs(disjoint.verdict, build_adapter.BasinVerdict.SOURCE_DEFECT)
+        self.assertEqual(
+            disjoint.evidence["derivation"],
+            {
+                "rule_id": "duplicate-ground-equality-v1",
+                "inputs": [
+                    "coordinate_sequences_finite",
+                    "geometries_valid",
+                    "spatially_equal",
+                    "coordinate_sequences_equal",
+                ],
+                "required_preconditions": {
+                    "coordinate_sequences_finite": [True, True],
+                    "geometries_valid": [True, True],
+                },
+                "consistency_requirement": {
+                    "coordinate_sequences_equal_implies": "spatially_equal",
+                },
+                "branches": [
+                    {
+                        "branch": "same_ground",
+                        "spatially_equal": True,
+                        "verdict": "adapter strictness",
+                    },
+                    {
+                        "branch": "different_ground",
+                        "spatially_equal": False,
+                        "coordinate_sequences_equal": False,
+                        "verdict": "source defect",
+                    },
+                ],
+                "selected_branch": "different_ground",
+            },
+        )
+        self.assertEqual(
+            [type(value) for value in disjoint.evidence["coordinate_sequences_finite"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [type(value) for value in disjoint.evidence["geometries_valid"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in disjoint.evidence["derivation"]["required_preconditions"][
+                    "coordinate_sequences_finite"
+                ]
+            ],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in disjoint.evidence["derivation"]["required_preconditions"][
+                    "geometries_valid"
+                ]
+            ],
+            [bool, bool],
+        )
+
+        same_ground_basins, _ = adjudication_frames("1020018110")
+        same_ground_basins.loc[1, "geometry"] = same_ground_basins.loc[0, "geometry"]
+        with (
+            patch("build_adapter._parse_acquired_product", return_value=product) as parse,
+            patch("build_adapter._read_adjudication_features", return_value=same_ground_basins) as read,
+        ):
+            same_ground = build_adapter._adjudicate_duplicate(root)
+        parse.assert_called_once_with(root, "1020018110", "basins")
+        read.assert_called_once_with(product, ["streamID"], "streamID = 9")
+        self.assertEqual(same_ground.processing_basin_id, "1020018110")
+        self.assertIs(same_ground.evidence_kind, build_adapter.AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY)
+        self.assertEqual(
+            same_ground.evidence["source"],
+            {
+                "bytes": 123,
+                "layer_name": "basins",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        )
+        self.assertEqual(
+            [value["coordinates"] for value in same_ground.evidence["features"]],
+            [first, first],
+        )
+        self.assertEqual(same_ground.evidence["coordinate_sequences_finite"], [True, True])
+        self.assertEqual(same_ground.evidence["geometries_valid"], [True, True])
+        self.assertIs(same_ground.evidence["spatially_equal"], True)
+        self.assertIs(same_ground.evidence["coordinate_sequences_equal"], True)
+        self.assertIs(same_ground.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
+        self.assertEqual(
+            same_ground.evidence["derivation"],
+            {
+                "rule_id": "duplicate-ground-equality-v1",
+                "inputs": [
+                    "coordinate_sequences_finite",
+                    "geometries_valid",
+                    "spatially_equal",
+                    "coordinate_sequences_equal",
+                ],
+                "required_preconditions": {
+                    "coordinate_sequences_finite": [True, True],
+                    "geometries_valid": [True, True],
+                },
+                "consistency_requirement": {
+                    "coordinate_sequences_equal_implies": "spatially_equal",
+                },
+                "branches": [
+                    {
+                        "branch": "same_ground",
+                        "spatially_equal": True,
+                        "verdict": "adapter strictness",
+                    },
+                    {
+                        "branch": "different_ground",
+                        "spatially_equal": False,
+                        "coordinate_sequences_equal": False,
+                        "verdict": "source defect",
+                    },
+                ],
+                "selected_branch": "same_ground",
+            },
+        )
+        self.assertEqual(
+            [type(value) for value in same_ground.evidence["coordinate_sequences_finite"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [type(value) for value in same_ground.evidence["geometries_valid"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in same_ground.evidence["derivation"]["required_preconditions"][
+                    "coordinate_sequences_finite"
+                ]
+            ],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in same_ground.evidence["derivation"]["required_preconditions"][
+                    "geometries_valid"
+                ]
+            ],
+            [bool, bool],
+        )
+
+    def test_duplicate_orchestration_uses_helper_result(self) -> None:
+        product = build_adapter.AcquiredProduct(
+            processing_basin_id="1020018110",
+            product="basins",
+            path=Path("/synthetic/1020018110-basins.gpkg"),
+            layer_name="basins",
+            byte_count=123,
+            sha256="a" * 64,
+            attempts=1,
+        )
+        basins, _ = adjudication_frames("1020018110")
+        with (
+            patch("build_adapter._parse_acquired_product", return_value=product),
+            patch("build_adapter._read_adjudication_features", return_value=basins),
+            patch(
+                "build_adapter._derive_duplicate_verdict",
+                return_value=(
+                    build_adapter.BasinVerdict.ADAPTER_STRICTNESS,
+                    "sentinel_branch",
+                ),
+            ) as derive,
+        ):
+            verdict = build_adapter._adjudicate_duplicate(Path("/synthetic/acquired"))
+
+        self.assertIs(verdict.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
+        derive.assert_called_once_with(False, False)
+        self.assertEqual(
+            verdict.evidence["derivation"],
+            {
+                "rule_id": "duplicate-ground-equality-v1",
+                "inputs": [
+                    "coordinate_sequences_finite",
+                    "geometries_valid",
+                    "spatially_equal",
+                    "coordinate_sequences_equal",
+                ],
+                "required_preconditions": {
+                    "coordinate_sequences_finite": [True, True],
+                    "geometries_valid": [True, True],
+                },
+                "consistency_requirement": {
+                    "coordinate_sequences_equal_implies": "spatially_equal",
+                },
+                "branches": [
+                    {
+                        "branch": "same_ground",
+                        "spatially_equal": True,
+                        "verdict": "adapter strictness",
+                    },
+                    {
+                        "branch": "different_ground",
+                        "spatially_equal": False,
+                        "coordinate_sequences_equal": False,
+                        "verdict": "source defect",
+                    },
+                ],
+                "selected_branch": "sentinel_branch",
+            },
+        )
+        self.assertEqual(
+            [type(value) for value in verdict.evidence["coordinate_sequences_finite"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [type(value) for value in verdict.evidence["geometries_valid"]],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in verdict.evidence["derivation"]["required_preconditions"][
+                    "coordinate_sequences_finite"
+                ]
+            ],
+            [bool, bool],
+        )
+        self.assertEqual(
+            [
+                type(value)
+                for value in verdict.evidence["derivation"]["required_preconditions"][
+                    "geometries_valid"
+                ]
+            ],
+            [bool, bool],
+        )
+
+    def test_duplicate_verdict_derivation_refuses_invalid_measurements(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "^duplicate geometry measurements are inconsistent: coordinate sequence equality requires spatial equality$",
+        ):
+            build_adapter._derive_duplicate_verdict(False, True)
+        for spatially_equal, coordinate_sequences_equal in ((1, False), (True, None)):
+            with self.subTest(
+                spatially_equal=spatially_equal,
+                coordinate_sequences_equal=coordinate_sequences_equal,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^duplicate geometry measurements must be booleans$",
+                ):
+                    build_adapter._derive_duplicate_verdict(
+                        spatially_equal,
+                        coordinate_sequences_equal,
+                    )
+
+    def test_duplicate_adjudication_refuses_geometry_outside_domain(self) -> None:
+        product = build_adapter.AcquiredProduct(
+            processing_basin_id="1020018110",
+            product="basins",
+            path=Path("/synthetic/1020018110-basins.gpkg"),
+            layer_name="basins",
+            byte_count=123,
+            sha256="a" * 64,
+            attempts=1,
+        )
+        root = Path("/synthetic/acquired")
+        structural_message = (
+            "^1020018110 streamID 9 geometry must be a non-empty "
+            "two-dimensional Polygon or MultiPolygon$"
+        )
+        structural_cases = (
+            ("none", None),
+            ("empty", Polygon()),
+            ("point", Point(0.0, 0.0)),
+            (
+                "three-dimensional",
+                Polygon(
+                    [
+                        (0.0, 0.0, 1.0),
+                        (1.0, 0.0, 1.0),
+                        (0.0, 1.0, 1.0),
+                        (0.0, 0.0, 1.0),
+                    ]
+                ),
+            ),
+        )
+        for name, replacement in structural_cases:
+            with self.subTest(name=name):
+                basins, _ = adjudication_frames("1020018110")
+                basins.loc[0, "geometry"] = replacement
+                with (
+                    patch("build_adapter._parse_acquired_product", return_value=product),
+                    patch("build_adapter._read_adjudication_features", return_value=basins),
+                    patch("build_adapter._derive_duplicate_verdict") as derive,
+                ):
+                    with self.assertRaisesRegex(ValueError, structural_message):
+                        build_adapter._adjudicate_duplicate(root)
+                self.assertEqual(derive.call_count, 0)
+
+        with self.subTest(name="non-geometry"):
+            basins, _ = adjudication_frames("1020018110")
+            rows = pd.DataFrame(
+                {
+                    "streamID": basins["streamID"].tolist(),
+                    "geometry": ["synthetic non-geometry", basins.geometry.iloc[1]],
+                }
+            )
+            with (
+                patch("build_adapter._parse_acquired_product", return_value=product),
+                patch("build_adapter._read_adjudication_features", return_value=rows),
+                patch("build_adapter._derive_duplicate_verdict") as derive,
+            ):
+                with self.assertRaisesRegex(ValueError, structural_message):
+                    build_adapter._adjudicate_duplicate(root)
+            self.assertEqual(derive.call_count, 0)
+
+        with self.subTest(name="invalid"):
+            basins, _ = adjudication_frames("1020018110")
+            basins.loc[0, "geometry"] = Polygon(
+                [(0.0, 0.0), (2.0, 2.0), (2.0, 0.0), (0.0, 2.0), (0.0, 0.0)]
+            )
+            with (
+                patch("build_adapter._parse_acquired_product", return_value=product),
+                patch("build_adapter._read_adjudication_features", return_value=basins),
+                patch("build_adapter._derive_duplicate_verdict") as derive,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^1020018110 streamID 9 geometry must be valid$",
+                ):
+                    build_adapter._adjudicate_duplicate(root)
+            self.assertEqual(derive.call_count, 0)
+
+        with self.subTest(name="non-finite"):
+            basins, _ = adjudication_frames("1020018110")
+            basins.loc[0, "geometry"] = Polygon(
+                [(0.0, 0.0), (1.0, 0.0), (float("nan"), 1.0), (0.0, 0.0)]
+            )
+            with (
+                patch("build_adapter._parse_acquired_product", return_value=product),
+                patch("build_adapter._read_adjudication_features", return_value=basins),
+                patch("build_adapter._derive_duplicate_verdict") as derive,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^1020018110 streamID 9 geometry must have finite coordinates$",
+                ):
+                    build_adapter._adjudicate_duplicate(root)
+            self.assertEqual(derive.call_count, 0)
+
+        with self.subTest(name="one-row"):
+            basins, _ = adjudication_frames("1020018110")
+            one_row = basins.iloc[[0]].copy()
+            with (
+                patch("build_adapter._parse_acquired_product", return_value=product),
+                patch("build_adapter._read_adjudication_features", return_value=one_row),
+                patch("build_adapter._derive_duplicate_verdict") as derive,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^1020018110 required streamID 9 feature identity mismatch: expected 2, found 1$",
+                ):
+                    build_adapter._adjudicate_duplicate(root)
+            self.assertEqual(derive.call_count, 0)
+
+    def test_read_adjudication_features_converts_unreadable_source(self) -> None:
+        product = build_adapter.AcquiredProduct(
+            processing_basin_id="1020018110",
+            product="basins",
+            path=Path("/synthetic/unreadable.gpkg"),
+            layer_name="basins",
+            byte_count=123,
+            sha256="a" * 64,
+            attempts=1,
+        )
+        with patch(
+            "build_adapter.pyogrio.read_dataframe",
+            side_effect=OSError("synthetic unreadable source"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^1020018110 basins acquired source is malformed: /synthetic/unreadable.gpkg$",
+            ):
+                build_adapter._read_adjudication_features(
+                    product,
+                    ["streamID"],
+                    "streamID = 9",
+                )
 
     def test_non_root_ambiguity_extracts_limits_matches_and_area(self) -> None:
         with TemporaryDirectory() as temp_dir:
