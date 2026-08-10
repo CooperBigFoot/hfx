@@ -275,6 +275,42 @@ The underlying Rust command is
 `catchments.parquet` and `aux/snap_stems.parquet` as GeoParquet 1.1 and verifies
 that `graph.parquet` has the expected non-GeoParquet classification.
 
+## Local basin adjudication
+
+The adapter can deterministically adjudicate the seven absent TDX-Hydro
+processing basins from two local, read-only evidence trees:
+
+```bash
+uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py adjudicate \
+  --acquired-evidence-root tdx-m5-seven-acquire-evidence \
+  --historical-evidence-root tdx-m5-planetary-evidence
+```
+
+The fixed processing-basin order is `1020018110`, `2020003440`, `2020065840`,
+`2020071190`, `4020050470`, `5020049720`, and `6020000010`. Acquired products
+and state are resolved without discovery at
+`salvage/downloads/<processing-basin-id>-{basins,streamnet}.gpkg` and
+`salvage/state/basins/<processing-basin-id>/current.json`. Historical state is
+resolved at `mirror/state/basins/<processing-basin-id>/current.json`.
+
+Source-defect and adapter-strictness verdicts come only from acquired source
+geometry, never a preserved traceback. A transfer-failure verdict comes from
+the historical campaign exhaustion record, with a later clean acquisition
+supplying resolution evidence. Missing, unsafe, malformed, or mismatched
+evidence refuses the complete result before stdout receives any JSON. A
+successful run emits one canonical, seven-item JSON document to stdout and has
+no output-file option.
+
+The adjudication reproduces adapter version `0.1.0` at git revision
+`bca87d8adb0651d130bde9c7dfcf3947427cfa24`. For processing basin `2020071190`,
+the governing pinned-adapter refusal is `cannot determine the upstream endpoint
+of root successor LINKNO 1104039` in the reverse-topological loop. The later
+`successor_conflict` ordering is historical-campaign context; the acquired
+feature does not reach that branch.
+
+The command never compiles, writes, uploads, contacts NGA, or reads S3. Real
+verdict output is intentionally absent from this change.
+
 ## Campaign notes
 
 The processing basin `7020000010` pilot ran on 2026-07-22 from VM
