@@ -3740,6 +3740,26 @@ def _build_compact_topology(
         connected_matches[row] = matches
         connected_current_indexes[row] = current_indexes
 
+    root_upstream_undetermined = np.int8(-1)
+    root_upstream_conflicting = np.int8(2)
+    root_upstream_endpoints = np.full(
+        len(stream_native_ids), root_upstream_undetermined, dtype="int8"
+    )
+    for root_value in np.flatnonzero((downstream_rows < 0) & ~degenerate):
+        root = int(root_value)
+        admitted_successor_indexes = {
+            matches[0][1]
+            for predecessor_value in predecessor_rows[
+                predecessor_offsets[root] : predecessor_offsets[root + 1]
+            ]
+            if (matches := connected_matches[int(predecessor_value)]) is not None
+            and len(matches) == 1
+        }
+        if len(admitted_successor_indexes) == 1:
+            root_upstream_endpoints[root] = admitted_successor_indexes.pop()
+        elif len(admitted_successor_indexes) > 1:
+            root_upstream_endpoints[root] = root_upstream_conflicting
+
     for row_value in topology_order[::-1]:
         row = int(row_value)
         successor = int(downstream_rows[row])
@@ -3786,61 +3806,87 @@ def _build_compact_topology(
                     "distinguish the successor endpoint side"
                 )
             if downstream_rows[successor] < 0:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 cannot determine "
-                    f"the upstream endpoint of root successor LINKNO {successor_id}"
-                )
-            if np.isnan(downstream_endpoints[successor]).any():
-                raise RuntimeError(
-                    "internal compact-topology orientation is missing for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id}"
-                )
-            successor_downstream_index = next(
-                (
-                    index
-                    for index in (0, 1)
-                    if np.array_equal(
-                        endpoints[successor, index],
-                        downstream_endpoints[successor],
+                root_upstream_index = int(root_upstream_endpoints[successor])
+                if root_upstream_index == root_upstream_undetermined:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                        "source vertex order: downstream-nondecreasing DSContArea "
+                        f"{current_area!r} km2 -> {successor_area!r} km2 cannot determine "
+                        f"the upstream endpoint of root successor LINKNO {successor_id}"
                     )
-                ),
-                -1,
-            )
-            if successor_downstream_index < 0:
-                raise RuntimeError(
-                    "internal compact-topology orientation is invalid for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id}"
+                if root_upstream_index == root_upstream_conflicting:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and root successor LINKNO {successor_id} cannot "
+                        "determine the root upstream endpoint: unique predecessor "
+                        "evidence names conflicting root endpoint indexes [0, 1]"
+                    )
+                candidate_current_indexes = sorted(
+                    {
+                        matched_current
+                        for matched_current, successor_index in matches
+                        if successor_index == root_upstream_index
+                    }
                 )
-            successor_upstream_index = 1 - successor_downstream_index
-            source_successor_indexes = sorted(
-                {
-                    successor_index
-                    for matched_current, successor_index in matches
-                    if matched_current == 1
-                }
-            )
-            if source_successor_indexes == [successor_downstream_index]:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} contradicts "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 identifies "
-                    f"successor endpoint {successor_upstream_index} as upstream, but "
-                    "source endpoint 1 matches successor downstream endpoint "
-                    f"{successor_downstream_index}"
+                if len(candidate_current_indexes) != 1:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and root successor LINKNO {successor_id} does not "
+                        "uniquely determine the current downstream endpoint matching "
+                        f"root upstream endpoint {root_upstream_index}: candidate "
+                        f"current endpoint indexes {candidate_current_indexes}"
+                    )
+                current_index = candidate_current_indexes[0]
+            else:
+                if np.isnan(downstream_endpoints[successor]).any():
+                    raise RuntimeError(
+                        "internal compact-topology orientation is missing for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id}"
+                    )
+                successor_downstream_index = next(
+                    (
+                        index
+                        for index in (0, 1)
+                        if np.array_equal(
+                            endpoints[successor, index],
+                            downstream_endpoints[successor],
+                        )
+                    ),
+                    -1,
                 )
-            if source_successor_indexes != [successor_upstream_index]:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 does not "
-                    "distinguish the successor endpoint side"
+                if successor_downstream_index < 0:
+                    raise RuntimeError(
+                        "internal compact-topology orientation is invalid for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id}"
+                    )
+                successor_upstream_index = 1 - successor_downstream_index
+                source_successor_indexes = sorted(
+                    {
+                        successor_index
+                        for matched_current, successor_index in matches
+                        if matched_current == 1
+                    }
                 )
-            current_index = 1
+                if source_successor_indexes == [successor_downstream_index]:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id} contradicts "
+                        "source vertex order: downstream-nondecreasing DSContArea "
+                        f"{current_area!r} km2 -> {successor_area!r} km2 identifies "
+                        f"successor endpoint {successor_upstream_index} as upstream, but "
+                        "source endpoint 1 matches successor downstream endpoint "
+                        f"{successor_downstream_index}"
+                    )
+                if source_successor_indexes != [successor_upstream_index]:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id} cannot use "
+                        "source vertex order: downstream-nondecreasing DSContArea "
+                        f"{current_area!r} km2 -> {successor_area!r} km2 does not "
+                        "distinguish the successor endpoint side"
+                    )
+                current_index = 1
             near_resolved[row] = True
         downstream_endpoints[row] = endpoints[row, current_index]
         successor_indexes = sorted(
