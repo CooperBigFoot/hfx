@@ -5432,11 +5432,19 @@ def _read_adjudication_features(product: AcquiredProduct, columns: Sequence[str]
 
 
 def _polygon_coordinates(geometry: object, label: str) -> list[object]:
-    if geometry is None or geometry.is_empty or geometry.has_z or not isinstance(geometry, (Polygon, MultiPolygon)):
+    if not isinstance(geometry, (Polygon, MultiPolygon)) or geometry.is_empty or geometry.has_z:
         raise ValueError(f"{label} must be a non-empty two-dimensional Polygon or MultiPolygon")
     if isinstance(geometry, Polygon):
         return [[[float(x), float(y)] for x, y in ring.coords] for ring in [geometry.exterior, *geometry.interiors]]
     return [_polygon_coordinates(polygon, label) for polygon in geometry.geoms]
+
+
+def _coordinates_are_finite(geometry: Polygon | MultiPolygon) -> bool:
+    return bool(np.isfinite(get_coordinates(geometry)).all())
+
+
+def _geometry_is_valid(geometry: Polygon | MultiPolygon) -> bool:
+    return bool(geometry.is_valid)
 
 
 def _line_endpoints(geometry: object, label: str) -> list[list[float]]:
@@ -5462,6 +5470,25 @@ def _distance_records(first: list[list[float]], second: list[list[float]], first
     return [{f"{first_name}_endpoint_index": i, f"{second_name}_endpoint_index": j, "distance_degrees": math.dist(a, b)} for i, a in enumerate(first) for j, b in enumerate(second)]
 
 
+def _derive_duplicate_verdict(
+    spatially_equal: bool,
+    coordinate_sequences_equal: bool,
+) -> tuple[BasinVerdict, str]:
+    if type(spatially_equal) is not bool or type(coordinate_sequences_equal) is not bool:
+        raise ValueError("duplicate geometry measurements must be booleans")
+    if not spatially_equal and coordinate_sequences_equal:
+        raise ValueError(
+            "duplicate geometry measurements are inconsistent: coordinate sequence equality requires spatial equality"
+        )
+    if (spatially_equal, coordinate_sequences_equal) == (True, True):
+        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
+    if (spatially_equal, coordinate_sequences_equal) == (True, False):
+        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
+    if (spatially_equal, coordinate_sequences_equal) == (False, False):
+        return BasinVerdict.SOURCE_DEFECT, "different_ground"
+    raise ValueError("duplicate geometry measurements do not determine a verdict")
+
+
 def _adjudicate_duplicate(root: Path) -> AdjudicationVerdict:
     basin_id = "1020018110"
     product = _parse_acquired_product(root, basin_id, "basins")
@@ -5470,16 +5497,60 @@ def _adjudicate_duplicate(root: Path) -> AdjudicationVerdict:
         raise ValueError(f"{basin_id} required streamID {DUPLICATE_STREAM_ID} feature identity mismatch: expected 2, found {len(rows)}")
     geometries = rows.geometry.tolist()
     coordinates = [_polygon_coordinates(value, f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry") for value in geometries]
+    coordinate_sequences_finite = [_coordinates_are_finite(value) for value in geometries]
+    if not all(coordinate_sequences_finite):
+        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must have finite coordinates")
+    geometries_valid = [_geometry_is_valid(value) for value in geometries]
+    if not all(geometries_valid):
+        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must be valid")
+    spatially_equal = bool(geometries[0].equals(geometries[1]))
+    coordinate_sequences_equal = coordinates[0] == coordinates[1]
+    verdict, selected_branch = _derive_duplicate_verdict(
+        spatially_equal,
+        coordinate_sequences_equal,
+    )
     return AdjudicationVerdict(
         basin_id,
-        BasinVerdict.SOURCE_DEFECT,
+        verdict,
         AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY,
         {
             "streamID": DUPLICATE_STREAM_ID,
             "features": [{"coordinates": value} for value in coordinates],
-            "spatially_equal": bool(geometries[0].equals(geometries[1])),
-            "coordinate_sequences_equal": coordinates[0] == coordinates[1],
+            "coordinate_sequences_finite": coordinate_sequences_finite,
+            "geometries_valid": geometries_valid,
+            "spatially_equal": spatially_equal,
+            "coordinate_sequences_equal": coordinate_sequences_equal,
             "source": {"bytes": product.byte_count, "layer_name": product.layer_name, "sha256": product.sha256},
+            "derivation": {
+                "rule_id": "duplicate-ground-equality-v1",
+                "inputs": [
+                    "coordinate_sequences_finite",
+                    "geometries_valid",
+                    "spatially_equal",
+                    "coordinate_sequences_equal",
+                ],
+                "required_preconditions": {
+                    "coordinate_sequences_finite": coordinate_sequences_finite,
+                    "geometries_valid": geometries_valid,
+                },
+                "consistency_requirement": {
+                    "coordinate_sequences_equal_implies": "spatially_equal",
+                },
+                "branches": [
+                    {
+                        "branch": "same_ground",
+                        "spatially_equal": True,
+                        "verdict": "adapter strictness",
+                    },
+                    {
+                        "branch": "different_ground",
+                        "spatially_equal": False,
+                        "coordinate_sequences_equal": False,
+                        "verdict": "source defect",
+                    },
+                ],
+                "selected_branch": selected_branch,
+            },
         },
     )
 
