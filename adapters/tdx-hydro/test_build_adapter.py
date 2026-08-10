@@ -1546,6 +1546,198 @@ class GlobalLinknoTests(unittest.TestCase):
         self.assertEqual(global_linkno(-1, 71), -1)
 
 
+class CompactRootSuccessorOrientationTests(unittest.TestCase):
+    def build_compact(
+        self,
+        stream_native_ids: list[int],
+        downstream_native_ids: list[int],
+        endpoints: list[list[tuple[float, float]]],
+        areas: list[float],
+    ) -> build_adapter._CompactTopology:
+        stream_native_ids_array = np.asarray(stream_native_ids, dtype="int64")
+        return build_adapter._build_compact_topology(
+            stream_native_ids_array.copy(),
+            stream_native_ids_array,
+            np.asarray(downstream_native_ids, dtype="int64"),
+            np.asarray(endpoints, dtype="float64"),
+            np.zeros(len(areas), dtype=bool),
+            np.asarray(areas, dtype="float64"),
+            71,
+            0.001,
+        )
+
+    def assert_compact(
+        self,
+        compact: build_adapter._CompactTopology,
+        outlets: dict[int, tuple[float, float]],
+        near_resolved: tuple[int, ...],
+    ) -> None:
+        np.testing.assert_array_equal(compact.native_ids, [100, 200, 300])
+        np.testing.assert_array_equal(
+            compact.global_ids, [710000100, 710000200, 710000300]
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_native_ids, [300, 300, -1]
+        )
+        np.testing.assert_array_equal(
+            compact.downstream_global_ids, [710000300, 710000300, -1]
+        )
+        self.assertEqual(
+            {
+                int(linkno): (float(lon), float(lat))
+                for linkno, lon, lat in zip(
+                    compact.native_ids,
+                    compact.outlet_lons,
+                    compact.outlet_lats,
+                    strict=True,
+                )
+            },
+            outlets,
+        )
+        self.assertEqual(compact.diagnostics.endpoint_coincidence_proven_link_count, 1)
+        self.assertEqual(
+            compact.diagnostics.predecessor_orientation_proven_root_count, 1
+        )
+        self.assertEqual(
+            compact.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            near_resolved,
+        )
+        self.assertEqual(compact.diagnostics.root_count, 1)
+        self.assertEqual(compact.diagnostics.orientation_tolerance, 0.001)
+
+    def test_nearest_within_tolerance_does_not_override_unique_evidence(self) -> None:
+        compact = self.build_compact(
+            [100, 200, 300],
+            [300, 300, -1],
+            [
+                [(0.0015, 0.0), (0.01, 0.0)],
+                [(0.0024, 0.0), (0.0001, 0.0)],
+                [(0.0, 0.0), (0.0015, 0.0)],
+            ],
+            [10.0, 20.0, 40.0],
+        )
+
+        self.assert_compact(
+            compact,
+            {100: (0.0015, 0.0), 200: (0.0024, 0.0), 300: (0.0, 0.0)},
+            (200,),
+        )
+
+    def test_root_evidence_is_independent_of_predecessor_traversal_order(self) -> None:
+        compact = self.build_compact(
+            [100, 200, 300],
+            [300, 300, -1],
+            [
+                [(0.0024, 0.0), (0.0001, 0.0)],
+                [(0.0015, 0.0), (0.01, 0.0)],
+                [(0.0, 0.0), (0.0015, 0.0)],
+            ],
+            [20.0, 10.0, 40.0],
+        )
+
+        self.assert_compact(
+            compact,
+            {100: (0.0024, 0.0), 200: (0.0015, 0.0), 300: (0.0, 0.0)},
+            (100,),
+        )
+
+    def test_root_without_unique_predecessor_evidence_refuses(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            self.build_compact(
+                [100, 300],
+                [300, -1],
+                [
+                    [(0.0022, 0.0), (0.0, 0.0)],
+                    [(0.0, 0.0), (0.0015, 0.0)],
+                ],
+                [10.0, 20.0],
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "orientation proof for native LINKNO 100 and downstream LINKNO 300 "
+            "cannot use source vertex order: downstream-nondecreasing DSContArea "
+            "10.0 km2 -> 20.0 km2 cannot determine the upstream endpoint of root "
+            "successor LINKNO 300",
+        )
+
+    def test_both_current_endpoints_matching_root_upstream_endpoint_refuses(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            self.build_compact(
+                [100, 200, 300],
+                [300, 300, -1],
+                [
+                    [(0.002, 0.0), (0.01, 0.0)],
+                    [(0.0011, 0.0), (0.0025, 0.0)],
+                    [(0.0, 0.0), (0.002, 0.0)],
+                ],
+                [10.0, 20.0, 40.0],
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "orientation proof for native LINKNO 200 and root successor LINKNO 300 "
+            "does not uniquely determine the current downstream endpoint matching root "
+            "upstream endpoint 1: candidate current endpoint indexes [0, 1]",
+        )
+
+    def test_zero_distance_does_not_override_unique_root_evidence(self) -> None:
+        compact = self.build_compact(
+            [100, 200, 300],
+            [300, 300, -1],
+            [
+                [(0.0015, 0.0), (0.01, 0.0)],
+                [(0.0022, 0.0), (0.0, 0.0)],
+                [(0.0, 0.0), (0.0015, 0.0)],
+            ],
+            [10.0, 20.0, 40.0],
+        )
+
+        self.assert_compact(
+            compact,
+            {100: (0.0015, 0.0), 200: (0.0022, 0.0), 300: (0.0, 0.0)},
+            (200,),
+        )
+
+    def test_conflicting_unique_evidence_refuses_at_the_consulting_arm(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            self.build_compact(
+                [100, 200, 300, 400],
+                [300, 300, -1, 300],
+                [
+                    [(0.0015, 0.0), (0.01, 0.0)],
+                    [(0.0, 0.0), (0.01, 0.0)],
+                    [(0.0, 0.0), (0.0015, 0.0)],
+                    [(0.0024, 0.0), (0.0001, 0.0)],
+                ],
+                [10.0, 20.0, 40.0, 30.0],
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "orientation proof for native LINKNO 400 and root successor LINKNO 300 "
+            "cannot determine the root upstream endpoint: unique predecessor evidence "
+            "names conflicting root endpoint indexes [0, 1]",
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            self.build_compact(
+                [100, 200, 300],
+                [300, 300, -1],
+                [
+                    [(0.0015, 0.0), (0.01, 0.0)],
+                    [(0.0, 0.0), (0.01, 0.0)],
+                    [(0.0, 0.0), (0.0015, 0.0)],
+                ],
+                [10.0, 20.0, 40.0],
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "orientation proof for root LINKNO 300 has conflicting predecessor matches",
+        )
+
+
 class StreamnetModelTests(unittest.TestCase):
     def test_compact_topology_matches_streamnet_model_rules(self) -> None:
         point = (-120.729444444445, 42.8208888888891)
