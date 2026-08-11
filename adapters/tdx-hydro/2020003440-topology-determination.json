@@ -1,0 +1,107 @@
+{
+  "adapter": {
+    "adapter_version": "0.1.0",
+    "format_version": "0.3.0",
+    "git_revision": "d5cb9239f1228a0c709bebf23cf2edbb3444972a"
+  },
+  "edge": {
+    "DSLINKNO": 399388,
+    "LINKNO": 148956
+  },
+  "evidence_assessment": {
+    "ingestion": {
+      "exact_float_equality": true,
+      "imports_build_adapter": false,
+      "reproducible_without_adapter": true,
+      "reproduction_wall_seconds": 149.6,
+      "role": "consistency_check"
+    }
+  },
+  "independent_reconstruction": {
+    "algorithm_source_revision": "d5cb9239f1228a0c709bebf23cf2edbb3444972a",
+    "condition_3825_matching_edge_count": null,
+    "does_not_establish": [
+      "that the adapter was run",
+      "the correctness or cause of the recorded refusal",
+      "a pass or failure for LINKNO 148956 -> DSLINKNO 399388",
+      "the published adapter strictness verdict in seven-basin-verdicts.json",
+      "a verdict or classification for other basin-wide line-3825 matches"
+    ],
+    "edges_evaluated_before_refusal": 555,
+    "first_3825_match": {
+      "DSLINKNO": 819270,
+      "LINKNO": 817894
+    },
+    "implementation_path": "adapters/tdx-hydro/reconstruct_2020003440_topology.py",
+    "imports_build_adapter": false,
+    "position_basis": "one_based_connected_edge_position_in_reverse_production_topology_order",
+    "recorded_refusal_is_first_3825_match": true,
+    "refusal_traversal_position": 556,
+    "status": "agrees",
+    "target_strictly_later": true,
+    "target_traversal_position": 227297
+  },
+  "measurement": {
+    "endpoint_tolerance": 0.001,
+    "header_number": 22,
+    "outcome": "refuses_before_target",
+    "refusal": {
+      "DSLINKNO": 819270,
+      "LINKNO": 817894,
+      "exception_type": "ValueError",
+      "message": "orientation proof for native LINKNO 817894 and downstream LINKNO 819270 contradicts source vertex order: downstream-nondecreasing DSContArea 262708.625408 km2 -> 262719.782912 km2 identifies successor endpoint 0 as upstream, but source endpoint 1 matches successor downstream endpoint 1",
+      "raising_branch": {
+        "condition": "source_successor_indexes == [successor_downstream_index]",
+        "function": "_build_compact_topology",
+        "raise_line": 3826,
+        "source_path": "adapters/tdx-hydro/build_adapter.py"
+      }
+    },
+    "stopped_before": "_compile_spooled_hfx",
+    "surface": [
+      "_ingest_source_spools",
+      "_build_compact_topology"
+    ],
+    "target_hypothesis_reason": "topology construction refused before LINKNO 148956 -> DSLINKNO 399388 was evaluated",
+    "target_hypothesis_status": "untested"
+  },
+  "processing_basin_id": "2020003440",
+  "run_evidence": {
+    "ingestion": {
+      "basins_clamp": {
+        "altered_vertex_count": 0
+      },
+      "basins_coordinate_count": 319057019,
+      "basins_geometry_count": 336922,
+      "dscontarea": {
+        "checked_polygon_bearing_link_count": 336922,
+        "dscontarea_sum_raw": 784573229018319.8,
+        "geodesic_upstream_area_sum_m2": 746759097022242.5,
+        "max_absolute_relative_divergence": 0.31386539918434125
+      },
+      "streamnet_clamp": {
+        "altered_vertex_count": 0
+      },
+      "streamnet_coordinate_count": 86985095,
+      "streamnet_geometry_count": 337012
+    },
+    "topology": null
+  },
+  "schema_version": 1,
+  "source_inputs": [
+    {
+      "bytes": 5397577728,
+      "layer_name": "basins",
+      "path": "tdx-m5-seven-acquire-evidence/salvage/downloads/2020003440-basins.gpkg",
+      "product": "basins",
+      "sha256": "a4fd60ff2623631906cc356fb83310a4071bc9a8bd7f3749cada97d2dac7fcba"
+    },
+    {
+      "bytes": 1688866816,
+      "layer_name": "TDX_streamnet_2020003440_01",
+      "path": "tdx-m5-seven-acquire-evidence/salvage/downloads/2020003440-streamnet.gpkg",
+      "product": "streamnet",
+      "sha256": "fa2676491f525fb769eff381ad165031c76ca6a8a73ee219573b336059a2d47e"
+    }
+  ]
+}
