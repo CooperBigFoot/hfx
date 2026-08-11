@@ -1547,6 +1547,35 @@ class GlobalLinknoTests(unittest.TestCase):
 
 
 class StreamnetModelTests(unittest.TestCase):
+    def test_pins_measured_2020003440_topology_outcome(self) -> None:
+        basin_native_ids = np.asarray([817894, 819270, 819271], dtype="int64")
+        stream_native_ids = np.asarray([817894, 819270, 819271], dtype="int64")
+        downstream_native_ids = np.asarray([819270, 819271, -1], dtype="int64")
+        endpoints = np.asarray(
+            [
+                [(0.0, 0.0), (0.00035624533324799597, 0.0)],
+                [(0.0, 0.0), (1.0, 0.0)],
+                [(0.0, 0.0), (2.0, 0.0)],
+            ],
+            dtype="float64",
+        )
+        degenerate = np.asarray([False, False, False], dtype=bool)
+        up_area_km2 = np.asarray(
+            [262708.625408, 262719.782912, 262730.0], dtype="float64"
+        )
+
+        with self.assertRaises(ValueError):
+            build_adapter._build_compact_topology(
+                basin_native_ids,
+                stream_native_ids,
+                downstream_native_ids,
+                endpoints,
+                degenerate,
+                up_area_km2,
+                22,
+                0.001,
+            )
+
     def test_compact_topology_matches_streamnet_model_rules(self) -> None:
         point = (-120.729444444445, 42.8208888888891)
         basins = pd.DataFrame({"streamID": [244107, 240000]})
