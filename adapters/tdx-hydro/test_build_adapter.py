@@ -26,6 +26,7 @@ from shapely import from_wkb, get_coordinates
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 import build_adapter
+import adjudicate_adapter_strictness as strictness
 import measure_prepass_classification as prepass
 from build_adapter import (
     ADAPTER_VERSION,
@@ -5992,6 +5993,265 @@ class BuildCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "return code 7"):
                     main(["validate", str(output), "--hfx-binary", str(failing)])
             validator.assert_not_called()
+
+
+class AdapterStrictnessDecisionTests(unittest.TestCase):
+    @staticmethod
+    def pairing(current: int, successor: int, distance: float, admitted: bool = True) -> dict:
+        return {
+            "current_endpoint_index": current,
+            "successor_endpoint_index": successor,
+            "distance_degrees": distance,
+            "within_endpoint_tolerance": admitted,
+        }
+
+    @staticmethod
+    def repository_paths() -> dict[str, Path]:
+        adapter_dir = Path(__file__).resolve().parent
+        return {
+            basin_id: adapter_dir / spec.filename
+            for basin_id, spec in strictness.SPECS.items()
+        }
+
+    def test_selector_makes_both_outcomes_reachable(self) -> None:
+        correction = strictness.select_orientation(
+            [
+                self.pairing(0, 0, 0.0008),
+                self.pairing(0, 1, 0.0007),
+                self.pairing(1, 1, 0.0006),
+            ],
+            1,
+        )
+        self.assertIsInstance(correction, strictness.CorrectionRequired)
+        self.assertEqual(correction.candidate_current_endpoint_indexes, (0,))
+        self.assertEqual(correction.selected_current_endpoint_index, 0)
+
+        no_correction = strictness.select_orientation(
+            [
+                self.pairing(0, 0, 0.0008),
+                self.pairing(1, 0, 0.0009),
+                self.pairing(0, 1, 0.0007),
+                self.pairing(1, 1, 0.0006),
+            ],
+            1,
+        )
+        self.assertIsInstance(no_correction, strictness.NoCorrectionRequired)
+        self.assertEqual(no_correction.candidate_current_endpoint_indexes, (0, 1))
+        self.assertIsNone(no_correction.selected_current_endpoint_index)
+
+    def test_selector_selects_the_sole_candidate_when_it_is_endpoint_one(self) -> None:
+        selection = strictness.select_orientation(
+            [
+                self.pairing(0, 0, 0.0012, False),
+                self.pairing(1, 0, 0.0009),
+                self.pairing(0, 1, 0.0007),
+                self.pairing(1, 1, 0.0006),
+            ],
+            1,
+        )
+        self.assertIsInstance(selection, strictness.CorrectionRequired)
+        self.assertEqual(selection.candidate_current_endpoint_indexes, (1,))
+        self.assertEqual(selection.selected_current_endpoint_index, 1)
+
+    def test_selector_refuses_inconsistent_tolerance_flag(self) -> None:
+        with self.assertRaisesRegex(
+            strictness.AdjudicationError,
+            r"^pairing \(0, 0\) distance 0\.001 has within_endpoint_tolerance false; expected true$",
+        ):
+            strictness.select_orientation([self.pairing(0, 0, 0.001, False)], 1)
+
+    def test_selector_ignores_pairing_order_and_in_tolerance_distance_ranking(self) -> None:
+        pairings = [
+            self.pairing(0, 0, 0.0008),
+            self.pairing(0, 1, 0.0002),
+            self.pairing(1, 0, 0.0012, False),
+            self.pairing(1, 1, 0.0003),
+        ]
+        baseline = strictness.select_orientation(pairings, 1)
+        self.assertEqual(baseline, strictness.select_orientation(list(reversed(pairings)), 1))
+        reordered = [pairings[index] for index in (2, 0, 3, 1)]
+        self.assertEqual(baseline, strictness.select_orientation(reordered, 1))
+        zero_changed = json.loads(json.dumps(pairings))
+        zero_changed[0]["distance_degrees"] = 0.0
+        changed = strictness.select_orientation(zero_changed, 1)
+        self.assertEqual(
+            (
+                type(baseline),
+                baseline.candidate_current_endpoint_indexes,
+                baseline.selected_current_endpoint_index,
+            ),
+            (
+                type(changed),
+                changed.candidate_current_endpoint_indexes,
+                changed.selected_current_endpoint_index,
+            ),
+        )
+
+    def test_selector_does_not_prefer_an_exact_zero_pairing_within_tolerance(self) -> None:
+        selection = strictness.select_orientation(
+            [
+                self.pairing(0, 0, 0.0),
+                self.pairing(1, 0, 0.0009),
+                self.pairing(0, 1, 0.0007),
+                self.pairing(1, 1, 0.0006),
+            ],
+            1,
+        )
+        self.assertIsInstance(selection, strictness.NoCorrectionRequired)
+        self.assertEqual(selection.candidate_current_endpoint_indexes, (0, 1))
+        self.assertIsNone(selection.selected_current_endpoint_index)
+
+    def test_committed_adapter_strictness_determination_matches_exact_contract(self) -> None:
+        adapter_dir = Path(__file__).resolve().parent
+        artifact = json.loads(
+            (adapter_dir / "adapter-strictness-correction-determination.json").read_text()
+        )
+        self.assertEqual(
+            set(artifact),
+            {
+                "basin_determinations",
+                "criterion",
+                "decision",
+                "inputs",
+                "integration_revision",
+                "population_checks",
+                "runtime_node_id",
+                "schema_version",
+                "scope",
+            },
+        )
+        self.assertEqual(
+            [artifact["schema_version"], artifact["runtime_node_id"], artifact["integration_revision"]],
+            [1, "m7-s4", "81b0784b067eabe4322dcf01a1b6feb1098baf52"],
+        )
+        self.assertEqual(
+            artifact["inputs"],
+            [
+                {
+                    "git_blob": "23bcc711cb8f048d47b93cc0c577ac9ac390d0d8",
+                    "path": "adapters/tdx-hydro/2020003440-prepass-determination.json",
+                    "processing_basin_id": "2020003440",
+                },
+                {
+                    "git_blob": "bcf0c1cf71479dddbbc9ccd4163c3ac6f2e74eb9",
+                    "path": "adapters/tdx-hydro/2020071190-prepass-determination.json",
+                    "processing_basin_id": "2020071190",
+                },
+            ],
+        )
+        self.assertEqual(artifact["criterion"]["endpoint_tolerance"], 0.001)
+        self.assertFalse(artifact["criterion"]["within_tolerance_distance_ordering_allowed"])
+        self.assertFalse(artifact["criterion"]["discarded_pairings_allowed"])
+        self.assertEqual(
+            [value["processing_basin_id"] for value in artifact["population_checks"]],
+            ["2020003440", "2020071190"],
+        )
+        expected_targets = {
+            "2020003440": (
+                817894,
+                819270,
+                [0.0007124906664959919, 0.0, 0.00035624533324799597],
+                [0.001068735999743988],
+            ),
+            "2020071190": (
+                1307547,
+                1308923,
+                [0.0004969039949952645, 0.0, 0.0006666666666745868],
+                [0.0011331154474683062],
+            ),
+        }
+        for basin in artifact["basin_determinations"]:
+            basin_id = basin["processing_basin_id"]
+            linkno, dslinkno, admitted, discarded = expected_targets[basin_id]
+            refusal = basin["outstanding_refusal"]
+            self.assertEqual(
+                [refusal["LINKNO"], refusal["DSLINKNO"], refusal["successor_downstream_endpoint_index"], refusal["successor_upstream_endpoint_index"]],
+                [linkno, dslinkno, 1, 0],
+            )
+            self.assertEqual([value["distance_degrees"] for value in basin["admitted_pairings"]], admitted)
+            self.assertEqual([value["distance_degrees"] for value in basin["discarded_pairings"]], discarded)
+            self.assertEqual(basin["candidate_current_endpoint_indexes"], [0])
+            self.assertEqual(basin["outcome"], "correction_required")
+            self.assertEqual(basin["selected_current_endpoint_index"], 0)
+            source_data = json.loads((adapter_dir / strictness.SPECS[basin_id].filename).read_text())
+            target_records = [
+                value
+                for value in source_data["two_current_endpoint_edges"]
+                if (value["LINKNO"], value["DSLINKNO"]) == (linkno, dslinkno)
+            ]
+            self.assertEqual(len(target_records), 1)
+            source_pairings = [strictness._pairing_from_object(value) for value in target_records[0]["candidate_pairing_distances"]]
+            relation = {(value.current_endpoint_index, value.successor_endpoint_index) for value in source_pairings if value.within_endpoint_tolerance}
+            upstream = 1 - refusal["successor_downstream_endpoint_index"]
+            candidates = sorted(current for current, successor in relation if successor == upstream)
+            self.assertEqual(candidates, basin["candidate_current_endpoint_indexes"])
+        self.assertEqual(
+            artifact["decision"],
+            {
+                "milestone_disposition": "follow_up_runtime_node_required",
+                "outcome": "correction_required",
+                "required_correction": {
+                    "algorithm": "filter admitted matches by successor_upstream_endpoint_index, collect sorted distinct current endpoint indexes, assign the sole index, and refuse zero or two indexes",
+                    "distance_ordering_within_tolerance": False,
+                    "implementation_node": "new runtime node after m7-s4",
+                    "per_basin_special_case": False,
+                    "replace_source_order_lines_at_integration_ref": "3864-3889",
+                    "target_branch": "ambiguous current reach with an already oriented non-root successor",
+                    "target_function": "_build_compact_topology",
+                    "target_path": "adapters/tdx-hydro/build_adapter.py",
+                },
+                "selected_processing_basin_ids": ["2020003440", "2020071190"],
+            },
+        )
+        self.assertEqual(
+            artifact["scope"],
+            {
+                "adapter_behavior_changed": False,
+                "bands_changed": False,
+                "compiled_basin_output_retained": False,
+                "decision_only": True,
+                "evidence_trees_read": False,
+                "guards_changed": False,
+                "verdicts_changed": False,
+            },
+        )
+
+    def test_committed_adapter_strictness_determination_is_byte_deterministic(self) -> None:
+        adapter_dir = Path(__file__).resolve().parent
+        artifact_path = adapter_dir / "adapter-strictness-correction-determination.json"
+        committed = artifact_path.read_bytes()
+        self.assertTrue(committed.endswith(b"\n"))
+        self.assertFalse(committed.endswith(b"\n\n"))
+        parsed = json.loads(committed)
+        self.assertEqual(strictness.serialize_artifact(parsed).encode(), committed)
+        command = [
+            sys.executable,
+            str(adapter_dir / "adjudicate_adapter_strictness.py"),
+            "--2020003440-prepass",
+            str((adapter_dir / "2020003440-prepass-determination.json").resolve()),
+            "--2020071190-prepass",
+            str((adapter_dir / "2020071190-prepass-determination.json").resolve()),
+        ]
+        outputs = [subprocess.run(command, check=True, capture_output=True).stdout for _ in range(2)]
+        self.assertEqual(outputs, [committed, committed])
+
+    def test_adjudicator_does_not_import_adapter_or_open_evidence_trees(self) -> None:
+        module_path = Path(strictness.__file__).resolve()
+        source = module_path.read_text()
+        self.assertNotIn("import build_adapter", source)
+        self.assertNotIn("import measure_prepass_classification", source)
+        root = module_path.parents[2]
+        for directory_name in strictness.PROHIBITED_EVIDENCE_DIRECTORIES:
+            prohibited = (root / directory_name / "fabricated.json").resolve()
+            with self.assertRaisesRegex(
+                strictness.AdjudicationError,
+                f"^pre-pass determination path is inside a prohibited evidence root: {prohibited}$",
+            ):
+                strictness.validate_prepass_path(prohibited)
+        for real_path in self.repository_paths().values():
+            self.assertEqual(strictness.validate_prepass_path(real_path.resolve()), real_path.resolve())
+        parser_actions = [action.dest for action in strictness._parser()._actions]
+        self.assertEqual(parser_actions, ["help", "2020003440_prepass", "2020071190_prepass"])
 
 
 class PrePassMeasurementTests(unittest.TestCase):
