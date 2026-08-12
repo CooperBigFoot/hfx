@@ -26,6 +26,7 @@ from shapely import from_wkb, get_coordinates
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 import build_adapter
+import measure_prepass_classification as prepass
 from build_adapter import (
     ADAPTER_VERSION,
     BBOX_LEAF_NAMES,
@@ -5991,6 +5992,205 @@ class BuildCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "return code 7"):
                     main(["validate", str(output), "--hfx-binary", str(failing)])
             validator.assert_not_called()
+
+
+class PrePassMeasurementTests(unittest.TestCase):
+    ARTIFACT_KEYS = {
+        "schema_version",
+        "processing_basin_id",
+        "algorithm",
+        "parameters",
+        "source_inputs",
+        "geometry_normalization",
+        "population",
+        "two_current_endpoint_edges",
+        "dscontarea_derivation",
+        "scope",
+        "reconciliation",
+    }
+
+    def test_classifier_exhausts_all_classes_and_keeps_full_cross_product(self) -> None:
+        native_ids = np.arange(1, 11, dtype="int64")
+        downstream_rows = np.asarray([1, -1, 3, -1, 5, -1, 7, -1, 9, -1], dtype="int64")
+        endpoints = np.asarray(
+            [
+                [(0.0, 0.0), (1.0, 0.0)],
+                [(10.0, 0.0), (11.0, 0.0)],
+                [(0.0, 0.0), (2.0, 0.0)],
+                [(0.001, 0.0), (5.0, 0.0)],
+                [(0.0, 0.0), (0.003, 0.0)],
+                [(0.0, 0.0), (0.003, 0.0)],
+                [(0.0, 0.0), (0.0031, 0.0)],
+                [(0.0, 0.0), (0.0031, 0.0)],
+                [(2.0, 0.0), (2.0, 0.0)],
+                [(2.0, 0.0), (3.0, 0.0)],
+            ],
+            dtype="float64",
+        )
+        degenerate = np.asarray([False] * 8 + [True, False])
+
+        counts, records = prepass.classify_edges(
+            native_ids, downstream_rows, endpoints, degenerate
+        )
+
+        self.assertEqual(tuple(counts), prepass.CLASS_NAMES)
+        self.assertEqual(counts, {
+            "NON_COINCIDENT": 1,
+            "SINGLE_ADMISSIBLE": 2,
+            "NEAR_DEGENERATE_ADMITTED": 1,
+            "REACH_SIDE_REFUSED": 1,
+        })
+        self.assertEqual(sum(counts.values()), 5)
+        self.assertEqual([record["LINKNO"] for record in records], [5, 7])
+        self.assertEqual([record["class"] for record in records], [
+            "NEAR_DEGENERATE_ADMITTED", "REACH_SIDE_REFUSED"
+        ])
+        self.assertEqual(records[0]["current_endpoint_separation_degrees"], 0.003)
+        self.assertEqual(len(records[0]["candidate_pairing_distances"]), 4)
+        self.assertTrue(any(
+            not pairing["within_endpoint_tolerance"]
+            for pairing in records[0]["candidate_pairing_distances"]
+        ))
+        self.assertEqual(
+            [(pairing["current_endpoint_index"], pairing["successor_endpoint_index"])
+             for pairing in records[0]["candidate_pairing_distances"]],
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+        )
+        self.assertNotIn(9, [record["LINKNO"] for record in records])
+        boundary_counts, boundary_pairings = prepass.classify_edges(
+            native_ids[2:4],
+            np.asarray([1, -1], dtype="int64"),
+            endpoints[2:4],
+            degenerate[2:4],
+        )
+        self.assertEqual(boundary_counts["SINGLE_ADMISSIBLE"], 1)
+        self.assertEqual(boundary_pairings, [])
+
+    def test_serialization_is_sorted_deterministic_and_newline_terminated(self) -> None:
+        value = {"z": [3, 2, 1], "a": {"d": True, "b": 0.001}}
+        first = prepass.serialize(value)
+        self.assertEqual(first, prepass.serialize(value))
+        self.assertTrue(first.endswith("\n"))
+        self.assertFalse(first.endswith("\n\n"))
+        self.assertLess(first.index('"a"'), first.index('"z"'))
+
+    def test_committed_prepass_artifacts_match_exact_contract(self) -> None:
+        root = Path(__file__).resolve().parent
+        expected = {
+            "2020003440": {
+                "total": 337_012,
+                "near": 4_219,
+                "strict": 4_368,
+                "basin_bytes": 5_397_577_728,
+                "stream_bytes": 1_688_866_816,
+            },
+            "2020071190": {
+                "total": 664_189,
+                "near": 10_832,
+                "strict": 11_445,
+                "basin_bytes": 13_388_906_496,
+                "stream_bytes": 3_697_729_536,
+            },
+        }
+        for basin_id, pinned in expected.items():
+            path = root / f"{basin_id}-prepass-determination.json"
+            encoded = path.read_bytes()
+            artifact = json.loads(encoded)
+            self.assertEqual(encoded, prepass.serialize(artifact).encode())
+            self.assertEqual(set(artifact), self.ARTIFACT_KEYS)
+            self.assertEqual(artifact["schema_version"], 1)
+            self.assertEqual(artifact["processing_basin_id"], basin_id)
+            self.assertEqual(set(artifact["algorithm"]), {
+                "mirrored_revision", "comparison_revision", "source_path",
+                "mirrored_lines", "reused_instrument_path", "reused_instrument_lines",
+                "prepass_predicates_unchanged", "imports_build_adapter",
+            })
+            self.assertEqual(artifact["algorithm"]["mirrored_revision"], prepass.MIRRORED_REVISION)
+            self.assertEqual(artifact["algorithm"]["comparison_revision"], prepass.COMPARISON_REVISION)
+            self.assertTrue(artifact["algorithm"]["prepass_predicates_unchanged"])
+            self.assertFalse(artifact["algorithm"]["imports_build_adapter"])
+            self.assertEqual(artifact["parameters"], {
+                "endpoint_tolerance": 0.001,
+                "non_root_reach_side_ambiguity_limit": 0.003,
+                "non_root_reach_side_ambiguity_tolerance_multiplier": 3.0,
+            })
+            spec = prepass.SPECS[basin_id]
+            self.assertEqual(artifact["source_inputs"], [
+                {
+                    "product": product,
+                    "path": source.portable_path,
+                    "layer_name": source.layer,
+                    "bytes": source.bytes,
+                    "sha256": source.sha256,
+                }
+                for product, source in (("basins", spec.basins), ("streamnet", spec.streamnet))
+            ])
+            normalization = artifact["geometry_normalization"]
+            self.assertEqual(set(normalization), {
+                "coordinate_domain_tolerance_degrees", "basins_clamp",
+                "streamnet_clamp", "start_equals_end",
+            })
+            self.assertEqual(normalization["start_equals_end"]["unsupported_more_than_two_coordinate_count"], 0)
+            self.assertEqual(normalization["start_equals_end"]["unsupported_more_than_two_coordinate_native_linknos"], [])
+            population = artifact["population"]
+            self.assertEqual(population["total_reach_count"], pinned["total"])
+            self.assertEqual(population["endpoint_separation_strictly_below_tolerance_reach_count"], pinned["strict"])
+            self.assertEqual(tuple(population["class_counts"]), tuple(sorted(prepass.CLASS_NAMES)))
+            self.assertEqual(population["class_counts"]["NEAR_DEGENERATE_ADMITTED"], pinned["near"])
+            self.assertEqual(population["class_counts"]["NON_COINCIDENT"], 0)
+            self.assertEqual(population["class_counts"]["REACH_SIDE_REFUSED"], 0)
+            self.assertEqual(sum(population["class_counts"].values()), population["class_count_sum"])
+            self.assertEqual(population["class_count_sum"], population["connected_edge_count"])
+            self.assertTrue(population["class_count_sum_equals_connected_edge_count"])
+            records = artifact["two_current_endpoint_edges"]
+            self.assertEqual(len(records), pinned["near"])
+            self.assertEqual(records, sorted(records, key=lambda value: (value["LINKNO"], value["DSLINKNO"])))
+            self.assertTrue(all(record["class"] == "NEAR_DEGENERATE_ADMITTED" for record in records))
+            self.assertTrue(all(
+                [(pairing["current_endpoint_index"], pairing["successor_endpoint_index"])
+                 for pairing in record["candidate_pairing_distances"]]
+                == ([(0, 0), (1, 0)] if record["successor_is_exact_production_degenerate"]
+                    else [(0, 0), (0, 1), (1, 0), (1, 1)])
+                for record in records
+            ))
+            self.assertTrue(any(
+                not pairing["within_endpoint_tolerance"]
+                for record in records
+                for pairing in record["candidate_pairing_distances"]
+            ))
+            diagnostics = artifact["dscontarea_derivation"]
+            self.assertEqual(diagnostics["own_area_method"], 'abs(float(Geod(ellps="WGS84").geometry_area_perimeter(post_clamp_geometry)[0])) stored as float64')
+            self.assertEqual(diagnostics["upstream_accumulation"], "math.fsum in production topology order")
+            self.assertIn(diagnostics["source_unit"], ("m2", "km2"))
+            for key in (
+                "geodesic_upstream_area_sum_m2", "dscontarea_sum_raw",
+                "m2_relative_error", "km2_relative_error", "selected_relative_error",
+                "signed_aggregate_relative_divergence",
+                "absolute_aggregate_relative_divergence",
+                "max_absolute_relative_divergence",
+            ):
+                self.assertTrue(math.isfinite(diagnostics[key]), key)
+            ratio = diagnostics["unit_decisiveness_ratio"]
+            self.assertTrue(ratio == "Infinity" or (math.isfinite(ratio) and ratio >= 1000.0))
+            self.assertEqual(diagnostics["fabric_divergence_sanity_ceiling"], 1.0)
+            self.assertTrue(diagnostics["divergence_is_production_comparable"])
+            scope = artifact["scope"]
+            self.assertEqual(scope["source_order_condition_3871_omission"], prepass.OMISSION)
+            self.assertTrue(scope["measurement_only"])
+            self.assertFalse(scope["orientation_derived_or_assigned"])
+            self.assertFalse(scope["reverse_topological_traversal_performed"])
+            self.assertFalse(scope["continued_past_production_refusal"])
+            self.assertFalse(scope["source_order_condition_3871_evaluated"])
+            self.assertFalse(scope["compiled_basin_output_retained"])
+        first = json.loads((root / "2020003440-prepass-determination.json").read_bytes())
+        self.assertIsNone(first["reconciliation"]["prior_estimate"])
+        self.assertEqual(first["reconciliation"]["prohibited_comparisons"], [4309, 4368])
+        second = json.loads((root / "2020071190-prepass-determination.json").read_bytes())
+        self.assertEqual(second["reconciliation"]["status"], "corrected")
+        self.assertEqual(
+            second["reconciliation"]["inconsistency"],
+            "two-current-endpoint count expected 11030, measured 10832",
+        )
 
 
 class BasinAdjudicationTests(unittest.TestCase):
