@@ -1,0 +1,172 @@
+{
+  "basin_determinations": [
+    {
+      "admitted_pairings": [
+        {
+          "current_endpoint_index": 0,
+          "distance_degrees": 0.0007124906664959919,
+          "successor_endpoint_index": 0
+        },
+        {
+          "current_endpoint_index": 0,
+          "distance_degrees": 0.0,
+          "successor_endpoint_index": 1
+        },
+        {
+          "current_endpoint_index": 1,
+          "distance_degrees": 0.00035624533324799597,
+          "successor_endpoint_index": 1
+        }
+      ],
+      "candidate_current_endpoint_indexes": [
+        0
+      ],
+      "discarded_pairings": [
+        {
+          "current_endpoint_index": 1,
+          "distance_degrees": 0.001068735999743988,
+          "successor_endpoint_index": 0
+        }
+      ],
+      "outcome": "correction_required",
+      "outstanding_refusal": {
+        "DSLINKNO": 819270,
+        "LINKNO": 817894,
+        "source": "adapters/tdx-hydro/2020003440-topology-determination.json:measurement.refusal",
+        "successor_downstream_endpoint_index": 1,
+        "successor_upstream_endpoint_index": 0
+      },
+      "processing_basin_id": "2020003440",
+      "selected_current_endpoint_index": 0
+    },
+    {
+      "admitted_pairings": [
+        {
+          "current_endpoint_index": 0,
+          "distance_degrees": 0.0004969039949952645,
+          "successor_endpoint_index": 0
+        },
+        {
+          "current_endpoint_index": 0,
+          "distance_degrees": 0.0,
+          "successor_endpoint_index": 1
+        },
+        {
+          "current_endpoint_index": 1,
+          "distance_degrees": 0.0006666666666745868,
+          "successor_endpoint_index": 1
+        }
+      ],
+      "candidate_current_endpoint_indexes": [
+        0
+      ],
+      "discarded_pairings": [
+        {
+          "current_endpoint_index": 1,
+          "distance_degrees": 0.0011331154474683062,
+          "successor_endpoint_index": 0
+        }
+      ],
+      "outcome": "correction_required",
+      "outstanding_refusal": {
+        "DSLINKNO": 1308923,
+        "LINKNO": 1307547,
+        "source": "milestone-7/step-2/plan.md quotation reproduced verbatim in m7-s4 plan",
+        "successor_downstream_endpoint_index": 1,
+        "successor_upstream_endpoint_index": 0
+      },
+      "processing_basin_id": "2020071190",
+      "selected_current_endpoint_index": 0
+    }
+  ],
+  "criterion": {
+    "admitted_pairing_predicate": "distance_degrees <= endpoint_tolerance",
+    "candidate_current_endpoint_derivation": "sorted distinct current_endpoint_index values among admitted pairings whose successor_endpoint_index equals the established successor upstream endpoint index",
+    "correction_required_predicate": "at least one outstanding traversal refusal has exactly one candidate current endpoint and the existing adapter refuses instead of consuming it",
+    "discarded_pairings_allowed": false,
+    "endpoint_tolerance": 0.001,
+    "no_correction_required_predicate": "both outstanding traversal refusals have zero or two candidate current endpoints",
+    "successor_upstream_endpoint_derivation": "1 - established_successor_downstream_endpoint_index",
+    "within_tolerance_distance_ordering_allowed": false
+  },
+  "decision": {
+    "milestone_disposition": "follow_up_runtime_node_required",
+    "outcome": "correction_required",
+    "required_correction": {
+      "algorithm": "filter admitted matches by successor_upstream_endpoint_index, collect sorted distinct current endpoint indexes, assign the sole index, and refuse zero or two indexes",
+      "distance_ordering_within_tolerance": false,
+      "implementation_node": "new runtime node after m7-s4",
+      "per_basin_special_case": false,
+      "replace_source_order_lines_at_integration_ref": "3864-3889",
+      "target_branch": "ambiguous current reach with an already oriented non-root successor",
+      "target_function": "_build_compact_topology",
+      "target_path": "adapters/tdx-hydro/build_adapter.py"
+    },
+    "selected_processing_basin_ids": [
+      "2020003440",
+      "2020071190"
+    ]
+  },
+  "inputs": [
+    {
+      "git_blob": "23bcc711cb8f048d47b93cc0c577ac9ac390d0d8",
+      "path": "adapters/tdx-hydro/2020003440-prepass-determination.json",
+      "processing_basin_id": "2020003440"
+    },
+    {
+      "git_blob": "bcf0c1cf71479dddbbc9ccd4163c3ac6f2e74eb9",
+      "path": "adapters/tdx-hydro/2020071190-prepass-determination.json",
+      "processing_basin_id": "2020071190"
+    }
+  ],
+  "integration_revision": "81b0784b067eabe4322dcf01a1b6feb1098baf52",
+  "population_checks": [
+    {
+      "admitted_pairing_count": 8509,
+      "class_counts": {
+        "NEAR_DEGENERATE_ADMITTED": 4219,
+        "NON_COINCIDENT": 0,
+        "REACH_SIDE_REFUSED": 0,
+        "SINGLE_ADMISSIBLE": 331077
+      },
+      "connected_edge_count": 335296,
+      "discarded_pairing_count": 8355,
+      "maximum_current_endpoint_separation_degrees": 0.0023297088607064573,
+      "processing_basin_id": "2020003440",
+      "retained_pairing_count": 16864,
+      "total_reach_count": 337012,
+      "two_current_endpoint_record_count": 4219,
+      "unique_exact_zero_pairing_record_count": 4219,
+      "unique_exact_zero_pairing_used_as_evidence": false
+    },
+    {
+      "admitted_pairing_count": 22059,
+      "class_counts": {
+        "NEAR_DEGENERATE_ADMITTED": 10832,
+        "NON_COINCIDENT": 0,
+        "REACH_SIDE_REFUSED": 0,
+        "SINGLE_ADMISSIBLE": 648586
+      },
+      "connected_edge_count": 659418,
+      "discarded_pairing_count": 21235,
+      "maximum_current_endpoint_separation_degrees": 0.0012570787221126288,
+      "processing_basin_id": "2020071190",
+      "retained_pairing_count": 43294,
+      "total_reach_count": 664189,
+      "two_current_endpoint_record_count": 10832,
+      "unique_exact_zero_pairing_record_count": 10832,
+      "unique_exact_zero_pairing_used_as_evidence": false
+    }
+  ],
+  "runtime_node_id": "m7-s4",
+  "schema_version": 1,
+  "scope": {
+    "adapter_behavior_changed": false,
+    "bands_changed": false,
+    "compiled_basin_output_retained": false,
+    "decision_only": true,
+    "evidence_trees_read": false,
+    "guards_changed": false,
+    "verdicts_changed": false
+  }
+}
