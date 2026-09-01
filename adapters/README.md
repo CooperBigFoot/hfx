@@ -5,7 +5,7 @@ HFX adapters compile a source hydrofabric into the canonical HFX artifacts (mani
 | Path | Status | Purpose |
 |---|---|---|
 | [`_template/`](_template/) | scaffold | Starting point for new adapters — copy and fill in the nine numbered stages. |
-| [`grit-v2/`](grit-v2/) | current reference adapter | Produced the hosted `grit/hfx-v0.3.0` dataset — `format_version` 0.3.0, `adapter_version` grit-global-2.0.0; planetary dag with segment (level 0) and reach (level 1) drainage units. |
+| [`grit-v2/`](grit-v2/) | current reference adapter | Produced the [hosted `grit/hfx-v0.3.0` dataset](https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/) — `format_version` 0.3.0, `adapter_version` grit-global-2.1.0; planetary dag with segment (level 0) and reach (level 1) drainage units plus direction and accumulation rasters. |
 | [`merit-v2/`](merit-v2/) | current reference implementation / worked example | Compiles MERIT-Basins + MERIT Hydro into HFX 0.3.0 locally — tree topology, D8 rasters as `hfx.aux.d8_raster.v2` COGs; per-basin, multi-basin, or planetary builds. |
 | [`tdx-hydro/`](tdx-hydro/) | current single-basin implementation | Compiles one pristine NGA TDX-Hydro processing basin into HFX 0.3.0 locally with tree topology and `hfx.aux.snap.v2` stems. |
 | [`grit/`](grit/) | historical (v1, format_version 0.1) | Compiled GRIT v1.0 regional segment catchments into the original HFX 0.1 layout. |
@@ -16,3 +16,11 @@ HFX adapters compile a source hydrofabric into the canonical HFX artifacts (mani
 The v2 adapters are the current reference implementations and target `format_version` 0.3.0; the v1 `grit/` and `merit/` adapters produced 0.1 datasets and are kept for historical reference only. The MERIT v2 adapter is the worked example to follow when authoring a new adapter: it covers vectors, tree topology, snap stems, and D8 raster auxiliaries end to end, and its output is fully reproducible from public sources.
 
 **HydroBASINS is the most-wanted next adapter.** To build it (or any other adapter): copy [`_template/`](_template/), use [`merit-v2/`](merit-v2/) as the worked example, and see [`../docs/adapter/index.md`](../docs/adapter/index.md).
+
+The hosted GRIT compilation uses the planetary direction and accumulation
+rasters `aux/d8/flow_dir.tif` and `aux/d8/flow_acc.tif` from the
+[GRIT vector archive](https://doi.org/10.5281/zenodo.17435232) and the
+[GRIT raster archive](https://doi.org/10.5281/zenodo.15715535). Cite the
+[Wortmann et al. GRIT paper](https://doi.org/10.1029/2024WR038308). The hosted
+dataset is licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+for NonCommercial use.

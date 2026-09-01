@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "dataset": "grit-hfx-v0.3.0",
+  "canonical_key": "grit/hfx-v0.3.0/manifest.json",
+  "revert_sibling": {
+    "key": "grit/hfx-v0.3.0/manifest.0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4.json",
+    "bytes": 1132,
+    "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4",
+    "content_type": "application/json"
+  },
+  "canonical_before": {
+    "phase": "before_revert_rehearsal",
+    "observed_at": "2026-08-19T15:58:22.814Z",
+    "method": "GET_full_body",
+    "key": "grit/hfx-v0.3.0/manifest.json",
+    "etag": "\"f6a60b1c826cbfaadfc83a38a84c425e\"",
+    "bytes": 1132,
+    "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+  },
+  "events": [
+    {
+      "observed_at": "2026-08-19T15:58:24.168Z",
+      "action": "created",
+      "key": "grit/hfx-v0.3.0/manifest.0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4.json",
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    },
+    {
+      "observed_at": "2026-08-19T15:58:24.793Z",
+      "action": "read_back_verified",
+      "key": "grit/hfx-v0.3.0/manifest.0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4.json",
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    }
+  ],
+  "canonical_after": {
+    "phase": "after_revert_rehearsal",
+    "observed_at": "2026-08-19T15:58:25.248Z",
+    "method": "GET_full_body",
+    "key": "grit/hfx-v0.3.0/manifest.json",
+    "etag": "\"f6a60b1c826cbfaadfc83a38a84c425e\"",
+    "bytes": 1132,
+    "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+  },
+  "cleanup": {
+    "observed_at": "2026-08-19T16:00:01.044Z",
+    "action": "deleted_and_absent",
+    "key": "grit/hfx-v0.3.0/manifest.0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4.json"
+  }
+}

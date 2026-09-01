@@ -10,6 +10,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  grit-publication-evidence:
+    name: GRIT publication evidence (offline)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout full authority history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify authority and immutable publication evidence
+        run: |
+          python3 hosting/grit-hfx-v0.3.0/verify-authority.py --self-test
+          python3 hosting/grit-hfx-v0.3.0/test-authority-pin-matches-recorded-source-ref.py
+          python3 hosting/grit-hfx-v0.3.0/verify-publication-evidence.py
+          python3 -m unittest discover -s hosting/grit-hfx-v0.3.0 -p 'test_*.py' -v
+
+      - name: Reject stale publication and attribution claims
+        run: python3 scripts/verify-grit-publication-docs.py
+
   rust-fmt:
     name: Rust fmt
     runs-on: ubuntu-24.04

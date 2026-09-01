@@ -1,0 +1,44 @@
+{
+  "schema": "hfx.grit-d8-live-containment.v1",
+  "canonical_key": "grit/hfx-v0.3.0/manifest.json",
+  "publication": {
+    "candidate_identity": {
+      "bytes": 1426,
+      "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+    },
+    "exposure_started_at": "2026-08-19T15:59:29Z",
+    "exposure_start_basis": "public canonical Last-Modified header observed before verdict",
+    "verdict_recorded_at": "2026-08-20T22:46:16Z",
+    "exposure_seconds_until_acceptance": 110807,
+    "verdict": "accepted"
+  },
+  "rollback": {
+    "authority_path": "manifest.former.json",
+    "identity": {
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    },
+    "offline_rehearsal": "scripts/upload-r2-grit-d8.sh --self-test restores a local published-object replica and verifies its byte identity",
+    "cache_clearing_guidance": "After a failed fire, clear local HFX dataset and raster-window caches before retrying the public address. Shared HTTP caches must purge grit/hfx-v0.3.0/manifest.json."
+  },
+  "historical_2026_07_24_evidence": [
+    {
+      "repository": "hfx",
+      "path": "docs/decisions/2026-07-24-grit-successor-prefix-frozen-v0-3-0.md",
+      "bytes": 1614,
+      "sha256": "a7256db6a251ec0a5485415058f8766b60b48aeadfd36d223debf6f9a98b903a"
+    },
+    {
+      "repository": "pourpoint",
+      "path": "docs/decisions/2026-07-24-bounded-reads-are-tile-count-independent.md",
+      "bytes": 1149,
+      "sha256": "ade730ddbbb23f8aaf19254b08d6a7b1ecb1cfa72e4e3b680402532ea3ee62a5"
+    },
+    {
+      "repository": "pourpoint",
+      "path": "docs/decisions/2026-07-24-remote-cog-parser-ownership.md",
+      "bytes": 4411,
+      "sha256": "85ced58aa56486b082ee1fd70a6f289f3a69d883a0f2278214d5c590ece7edd1"
+    }
+  ]
+}

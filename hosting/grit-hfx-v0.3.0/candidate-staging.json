@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "dataset": "grit-hfx-v0.3.0",
+  "base_url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/",
+  "bucket": "basin-delineations-public",
+  "canonical_key": "grit/hfx-v0.3.0/manifest.json",
+  "authorities": {
+    "candidate": {
+      "authority_path": "manifest.json",
+      "bytes": 1426,
+      "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+    },
+    "former": {
+      "authority_path": "manifest.former.json",
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    }
+  },
+  "siblings": [
+    {
+      "key": "grit/hfx-v0.3.0/manifest.02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c.json",
+      "authority_path": "manifest.json",
+      "bytes": 1426,
+      "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c",
+      "content_type": "application/json"
+    }
+  ],
+  "canonical_observations": [
+    {
+      "phase": "before_staging",
+      "observed_at": "2026-08-19T14:19:05Z",
+      "method": "GET_full_body",
+      "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manifest.json",
+      "http_status": 200,
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    },
+    {
+      "phase": "after_staging",
+      "observed_at": "2026-08-19T14:19:17Z",
+      "method": "GET_full_body",
+      "url": "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manifest.json",
+      "http_status": 200,
+      "bytes": 1132,
+      "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+    }
+  ],
+  "staging_events": [
+    {
+      "observed_at": "2026-08-19T14:19:17Z",
+      "action": "created",
+      "key": "grit/hfx-v0.3.0/manifest.02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c.json",
+      "before": "not_found",
+      "after_bytes": 1426,
+      "after_sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+    }
+  ]
+}
