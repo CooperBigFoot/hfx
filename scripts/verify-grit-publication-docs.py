@@ -26,6 +26,16 @@ STALE = (
     "human-gated, unfired",
     "awaiting publication",
 )
+AUTHORITY = "hosting/grit-hfx-v0.3.0/AUTHORITY.md"
+AUTHORITY_CURRENT = (
+    "PUBLISHED AND ACCEPTED",
+    "manifest.json` is the current canonical public body",
+)
+AUTHORITY_STALE = (
+    "manifest.json` is future human-controlled publication material",
+    "This package does not implement m1-s2, m2, m3, or m4",
+    "Delivery is exactly one commit containing exactly the five authority files",
+)
 BANDS = {
     "adapters/grit-v2/README.md": ("uint8", "nodata `255`", "float32", "NaN nodata"),
     "hosting/grit-hfx-v0.3.0/README.md": ("uint8", "nodata `255`", "float32", "NaN nodata"),
@@ -47,6 +57,13 @@ def main():
         if ("hfx.aux.d8_raster.v2" not in text
                 and "manifest declares the raster objects" not in lowered):
             failures.append(f"{relative}: missing current D8 publication state")
+    authority = (root / AUTHORITY).read_text(encoding="utf-8")
+    for claim in AUTHORITY_CURRENT:
+        if claim not in authority:
+            failures.append(f"{AUTHORITY}: missing current status {claim!r}")
+    for claim in AUTHORITY_STALE:
+        if claim in authority:
+            failures.append(f"{AUTHORITY}: stale preparation status {claim!r}")
     for relative, claims in BANDS.items():
         text = (root / relative).read_text(encoding="utf-8")
         for claim in claims:
