@@ -1,17 +1,22 @@
 # Upstream Tech Public Hydrologic Basin Delineation Datasets
 
 This bucket hosts the canonical GRIT 2.0.0 HFX dataset, an HFX
-v0.3.0 compilation of the Global River Topology (GRIT) vector datasets,
-stored under `grit/hfx-v0.3.0/`.
+v0.3.0 compilation of the Global River Topology (GRIT) vector datasets and
+planetary direction and accumulation raster archive, stored under
+`grit/hfx-v0.3.0/`. The manifest declares the raster objects as
+`aux/d8/flow_dir.tif` and `aux/d8/flow_acc.tif`.
 
 - [manifest.json](https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manifest.json)
 - [README.md](https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/README.md)
 - [NOTICE](https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/NOTICE)
 - [CITATION.txt](https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/CITATION.txt)
 
-Attribution: Wortmann et al. 2025, DOI 10.5281/zenodo.17435232, licensed
-CC BY-NC 4.0 (NonCommercial). See the dataset NOTICE and CITATION.txt above
-for the full license terms and citation.
+Attribution: Wortmann et al. 2025. Cite the vector archive (DOI
+10.5281/zenodo.17435232), the [GRIT raster archive](https://doi.org/10.5281/zenodo.15715535),
+and the [GRIT paper](https://doi.org/10.1029/2024WR038308). The combined hosted
+dataset is licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+for NonCommercial use. See the dataset NOTICE and CITATION.txt above for the
+full license terms and citations.
 
 HFX spec and toolkit: https://github.com/CooperBigFoot/hfx
 

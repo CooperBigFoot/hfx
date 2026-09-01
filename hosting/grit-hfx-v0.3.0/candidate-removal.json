@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "dataset": "grit-hfx-v0.3.0",
+  "canonical_key": "grit/hfx-v0.3.0/manifest.json",
+  "staging_record": "candidate-staging.json",
+  "events": [
+    {
+      "observed_at": "2026-08-20T22:54:02Z",
+      "action": "deleted",
+      "key": "grit/hfx-v0.3.0/manifest.02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c.json",
+      "before_bytes": 1426,
+      "before_sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c",
+      "after": "not_found"
+    }
+  ]
+}

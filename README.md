@@ -61,8 +61,8 @@ Manifest: <https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manif
 | `unit_count` | 22,337,300 |
 | `topology` | dag |
 | CRS | EPSG:4326 |
-| Auxiliaries | two `hfx.aux.snap.v2` snap indexes (segment-stems, reach-stems) |
-| Total size | ~43 GB |
+| Auxiliaries | two `hfx.aux.snap.v2` snap indexes and one planetary `hfx.aux.d8_raster.v2` entry |
+| Total size | ~299 GB |
 
 **Objects** (base URL `https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/`):
 
@@ -71,6 +71,8 @@ Manifest: <https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/manif
 - `graph.parquet`
 - `aux/snap_segments.parquet`
 - `aux/snap_reaches.parquet`
+- `aux/d8/flow_dir.tif`
+- `aux/d8/flow_acc.tif`
 - `NOTICE`, `CITATION.txt`, `README.md` (attribution objects)
 
 **License and attribution:** CC BY-NC 4.0 (<https://creativecommons.org/licenses/by-nc/4.0/>), inherited from the source data, so NonCommercial use only.
@@ -79,6 +81,10 @@ Any use of this dataset must credit the source data authors:
 > Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.
 
 DOI: <https://doi.org/10.5281/zenodo.17435232>
+
+The planetary direction and accumulation rasters come from the
+[GRIT raster archive](https://doi.org/10.5281/zenodo.15715535). Also cite the
+[Wortmann et al. GRIT paper](https://doi.org/10.1029/2024WR038308).
 
 **Validate** any local copy:
 

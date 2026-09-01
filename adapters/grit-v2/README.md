@@ -8,7 +8,9 @@ Current reference adapter. This adapter compiled the hosted GRIT 2.0.0 reference
 
 <https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/>
 
-The hosted manifest reports:
+The hosted manifest reports the vector objects and the planetary GRIT direction
+and accumulation raster archive (`aux/d8/flow_dir.tif` and
+`aux/d8/flow_acc.tif`):
 
 | Property | Value |
 |---|---|
@@ -86,7 +88,7 @@ The command mosaics the source rasters directly on their native EPSG:8857 grid a
 - `aux/d8/flow_dir.tif`
 - `aux/d8/flow_acc.tif`
 
-The operation preserves source values and nodata tags. `flow_dir.tif` remains `int8`, including negative GRASS flow-direction codes, and `flow_acc.tif` remains `int32` in km2. The native-grid mosaic performs direct cell copies and COG retiling, with the source CRS, resolution, alignment, and values preserved.
+The published hosted direction band is `uint8` with nodata `255`; the accumulation band is `float32` in km2 with NaN nodata. The native-grid mosaic preserves the source CRS, resolution, alignment, and GRASS direction interpretation while normalizing the hosted band types and nodata values.
 
 The command amends the existing `manifest.json` idempotently. Repeated runs converge to exactly one `hfx.aux.d8_raster.v2` entry:
 
@@ -121,6 +123,10 @@ uv run --project adapters/grit-v2 pytest adapters/grit-v2
 
 ## License and Attribution
 
-The compiled dataset inherits CC BY-NC 4.0 from the source data — NonCommercial use only. Any use must credit the source data authors:
+The compiled dataset inherits [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+from the source data — NonCommercial use only. Any use must credit the source
+data authors. Cite the vector dataset above, the
+[GRIT raster archive](https://doi.org/10.5281/zenodo.15715535), and the
+[Wortmann et al. GRIT paper](https://doi.org/10.1029/2024WR038308).
 
 > Wortmann, M. et al. (2025) “Global River Topology (GRIT) vector datasets”. Zenodo. doi:10.5281/zenodo.17435232.

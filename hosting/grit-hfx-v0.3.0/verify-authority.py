@@ -6,8 +6,11 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -77,6 +80,20 @@ def require(condition, message):
 def identity(data):
     """Return byte count and lowercase SHA-256 for data."""
     return len(data), hashlib.sha256(data).hexdigest()
+
+
+def source_ref_bytes(source_ref, authority_path):
+    """Read an authority input from the identity inventory's recorded Git tree."""
+    repository = Path(__file__).resolve().parents[2]
+    relative = f"hosting/grit-hfx-v0.3.0/{authority_path}"
+    result = subprocess.run(
+        ["git", "-C", str(repository), "show", f"{source_ref}:{relative}"],
+        check=False,
+        capture_output=True,
+    )
+    require(result.returncode == 0,
+            f"cannot read {authority_path} at inventory source_ref")
+    return result.stdout
 
 
 def exact_type_tree(actual, expected, label):
@@ -156,10 +173,17 @@ def verify_authority(root):
     require(bool(prefix(PROVENANCE["discrimination"][2]["sha256_prefix"])), "upper neighbor prefix invalid")
 
     object_by_path = {item["authority_path"]: item for item in objects if item["authority_path"] is not None}
+    checkout_authorities = {"manifest.json", "manifest.former.json"}
     for path, expected in LOCAL_IDENTITIES.items():
-        measured = identity((root / path).read_bytes())
-        require(measured == expected, f"{path} hard-coded identity differs")
-        require(measured == (object_by_path[path]["identity"]["bytes"], object_by_path[path]["identity"]["sha256"]), f"{path} inventory identity differs")
+        data = ((root / path).read_bytes() if path in checkout_authorities
+                else source_ref_bytes(inventory["source_ref"], path))
+        measured = identity(data)
+        require(measured == expected,
+                f"{path} hard-coded identity differs at recorded source_ref")
+        inventory_identity = (object_by_path[path]["identity"]["bytes"],
+                              object_by_path[path]["identity"]["sha256"])
+        require(measured == inventory_identity,
+                f"{path} inventory identity differs at recorded source_ref")
 
     expected_observations = [
         None,
@@ -225,15 +249,69 @@ def verify_authority(root):
     require(identity(former_bytes) == LOCAL_IDENTITIES["manifest.former.json"], "former final identity differs")
 
 
+def verify_public(
+    root: Path,
+    base: str = "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/",
+) -> None:
+    """Verify the public declaration and unchanged hosted object identities."""
+    headers = {"User-Agent": "hfx-grit-authority-verifier/1"}
+    request = urllib.request.Request(base + "manifest.json", headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        require(response.status == 200, "public manifest did not return HTTP 200")
+        public_bytes = response.read(LOCAL_IDENTITIES["manifest.json"][0] + 1)
+    require(identity(public_bytes) == LOCAL_IDENTITIES["manifest.json"],
+            "public manifest identity differs from reviewed candidate")
+    public_manifest = json.loads(public_bytes)
+    declarations = [entry for entry in public_manifest.get("auxiliary", [])
+                    if isinstance(entry, dict)
+                    and entry.get("schema") == "hfx.aux.d8_raster.v2"]
+    require(len(declarations) == 1 and declarations[0] == D8,
+            "public manifest does not carry exactly one reviewed GRIT D8 declaration")
+    require(identity((root / "manifest.former.json").read_bytes())
+            == LOCAL_IDENTITIES["manifest.former.json"],
+            "rollback authority identity differs")
+    expected_attribution = {
+        "NOTICE": (1454, "eac224bf0b70b1494e5abd89f80079d665150ea744a2f730593f7216ca223db3"),
+        "CITATION.txt": (2495, "8c7bf86a5962bf42282bbfd401226773601c2551f79685bad9be68d3b41363ac"),
+        "README.md": (6967, "2b86e8278996aa7540359e6b397c0a042f90c827e9c61730c81fca9eb3e63e56"),
+    }
+    for key, expected in expected_attribution.items():
+        attribution_request = urllib.request.Request(base + key, headers=headers)
+        with urllib.request.urlopen(attribution_request, timeout=60) as response:
+            require(response.status == 200,
+                    f"hosted attribution {key} did not return HTTP 200")
+            attribution_bytes = response.read(expected[0] + 1)
+        require(identity(attribution_bytes) == expected,
+                f"hosted attribution {key} identity differs")
+    expected_cogs = {
+        "aux/d8/flow_dir.tif": (50686516478, '"bc48d1013cf6908fb44c325dd2ad10ab-1511"'),
+        "aux/d8/flow_acc.tif": (205069870081, '"49eab3942a26036aa49e72ea33a1b724-6112"'),
+    }
+    for key, (expected_length, expected_etag) in expected_cogs.items():
+        head = urllib.request.Request(base + key, headers=headers, method="HEAD")
+        with urllib.request.urlopen(head, timeout=60) as response:
+            require(response.status == 200, f"hosted COG {key} did not return HTTP 200")
+            require(int(response.headers.get("Content-Length", "-1")) == expected_length,
+                    f"hosted COG {key} length differs")
+            require(response.headers.get("ETag") == expected_etag,
+                    f"hosted COG {key} ETag differs")
+    print("GRIT HFX v0.3.0 public authority verified: manifest and attribution bodies match; hosted COG identities unchanged")
+
+
 def main():
     """Parse arguments, run verification, and optionally falsify corruptions."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--public", action="store_true")
     args = parser.parse_args()
+    if args.self_test and args.public:
+        parser.error("--self-test and --public cannot be combined")
     try:
         verify_authority(args.root)
         print("GRIT HFX v0.3.0 authority verified")
+        if args.public:
+            verify_public(args.root)
         if args.self_test:
             messages = [
                 ("manifest.json", "PASS: candidate manifest byte drift rejected"),
@@ -253,7 +331,8 @@ def main():
                     else:
                         raise VerificationError(f"{path} corruption was accepted")
             print("authority corruption self-test passed")
-    except (VerificationError, OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (VerificationError, OSError, UnicodeError, json.JSONDecodeError,
+            urllib.error.URLError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     return 0

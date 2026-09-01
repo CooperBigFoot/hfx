@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "dataset": "grit-hfx-v0.3.0",
+  "canonical_key": "grit/hfx-v0.3.0/manifest.json",
+  "candidate_sibling_key": "grit/hfx-v0.3.0/manifest.02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c.json",
+  "pre_write_observation": {
+    "phase": "immediately_before_write",
+    "observed_at": "2026-08-19T15:59:28.710Z",
+    "method": "GET_full_body",
+    "key": "grit/hfx-v0.3.0/manifest.json",
+    "etag": "\"f6a60b1c826cbfaadfc83a38a84c425e\"",
+    "bytes": 1132,
+    "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+  },
+  "invocations": [
+    {
+      "invoked_at": "2026-08-19T15:59:29.197Z",
+      "action": "written",
+      "observed_identity": {
+        "bytes": 1132,
+        "sha256": "0935a7bc09b7c2636786082fd9fd9a669ea1b32c6e2e4d92cb3f8da531c083c4"
+      },
+      "writes": 1
+    },
+    {
+      "invoked_at": "2026-08-19T15:59:31.155Z",
+      "action": "attested",
+      "observed_identity": {
+        "bytes": 1426,
+        "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+      },
+      "writes": 0
+    }
+  ],
+  "write_events": [
+    {
+      "started_at": "2026-08-19T15:59:29.197Z",
+      "completed_at": "2026-08-19T15:59:29.963Z",
+      "key": "grit/hfx-v0.3.0/manifest.json",
+      "if_match": "\"f6a60b1c826cbfaadfc83a38a84c425e\"",
+      "bytes": 1426,
+      "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+    }
+  ],
+  "verdict": {
+    "observed_at": "2026-08-19T15:59:30.624Z",
+    "result": "accepted",
+    "basis": "canonical_full_body_read_back",
+    "bytes": 1426,
+    "sha256": "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+  },
+  "exposure_window": {
+    "started_at": "2026-08-19T15:59:29.197Z",
+    "ended_at": "2026-08-19T15:59:30.624Z",
+    "duration_seconds": 1.427,
+    "unaccepted_intervals": [
+      {
+        "started_at": "2026-08-19T15:59:29.197Z",
+        "ended_at": "2026-08-19T15:59:30.624Z",
+        "reason": "candidate_pending_identity_verdict"
+      }
+    ]
+  }
+}
