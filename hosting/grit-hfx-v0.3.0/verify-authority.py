@@ -249,9 +249,11 @@ def verify_authority(root):
     require(identity(former_bytes) == LOCAL_IDENTITIES["manifest.former.json"], "former final identity differs")
 
 
-def verify_public(root: Path) -> None:
-    """Verify the live canonical declaration and unchanged hosted COG identities."""
-    base = "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/"
+def verify_public(
+    root: Path,
+    base: str = "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/",
+) -> None:
+    """Verify the public declaration and unchanged hosted object identities."""
     headers = {"User-Agent": "hfx-grit-authority-verifier/1"}
     request = urllib.request.Request(base + "manifest.json", headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
@@ -268,6 +270,19 @@ def verify_public(root: Path) -> None:
     require(identity((root / "manifest.former.json").read_bytes())
             == LOCAL_IDENTITIES["manifest.former.json"],
             "rollback authority identity differs")
+    expected_attribution = {
+        "NOTICE": (1454, "eac224bf0b70b1494e5abd89f80079d665150ea744a2f730593f7216ca223db3"),
+        "CITATION.txt": (2495, "8c7bf86a5962bf42282bbfd401226773601c2551f79685bad9be68d3b41363ac"),
+        "README.md": (6967, "2b86e8278996aa7540359e6b397c0a042f90c827e9c61730c81fca9eb3e63e56"),
+    }
+    for key, expected in expected_attribution.items():
+        attribution_request = urllib.request.Request(base + key, headers=headers)
+        with urllib.request.urlopen(attribution_request, timeout=60) as response:
+            require(response.status == 200,
+                    f"hosted attribution {key} did not return HTTP 200")
+            attribution_bytes = response.read(expected[0] + 1)
+        require(identity(attribution_bytes) == expected,
+                f"hosted attribution {key} identity differs")
     expected_cogs = {
         "aux/d8/flow_dir.tif": (50686516478, '"bc48d1013cf6908fb44c325dd2ad10ab-1511"'),
         "aux/d8/flow_acc.tif": (205069870081, '"49eab3942a26036aa49e72ea33a1b724-6112"'),
@@ -280,7 +295,7 @@ def verify_public(root: Path) -> None:
                     f"hosted COG {key} length differs")
             require(response.headers.get("ETag") == expected_etag,
                     f"hosted COG {key} ETag differs")
-    print("GRIT HFX v0.3.0 public authority verified: manifest only changed; hosted COG identities unchanged")
+    print("GRIT HFX v0.3.0 public authority verified: manifest and attribution bodies match; hosted COG identities unchanged")
 
 
 def main():
