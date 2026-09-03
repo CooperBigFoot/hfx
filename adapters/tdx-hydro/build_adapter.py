@@ -3940,6 +3940,24 @@ def _build_compact_topology(
     header_number: int,
     endpoint_tolerance: float,
 ) -> _CompactTopology:
+    """Orient every reach and contract the polygon-bearing unit graph.
+
+    compact_topology : (BasinIdentities, StreamnetReaches, HeaderNumber, Tolerance)
+                       -> _CompactTopology                 (partial: refuses)
+
+    where StreamnetReaches = (LINKNO, DSLINKNO, endpoints, degeneracy, DSContArea)
+    sorted by LINKNO. Each reach's outlet is
+    orient(reach) = the endpoint singled out by coincidence evidence: a unique
+    admitted pairing with the successor, else the unique candidate on the
+    successor's established upstream endpoint, else the candidate exactly
+    coincident with that endpoint; root upstream endpoints come from predecessor
+    evidence collected first. The function refuses whenever that evidence is
+    absent, tied, or conflicting, except for the two inherited root conventions
+    recorded as `ReachResolution.ROOT_SOURCE_ORDER_TRUSTED` and
+    `ReachResolution.ROOT_ISOLATED_TRUSTED`. Units, global IDs, contracted edges,
+    outlets, and upstream adjacency are then pure functions of the orientation
+    and the polygon join.
+    """
     tolerance = _positive_finite_tolerance(endpoint_tolerance)
     polygon_positions = np.searchsorted(stream_native_ids, basin_native_ids)
     if (
