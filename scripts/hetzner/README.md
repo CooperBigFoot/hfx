@@ -12,6 +12,8 @@ Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-h
 
 Operator runbook: [acquire the seven absent TDX-Hydro basins plus the frozen control](RUNBOOK-tdx-hydro-seven-basin-acquisition.md) (acquisition only).
 
+Compile and extension runbook: [compile the seven absent basins with the corrected adapter, prove both control builds byte for byte, extend the frozen 55-basin artifact, and preserve everything before exact-resource teardown](RUNBOOK-tdx-hydro-seven-basin-compile.md). Its helpers are `verify-compile-runbook.sh` (contract drift), `verify-campaign-inputs.sh` (evidence root, opaque credential file, hcloud context), `price-preflight.sh` (current-price cost projection and gates), and `compare-dataset-trees.sh` (SHA-256 comparison of two dataset trees).
+
 The scripts in this directory compose one lifecycle and remain independently
 runnable. Campaign identifiers use 1-32 lowercase letters, digits, or hyphens
 and begin with a letter or digit. The deterministic resource names are
