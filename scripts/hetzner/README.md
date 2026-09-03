@@ -8,7 +8,7 @@ discipline. Nothing durable survives on the VM. Inputs are re-fetchable,
 outputs are re-creatable, and delivered artifacts live outside the VM before
 teardown.
 
-Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md) and [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md).
+Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md), [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md), and [55-basin TDX-Hydro planetary campaign](CAMPAIGN-tdx-hydro-planetary.md).
 
 Operator runbook: [acquire the seven absent TDX-Hydro basins plus the frozen control](RUNBOOK-tdx-hydro-seven-basin-acquisition.md) (acquisition only).
 
