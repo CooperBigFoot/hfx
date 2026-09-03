@@ -11,18 +11,20 @@ import logging
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 from collections import Counter, deque
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
+from urllib.parse import quote
 
 import geopandas as gpd
 import numpy as np
@@ -94,9 +96,12 @@ ADJUDICATION_CONTROL_ID = "7020000010"
 ADJUDICATED_ADAPTER_GIT_REVISION = "bca87d8adb0651d130bde9c7dfcf3947427cfa24"
 SQLITE3_IDENTITY_HEX = "53514c69746520666f726d6174203300"
 HISTORICAL_TRANSFER_FAILURE_REASON = "transfer interrupted; retry from byte zero"
-DUPLICATE_STREAM_ID = 9
 AMBIGUOUS_NON_ROOT_LINKNO = 148956
 CONFLICTING_ROOT_LINKNO = 1104039
+VERDICT_LEDGER_SCHEMA_VERSION = 2
+DUPLICATE_IDENTITY_ADJUDICATION_KIND = "duplicate identity"
+DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION = 1
+DUPLICATE_GROUND_EQUALITY_RULE_ID = "duplicate-ground-equality-v1"
 
 
 class BasinVerdict(Enum):
@@ -117,13 +122,21 @@ class AdjudicationEvidenceKind(Enum):
 
 
 @dataclass(frozen=True)
-class AcquiredProduct:
+class SourceLayer:
+    """One single-layer TDX-Hydro product file, identified by its exact bytes."""
+
     processing_basin_id: str
     product: str
     path: Path
     layer_name: str
     byte_count: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class AcquiredProduct(SourceLayer):
+    """A source layer whose identity the acquisition state record also attests."""
+
     attempts: int
 
 
@@ -5385,7 +5398,12 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _parse_acquired_product(root: Path, basin_id: str, product: str) -> AcquiredProduct:
+def _expected_product_layer_name(basin_id: str, product: str) -> str:
+    return "basins" if product == "basins" else f"TDX_streamnet_{basin_id}_01"
+
+
+def _parse_acquired_state(root: Path, basin_id: str, product: str) -> tuple[Path, dict[str, object], int]:
+    """Return the acquired product path, its attested evidence, and its attempt count."""
     basins_path, streamnet_path, state_path = _acquired_paths(root, basin_id)
     path = basins_path if product == "basins" else streamnet_path
     if path.is_symlink() or not path.is_file():
@@ -5402,21 +5420,76 @@ def _parse_acquired_product(root: Path, basin_id: str, product: str) -> Acquired
     attempts, evidence = stage.get("attempts"), stage.get("evidence")
     if stage.get("status") != "succeeded" or not _is_int(attempts) or not 1 <= attempts <= 3 or stage.get("failure_reason") is not None or not isinstance(evidence, dict) or set(evidence) != {"bytes", "layer_name", "sha256", "sqlite_identity"}:
         raise ValueError(f"{basin_id} {product} acquired state mismatch: {state_path}")
+    if not _is_int(evidence.get("bytes")) or not _valid_sha256(evidence.get("sha256")) or evidence.get("sqlite_identity") != SQLITE3_IDENTITY_HEX or evidence.get("layer_name") != _expected_product_layer_name(basin_id, product):
+        raise ValueError(f"{basin_id} {product} acquired state mismatch: {state_path}")
+    return path, evidence, attempts
+
+
+def _parse_source_layer(path: Path, basin_id: str, product: str) -> SourceLayer:
+    """Identify one single-layer TDX-Hydro product file by its exact bytes.
+
+    Raises:
+        ValueError: The file is missing, unsafe, unreadable, multi-layer, or its
+            layer is not the one the product carries for this processing basin.
+    """
+    path = Path(path).expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{basin_id} {product} source file is missing or unsafe: {path}")
     try:
         layers = [str(name) for name in pyogrio.list_layers(path)[:, 0].tolist()]
         with path.open("rb") as handle:
             header = handle.read(16).hex()
         byte_count, sha256 = path.stat().st_size, _file_sha256(path)
     except Exception as error:
-        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}") from error
-    if not _is_int(evidence.get("bytes")) or evidence["bytes"] != byte_count or not _valid_sha256(evidence.get("sha256")) or evidence["sha256"] != sha256 or evidence.get("sqlite_identity") != SQLITE3_IDENTITY_HEX or header != SQLITE3_IDENTITY_HEX or len(layers) != 1 or evidence.get("layer_name") != layers[0]:
-        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}")
-    return AcquiredProduct(basin_id, product, path, layers[0], byte_count, sha256, attempts)
+        raise ValueError(f"{basin_id} {product} source identity mismatch: {path}") from error
+    if header != SQLITE3_IDENTITY_HEX or layers != [_expected_product_layer_name(basin_id, product)]:
+        raise ValueError(f"{basin_id} {product} source identity mismatch: {path}")
+    return SourceLayer(basin_id, product, path, layers[0], byte_count, sha256)
 
 
-def _read_adjudication_features(product: AcquiredProduct, columns: Sequence[str], where: str) -> gpd.GeoDataFrame:
+def _parse_acquired_product(root: Path, basin_id: str, product: str) -> AcquiredProduct:
+    path, evidence, attempts = _parse_acquired_state(root, basin_id, product)
     try:
-        frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), where=where)
+        source = _parse_source_layer(path, basin_id, product)
+    except ValueError as error:
+        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}") from error
+    if evidence["bytes"] != source.byte_count or evidence["sha256"] != source.sha256:
+        raise ValueError(f"{basin_id} {product} acquired source identity mismatch: {path}")
+    return AcquiredProduct(basin_id, product, source.path, source.layer_name, source.byte_count, source.sha256, attempts)
+
+
+def _read_adjudication_attributes(source: SourceLayer, sql: str) -> list[tuple[object, ...]]:
+    """Run one attribute-only SQL statement on the GeoPackage in read-only, immutable mode.
+
+    SQLite reads the table rows directly and never touches geometry blobs the
+    statement does not name; no journal or lock file is created.
+    """
+    uri = f"file:{quote(str(source.path.resolve()))}?mode=ro&immutable=1"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            return [tuple(row) for row in connection.execute(sql).fetchall()]
+    except sqlite3.Error as error:
+        raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}") from error
+
+
+def _quoted_layer(source: SourceLayer) -> str:
+    return '"' + source.layer_name.replace('"', '""') + '"'
+
+
+def _read_adjudication_features(
+    product: SourceLayer,
+    columns: Sequence[str],
+    where: str | None = None,
+    fids: Sequence[int] | None = None,
+) -> gpd.GeoDataFrame:
+    """Read the named columns and geometry of the features selected by `where` or by `fids`."""
+    if (where is None) == (fids is None):
+        raise ValueError(f"{product.processing_basin_id} {product.product} feature selection requires exactly one of where or fids")
+    try:
+        if fids is not None:
+            frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), fids=[int(value) for value in fids])
+        else:
+            frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), where=where)
     except Exception as error:
         raise ValueError(f"{product.processing_basin_id} {product.product} acquired source is malformed: {product.path}") from error
     if not isinstance(frame, gpd.GeoDataFrame) or frame.crs is None:
@@ -5489,70 +5562,226 @@ def _derive_duplicate_verdict(
     raise ValueError("duplicate geometry measurements do not determine a verdict")
 
 
-def _adjudicate_duplicate(root: Path) -> AdjudicationVerdict:
-    basin_id = "1020018110"
-    product = _parse_acquired_product(root, basin_id, "basins")
-    rows = _read_adjudication_features(product, ["streamID"], f"streamID = {DUPLICATE_STREAM_ID}")
-    if len(rows) != 2:
-        raise ValueError(f"{basin_id} required streamID {DUPLICATE_STREAM_ID} feature identity mismatch: expected 2, found {len(rows)}")
+@dataclass(frozen=True)
+class DuplicatedIdentityIndex:
+    """Every streamID carried by more than one feature of a basins layer, with those features' IDs."""
+
+    feature_count: int
+    feature_ids: Mapping[int, tuple[int, ...]]
+
+    @property
+    def stream_ids(self) -> list[int]:
+        return sorted(self.feature_ids)
+
+    @property
+    def duplicated_feature_count(self) -> int:
+        return sum(len(value) for value in self.feature_ids.values())
+
+    def layer_summary(self) -> dict[str, int]:
+        return {
+            "feature_count": self.feature_count,
+            "duplicated_stream_id_count": len(self.feature_ids),
+            "features_carrying_duplicated_stream_ids": self.duplicated_feature_count,
+        }
+
+
+def index_duplicated_identities(source: SourceLayer) -> DuplicatedIdentityIndex:
+    """Index the duplicated streamIDs of a basins layer in one attribute-only pass.
+
+    Only the feature ID and streamID columns are read; no geometry is loaded.
+
+    Raises:
+        ValueError: The layer is unreadable or an identity is not an integer.
+    """
+    try:
+        fid_column = str(pyogrio.read_info(source.path, layer=source.layer_name)["fid_column"])
+    except Exception as error:
+        raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}") from error
+    if not fid_column:
+        raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}")
+    column = '"' + fid_column.replace('"', '""') + '"'
+    rows = _read_adjudication_attributes(source, f'SELECT {column}, "streamID" FROM {_quoted_layer(source)} ORDER BY {column}')
+    by_stream_id: dict[int, list[int]] = {}
+    for row in rows:
+        if len(row) != 2 or not _is_int(row[0]) or not _is_int(row[1]):
+            raise ValueError(f"{source.processing_basin_id} basins feature identity {row!r} is not an integer streamID")
+        by_stream_id.setdefault(row[1], []).append(row[0])
+    return DuplicatedIdentityIndex(
+        feature_count=len(rows),
+        feature_ids={stream_id: tuple(fids) for stream_id, fids in by_stream_id.items() if len(fids) > 1},
+    )
+
+
+def _source_identity(source: SourceLayer) -> dict[str, object]:
+    return {"file_name": source.path.name, "bytes": source.byte_count, "layer_name": source.layer_name, "sha256": source.sha256}
+
+
+def _geodesic_area_km2(geod: Geod, geometry: Polygon | MultiPolygon) -> float:
+    return abs(float(geod.geometry_area_perimeter(geometry)[0])) / 1_000_000.0
+
+
+def _streamnet_link_feature_count(streamnet: SourceLayer, stream_id: int) -> int:
+    rows = _read_adjudication_attributes(
+        streamnet,
+        f'SELECT COUNT(*) FROM {_quoted_layer(streamnet)} WHERE "LINKNO" = {int(stream_id)}',
+    )
+    if len(rows) != 1 or len(rows[0]) != 1 or not _is_int(rows[0][0]):
+        raise ValueError(f"{streamnet.processing_basin_id} {streamnet.product} acquired source is malformed: {streamnet.path}")
+    return rows[0][0]
+
+
+def adjudicate_duplicate_identity(
+    source: SourceLayer,
+    stream_id: int,
+    index: DuplicatedIdentityIndex,
+    streamnet: SourceLayer | None = None,
+) -> AdjudicationVerdict:
+    """Adjudicate one duplicated streamID of a basins layer from its geometry alone.
+
+    Only the features the index names as carriers of `stream_id` are read. Rule
+    `duplicate-ground-equality-v1`: every feature covering the same ground is
+    adapter strictness; any feature covering different ground is a source
+    defect; invalid, non-finite, or inconsistent measurements refuse.
+
+    Raises:
+        ValueError: Fewer than two features carry the identity, a geometry is
+            structurally unusable, or the measurements contradict each other.
+    """
+    basin_id = source.processing_basin_id
+    label = f"{basin_id} streamID {stream_id}"
+    feature_ids = index.feature_ids.get(int(stream_id), ())
+    if len(feature_ids) < 2:
+        raise ValueError(f"{label} is not a duplicated identity: expected at least 2 features, found {len(feature_ids)}")
+    rows = _read_adjudication_features(source, ["streamID"], fids=feature_ids)
+    if len(rows) != len(feature_ids) or rows["streamID"].tolist() != [stream_id] * len(feature_ids):
+        raise ValueError(f"{label} feature identity mismatch: expected {len(feature_ids)} features carrying the identity, found {len(rows)}")
     geometries = rows.geometry.tolist()
-    coordinates = [_polygon_coordinates(value, f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry") for value in geometries]
+    coordinates = [_polygon_coordinates(value, f"{label} geometry") for value in geometries]
     coordinate_sequences_finite = [_coordinates_are_finite(value) for value in geometries]
     if not all(coordinate_sequences_finite):
-        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must have finite coordinates")
+        raise ValueError(f"{label} geometry must have finite coordinates")
     geometries_valid = [_geometry_is_valid(value) for value in geometries]
     if not all(geometries_valid):
-        raise ValueError(f"{basin_id} streamID {DUPLICATE_STREAM_ID} geometry must be valid")
-    spatially_equal = bool(geometries[0].equals(geometries[1]))
-    coordinate_sequences_equal = coordinates[0] == coordinates[1]
+        raise ValueError(f"{label} geometry must be valid")
+    spatially_equal = all(bool(geometries[0].equals(value)) for value in geometries[1:])
+    coordinate_sequences_equal = all(coordinates[0] == value for value in coordinates[1:])
     verdict, selected_branch = _derive_duplicate_verdict(
         spatially_equal,
         coordinate_sequences_equal,
     )
-    return AdjudicationVerdict(
-        basin_id,
-        verdict,
-        AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY,
-        {
-            "streamID": DUPLICATE_STREAM_ID,
-            "features": [{"coordinates": value} for value in coordinates],
-            "coordinate_sequences_finite": coordinate_sequences_finite,
-            "geometries_valid": geometries_valid,
-            "spatially_equal": spatially_equal,
-            "coordinate_sequences_equal": coordinate_sequences_equal,
-            "source": {"bytes": product.byte_count, "layer_name": product.layer_name, "sha256": product.sha256},
-            "derivation": {
-                "rule_id": "duplicate-ground-equality-v1",
-                "inputs": [
-                    "coordinate_sequences_finite",
-                    "geometries_valid",
-                    "spatially_equal",
-                    "coordinate_sequences_equal",
-                ],
-                "required_preconditions": {
-                    "coordinate_sequences_finite": coordinate_sequences_finite,
-                    "geometries_valid": geometries_valid,
-                },
-                "consistency_requirement": {
-                    "coordinate_sequences_equal_implies": "spatially_equal",
-                },
-                "branches": [
-                    {
-                        "branch": "same_ground",
-                        "spatially_equal": True,
-                        "verdict": "adapter strictness",
-                    },
-                    {
-                        "branch": "different_ground",
-                        "spatially_equal": False,
-                        "coordinate_sequences_equal": False,
-                        "verdict": "source defect",
-                    },
-                ],
-                "selected_branch": selected_branch,
+    geod = Geod(ellps="WGS84")
+    areas = [_geodesic_area_km2(geod, value) for value in geometries]
+    union_area = _geodesic_area_km2(geod, gpd.GeoSeries(geometries, crs=CRS).union_all())
+    evidence: dict[str, object] = {
+        "streamID": int(stream_id),
+        "feature_count": len(geometries),
+        "features": [
+            {
+                "identifier": {"streamID": int(stream_id)},
+                "vertex_count": int(len(get_coordinates(geometry))),
+                "bbox": [float(value) for value in geometry.bounds],
+                "area_km2": area,
+                "coordinates": value,
+            }
+            for geometry, area, value in zip(geometries, areas, coordinates, strict=True)
+        ],
+        "union_area_km2": union_area,
+        "overlap_area_km2": max(sum(areas) - union_area, 0.0),
+        "coordinate_sequences_finite": coordinate_sequences_finite,
+        "geometries_valid": geometries_valid,
+        "spatially_equal": spatially_equal,
+        "coordinate_sequences_equal": coordinate_sequences_equal,
+        "source": _source_identity(source),
+        "layer": index.layer_summary(),
+        "derivation": {
+            "rule_id": DUPLICATE_GROUND_EQUALITY_RULE_ID,
+            "inputs": [
+                "coordinate_sequences_finite",
+                "geometries_valid",
+                "spatially_equal",
+                "coordinate_sequences_equal",
+            ],
+            "required_preconditions": {
+                "coordinate_sequences_finite": coordinate_sequences_finite,
+                "geometries_valid": geometries_valid,
             },
+            "consistency_requirement": {
+                "coordinate_sequences_equal_implies": "spatially_equal",
+            },
+            "branches": [
+                {
+                    "branch": "same_ground",
+                    "spatially_equal": True,
+                    "verdict": "adapter strictness",
+                },
+                {
+                    "branch": "different_ground",
+                    "spatially_equal": False,
+                    "coordinate_sequences_equal": False,
+                    "verdict": "source defect",
+                },
+            ],
+            "selected_branch": selected_branch,
         },
-    )
+    }
+    if streamnet is not None:
+        evidence["streamnet"] = {
+            **_source_identity(streamnet),
+            "LINKNO": int(stream_id),
+            "LINKNO_feature_count": _streamnet_link_feature_count(streamnet, stream_id),
+        }
+    return AdjudicationVerdict(basin_id, verdict, AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY, evidence)
+
+
+def _adjudicate_duplicate(root: Path, basin_id: str) -> AdjudicationVerdict:
+    """Adjudicate the duplicated streamID a compile of the acquired basins product refuses.
+
+    The compile refusal names the smallest duplicated streamID, so the
+    historical verdict examines exactly that identity; the evidence records
+    how many identities the layer duplicates in total.
+    """
+    product = _parse_acquired_product(root, basin_id, "basins")
+    index = index_duplicated_identities(product)
+    if not index.feature_ids:
+        raise ValueError(f"{basin_id} basins source carries no duplicated streamID")
+    return adjudicate_duplicate_identity(product, min(index.feature_ids), index, _parse_acquired_product(root, basin_id, "streamnet"))
+
+
+def adjudicate_duplicate_identities(
+    basins_path: Path,
+    processing_basin_id: str,
+    stream_id: int | None = None,
+    streamnet_path: Path | None = None,
+) -> dict[str, object]:
+    """Adjudicate every duplicated streamID of one basins file, or one requested identity.
+
+    Raises:
+        ValueError: The source identity is unsound, no identity is duplicated, or
+            any adjudicated identity refuses.
+    """
+    basin_id = str(processing_basin_id)
+    source = _parse_source_layer(basins_path, basin_id, "basins")
+    streamnet = _parse_source_layer(streamnet_path, basin_id, "streamnet") if streamnet_path is not None else None
+    index = index_duplicated_identities(source)
+    layer = index.layer_summary()
+    if stream_id is None:
+        stream_ids, selection = index.stream_ids, "discovered"
+        if not stream_ids:
+            raise ValueError(f"{basin_id} basins source carries no duplicated streamID")
+    else:
+        stream_ids, selection = [int(stream_id)], "requested"
+    verdicts = [adjudicate_duplicate_identity(source, value, index, streamnet) for value in stream_ids]
+    return {
+        "adapter": {"adapter_version": ADAPTER_VERSION},
+        "adjudication_kind": DUPLICATE_IDENTITY_ADJUDICATION_KIND,
+        "schema_version": DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION,
+        "processing_basin_id": basin_id,
+        "source": _source_identity(source),
+        "layer": layer,
+        "stream_id_selection": selection,
+        "duplicated_stream_ids": stream_ids,
+        "verdicts": [_serialized_verdict(value) for value in verdicts],
+    }
 
 
 def _adjudicate_non_root(root: Path) -> AdjudicationVerdict:
@@ -5704,45 +5933,137 @@ def _serialized_verdict(value: AdjudicationVerdict) -> dict[str, object]:
     return {"processing_basin_id": value.processing_basin_id, "verdict": value.verdict.value, "evidence_kind": value.evidence_kind.value, "evidence": value.evidence}
 
 
-def _validate_adjudication_result(verdicts: Sequence[object]) -> None:
-    if len(verdicts) != 7:
+def _serialized_ledger_entry(historical: AdjudicationVerdict, current: dict[str, object] | None) -> dict[str, object]:
+    serialized = _serialized_verdict(historical)
+    return {
+        "processing_basin_id": serialized.pop("processing_basin_id"),
+        "historical_absence": serialized,
+        "current_disposition": current,
+    }
+
+
+def _current_disposition_from_document(document_path: Path, acquired_evidence_root: Path) -> tuple[str, dict[str, object]]:
+    """Convert one duplicate-identity adjudication document into a ledger disposition.
+
+    The document must describe exactly the acquired basins bytes recorded for
+    its processing basin; any identity drift refuses.
+
+    Raises:
+        ValueError: The document is malformed, names a basin outside the ledger,
+            or describes bytes other than the acquired product.
+    """
+    document = _read_json_object(Path(document_path).expanduser(), "current disposition", "document")
+    basin_id = document.get("processing_basin_id")
+    if not isinstance(basin_id, str) or basin_id not in ABSENT_PROCESSING_BASIN_IDS:
+        raise ValueError(f"current disposition document names a processing basin outside the ledger: {document_path}")
+    verdicts, source, stream_ids = document.get("verdicts"), document.get("source"), document.get("duplicated_stream_ids")
+    layer = document.get("layer")
+    if (
+        document.get("adjudication_kind") != DUPLICATE_IDENTITY_ADJUDICATION_KIND
+        or document.get("schema_version") != DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION
+        or not isinstance(source, dict)
+        or not isinstance(layer, dict)
+        or set(layer) != {"feature_count", "duplicated_stream_id_count", "features_carrying_duplicated_stream_ids"}
+        or not all(_is_int(value) for value in layer.values())
+        or not isinstance(stream_ids, list)
+        or not stream_ids
+        or not isinstance(verdicts, list)
+        or len(verdicts) != len(stream_ids)
+    ):
+        raise ValueError(f"{basin_id} current disposition document is malformed: {document_path}")
+    allowed = {BasinVerdict.SOURCE_DEFECT.value, BasinVerdict.ADAPTER_STRICTNESS.value}
+    for stream_id, verdict in zip(stream_ids, verdicts, strict=True):
+        evidence = verdict.get("evidence") if isinstance(verdict, dict) else None
+        if (
+            not _is_int(stream_id)
+            or not isinstance(evidence, dict)
+            or verdict.get("processing_basin_id") != basin_id
+            or verdict.get("verdict") not in allowed
+            or verdict.get("evidence_kind") != AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY.value
+            or evidence.get("streamID") != stream_id
+            or evidence.get("source") != source
+        ):
+            raise ValueError(f"{basin_id} current disposition document is malformed: {document_path}")
+    _, attested, _ = _parse_acquired_state(acquired_evidence_root, basin_id, "basins")
+    if source.get("bytes") != attested["bytes"] or source.get("sha256") != attested["sha256"] or source.get("layer_name") != attested["layer_name"]:
+        raise ValueError(f"{basin_id} current disposition source identity mismatch: {document_path}")
+    combined = BasinVerdict.SOURCE_DEFECT if any(value["verdict"] == BasinVerdict.SOURCE_DEFECT.value for value in verdicts) else BasinVerdict.ADAPTER_STRICTNESS
+    return basin_id, {
+        "verdict": combined.value,
+        "evidence_kind": AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY.value,
+        "adjudication_kind": DUPLICATE_IDENTITY_ADJUDICATION_KIND,
+        "evidence": {
+            "source": source,
+            "layer": layer,
+            "stream_id_selection": document.get("stream_id_selection"),
+            "duplicated_stream_ids": stream_ids,
+            "identities": verdicts,
+        },
+    }
+
+
+def _validate_adjudication_result(entries: Sequence[object]) -> None:
+    if len(entries) != 7:
         raise ValueError("adjudication must contain exactly seven verdicts")
-    values = [_serialized_verdict(value) if isinstance(value, AdjudicationVerdict) else value for value in verdicts]
-    if not all(isinstance(value, dict) for value in values):
+    if not all(isinstance(value, dict) for value in entries):
         raise ValueError("adjudication processing basin IDs must equal the seven absent IDs exactly once")
-    ids = [value.get("processing_basin_id") for value in values]
+    ids = [value.get("processing_basin_id") for value in entries]
     if tuple(ids) != ABSENT_PROCESSING_BASIN_IDS or len(set(ids)) != 7:
         raise ValueError("adjudication processing basin IDs must equal the seven absent IDs exactly once")
     allowed = {value.value for value in BasinVerdict}
-    for value in values:
-        basin_id = str(value["processing_basin_id"])
-        if value.get("verdict") not in allowed or "unadjudicated" in value or "unadjudicated" in value.values():
+    for entry in entries:
+        basin_id = str(entry["processing_basin_id"])
+        historical = entry.get("historical_absence")
+        if not isinstance(historical, dict) or historical.get("verdict") not in allowed or "unadjudicated" in historical or "unadjudicated" in historical.values():
             raise ValueError(f"adjudication verdict for {basin_id} is missing or invalid")
         expected = AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY.value if basin_id in GEOMETRY_ADJUDICATION_IDS else AdjudicationEvidenceKind.HISTORICAL_TRANSFER_WITH_RESOLUTION.value
-        if value.get("evidence_kind") != expected:
+        if historical.get("evidence_kind") != expected:
             raise ValueError(f"adjudication evidence kind is invalid for {basin_id}")
+        current = entry.get("current_disposition")
+        if current is None:
+            continue
+        if (
+            not isinstance(current, dict)
+            or current.get("verdict") not in {BasinVerdict.SOURCE_DEFECT.value, BasinVerdict.ADAPTER_STRICTNESS.value}
+            or current.get("evidence_kind") != AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY.value
+        ):
+            raise ValueError(f"current disposition for {basin_id} is invalid")
 
 
-def adjudicate_basins(acquired_evidence_root: Path, historical_evidence_root: Path) -> dict[str, object]:
+def adjudicate_basins(
+    acquired_evidence_root: Path,
+    historical_evidence_root: Path,
+    current_disposition_paths: Sequence[Path] = (),
+) -> dict[str, object]:
     """Adjudicate seven absent processing basins from checked local evidence.
+
+    Each entry pairs the historical reason for absence from the 55-basin
+    campaign with the basin's current source-backed disposition, when a
+    duplicate-identity adjudication document supplies one.
 
     Raises:
         ValueError: Required evidence is absent, unsafe, malformed, or inconsistent.
     """
+    current: dict[str, dict[str, object]] = {}
+    for path in current_disposition_paths:
+        basin_id, disposition = _current_disposition_from_document(path, acquired_evidence_root)
+        if basin_id in current:
+            raise ValueError(f"{basin_id} has more than one current disposition document")
+        current[basin_id] = disposition
     by_id = {
-        "1020018110": _adjudicate_duplicate(acquired_evidence_root),
+        "1020018110": _adjudicate_duplicate(acquired_evidence_root, "1020018110"),
         "2020003440": _adjudicate_non_root(acquired_evidence_root),
         "2020071190": _adjudicate_root(acquired_evidence_root),
     }
     for basin_id in TRANSFER_ADJUDICATION_IDS:
         by_id[basin_id] = _adjudicate_transfer(acquired_evidence_root, historical_evidence_root, basin_id)
-    verdicts = [by_id[basin_id] for basin_id in ABSENT_PROCESSING_BASIN_IDS]
-    _validate_adjudication_result(verdicts)
+    entries = [_serialized_ledger_entry(by_id[basin_id], current.get(basin_id)) for basin_id in ABSENT_PROCESSING_BASIN_IDS]
+    _validate_adjudication_result(entries)
     return {
         "adapter": {"adapter_version": ADAPTER_VERSION, "git_revision": ADJUDICATED_ADAPTER_GIT_REVISION},
         "endpoint_tolerance": DEFAULT_ENDPOINT_TOLERANCE,
-        "schema_version": 1,
-        "verdicts": [_serialized_verdict(value) for value in verdicts],
+        "schema_version": VERDICT_LEDGER_SCHEMA_VERSION,
+        "verdicts": entries,
     }
 
 
@@ -5783,6 +6104,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     adjudicate_parser.add_argument(
         "--historical-evidence-root", required=True, type=Path
     )
+    adjudicate_parser.add_argument(
+        "--current-disposition",
+        dest="current_dispositions",
+        action="append",
+        default=[],
+        type=Path,
+    )
+    duplicate_parser = subparsers.add_parser("adjudicate-duplicate-identity")
+    duplicate_parser.add_argument("--basins", required=True, type=Path)
+    duplicate_parser.add_argument("--processing-basin-id", required=True)
+    duplicate_parser.add_argument("--stream-id", type=int)
+    duplicate_parser.add_argument("--streamnet", type=Path)
     return parser
 
 
@@ -5858,6 +6191,15 @@ def main(argv: list[str] | None = None) -> int:
         result = adjudicate_basins(
             arguments.acquired_evidence_root,
             arguments.historical_evidence_root,
+            arguments.current_dispositions,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif arguments.command == "adjudicate-duplicate-identity":
+        result = adjudicate_duplicate_identities(
+            arguments.basins,
+            arguments.processing_basin_id,
+            stream_id=arguments.stream_id,
+            streamnet_path=arguments.streamnet,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

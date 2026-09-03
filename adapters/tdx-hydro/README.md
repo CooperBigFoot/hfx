@@ -283,8 +283,14 @@ processing basins from two local, read-only evidence trees:
 ```bash
 uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py adjudicate \
   --acquired-evidence-root tdx-m5-seven-acquire-evidence \
-  --historical-evidence-root tdx-m5-planetary-evidence
+  --historical-evidence-root tdx-m5-planetary-evidence \
+  --current-disposition 1020018110-duplicate-identity.json \
+  --current-disposition 5020049720-duplicate-identity.json
 ```
+
+Each `--current-disposition` argument names one document written by the
+`adjudicate-duplicate-identity` command described below. The flag is optional
+and repeatable; at most one document per processing basin is accepted.
 
 The fixed processing-basin order is `1020018110`, `2020003440`, `2020065840`,
 `2020071190`, `4020050470`, `5020049720`, and `6020000010`. Acquired products
@@ -315,7 +321,9 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 `adapter.git_revision` value
 `bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
 under which the seven processing basins are absent. The adjudicator at commit
-`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
+`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the schema 1 ledger; the
+adjudicator on branch `effort-195/duplicate-adjudication` regenerated it as
+schema 2 with the two duplicate-identity documents named above.
 
 The `1020018110` duplicate `streamID` finding is an encoding inconsistency
 between NGA products. Every processing basin that compiles stores its `basins`
@@ -334,9 +342,14 @@ unions into one `MultiPolygon` unit per `streamID`, refusing only on interior
 overlap. No source-defect report is warranted, and none was sent. The geometry
 evidence remains in [`seven-basin-verdicts.json`](seven-basin-verdicts.json).
 
-The acquired geometry sources and fixed feature identities are:
+The acquired geometry sources and feature identities are:
 
-- `salvage/downloads/1020018110-basins.gpkg`, `streamID 9`
+- `salvage/downloads/1020018110-basins.gpkg`, the smallest duplicated
+  `streamID` found by an attribute-only index of the layer (`streamID 9`, the
+  identity the compile refusal names), with
+  `salvage/downloads/1020018110-streamnet.gpkg` supplying the `LINKNO 9`
+  feature count; the evidence `layer` counts record that 122,259 of the
+  layer's `streamID` values are duplicated across its 924,556 polygon rows
 - `salvage/downloads/2020003440-streamnet.gpkg`, `LINKNO 148956` and its
   `DSLINKNO` successor
 - `salvage/downloads/2020071190-streamnet.gpkg`, root `LINKNO 1104039` and every
@@ -377,6 +390,98 @@ of exactly one historical product plus successful later acquisition identities
 for both products yields `transfer failure`.
 
 Both evidence trees remained read-only, and no bulk evidence is committed.
+
+### Ledger schema 2: historical reason and current disposition
+
+Every ledger entry carries two distinct fields:
+
+- `historical_absence` records why the processing basin was absent from the
+  55-basin campaign: `verdict`, `evidence_kind`, and `evidence`, exactly as the
+  schema 1 entry did.
+- `current_disposition` records the basin's current source-backed disposition,
+  or `null` when this ledger holds none. `null` means no duplicate-identity
+  document was supplied for that basin; the historical reason remains its
+  latest classification. A non-null disposition carries `verdict`,
+  `evidence_kind` (always `acquired source geometry`), `adjudication_kind`
+  (`duplicate identity`), and `evidence` with the document's `source`,
+  `stream_id_selection`, `duplicated_stream_ids`, and one `identities` entry
+  per duplicated identity. Its `verdict` is `source defect` when any identity
+  is a source defect and `adapter strictness` otherwise.
+
+Before a document is accepted, its `source` `bytes`, `sha256`, and
+`layer_name` must equal the acquired basins evidence attested in
+`salvage/state/basins/<processing-basin-id>/current.json`, so a disposition
+about other bytes refuses the whole ledger.
+
+In the committed ledger, `1020018110` and `5020049720` carry non-null current
+dispositions. `5020049720` was historically absent because its transfer failed
+(`historical_absence.verdict` is `transfer failure`); the later compile of the
+acquired source refused `duplicate unit identity for streamID 24`, and its
+`current_disposition.verdict` is `source defect` under
+`duplicate-ground-equality-v1`: seventeen valid polygons carry `streamID 24`
+(sixteen single-cell polygons along a diagonal at about 142.108 E, 10.082 S
+plus one 1,009-vertex catchment of about 5.79 km² whose bounding box encloses
+them), they are pairwise disjoint (`overlap_area_km2` is 0.0), and the
+streamnet carries `LINKNO 24` exactly once. The recorded `layer` counts show
+the duplication is systemic in that product: 211,758 of its 933,755 distinct
+`streamID` values are carried by more than one of its 1,453,118 polygon rows,
+while the streamnet carries 933,991 unique `LINKNO` values. The `1020018110`
+product shows the same pattern at 122,259 duplicated identities. Whether
+disjoint single-part pieces of one catchment should be unioned into one
+drainage unit is a generic adapter decision that this ledger records but does
+not take. The
+other five basins carry `null` because their orientation refusals are
+adjudicated separately.
+
+### Duplicate identity adjudication
+
+Any duplicated `streamID` in any processing basin's `basins` product can be
+adjudicated from source geometry alone, without campaign state:
+
+```bash
+uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py \
+  adjudicate-duplicate-identity \
+  --basins <path>/5020049720-basins.gpkg \
+  --processing-basin-id 5020049720 \
+  --streamnet <path>/5020049720-streamnet.gpkg \
+  > 5020049720-duplicate-identity.json
+```
+
+In both modes the command first indexes the layer's duplicated `streamID`
+values and their feature IDs in one attribute-only pass over the feature ID
+and `streamID` columns, run through the standard library `sqlite3` module in
+read-only, immutable mode, so no geometry is loaded and no journal file is
+created; the counts are recorded under `layer`. Without
+`--stream-id`, every discovered duplicated `streamID` is adjudicated, and the
+command refuses when none is duplicated. With `--stream-id N`, only that
+identity is adjudicated, and the command refuses when fewer than two features
+carry it. Only the features carrying an adjudicated identity are ever read
+from the layer, by feature ID, so a basin with many duplicated identities
+should be examined one requested identity at a time. The optional `--streamnet` argument records,
+per identity, how many streamnet features carry the matching `LINKNO`; it
+never changes the verdict. Both files
+must be regular single-layer GeoPackages whose layer is `basins` or
+`TDX_streamnet_<processing-basin-id>_01`; a symlink, a multi-layer file, or a
+layer for another basin refuses.
+
+Rule `duplicate-ground-equality-v1` applies to every feature carrying the
+identity, however many there are: when every feature is spatially equal to the
+first, the features cover the same ground and the verdict is `adapter
+strictness`; otherwise they cover different ground under one identity and the
+verdict is `source defect`. A structurally unusable, invalid, or non-finite
+geometry refuses, as does a measurement set where coordinate sequences are
+equal but geometries are not. Each feature is recorded with its `identifier`,
+`vertex_count`, `bbox`, geodesic `area_km2`, and full `coordinates`; the
+identity also records `union_area_km2` and `overlap_area_km2` so a reader can
+see whether the features overlap without recomputing geometry, and the
+`layer` counts so one identity is never mistaken for the only one.
+
+The command emits one canonical JSON document to stdout with `adjudication_kind`
+`duplicate identity`, `schema_version` 1, the source identity, the `layer`
+counts, the selection mode (`discovered` or `requested`), the adjudicated
+identities, and one verdict
+per identity in the same evidence shape as the ledger's historical duplicate
+record. It never writes files, compiles, or contacts NGA.
 
 ## Campaign notes
 
