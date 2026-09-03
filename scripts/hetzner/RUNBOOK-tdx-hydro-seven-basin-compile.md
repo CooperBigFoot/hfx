@@ -107,7 +107,8 @@ CAMPAIGN=seven-basin-extension
 SERVER_NAME=hfx-build-seven-basin-extension
 VOLUME_NAME=hfx-build-seven-basin-extension-data
 CONTROL_ID=7020000010
-ABSENT_IDS='1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010'
+ABSENT_IDS=(1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010)
+test "${#ABSENT_IDS[@]}" -eq 7
 WORKSPACE_ROOT=/mnt/hfx/work
 CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-seven-basin-extension
 CONTROL_ROOT=/mnt/hfx/work/control-builds
@@ -134,6 +135,8 @@ printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be d
 IFS= read -r S3_ENV_FILE
 test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
 ```
+
+The shell sets `IFS` to newline and tab, so the seven absent basins are held in a Bash array and every loop iterates `"${ABSENT_IDS[@]}"`; a space-separated string would be one word under that `IFS`. The count check above proves the array holds seven entries.
 
 `HFX_CAMPAIGN_EVIDENCE` is the existing evidence root that holds the approval record, the preserved corpus, and the preserved planetary control output. New records go under `$LOCAL_EVIDENCE_DIR` so the earlier lifecycles' records stay intact.
 
@@ -495,7 +498,9 @@ rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
 scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json"
 ```
 
-Build the control with the corrected adapter first, because its result decides whether any per-basin output can be trusted. Then rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. When the flag is absent, the comparison tolerates a manifest that differs only in `created_at` and records that tolerance.
+Build the control with the corrected adapter first, because its result decides whether any per-basin output can be trusted. Then rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. The remote fence records which branch it took in `created-at-record.json` under the control root. When the flag was passed, the corrected comparison runs without any allowance and must report `identical` for every file including `manifest.json`. Only when the flag was unavailable does the comparison tolerate a manifest that differs solely in `created_at`, and the record states that this tolerance applied. The planetary rebuild has no such flag at its revision, so its comparison always carries the allowance and its `manifest.json` is expected to differ only in `created_at`.
+
+Both control builds pass `--fabric-version 0.3.0` because the preserved control was built with that value and the manifest embeds it; the per-basin compiles in section 11 use `NGA-TDX-Hydro-20230126` because the baseline artifact carries that value and extension assembly requires the inputs to agree with it. The manifest also embeds `adapter_version`, which is `0.1.0` at both revisions today; a later bump would surface as a `manifest.json` difference and stops the work like any other difference.
 
 ```bash
 campaign_gate pre-control-builds 56
@@ -510,9 +515,15 @@ preserved_created_at=$(jq -r '.created_at' "$control_root/preserved/$control_id/
 
 mkdir -p "$control_root/corrected" "$control_root/planetary"
 created_at_args=()
+created_at_flag_used=false
 if "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py build --help 2>/dev/null | grep -q -- '--created-at'; then
   created_at_args=(--created-at "$preserved_created_at")
+  created_at_flag_used=true
 fi
+jq -n --argjson used "$created_at_flag_used" --arg value "$preserved_created_at" \
+  '{schema_version: 1, corrected_build_created_at_flag_used: $used, preserved_created_at: $value,
+    manifest_rule: (if $used then "manifest.json must be byte-identical" else "manifest.json may differ only in created_at" end)}' \
+  > "$control_root/created-at-record.json"
 "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py build \
   --basins "$campaign_dir/downloads/$control_id-basins.gpkg" \
   --streamnet "$campaign_dir/downloads/$control_id-streamnet.gpkg" \
@@ -530,10 +541,14 @@ fi
   --processing-basin-id "$control_id" --fabric-version 0.3.0
 "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py validate "$control_root/planetary/$control_id" --hfx-binary "$hfx"
 
+corrected_allowance=()
+if [ "$created_at_flag_used" = false ]; then
+  corrected_allowance=(--allow-created-at-difference)
+fi
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/preserved/$control_id" --right "$control_root/corrected/$control_id" \
   --expected-sha256 /mnt/hfx/work/sha256/expected-control-sha256.json \
-  --allow-created-at-difference > "$control_root/compare-corrected.json"
+  ${corrected_allowance[@]+"${corrected_allowance[@]}"} > "$control_root/compare-corrected.json"
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/preserved/$control_id" --right "$control_root/planetary/$control_id" \
   --expected-sha256 /mnt/hfx/work/sha256/expected-control-sha256.json \
@@ -543,11 +558,17 @@ fi
   --allow-created-at-difference > "$control_root/compare-corrected-planetary.json"
 jq -r '.verdict' "$control_root/compare-corrected.json" "$control_root/compare-planetary.json" "$control_root/compare-corrected-planetary.json"
 REMOTE
-scp -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/compare-*.json" "$LOCAL_EVIDENCE_DIR/"
-jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+scp -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/compare-*.json" "root@$SERVER_IP:$CONTROL_ROOT/created-at-record.json" "$LOCAL_EVIDENCE_DIR/"
+jq -e '.corrected_build_created_at_flag_used | type == "boolean"' "$LOCAL_EVIDENCE_DIR/created-at-record.json"
+if jq -e '.corrected_build_created_at_flag_used' "$LOCAL_EVIDENCE_DIR/created-at-record.json" >/dev/null; then
+  jq -e '.verdict == "identical" and .created_at_difference_allowed == false' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+else
+  jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+fi
+jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-planetary.json"
 ```
 
-The three data files, `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet`, must equal the preserved digests exactly in both builds. `manifest.json` must equal the preserved digest when `--created-at` was available, and must differ only in `created_at` otherwise; the comparison record states which case occurred. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees and both build reports, then go to section 14 and section 16.
+The three data files, `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet`, must equal the preserved digests exactly in both builds. `manifest.json` must equal the preserved digest when `--created-at` was passed, and may differ only in `created_at` when the flag was unavailable; `created-at-record.json` states which case occurred and the local check above enforces the matching rule. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees and both build reports, then go to section 14 and section 16.
 
 A corrected build that refuses is the same stop: the refusal, its build report if any, and the log are preserved as the campaign's terminal evidence, and no per-basin compile starts.
 
@@ -570,6 +591,12 @@ campaign_gate compile-monitor 20
 ./scripts/hetzner/launch.sh --campaign "$CAMPAIGN" status --workload tdx-compile || test "$?" -eq 3
 ```
 
+```bash
+ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 /mnt/hfx/logs/hfx-seven-basin-extension-tdx-compile.log \
+  | tee "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt"
+grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt"
+```
+
 Every refusal is terminal evidence. The runner records `failed` with the adapter's message in `state/basins/<id>/current.json`, keeps any build report, and the workload log holds the traceback. Nothing is guessed around and nothing is retried with different inputs. Preserve the per-basin results before assembly:
 
 ```bash
@@ -586,8 +613,9 @@ copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
 copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
 (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
 ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
-compiled_absent=$(for id in $ABSENT_IDS; do jq -r --arg id "$id" 'select(.stages.compile.status == "succeeded") | $id' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done)
+compiled_absent=$(for id in "${ABSENT_IDS[@]}"; do jq -r --arg id "$id" 'select(.stages.compile.status == "succeeded") | $id' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done)
 printf '%s\n' "$compiled_absent" | sed '/^$/d' > "$LOCAL_EVIDENCE_DIR/compiled-absent-basins.txt"
+test "$(for id in "${ABSENT_IDS[@]}"; do test -f "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json" && printf '%s\n' "$id"; done | wc -l | tr -d ' ')" -eq 7
 ```
 
 If `compiled-absent-basins.txt` is empty, no extension is attempted. The strict-validated 55-basin artifact stays the final fabric, section 15 records the disposition of every basin, and the campaign continues at section 14.
@@ -659,6 +687,7 @@ Classify from the runner's assembly state and the workload log:
 | status `failed`, reason `assembled dataset validation failed; retained for inspection`, log shows `hfx` exit status 1 with validator diagnostics | strict validation `failed`, diagnostics preserved |
 | status `failed`, same reason, log shows a negative or 137 exit status, `dmesg` shows the OOM killer ending `hfx`, or the operator stopped the workload at a decision point | strict validation `incomplete` |
 | status `failed`, reason `adapter assembly failed` | assembly `failed`; no extended artifact exists |
+| status `failed`, reason `adapter assembly failed and left an artifact; retained for inspection` | assembly `failed`; the partial tree under `assembly/dataset` is preserved as a diagnostic and is no artifact |
 
 An interrupted or OOM-killed validation is recorded as `incomplete`, never as passing. Only a completed pass is called strict-validated. Capture the evidence when the workload ends:
 
@@ -753,16 +782,18 @@ jq -n \
   --arg ground_truth_ref "$(cat "$LOCAL_EVIDENCE_DIR/ground-truth-ref.txt")" \
   --slurpfile corrected "$(record_or_empty compare-corrected.json)" \
   --slurpfile planetary "$(record_or_empty compare-planetary.json)" \
+  --slurpfile created_at_record "$(record_or_empty created-at-record.json)" \
   --slurpfile assembly "$(record_or_empty off-vm/campaign/state/assembly.json)" \
   --arg validation_outcome "$VALIDATION_OUTCOME" \
-  --argjson basins "$(for id in $ABSENT_IDS $CONTROL_ID; do jq -c --arg id "$id" '{processing_basin_id:$id, acquire_basins:.stages.acquire_basins.status, acquire_streamnet:.stages.acquire_streamnet.status, compile:.stages.compile.status, failure_reason:.stages.compile.failure_reason, diagnostic_report:.stages.compile.diagnostic_report}' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done | jq -s '.')" '{
+  --argjson basins "$(for id in "${ABSENT_IDS[@]}" "$CONTROL_ID"; do jq -c --arg id "$id" '{processing_basin_id:$id, acquire_basins:.stages.acquire_basins.status, acquire_streamnet:.stages.acquire_streamnet.status, compile:.stages.compile.status, failure_reason:.stages.compile.failure_reason, diagnostic_report:.stages.compile.diagnostic_report}' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done | jq -s '.')" '{
     schema_version: 1,
     campaign: $campaign,
     ground_truth_ref: $ground_truth_ref,
     control_builds: {
       corrected_versus_preserved: ($corrected[0].verdict // "not-attempted"),
       planetary_versus_preserved: ($planetary[0].verdict // "not-attempted"),
-      preserved_matches_pinned_digests: ($corrected[0].left_matches_expected_sha256 // null)
+      preserved_matches_pinned_digests: ($corrected[0].left_matches_expected_sha256 // null),
+      corrected_build_created_at_flag_used: ($created_at_record[0].corrected_build_created_at_flag_used // null)
     },
     basins: $basins,
     extension: (if ($assembly | length) == 0 then null else {

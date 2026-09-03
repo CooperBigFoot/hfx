@@ -105,7 +105,7 @@ check_credential_file_authenticates() {
 
     set +x
     unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
-    printf 'credential-file: %s\n' "$path"
+    printf '%s\n' 'credential-file: present'
     [[ -n "$path" && "$path" == /* ]] || status=1
     [[ -f "$path" && ! -L "$path" && -s "$path" ]] || status=1
     if ((status == 0)); then

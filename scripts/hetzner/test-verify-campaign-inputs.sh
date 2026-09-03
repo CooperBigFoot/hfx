@@ -67,7 +67,9 @@ MOCK
 chmod +x "$tmp/bin/aws"
 PATH="$tmp/bin:$PATH" "$runner" --s3-env-file "$tmp/credentials.env" \
     --check credential-file-authenticates >"$stdout" 2>"$stderr"
-assert_contains "$stdout" "credential-file: $tmp/credentials.env"
+assert_contains "$stdout" 'credential-file: present'
+assert_not_contains "$stdout" "$tmp/credentials.env"
+assert_not_contains "$stderr" "$tmp/credentials.env"
 assert_contains "$stdout" 'credential-file-authenticates: PASS'
 assert_not_contains "$stdout" "$access"
 assert_not_contains "$stdout" "$secret"

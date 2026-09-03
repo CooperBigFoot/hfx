@@ -188,5 +188,14 @@ expect_failure --runbook "$tmp/runbook-link.md" --check scope-permits-compilatio
 assert_contains "$stderr" 'not a regular file'
 pass 'a relative or symlinked runbook path refuses'
 
+# The runbook shell sets IFS to newline and tab; the absent-basin list must be an
+# array so loops enumerate seven ids instead of one space-joined word.
+array_line=$(grep -E '^ABSENT_IDS=\(' "$runbook") || die 'runbook does not define ABSENT_IDS as an array'
+enumerated=$(bash -c "set -Eeuo pipefail; IFS=\$'\n\t'; $array_line; for id in \"\${ABSENT_IDS[@]}\"; do printf '%s\n' \"\$id\"; done")
+[[ $(printf '%s\n' "$enumerated" | wc -l | tr -d ' ') == 7 ]] || die 'ABSENT_IDS did not enumerate seven ids under the runbook IFS'
+[[ $(printf '%s\n' "$enumerated" | sort -u | grep -c -E '^[0-9]{10}$') == 7 ]] || die 'ABSENT_IDS entries are not seven distinct ten-digit ids'
+! grep -E -- '\$ABSENT_IDS([^\[]|$)' "$runbook" >/dev/null || die 'runbook still expands ABSENT_IDS as a scalar'
+pass 'the absent-basin array enumerates seven ids under the runbook IFS and is never expanded as a scalar'
+
 printf '1..%d\n' "$passed"
 printf 'test-verify-compile-runbook: all %d cases passed\n' "$passed"
