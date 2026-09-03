@@ -16,7 +16,6 @@
           "identities": [
             {
               "evidence": {
-                "coordinate_sequences_equal": false,
                 "coordinate_sequences_finite": [
                   true,
                   true
@@ -24,25 +23,20 @@
                 "derivation": {
                   "branches": [
                     {
-                      "branch": "same_ground",
-                      "spatially_equal": true,
-                      "verdict": "adapter strictness"
+                      "branch": "interior_overlap",
+                      "condition": "interior_overlapping_pair_count > 0",
+                      "verdict": "source defect"
                     },
                     {
-                      "branch": "different_ground",
-                      "coordinate_sequences_equal": false,
-                      "spatially_equal": false,
-                      "verdict": "source defect"
+                      "branch": "single_part_encoding",
+                      "condition": "interior_overlapping_pair_count == 0",
+                      "verdict": "adapter strictness"
                     }
                   ],
-                  "consistency_requirement": {
-                    "coordinate_sequences_equal_implies": "spatially_equal"
-                  },
                   "inputs": [
                     "coordinate_sequences_finite",
                     "geometries_valid",
-                    "spatially_equal",
-                    "coordinate_sequences_equal"
+                    "interior_overlapping_pair_count"
                   ],
                   "required_preconditions": {
                     "coordinate_sequences_finite": [
@@ -54,9 +48,10 @@
                       true
                     ]
                   },
-                  "rule_id": "duplicate-ground-equality-v1",
-                  "selected_branch": "different_ground"
+                  "rule_id": "duplicate-identity-part-overlap-v1",
+                  "selected_branch": "single_part_encoding"
                 },
+                "dissolved_geometry_type": "MultiPolygon",
                 "feature_count": 2,
                 "features": [
                   {
@@ -3322,10 +3317,14 @@
                   true,
                   true
                 ],
+                "interior_overlapping_pair_count": 0,
+                "interior_overlapping_pairs": [],
                 "layer": {
+                  "distinct_stream_id_count": 515349,
                   "duplicated_stream_id_count": 122259,
                   "feature_count": 924556,
-                  "features_carrying_duplicated_stream_ids": 531466
+                  "features_carrying_duplicated_stream_ids": 531466,
+                  "geometry_type": "Polygon"
                 },
                 "overlap_area_km2": 0.0,
                 "source": {
@@ -3334,7 +3333,6 @@
                   "layer_name": "basins",
                   "sha256": "4965c693b8891e0b3e4270241422567b6c1a7766099ab2324d55be08a6abec27"
                 },
-                "spatially_equal": false,
                 "streamID": 9,
                 "streamnet": {
                   "LINKNO": 9,
@@ -3342,19 +3340,22 @@
                   "bytes": 2532990976,
                   "file_name": "1020018110-streamnet.gpkg",
                   "layer_name": "TDX_streamnet_1020018110_01",
+                  "reach_count": 515435,
                   "sha256": "b7bdd31f3c4ec06c57a557fea2c8f76fc42f9e4731881b7ed455f50a1918e1ac"
                 },
                 "union_area_km2": 8.400877554838875
               },
               "evidence_kind": "acquired source geometry",
               "processing_basin_id": "1020018110",
-              "verdict": "source defect"
+              "verdict": "adapter strictness"
             }
           ],
           "layer": {
+            "distinct_stream_id_count": 515349,
             "duplicated_stream_id_count": 122259,
             "feature_count": 924556,
-            "features_carrying_duplicated_stream_ids": 531466
+            "features_carrying_duplicated_stream_ids": 531466,
+            "geometry_type": "Polygon"
           },
           "source": {
             "bytes": 9772503040,
@@ -3365,11 +3366,10 @@
           "stream_id_selection": "requested"
         },
         "evidence_kind": "acquired source geometry",
-        "verdict": "source defect"
+        "verdict": "adapter strictness"
       },
       "historical_absence": {
         "evidence": {
-          "coordinate_sequences_equal": false,
           "coordinate_sequences_finite": [
             true,
             true
@@ -3377,25 +3377,20 @@
           "derivation": {
             "branches": [
               {
-                "branch": "same_ground",
-                "spatially_equal": true,
-                "verdict": "adapter strictness"
+                "branch": "interior_overlap",
+                "condition": "interior_overlapping_pair_count > 0",
+                "verdict": "source defect"
               },
               {
-                "branch": "different_ground",
-                "coordinate_sequences_equal": false,
-                "spatially_equal": false,
-                "verdict": "source defect"
+                "branch": "single_part_encoding",
+                "condition": "interior_overlapping_pair_count == 0",
+                "verdict": "adapter strictness"
               }
             ],
-            "consistency_requirement": {
-              "coordinate_sequences_equal_implies": "spatially_equal"
-            },
             "inputs": [
               "coordinate_sequences_finite",
               "geometries_valid",
-              "spatially_equal",
-              "coordinate_sequences_equal"
+              "interior_overlapping_pair_count"
             ],
             "required_preconditions": {
               "coordinate_sequences_finite": [
@@ -3407,9 +3402,10 @@
                 true
               ]
             },
-            "rule_id": "duplicate-ground-equality-v1",
-            "selected_branch": "different_ground"
+            "rule_id": "duplicate-identity-part-overlap-v1",
+            "selected_branch": "single_part_encoding"
           },
+          "dissolved_geometry_type": "MultiPolygon",
           "feature_count": 2,
           "features": [
             {
@@ -6675,10 +6671,15 @@
             true,
             true
           ],
+          "historical_compile_refusal": "duplicate unit identity for streamID 9",
+          "interior_overlapping_pair_count": 0,
+          "interior_overlapping_pairs": [],
           "layer": {
+            "distinct_stream_id_count": 515349,
             "duplicated_stream_id_count": 122259,
             "feature_count": 924556,
-            "features_carrying_duplicated_stream_ids": 531466
+            "features_carrying_duplicated_stream_ids": 531466,
+            "geometry_type": "Polygon"
           },
           "overlap_area_km2": 0.0,
           "source": {
@@ -6687,7 +6688,6 @@
             "layer_name": "basins",
             "sha256": "4965c693b8891e0b3e4270241422567b6c1a7766099ab2324d55be08a6abec27"
           },
-          "spatially_equal": false,
           "streamID": 9,
           "streamnet": {
             "LINKNO": 9,
@@ -6695,12 +6695,13 @@
             "bytes": 2532990976,
             "file_name": "1020018110-streamnet.gpkg",
             "layer_name": "TDX_streamnet_1020018110_01",
+            "reach_count": 515435,
             "sha256": "b7bdd31f3c4ec06c57a557fea2c8f76fc42f9e4731881b7ed455f50a1918e1ac"
           },
           "union_area_km2": 8.400877554838875
         },
         "evidence_kind": "acquired source geometry",
-        "verdict": "source defect"
+        "verdict": "adapter strictness"
       },
       "processing_basin_id": "1020018110"
     },
@@ -6969,7 +6970,6 @@
           "identities": [
             {
               "evidence": {
-                "coordinate_sequences_equal": false,
                 "coordinate_sequences_finite": [
                   true,
                   true,
@@ -6992,25 +6992,20 @@
                 "derivation": {
                   "branches": [
                     {
-                      "branch": "same_ground",
-                      "spatially_equal": true,
-                      "verdict": "adapter strictness"
+                      "branch": "interior_overlap",
+                      "condition": "interior_overlapping_pair_count > 0",
+                      "verdict": "source defect"
                     },
                     {
-                      "branch": "different_ground",
-                      "coordinate_sequences_equal": false,
-                      "spatially_equal": false,
-                      "verdict": "source defect"
+                      "branch": "single_part_encoding",
+                      "condition": "interior_overlapping_pair_count == 0",
+                      "verdict": "adapter strictness"
                     }
                   ],
-                  "consistency_requirement": {
-                    "coordinate_sequences_equal_implies": "spatially_equal"
-                  },
                   "inputs": [
                     "coordinate_sequences_finite",
                     "geometries_valid",
-                    "spatially_equal",
-                    "coordinate_sequences_equal"
+                    "interior_overlapping_pair_count"
                   ],
                   "required_preconditions": {
                     "coordinate_sequences_finite": [
@@ -7052,9 +7047,10 @@
                       true
                     ]
                   },
-                  "rule_id": "duplicate-ground-equality-v1",
-                  "selected_branch": "different_ground"
+                  "rule_id": "duplicate-identity-part-overlap-v1",
+                  "selected_branch": "single_part_encoding"
                 },
+                "dissolved_geometry_type": "MultiPolygon",
                 "feature_count": 17,
                 "features": [
                   {
@@ -11722,10 +11718,14 @@
                   true,
                   true
                 ],
+                "interior_overlapping_pair_count": 0,
+                "interior_overlapping_pairs": [],
                 "layer": {
+                  "distinct_stream_id_count": 933755,
                   "duplicated_stream_id_count": 211758,
                   "feature_count": 1453118,
-                  "features_carrying_duplicated_stream_ids": 731121
+                  "features_carrying_duplicated_stream_ids": 731121,
+                  "geometry_type": "Polygon"
                 },
                 "overlap_area_km2": 0.0,
                 "source": {
@@ -11734,7 +11734,6 @@
                   "layer_name": "basins",
                   "sha256": "9c1cf35d120312731de28f86212382e79bbc9b660035265e7c4e164624a04e8a"
                 },
-                "spatially_equal": false,
                 "streamID": 24,
                 "streamnet": {
                   "LINKNO": 24,
@@ -11742,19 +11741,22 @@
                   "bytes": 5020688384,
                   "file_name": "5020049720-streamnet.gpkg",
                   "layer_name": "TDX_streamnet_5020049720_01",
+                  "reach_count": 933991,
                   "sha256": "dcd55720a98b1d2691d063c557ca95dff76dd4562342c6b94c8c89b08e11fff5"
                 },
                 "union_area_km2": 5.794007387265205
               },
               "evidence_kind": "acquired source geometry",
               "processing_basin_id": "5020049720",
-              "verdict": "source defect"
+              "verdict": "adapter strictness"
             }
           ],
           "layer": {
+            "distinct_stream_id_count": 933755,
             "duplicated_stream_id_count": 211758,
             "feature_count": 1453118,
-            "features_carrying_duplicated_stream_ids": 731121
+            "features_carrying_duplicated_stream_ids": 731121,
+            "geometry_type": "Polygon"
           },
           "source": {
             "bytes": 18148749312,
@@ -11765,7 +11767,7 @@
           "stream_id_selection": "requested"
         },
         "evidence_kind": "acquired source geometry",
-        "verdict": "source defect"
+        "verdict": "adapter strictness"
       },
       "historical_absence": {
         "evidence": {
