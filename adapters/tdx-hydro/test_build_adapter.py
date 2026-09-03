@@ -848,6 +848,11 @@ Path(sys.argv[5]).write_text(json.dumps(events))
                     "altered_native_ids": [],
                 },
                 "dscontarea": expected_dscontarea,
+                "basins_dissolve": {
+                    "dissolved_unit_count": 0,
+                    "dissolved_part_count": 0,
+                    "max_part_count": 0,
+                },
             },
         )
         self.assertEqual(
@@ -931,6 +936,7 @@ Path(sys.argv[5]).write_text(json.dumps(events))
             {
                 "basins_load",
                 "streamnet_load",
+                "basins_dissolve",
                 "source_validate",
                 "basins_clamp",
                 "streamnet_clamp",
@@ -1530,13 +1536,149 @@ class GeoPackageIngestionTests(unittest.TestCase):
                 basins, streamnet, _, _ = canonical_frames()
                 if layer == "basins":
                     basins = gpd.GeoDataFrame(pd.concat([basins, basins.iloc[[1]]], ignore_index=True), crs=basins.crs)
-                    pattern = r"duplicate unit.*100"
+                    pattern = r"^basins streamID 100 has 2 parts whose interiors overlap: 1 part pair\(s\) such as \(0, 1\)$"
                 else:
                     streamnet = gpd.GeoDataFrame(pd.concat([streamnet, streamnet.iloc[[1]]], ignore_index=True), crs=streamnet.crs)
                     pattern = r"duplicate LINKNO.*100"
                 with TemporaryDirectory() as temp_dir:
                     with self.assertRaisesRegex(ValueError, pattern):
                         load_tdx_geopackages(*write_pair(Path(temp_dir), basins, streamnet))
+
+
+class SinglePartCatchmentEncodingTests(unittest.TestCase):
+    """A catchment stored as several single-part rows under one streamID compiles as one unit."""
+
+    @staticmethod
+    def frames(encoding: str) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+        """Canonical two-unit fixture with unit 100 stored under the requested encoding."""
+        basins, streamnet, _, area_200_m2 = canonical_frames()
+        west = Polygon([(0.0, 0.0), (0.004, 0.0), (0.004, 0.01), (0.0, 0.01), (0.0, 0.0)])
+        cell = Polygon([(0.004, 0.0), (0.005, 0.0), (0.005, 0.001), (0.004, 0.001), (0.004, 0.0)])
+        east = Polygon([(0.006, 0.002), (0.01, 0.002), (0.01, 0.01), (0.006, 0.01), (0.006, 0.002)])
+        overlapping = Polygon([(0.003, 0.003), (0.007, 0.003), (0.007, 0.007), (0.003, 0.007), (0.003, 0.003)])
+        parts = {
+            "native": [MultiPolygon([west, east])],
+            "exploded": [west, east],
+            "touching": [west, cell, east],
+            "overlapping": [west, overlapping, east],
+        }[encoding]
+        rows = pd.concat(
+            [
+                gpd.GeoDataFrame({"streamID": [100] * len(parts), "label": ["upstream"] * len(parts)}, geometry=parts, crs=basins.crs),
+                basins[basins["streamID"] != 100],
+            ],
+            ignore_index=True,
+        )
+        basins = gpd.GeoDataFrame(rows, crs=basins.crs)
+        geod = Geod(ellps="WGS84")
+        unit_area_m2 = abs(geod.geometry_area_perimeter(gpd.GeoSeries(parts).union_all())[0])
+        streamnet = streamnet.copy()
+        streamnet.loc[streamnet["LINKNO"] == 100, "DSContArea"] = unit_area_m2 / 1_000_000
+        streamnet.loc[streamnet["LINKNO"] == 200, "DSContArea"] = (unit_area_m2 + area_200_m2) / 1_000_000
+        return basins, streamnet
+
+    def build(self, root: Path, encoding: str) -> tuple[dict[str, object], gpd.GeoDataFrame]:
+        basins, streamnet = self.frames(encoding)
+        source = root / encoding
+        source.mkdir()
+        basins_path, streamnet_path = write_pair(source, basins, streamnet)
+        output, report = root / f"{encoding}-out", root / f"{encoding}-report.json"
+        with patch("build_adapter._utc_now", return_value=datetime(2026, 7, 21, 12, 34, 56, tzinfo=timezone.utc)):
+            self.assertEqual(
+                main([
+                    "build", "--basins", str(basins_path), "--streamnet", str(streamnet_path),
+                    "--out", str(output), "--report", str(report),
+                    "--processing-basin-id", "7020000010", "--fabric-version", "synthetic-2026.07",
+                ]),
+                0,
+            )
+        catchments = gpd.read_parquet(output / "catchments.parquet")
+        return json.loads(report.read_text()), catchments
+
+    def test_old_identity_check_refused_exploded_rows(self) -> None:
+        basins, _ = self.frames("exploded")
+        with self.assertRaisesRegex(ValueError, "^duplicate unit identity for streamID 100$"):
+            build_adapter._sorted_unique_ids(basins["streamID"].to_numpy(dtype="int64"), "basins")
+
+    def test_exploded_rows_compile_as_one_unit_equal_to_the_native_multipolygon(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            native_report, native = self.build(root, "native")
+            exploded_report, exploded = self.build(root, "exploded")
+            touching_report, touching = self.build(root, "touching")
+            self.assertEqual(native_report["diagnostics"]["ingestion"]["basins_dissolve"], {"dissolved_unit_count": 0, "dissolved_part_count": 0, "max_part_count": 0})
+            self.assertEqual(exploded_report["diagnostics"]["ingestion"]["basins_dissolve"], {"dissolved_unit_count": 1, "dissolved_part_count": 2, "max_part_count": 2})
+            self.assertEqual(touching_report["diagnostics"]["ingestion"]["basins_dissolve"], {"dissolved_unit_count": 1, "dissolved_part_count": 3, "max_part_count": 3})
+            self.assertEqual(len(native), 2)
+            self.assertEqual(native["id"].tolist(), exploded["id"].tolist())
+            self.assertEqual(native["id"].tolist(), touching["id"].tolist())
+            for column in ("level", "outlet_lon", "outlet_lat", "up_area_km2", "area_km2"):
+                self.assertEqual(native[column].tolist(), exploded[column].tolist(), column)
+            self.assertTrue(native["parent_id"].isna().all() and exploded["parent_id"].isna().all())
+            self.assertEqual(native.geometry.bounds.to_numpy().tolist(), exploded.geometry.bounds.to_numpy().tolist())
+            for left, right in zip(native.geometry, exploded.geometry, strict=True):
+                self.assertTrue(left.equals(right))
+            unit_id = global_linkno(100, 71)
+            dissolved = touching[touching["id"] == unit_id].geometry.iloc[0]
+            self.assertEqual((dissolved.geom_type, len(dissolved.geoms)), ("MultiPolygon", 2))
+            self.assertGreater(
+                float(touching[touching["id"] == unit_id]["area_km2"].iloc[0]),
+                float(native[native["id"] == unit_id]["area_km2"].iloc[0]),
+            )
+            exploded_streamnet = native_report["diagnostics"]["streamnet"]
+            self.assertEqual(exploded_report["diagnostics"]["streamnet"], exploded_streamnet)
+            self.assertEqual(exploded_report["diagnostics"]["ingestion"]["dscontarea"], native_report["diagnostics"]["ingestion"]["dscontarea"])
+            self.assertEqual(json.loads((root / "native-out/manifest.json").read_text()), json.loads((root / "exploded-out/manifest.json").read_text()))
+            self.assertEqual((root / "native-out/graph.parquet").read_bytes(), (root / "exploded-out/graph.parquet").read_bytes())
+            self.assertEqual((root / "native-out/aux/snap_stems.parquet").read_bytes(), (root / "exploded-out/aux/snap_stems.parquet").read_bytes())
+
+    def test_interior_overlapping_parts_refuse(self) -> None:
+        basins, streamnet = self.frames("overlapping")
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            output, report = root / "out", root / "report.json"
+            with self.assertRaisesRegex(ValueError, r"^basins streamID 100 has 3 parts whose interiors overlap: 2 part pair\(s\) such as \(0, 1\), \(1, 2\)$"):
+                main([
+                    "build", "--basins", str(basins_path), "--streamnet", str(streamnet_path),
+                    "--out", str(output), "--report", str(report),
+                    "--processing-basin-id", "7020000010", "--fabric-version", "synthetic-2026.07",
+                ])
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+            with self.assertRaisesRegex(ValueError, "^basins streamID 100 has 3 parts whose interiors overlap"):
+                load_tdx_geopackages(basins_path, streamnet_path)
+
+    def test_in_memory_loader_dissolves_like_the_streaming_path(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            native = load_tdx_geopackages(*write_pair(root / "n", *self.frames("native"))) if (root / "n").mkdir() is None else None
+            exploded = load_tdx_geopackages(*write_pair(root / "e", *self.frames("exploded"))) if (root / "e").mkdir() is None else None
+            self.assertEqual(native.diagnostics.basins_dissolve, build_adapter.LayerDissolveDiagnostics(0, 0, 0))
+            self.assertEqual(exploded.diagnostics.basins_dissolve, build_adapter.LayerDissolveDiagnostics(1, 2, 2))
+            self.assertEqual(native.basins["streamID"].tolist(), exploded.basins["streamID"].tolist())
+            for left, right in zip(native.basins.geometry, exploded.basins.geometry, strict=True):
+                self.assertTrue(left.equals(right))
+
+    def test_dissolve_rule_on_synthetic_parts(self) -> None:
+        square = Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)])
+        edge_neighbor = Polygon([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
+        corner_neighbor = Polygon([(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0), (1.0, 1.0)])
+        far = Polygon([(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 6.0), (5.0, 5.0)])
+        inside = Polygon([(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75), (0.25, 0.25)])
+        self.assertEqual(build_adapter._interior_overlapping_pairs([square, edge_neighbor, corner_neighbor, far]), [])
+        merged = build_adapter.dissolve_identity_parts(7, [square, edge_neighbor])
+        self.assertEqual(merged.geom_type, "Polygon")
+        self.assertTrue(merged.equals(Polygon([(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0), (0.0, 0.0)])))
+        multi = build_adapter.dissolve_identity_parts(7, [square, corner_neighbor, far])
+        self.assertEqual((multi.geom_type, len(multi.geoms)), ("MultiPolygon", 3))
+        self.assertEqual(build_adapter._interior_overlapping_pairs([square, inside, far, square]), [(0, 1), (0, 3), (1, 3)])
+        with self.assertRaisesRegex(ValueError, r"^basins streamID 7 has 4 parts whose interiors overlap: 3 part pair\(s\) such as \(0, 1\), \(0, 3\), \(1, 3\)$"):
+            build_adapter.dissolve_identity_parts(7, [square, inside, far, square])
+        with self.assertRaisesRegex(ValueError, "^basins streamID 7 part 1 must be valid$"):
+            build_adapter.dissolve_identity_parts(7, [square, Polygon([(3.0, 3.0), (5.0, 5.0), (5.0, 3.0), (3.0, 5.0), (3.0, 3.0)])])
+        with self.assertRaisesRegex(ValueError, "^basins streamID 7 part 0 must be a non-empty Polygon or MultiPolygon$"):
+            build_adapter.dissolve_identity_parts(7, [LineString([(0.0, 0.0), (1.0, 1.0)]), square])
 
 
 class HeaderCrosswalkTests(unittest.TestCase):
@@ -4918,6 +5060,7 @@ class BuildCliTests(unittest.TestCase):
                 "ingestion": {
                     "basins_clamp": {"altered_vertex_count": 0, "altered_native_ids": []},
                     "streamnet_clamp": {"altered_vertex_count": 0, "altered_native_ids": []},
+                    "basins_dissolve": {"dissolved_unit_count": 0, "dissolved_part_count": 0, "max_part_count": 0},
                     "dscontarea": {
                         "source_unit": "km2",
                         "checked_polygon_bearing_link_count": 2,
@@ -4971,6 +5114,7 @@ class BuildCliTests(unittest.TestCase):
                         for name in (
                             "basins_load",
                             "streamnet_load",
+                            "basins_dissolve",
                             "source_validate",
                             "basins_clamp",
                             "streamnet_clamp",
@@ -5798,33 +5942,28 @@ class BasinAdjudicationTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
 
     @staticmethod
-    def duplicate_derivation(selected_branch: str) -> dict[str, object]:
+    def duplicate_derivation(selected_branch: str, part_count: int = 2) -> dict[str, object]:
         return {
-            "rule_id": "duplicate-ground-equality-v1",
+            "rule_id": "duplicate-identity-part-overlap-v1",
             "inputs": [
                 "coordinate_sequences_finite",
                 "geometries_valid",
-                "spatially_equal",
-                "coordinate_sequences_equal",
+                "interior_overlapping_pair_count",
             ],
             "required_preconditions": {
-                "coordinate_sequences_finite": [True, True],
-                "geometries_valid": [True, True],
-            },
-            "consistency_requirement": {
-                "coordinate_sequences_equal_implies": "spatially_equal",
+                "coordinate_sequences_finite": [True] * part_count,
+                "geometries_valid": [True] * part_count,
             },
             "branches": [
                 {
-                    "branch": "same_ground",
-                    "spatially_equal": True,
-                    "verdict": "adapter strictness",
+                    "branch": "interior_overlap",
+                    "condition": "interior_overlapping_pair_count > 0",
+                    "verdict": "source defect",
                 },
                 {
-                    "branch": "different_ground",
-                    "spatially_equal": False,
-                    "coordinate_sequences_equal": False,
-                    "verdict": "source defect",
+                    "branch": "single_part_encoding",
+                    "condition": "interior_overlapping_pair_count == 0",
+                    "verdict": "adapter strictness",
                 },
             ],
             "selected_branch": selected_branch,
@@ -5841,7 +5980,26 @@ class BasinAdjudicationTests(unittest.TestCase):
             sha256="a" * 64,
         )
 
-    two_features = build_adapter.DuplicatedIdentityIndex(feature_count=2, feature_ids={9: (1, 2)})
+    two_features = build_adapter.DuplicatedIdentityIndex(feature_count=2, distinct_stream_id_count=1, geometry_type="Polygon", feature_ids={9: (1, 2)})
+    synthetic_layer = {"geometry_type": "Polygon", "feature_count": 2, "distinct_stream_id_count": 1, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2}
+
+    @staticmethod
+    def synthetic_streamnet(basin_id: str = "1020018110") -> build_adapter.SourceLayer:
+        return build_adapter.SourceLayer(
+            processing_basin_id=basin_id,
+            product="streamnet",
+            path=Path(f"/synthetic/{basin_id}-streamnet.gpkg"),
+            layer_name=f"TDX_streamnet_{basin_id}_01",
+            byte_count=45,
+            sha256="b" * 64,
+        )
+
+    @staticmethod
+    def streamnet_counts():
+        return (
+            patch("build_adapter._streamnet_reach_count", return_value=3),
+            patch("build_adapter._streamnet_link_feature_count", return_value=1),
+        )
 
     def assert_boolean_evidence(self, evidence: dict[str, object]) -> None:
         for key in ("coordinate_sequences_finite", "geometries_valid"):
@@ -5860,8 +6018,9 @@ class BasinAdjudicationTests(unittest.TestCase):
             entry, evidence = self.evidence(self.run_fixture(acquired, historical), "1020018110")
             self.assertEqual(sorted(entry), ["current_disposition", "historical_absence", "processing_basin_id"])
             self.assertIsNone(entry["current_disposition"])
-            self.assertEqual(entry["historical_absence"]["verdict"], "source defect")
+            self.assertEqual(entry["historical_absence"]["verdict"], "adapter strictness")
             self.assertEqual(entry["historical_absence"]["evidence_kind"], "acquired source geometry")
+            self.assertEqual(evidence["historical_compile_refusal"], "duplicate unit identity for streamID 9")
             self.assertEqual(evidence["streamID"], 9)
             self.assertEqual(evidence["feature_count"], 2)
             self.assertEqual([value["coordinates"] for value in evidence["features"]], [first, second])
@@ -5873,8 +6032,9 @@ class BasinAdjudicationTests(unittest.TestCase):
             self.assertEqual(evidence["overlap_area_km2"], 0.0)
             self.assertEqual(evidence["coordinate_sequences_finite"], [True, True])
             self.assertEqual(evidence["geometries_valid"], [True, True])
-            self.assertIs(evidence["spatially_equal"], False)
-            self.assertIs(evidence["coordinate_sequences_equal"], False)
+            self.assertEqual(evidence["interior_overlapping_pairs"], [])
+            self.assertEqual(evidence["interior_overlapping_pair_count"], 0)
+            self.assertEqual(evidence["dissolved_geometry_type"], "MultiPolygon")
             self.assertEqual(
                 evidence["source"],
                 {
@@ -5885,76 +6045,49 @@ class BasinAdjudicationTests(unittest.TestCase):
                 },
             )
             self.assertEqual(
+                evidence["layer"],
+                {"geometry_type": "Polygon", "feature_count": 2, "distinct_stream_id_count": 1, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2},
+            )
+            self.assertEqual(
                 evidence["streamnet"],
                 {
                     "file_name": "1020018110-streamnet.gpkg",
                     "bytes": streamnet_evidence["bytes"],
                     "layer_name": "TDX_streamnet_1020018110_01",
                     "sha256": streamnet_evidence["sha256"],
+                    "reach_count": 1,
                     "LINKNO": 9,
                     "LINKNO_feature_count": 1,
                 },
             )
-            self.assertEqual(evidence["layer"], {"feature_count": 2, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2})
-            self.assertEqual(evidence["derivation"], self.duplicate_derivation("different_ground"))
+            self.assertEqual(evidence["derivation"], self.duplicate_derivation("single_part_encoding"))
             self.assert_boolean_evidence(evidence)
             basins, streamnet = adjudication_frames("1020018110")
             basins.loc[1, "geometry"] = basins.loc[0, "geometry"]
             write_adjudication_pair(acquired, "1020018110", basins, streamnet)
             entry, evidence = self.evidence(self.run_fixture(acquired, historical), "1020018110")
-            self.assertEqual(entry["historical_absence"]["verdict"], "adapter strictness")
+            self.assertEqual(entry["historical_absence"]["verdict"], "source defect")
             self.assertEqual([value["coordinates"] for value in evidence["features"]], [first, first])
-            self.assertIs(evidence["spatially_equal"], True)
-            self.assertIs(evidence["coordinate_sequences_equal"], True)
+            self.assertEqual(evidence["interior_overlapping_pairs"], [[0, 1]])
+            self.assertEqual(evidence["interior_overlapping_pair_count"], 1)
+            self.assertIsNone(evidence["dissolved_geometry_type"])
             self.assertAlmostEqual(evidence["overlap_area_km2"], evidence["union_area_km2"])
-            self.assertEqual(evidence["derivation"], self.duplicate_derivation("same_ground"))
+            self.assertEqual(evidence["derivation"], self.duplicate_derivation("interior_overlap"))
             self.assert_boolean_evidence(evidence)
 
     def test_duplicate_verdict_derivation_from_synthetic_geometry(self) -> None:
-        first = Polygon(
-            [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
-        )
-        same_ground = Polygon(
-            [(2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0), (2.0, 0.0)]
-        )
-        different_ground = Polygon(
-            [(3.0, 0.0), (5.0, 0.0), (5.0, 2.0), (3.0, 2.0), (3.0, 0.0)]
-        )
-        identical = Polygon(
-            [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]
-        )
-
-        measurements = (
-            bool(first.equals(same_ground)),
-            build_adapter._polygon_coordinates(first, "first")
-            == build_adapter._polygon_coordinates(same_ground, "same_ground"),
-        )
-        self.assertEqual(measurements, (True, False))
+        square = Polygon([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)])
+        edge_neighbor = Polygon([(2.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 2.0), (2.0, 0.0)])
+        far = Polygon([(3.0, 5.0), (5.0, 5.0), (5.0, 7.0), (3.0, 7.0), (3.0, 5.0)])
+        identical = Polygon([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)])
+        for parts in ([square, edge_neighbor], [square, far], [square, edge_neighbor, far]):
+            self.assertEqual(
+                build_adapter._derive_duplicate_verdict(len(build_adapter._interior_overlapping_pairs(parts))),
+                (build_adapter.BasinVerdict.ADAPTER_STRICTNESS, "single_part_encoding"),
+            )
         self.assertEqual(
-            build_adapter._derive_duplicate_verdict(*measurements),
-            (build_adapter.BasinVerdict.ADAPTER_STRICTNESS, "same_ground"),
-        )
-
-        measurements = (
-            bool(first.equals(different_ground)),
-            build_adapter._polygon_coordinates(first, "first")
-            == build_adapter._polygon_coordinates(different_ground, "different_ground"),
-        )
-        self.assertEqual(measurements, (False, False))
-        self.assertEqual(
-            build_adapter._derive_duplicate_verdict(*measurements),
-            (build_adapter.BasinVerdict.SOURCE_DEFECT, "different_ground"),
-        )
-
-        measurements = (
-            bool(first.equals(identical)),
-            build_adapter._polygon_coordinates(first, "first")
-            == build_adapter._polygon_coordinates(identical, "identical"),
-        )
-        self.assertEqual(measurements, (True, True))
-        self.assertEqual(
-            build_adapter._derive_duplicate_verdict(*measurements),
-            (build_adapter.BasinVerdict.ADAPTER_STRICTNESS, "same_ground"),
+            build_adapter._derive_duplicate_verdict(len(build_adapter._interior_overlapping_pairs([square, identical]))),
+            (build_adapter.BasinVerdict.SOURCE_DEFECT, "interior_overlap"),
         )
 
     def test_duplicate_measurement_seams_feed_evidence(self) -> None:
@@ -5965,8 +6098,10 @@ class BasinAdjudicationTests(unittest.TestCase):
             patch("build_adapter._read_adjudication_features", return_value=basins) as read,
             patch("build_adapter._coordinates_are_finite", return_value=True) as coordinates_are_finite,
             patch("build_adapter._geometry_is_valid", return_value=True) as geometry_is_valid,
+            patch("build_adapter._streamnet_reach_count", return_value=3),
+            patch("build_adapter._streamnet_link_feature_count", return_value=1),
         ):
-            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
 
         read.assert_called_once_with(source, ["streamID"], fids=(1, 2))
         for seam in (coordinates_are_finite, geometry_is_valid):
@@ -5986,12 +6121,14 @@ class BasinAdjudicationTests(unittest.TestCase):
 
     def test_duplicate_identity_derives_both_verdicts_for_any_basin_and_identity(self) -> None:
         source = self.synthetic_source("5020049720")
+        streamnet = self.synthetic_streamnet("5020049720")
+        index = build_adapter.DuplicatedIdentityIndex(feature_count=3, distinct_stream_id_count=2, geometry_type="Polygon", feature_ids={24: (7, 9)})
         first = [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
         second = [[[2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0], [2.0, 0.0]]]
         disjoint_basins, _ = adjudication_frames("1020018110")
         disjoint_basins["streamID"] = [24, 24]
-        with patch("build_adapter._read_adjudication_features", return_value=disjoint_basins) as read:
-            disjoint = build_adapter.adjudicate_duplicate_identity(source, 24, build_adapter.DuplicatedIdentityIndex(feature_count=3, feature_ids={24: (7, 9)}))
+        with patch("build_adapter._read_adjudication_features", return_value=disjoint_basins) as read, patch("build_adapter._streamnet_reach_count", return_value=3), patch("build_adapter._streamnet_link_feature_count", return_value=1):
+            disjoint = build_adapter.adjudicate_duplicate_identity(source, 24, index, streamnet)
         read.assert_called_once_with(source, ["streamID"], fids=(7, 9))
         self.assertEqual(disjoint.processing_basin_id, "5020049720")
         self.assertIs(disjoint.evidence_kind, build_adapter.AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY)
@@ -5999,53 +6136,60 @@ class BasinAdjudicationTests(unittest.TestCase):
             disjoint.evidence["source"],
             {"file_name": "5020049720-basins.gpkg", "bytes": 123, "layer_name": "basins", "sha256": "a" * 64},
         )
-        self.assertNotIn("streamnet", disjoint.evidence)
-        self.assertEqual(disjoint.evidence["layer"], {"feature_count": 3, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2})
+        self.assertEqual(
+            disjoint.evidence["layer"],
+            {"geometry_type": "Polygon", "feature_count": 3, "distinct_stream_id_count": 2, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2},
+        )
+        self.assertEqual(
+            disjoint.evidence["streamnet"],
+            {"file_name": "5020049720-streamnet.gpkg", "bytes": 45, "layer_name": "TDX_streamnet_5020049720_01", "sha256": "b" * 64, "reach_count": 3, "LINKNO": 24, "LINKNO_feature_count": 1},
+        )
         self.assertEqual(disjoint.evidence["streamID"], 24)
         self.assertEqual([value["coordinates"] for value in disjoint.evidence["features"]], [first, second])
         self.assertEqual([value["identifier"] for value in disjoint.evidence["features"]], [{"streamID": 24}] * 2)
-        self.assertIs(disjoint.evidence["spatially_equal"], False)
-        self.assertIs(disjoint.evidence["coordinate_sequences_equal"], False)
-        self.assertIs(disjoint.verdict, build_adapter.BasinVerdict.SOURCE_DEFECT)
-        self.assertEqual(disjoint.evidence["derivation"], self.duplicate_derivation("different_ground"))
+        self.assertEqual(disjoint.evidence["interior_overlapping_pairs"], [])
+        self.assertEqual(disjoint.evidence["dissolved_geometry_type"], "MultiPolygon")
+        self.assertIs(disjoint.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
+        self.assertEqual(disjoint.evidence["derivation"], self.duplicate_derivation("single_part_encoding"))
         self.assert_boolean_evidence(disjoint.evidence)
 
-        same_ground_basins, _ = adjudication_frames("1020018110")
-        same_ground_basins["streamID"] = [24, 24]
-        same_ground_basins.loc[1, "geometry"] = same_ground_basins.loc[0, "geometry"]
-        with patch("build_adapter._read_adjudication_features", return_value=same_ground_basins) as read:
-            same_ground = build_adapter.adjudicate_duplicate_identity(source, 24, build_adapter.DuplicatedIdentityIndex(feature_count=3, feature_ids={24: (7, 9)}))
+        overlapping_basins, _ = adjudication_frames("1020018110")
+        overlapping_basins["streamID"] = [24, 24]
+        overlapping_basins.loc[1, "geometry"] = Polygon([(0.5, 0.5), (1.5, 0.5), (1.5, 1.5), (0.5, 1.5), (0.5, 0.5)])
+        with patch("build_adapter._read_adjudication_features", return_value=overlapping_basins) as read, patch("build_adapter._streamnet_reach_count", return_value=3), patch("build_adapter._streamnet_link_feature_count", return_value=1):
+            overlapping = build_adapter.adjudicate_duplicate_identity(source, 24, index, streamnet)
         read.assert_called_once_with(source, ["streamID"], fids=(7, 9))
-        self.assertEqual([value["coordinates"] for value in same_ground.evidence["features"]], [first, first])
-        self.assertIs(same_ground.evidence["spatially_equal"], True)
-        self.assertIs(same_ground.evidence["coordinate_sequences_equal"], True)
-        self.assertIs(same_ground.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
-        self.assertEqual(same_ground.evidence["derivation"], self.duplicate_derivation("same_ground"))
-        self.assert_boolean_evidence(same_ground.evidence)
+        self.assertEqual(overlapping.evidence["interior_overlapping_pairs"], [[0, 1]])
+        self.assertEqual(overlapping.evidence["interior_overlapping_pair_count"], 1)
+        self.assertIsNone(overlapping.evidence["dissolved_geometry_type"])
+        self.assertGreater(overlapping.evidence["overlap_area_km2"], 0.0)
+        self.assertIs(overlapping.verdict, build_adapter.BasinVerdict.SOURCE_DEFECT)
+        self.assertEqual(overlapping.evidence["derivation"], self.duplicate_derivation("interior_overlap"))
+        self.assert_boolean_evidence(overlapping.evidence)
 
-    def test_duplicate_identity_with_many_features_requires_all_to_cover_the_same_ground(self) -> None:
+    def test_duplicate_identity_with_many_parts_refuses_only_interior_overlap(self) -> None:
         source = self.synthetic_source()
+        streamnet = self.synthetic_streamnet()
+        index = build_adapter.DuplicatedIdentityIndex(feature_count=3, distinct_stream_id_count=1, geometry_type="Polygon", feature_ids={9: (1, 2, 3)})
         square = Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)])
-        rotated = Polygon([(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (1.0, 0.0)])
-        elsewhere = Polygon([(2.0, 0.0), (3.0, 0.0), (3.0, 1.0), (2.0, 1.0), (2.0, 0.0)])
-        same = gpd.GeoDataFrame({"streamID": [9, 9, 9], "geometry": [square, rotated, square]}, crs="EPSG:4326")
-        with patch("build_adapter._read_adjudication_features", return_value=same):
-            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, build_adapter.DuplicatedIdentityIndex(feature_count=3, feature_ids={9: (1, 2, 3)}))
+        edge_neighbor = Polygon([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
+        corner_neighbor = Polygon([(2.0, 1.0), (3.0, 1.0), (3.0, 2.0), (2.0, 2.0), (2.0, 1.0)])
+        touching = gpd.GeoDataFrame({"streamID": [9, 9, 9], "geometry": [square, edge_neighbor, corner_neighbor]}, crs="EPSG:4326")
+        with patch("build_adapter._read_adjudication_features", return_value=touching), patch("build_adapter._streamnet_reach_count", return_value=3), patch("build_adapter._streamnet_link_feature_count", return_value=1):
+            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, index, streamnet)
         self.assertIs(verdict.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
         self.assertEqual(verdict.evidence["feature_count"], 3)
-        self.assertIs(verdict.evidence["spatially_equal"], True)
-        self.assertIs(verdict.evidence["coordinate_sequences_equal"], False)
+        self.assertEqual(verdict.evidence["interior_overlapping_pairs"], [])
+        self.assertEqual(verdict.evidence["dissolved_geometry_type"], "MultiPolygon")
         self.assertEqual(verdict.evidence["coordinate_sequences_finite"], [True, True, True])
-        self.assertEqual(verdict.evidence["geometries_valid"], [True, True, True])
-        self.assertEqual(verdict.evidence["derivation"]["required_preconditions"]["geometries_valid"], [True, True, True])
-        self.assertAlmostEqual(verdict.evidence["overlap_area_km2"], 2.0 * verdict.evidence["union_area_km2"])
-        mixed = gpd.GeoDataFrame({"streamID": [9, 9, 9], "geometry": [square, square, elsewhere]}, crs="EPSG:4326")
-        with patch("build_adapter._read_adjudication_features", return_value=mixed):
-            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, build_adapter.DuplicatedIdentityIndex(feature_count=3, feature_ids={9: (1, 2, 3)}))
+        self.assertEqual(verdict.evidence["derivation"], self.duplicate_derivation("single_part_encoding", 3))
+        self.assertAlmostEqual(verdict.evidence["overlap_area_km2"], 0.0)
+        mixed = gpd.GeoDataFrame({"streamID": [9, 9, 9], "geometry": [square, square, corner_neighbor]}, crs="EPSG:4326")
+        with patch("build_adapter._read_adjudication_features", return_value=mixed), patch("build_adapter._streamnet_reach_count", return_value=3), patch("build_adapter._streamnet_link_feature_count", return_value=1):
+            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, index, streamnet)
         self.assertIs(verdict.verdict, build_adapter.BasinVerdict.SOURCE_DEFECT)
-        self.assertIs(verdict.evidence["spatially_equal"], False)
-        self.assertIs(verdict.evidence["coordinate_sequences_equal"], False)
-        self.assertEqual(verdict.evidence["derivation"]["selected_branch"], "different_ground")
+        self.assertEqual(verdict.evidence["interior_overlapping_pairs"], [[0, 1]])
+        self.assertEqual(verdict.evidence["derivation"]["selected_branch"], "interior_overlap")
         self.assertAlmostEqual(verdict.evidence["overlap_area_km2"], verdict.evidence["features"][0]["area_km2"])
 
     def test_duplicate_orchestration_uses_helper_result(self) -> None:
@@ -6060,11 +6204,13 @@ class BasinAdjudicationTests(unittest.TestCase):
                     "sentinel_branch",
                 ),
             ) as derive,
+            patch("build_adapter._streamnet_reach_count", return_value=3),
+            patch("build_adapter._streamnet_link_feature_count", return_value=1),
         ):
-            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+            verdict = build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
 
         self.assertIs(verdict.verdict, build_adapter.BasinVerdict.ADAPTER_STRICTNESS)
-        derive.assert_called_once_with(False, False)
+        derive.assert_called_once_with(0)
         self.assertEqual(verdict.evidence["derivation"], self.duplicate_derivation("sentinel_branch"))
         self.assert_boolean_evidence(verdict.evidence)
 
@@ -6073,18 +6219,20 @@ class BasinAdjudicationTests(unittest.TestCase):
         basins_product = build_adapter.AcquiredProduct("1020018110", "basins", Path("/synthetic/b.gpkg"), "basins", 1, "a" * 64, 1)
         streamnet_product = build_adapter.AcquiredProduct("1020018110", "streamnet", Path("/synthetic/s.gpkg"), "TDX_streamnet_1020018110_01", 1, "b" * 64, 1)
         products = {"basins": basins_product, "streamnet": streamnet_product}
-        sentinel = build_adapter.AdjudicationVerdict("1020018110", build_adapter.BasinVerdict.SOURCE_DEFECT, build_adapter.AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY, {})
-        many = build_adapter.DuplicatedIdentityIndex(feature_count=9, feature_ids={12: (4, 5), 9: (1, 3), 300: (6, 7, 8)})
+        sentinel = build_adapter.AdjudicationVerdict("1020018110", build_adapter.BasinVerdict.ADAPTER_STRICTNESS, build_adapter.AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY, {"streamID": 9})
+        many = build_adapter.DuplicatedIdentityIndex(feature_count=9, distinct_stream_id_count=3, geometry_type="Polygon", feature_ids={12: (4, 5), 9: (1, 3), 300: (6, 7, 8)})
         with (
             patch("build_adapter._parse_acquired_product", side_effect=lambda _root, _basin, product: products[product]) as parse,
             patch("build_adapter.index_duplicated_identities", return_value=many) as index,
             patch("build_adapter.adjudicate_duplicate_identity", return_value=sentinel) as adjudicate,
         ):
-            self.assertIs(build_adapter._adjudicate_duplicate(root, "1020018110"), sentinel)
+            historical = build_adapter._adjudicate_duplicate(root, "1020018110")
+        self.assertEqual((historical.processing_basin_id, historical.verdict, historical.evidence_kind), ("1020018110", sentinel.verdict, sentinel.evidence_kind))
+        self.assertEqual(historical.evidence, {"historical_compile_refusal": "duplicate unit identity for streamID 9", "streamID": 9})
         self.assertEqual([call.args for call in parse.call_args_list], [(root, "1020018110", "basins"), (root, "1020018110", "streamnet")])
         index.assert_called_once_with(basins_product)
         adjudicate.assert_called_once_with(basins_product, 9, many, streamnet_product)
-        none = build_adapter.DuplicatedIdentityIndex(feature_count=3, feature_ids={})
+        none = build_adapter.DuplicatedIdentityIndex(feature_count=3, distinct_stream_id_count=3, geometry_type="Polygon", feature_ids={})
         with (
             patch("build_adapter._parse_acquired_product", side_effect=lambda _root, _basin, product: products[product]),
             patch("build_adapter.index_duplicated_identities", return_value=none),
@@ -6093,7 +6241,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "^1020018110 basins source carries no duplicated streamID$"):
                 build_adapter._adjudicate_duplicate(root, "1020018110")
         adjudicate.assert_not_called()
-        self.assertEqual(many.layer_summary(), {"feature_count": 9, "duplicated_stream_id_count": 3, "features_carrying_duplicated_stream_ids": 7})
+        self.assertEqual(many.layer_summary(), {"geometry_type": "Polygon", "feature_count": 9, "distinct_stream_id_count": 3, "duplicated_stream_id_count": 3, "features_carrying_duplicated_stream_ids": 7})
 
     def test_index_duplicated_identities_reads_attributes_only(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -6107,7 +6255,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             with patch("build_adapter.pyogrio.read_dataframe") as read:
                 index = build_adapter.index_duplicated_identities(source)
             read.assert_not_called()
-            self.assertEqual(index.feature_count, 6)
+            self.assertEqual((index.feature_count, index.distinct_stream_id_count, index.geometry_type), (6, 3, "Polygon"))
             self.assertEqual(index.feature_ids, {9: (2, 5), 12: (1, 4, 6)})
             self.assertEqual(index.stream_ids, [9, 12])
             self.assertEqual(index.duplicated_feature_count, 5)
@@ -6119,41 +6267,27 @@ class BasinAdjudicationTests(unittest.TestCase):
             unique.to_file(path, layer="basins", driver="GPKG", engine="pyogrio")
             source = build_adapter._parse_source_layer(path, "1020018110", "basins")
             index = build_adapter.index_duplicated_identities(source)
-            self.assertEqual((index.feature_count, index.feature_ids, index.stream_ids), (3, {}, []))
+            self.assertEqual((index.feature_count, index.distinct_stream_id_count, index.feature_ids, index.stream_ids), (3, 3, {}, []))
             not_sqlite = Path(temp_dir) / "text.gpkg"
             not_sqlite.write_text("not a database", encoding="utf-8")
             broken = build_adapter.SourceLayer("1020018110", "basins", not_sqlite, "basins", 14, "a" * 64)
             with self.assertRaisesRegex(ValueError, "^1020018110 basins acquired source is malformed: "):
                 build_adapter.index_duplicated_identities(broken)
         source = self.synthetic_source()
-        with patch("build_adapter.pyogrio.read_info", return_value={"fid_column": "fid"}), patch("build_adapter._read_adjudication_attributes", return_value=[(1, 9.5)]):
+        with patch("build_adapter.pyogrio.read_info", return_value={"fid_column": "fid", "geometry_type": "Polygon"}), patch("build_adapter._read_adjudication_attributes", return_value=[(1, 9.5)]):
             with self.assertRaisesRegex(ValueError, r"^1020018110 basins feature identity \(1, 9.5\) is not an integer streamID$"):
                 build_adapter.index_duplicated_identities(source)
-        with patch("build_adapter.pyogrio.read_info", return_value={"fid_column": ""}):
+        with patch("build_adapter.pyogrio.read_info", return_value={"fid_column": "", "geometry_type": "Polygon"}):
             with self.assertRaisesRegex(ValueError, "^1020018110 basins acquired source is malformed: "):
                 build_adapter.index_duplicated_identities(source)
         with self.assertRaisesRegex(ValueError, "feature selection requires exactly one of where or fids"):
             build_adapter._read_adjudication_features(source, ["streamID"])
 
     def test_duplicate_verdict_derivation_refuses_invalid_measurements(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError,
-            "^duplicate geometry measurements are inconsistent: coordinate sequence equality requires spatial equality$",
-        ):
-            build_adapter._derive_duplicate_verdict(False, True)
-        for spatially_equal, coordinate_sequences_equal in ((1, False), (True, None)):
-            with self.subTest(
-                spatially_equal=spatially_equal,
-                coordinate_sequences_equal=coordinate_sequences_equal,
-            ):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "^duplicate geometry measurements must be booleans$",
-                ):
-                    build_adapter._derive_duplicate_verdict(
-                        spatially_equal,
-                        coordinate_sequences_equal,
-                    )
+        for count in (-1, True, 1.0, None):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "^duplicate identity measurements must be a non-negative integer pair count$"):
+                    build_adapter._derive_duplicate_verdict(count)
 
     def test_duplicate_adjudication_refuses_geometry_outside_domain(self) -> None:
         source = self.synthetic_source()
@@ -6184,9 +6318,11 @@ class BasinAdjudicationTests(unittest.TestCase):
                 with (
                     patch("build_adapter._read_adjudication_features", return_value=basins),
                     patch("build_adapter._derive_duplicate_verdict") as derive,
+                    patch("build_adapter._streamnet_reach_count", return_value=3),
+                    patch("build_adapter._streamnet_link_feature_count", return_value=1),
                 ):
                     with self.assertRaisesRegex(ValueError, structural_message):
-                        build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+                        build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
                 self.assertEqual(derive.call_count, 0)
 
         with self.subTest(name="non-geometry"):
@@ -6200,9 +6336,11 @@ class BasinAdjudicationTests(unittest.TestCase):
             with (
                 patch("build_adapter._read_adjudication_features", return_value=rows),
                 patch("build_adapter._derive_duplicate_verdict") as derive,
+                patch("build_adapter._streamnet_reach_count", return_value=3),
+                patch("build_adapter._streamnet_link_feature_count", return_value=1),
             ):
                 with self.assertRaisesRegex(ValueError, structural_message):
-                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
             self.assertEqual(derive.call_count, 0)
 
         with self.subTest(name="invalid"):
@@ -6213,12 +6351,14 @@ class BasinAdjudicationTests(unittest.TestCase):
             with (
                 patch("build_adapter._read_adjudication_features", return_value=basins),
                 patch("build_adapter._derive_duplicate_verdict") as derive,
+                patch("build_adapter._streamnet_reach_count", return_value=3),
+                patch("build_adapter._streamnet_link_feature_count", return_value=1),
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "^1020018110 streamID 9 geometry must be valid$",
                 ):
-                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
             self.assertEqual(derive.call_count, 0)
 
         with self.subTest(name="non-finite"):
@@ -6229,12 +6369,14 @@ class BasinAdjudicationTests(unittest.TestCase):
             with (
                 patch("build_adapter._read_adjudication_features", return_value=basins),
                 patch("build_adapter._derive_duplicate_verdict") as derive,
+                patch("build_adapter._streamnet_reach_count", return_value=3),
+                patch("build_adapter._streamnet_link_feature_count", return_value=1),
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "^1020018110 streamID 9 geometry must have finite coordinates$",
                 ):
-                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
             self.assertEqual(derive.call_count, 0)
 
         with self.subTest(name="one-row"):
@@ -6243,12 +6385,14 @@ class BasinAdjudicationTests(unittest.TestCase):
             with (
                 patch("build_adapter._read_adjudication_features", return_value=one_row) as read,
                 patch("build_adapter._derive_duplicate_verdict") as derive,
+                patch("build_adapter._streamnet_reach_count", return_value=3),
+                patch("build_adapter._streamnet_link_feature_count", return_value=1),
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "^1020018110 streamID 9 is not a duplicated identity: expected at least 2 features, found 0$",
                 ):
-                    build_adapter.adjudicate_duplicate_identity(source, 9, build_adapter.DuplicatedIdentityIndex(feature_count=2, feature_ids={}))
+                    build_adapter.adjudicate_duplicate_identity(source, 9, build_adapter.DuplicatedIdentityIndex(feature_count=2, distinct_stream_id_count=2, geometry_type="Polygon", feature_ids={}), self.synthetic_streamnet())
             self.assertEqual((read.call_count, derive.call_count), (0, 0))
 
         with self.subTest(name="identity-drift"):
@@ -6258,12 +6402,14 @@ class BasinAdjudicationTests(unittest.TestCase):
             with (
                 patch("build_adapter._read_adjudication_features", return_value=drifted),
                 patch("build_adapter._derive_duplicate_verdict") as derive,
+                patch("build_adapter._streamnet_reach_count", return_value=3),
+                patch("build_adapter._streamnet_link_feature_count", return_value=1),
             ):
                 with self.assertRaisesRegex(
                     ValueError,
                     "^1020018110 streamID 9 feature identity mismatch: expected 2 features carrying the identity, found 2$",
                 ):
-                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features)
+                    build_adapter.adjudicate_duplicate_identity(source, 9, self.two_features, self.synthetic_streamnet())
             self.assertEqual(derive.call_count, 0)
 
     def run_duplicate_identity_cli(self, *arguments: str) -> dict[str, object]:
@@ -6291,7 +6437,7 @@ class BasinAdjudicationTests(unittest.TestCase):
                 sorted(discovered),
                 ["adapter", "adjudication_kind", "duplicated_stream_ids", "layer", "processing_basin_id", "schema_version", "source", "stream_id_selection", "verdicts"],
             )
-            self.assertEqual(discovered["layer"], {"feature_count": 3, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2})
+            self.assertEqual(discovered["layer"], {"geometry_type": "Polygon", "feature_count": 3, "distinct_stream_id_count": 2, "duplicated_stream_id_count": 1, "features_carrying_duplicated_stream_ids": 2})
             self.assertEqual(discovered["adapter"], {"adapter_version": "0.1.0"})
             self.assertEqual(discovered["adjudication_kind"], "duplicate identity")
             self.assertEqual(discovered["schema_version"], 1)
@@ -6303,28 +6449,31 @@ class BasinAdjudicationTests(unittest.TestCase):
                 {"file_name": "5020049720-basins.gpkg", "bytes": basins_path.stat().st_size, "layer_name": "basins", "sha256": before[basins_path][1]},
             )
             (verdict,) = discovered["verdicts"]
-            self.assertEqual([verdict["processing_basin_id"], verdict["verdict"], verdict["evidence_kind"]], ["5020049720", "source defect", "acquired source geometry"])
+            self.assertEqual([verdict["processing_basin_id"], verdict["verdict"], verdict["evidence_kind"]], ["5020049720", "adapter strictness", "acquired source geometry"])
             self.assertEqual(verdict["evidence"]["streamID"], 24)
             self.assertEqual(verdict["evidence"]["feature_count"], 2)
             self.assertEqual(verdict["evidence"]["source"], discovered["source"])
             self.assertEqual(verdict["evidence"]["streamnet"]["LINKNO_feature_count"], 1)
+            self.assertEqual(verdict["evidence"]["streamnet"]["reach_count"], 2)
             self.assertEqual(verdict["evidence"]["streamnet"]["file_name"], "5020049720-streamnet.gpkg")
-            self.assertEqual(verdict["evidence"]["derivation"], self.duplicate_derivation("different_ground"))
-            requested = self.run_duplicate_identity_cli("--basins", str(basins_path), "--processing-basin-id", "5020049720", "--stream-id", "24")
+            self.assertEqual(verdict["evidence"]["interior_overlapping_pairs"], [])
+            self.assertEqual(verdict["evidence"]["dissolved_geometry_type"], "MultiPolygon")
+            self.assertNotIn("historical_compile_refusal", verdict["evidence"])
+            self.assertEqual(verdict["evidence"]["derivation"], self.duplicate_derivation("single_part_encoding"))
+            requested = self.run_duplicate_identity_cli("--basins", str(basins_path), "--processing-basin-id", "5020049720", "--stream-id", "24", "--streamnet", str(streamnet_path))
             self.assertEqual(requested["stream_id_selection"], "requested")
             self.assertEqual(requested["duplicated_stream_ids"], [24])
-            self.assertNotIn("streamnet", requested["verdicts"][0]["evidence"])
-            self.assertEqual(requested["verdicts"][0]["evidence"]["features"], verdict["evidence"]["features"])
+            self.assertEqual(requested["verdicts"], discovered["verdicts"])
             again = self.run_duplicate_identity_cli("--basins", str(basins_path), "--processing-basin-id", "5020049720", "--streamnet", str(streamnet_path))
             self.assertEqual(again, discovered)
             self.assertEqual({path: (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()) for path in before}, before)
             self.assert_duplicate_identity_cli_refuses(
                 "^5020049720 streamID 1 is not a duplicated identity: expected at least 2 features, found 0$",
-                "--basins", str(basins_path), "--processing-basin-id", "5020049720", "--stream-id", "1",
+                "--basins", str(basins_path), "--processing-basin-id", "5020049720", "--stream-id", "1", "--streamnet", str(streamnet_path),
             )
             self.assert_duplicate_identity_cli_refuses(
                 "^7020000010 basins source carries no duplicated streamID$",
-                "--basins", str(downloads / "7020000010-basins.gpkg"), "--processing-basin-id", "7020000010",
+                "--basins", str(downloads / "7020000010-basins.gpkg"), "--processing-basin-id", "7020000010", "--streamnet", str(downloads / "7020000010-streamnet.gpkg"),
             )
             self.assert_duplicate_identity_cli_refuses(
                 "^7020000010 streamnet source identity mismatch: ",
@@ -6332,13 +6481,13 @@ class BasinAdjudicationTests(unittest.TestCase):
             )
             self.assert_duplicate_identity_cli_refuses(
                 "^5020049720 basins source file is missing or unsafe: ",
-                "--basins", str(downloads / "absent.gpkg"), "--processing-basin-id", "5020049720",
+                "--basins", str(downloads / "absent.gpkg"), "--processing-basin-id", "5020049720", "--streamnet", str(streamnet_path),
             )
             link = Path(temp_dir) / "link.gpkg"
             link.symlink_to(basins_path)
             self.assert_duplicate_identity_cli_refuses(
                 "^5020049720 basins source file is missing or unsafe: ",
-                "--basins", str(link), "--processing-basin-id", "5020049720",
+                "--basins", str(link), "--processing-basin-id", "5020049720", "--streamnet", str(streamnet_path),
             )
             multi_layer = Path(temp_dir) / "5020049720-basins.gpkg"
             basins, streamnet = adjudication_frames("5020049720")
@@ -6346,7 +6495,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             streamnet.to_file(multi_layer, layer="extra", driver="GPKG", engine="pyogrio", mode="a")
             self.assert_duplicate_identity_cli_refuses(
                 "^5020049720 basins source identity mismatch: ",
-                "--basins", str(multi_layer), "--processing-basin-id", "5020049720",
+                "--basins", str(multi_layer), "--processing-basin-id", "5020049720", "--streamnet", str(streamnet_path),
             )
 
     def test_ledger_composes_current_disposition_from_duplicate_identity_document(self) -> None:
@@ -6354,7 +6503,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             acquired, historical = make_adjudication_fixture(Path(temp_dir))
             downloads = acquired / "salvage/downloads"
             document = build_adapter.adjudicate_duplicate_identities(
-                downloads / "5020049720-basins.gpkg", "5020049720", streamnet_path=downloads / "5020049720-streamnet.gpkg"
+                downloads / "5020049720-basins.gpkg", "5020049720", downloads / "5020049720-streamnet.gpkg"
             )
             document_path = Path(temp_dir) / "5020049720-duplicate-identity.json"
             document_path.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
@@ -6365,7 +6514,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             self.assertEqual(evidence["historical_failed_product"], "basins")
             current = entry["current_disposition"]
             self.assertEqual(sorted(current), ["adjudication_kind", "evidence", "evidence_kind", "verdict"])
-            self.assertEqual([current["verdict"], current["evidence_kind"], current["adjudication_kind"]], ["source defect", "acquired source geometry", "duplicate identity"])
+            self.assertEqual([current["verdict"], current["evidence_kind"], current["adjudication_kind"]], ["adapter strictness", "acquired source geometry", "duplicate identity"])
             self.assertEqual(sorted(current["evidence"]), ["duplicated_stream_ids", "identities", "layer", "source", "stream_id_selection"])
             self.assertEqual(current["evidence"]["source"], document["source"])
             self.assertEqual(current["evidence"]["layer"], document["layer"])
@@ -6384,12 +6533,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue()), result)
             self.assertEqual(json.loads(output.getvalue())["schema_version"], 2)
 
-            same_ground = json.loads(json.dumps(document))
-            same_ground["verdicts"][0]["verdict"] = "adapter strictness"
-            document_path.write_text(json.dumps(same_ground), encoding="utf-8")
-            entry, _ = self.evidence(build_adapter.adjudicate_basins(acquired, historical, [document_path]), "5020049720")
-            self.assertEqual(entry["current_disposition"]["verdict"], "adapter strictness")
-            mixed = json.loads(json.dumps(same_ground))
+            mixed = json.loads(json.dumps(document))
             second = json.loads(json.dumps(mixed["verdicts"][0]))
             second["verdict"], second["evidence"]["streamID"] = "source defect", 25
             mixed["verdicts"].append(second)
@@ -6415,7 +6559,7 @@ class BasinAdjudicationTests(unittest.TestCase):
             outside = json.loads(json.dumps(document))
             outside["processing_basin_id"] = "7020000010"
             refuses(outside, "^current disposition document names a processing basin outside the ledger: ")
-            for key, value in (("schema_version", 2), ("adjudication_kind", "orientation"), ("duplicated_stream_ids", []), ("verdicts", []), ("layer", {"feature_count": 3})):
+            for key, value in (("schema_version", 2), ("adjudication_kind", "orientation"), ("duplicated_stream_ids", []), ("verdicts", []), ("layer", {"feature_count": 3}), ("layer", {**document["layer"], "geometry_type": 7})):
                 changed = json.loads(json.dumps(document))
                 changed[key] = value
                 refuses(changed, "^5020049720 current disposition document is malformed: ")

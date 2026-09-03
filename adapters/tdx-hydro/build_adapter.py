@@ -35,7 +35,7 @@ import pyogrio
 import psutil
 from geoparquet_io.core.validate import validate_geoparquet
 from pyproj import Geod
-from shapely import from_wkb, get_coordinates, set_coordinates
+from shapely import STRtree, from_wkb, get_coordinates, relate_pattern, set_coordinates, union_all
 from shapely.geometry import LineString, MultiPolygon, Polygon
 
 
@@ -101,7 +101,7 @@ CONFLICTING_ROOT_LINKNO = 1104039
 VERDICT_LEDGER_SCHEMA_VERSION = 2
 DUPLICATE_IDENTITY_ADJUDICATION_KIND = "duplicate identity"
 DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION = 1
-DUPLICATE_GROUND_EQUALITY_RULE_ID = "duplicate-ground-equality-v1"
+DUPLICATE_IDENTITY_PART_OVERLAP_RULE_ID = "duplicate-identity-part-overlap-v1"
 
 
 class BasinVerdict(Enum):
@@ -160,6 +160,15 @@ class AdjudicationVerdict:
 class LayerClampDiagnostics:
     altered_vertex_count: int
     altered_native_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class LayerDissolveDiagnostics:
+    """How many single-part rows sharing one streamID were dissolved into one unit."""
+
+    dissolved_unit_count: int
+    dissolved_part_count: int
+    max_part_count: int
 
 
 @dataclass(frozen=True)
@@ -248,6 +257,7 @@ class IngestionDiagnostics:
     basins_clamp: LayerClampDiagnostics
     streamnet_clamp: LayerClampDiagnostics
     dscontarea: DSContAreaDiagnostics
+    basins_dissolve: LayerDissolveDiagnostics
 
 
 @dataclass(frozen=True)
@@ -710,6 +720,76 @@ def _normalize_topology_column(
     )
 
 
+def _interior_overlapping_pairs(parts: Sequence[Polygon | MultiPolygon]) -> list[tuple[int, int]]:
+    """List index pairs of parts whose interiors intersect (DE-9IM interior/interior)."""
+    if len(parts) < 2:
+        return []
+    left, right = STRtree(parts).query(parts, predicate="intersects")
+    candidates = sorted({(int(a), int(b)) for a, b in zip(left.tolist(), right.tolist(), strict=True) if a < b})
+    return [(a, b) for a, b in candidates if bool(relate_pattern(parts[a], parts[b], "T********"))]
+
+
+def dissolve_identity_parts(stream_id: int, parts: Sequence[Polygon | MultiPolygon]) -> Polygon | MultiPolygon:
+    """dissolve : (streamID, parts) -> unit geometry, total on interior-disjoint parts.
+
+    Several single-part rows carrying one streamID encode one multipart
+    catchment. Parts that touch only at edges or corners dissolve into one
+    Polygon or MultiPolygon. Parts whose interiors overlap contradict each
+    other and refuse.
+
+    Raises:
+        ValueError: Two parts overlap in interior, or the dissolved geometry is
+            not a valid Polygon or MultiPolygon.
+    """
+    for index, part in enumerate(parts):
+        if part is None or part.is_empty or not isinstance(part, (Polygon, MultiPolygon)):
+            raise ValueError(f"basins streamID {stream_id} part {index} must be a non-empty Polygon or MultiPolygon")
+        if part.has_z:
+            raise ValueError(f"basins streamID {stream_id} part {index} must be two-dimensional")
+        if not part.is_valid:
+            raise ValueError(f"basins streamID {stream_id} part {index} must be valid")
+    overlapping = _interior_overlapping_pairs(parts)
+    if overlapping:
+        shown = ", ".join(f"({a}, {b})" for a, b in overlapping[:5])
+        raise ValueError(
+            f"basins streamID {stream_id} has {len(parts)} parts whose interiors overlap: "
+            f"{len(overlapping)} part pair(s) such as {shown}"
+        )
+    geometry = union_all(list(parts))
+    if not isinstance(geometry, (Polygon, MultiPolygon)) or geometry.is_empty or not geometry.is_valid:
+        raise ValueError(
+            f"basins streamID {stream_id} parts do not dissolve into a valid Polygon or MultiPolygon"
+        )
+    return geometry
+
+
+def _dissolve_basin_frame(basins: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, LayerDissolveDiagnostics]:
+    """Dissolve every duplicated streamID of an in-memory basins frame into one row."""
+    ids = basins["streamID"].to_numpy(dtype="int64")
+    unique, first_index, counts = np.unique(ids, return_index=True, return_counts=True)
+    duplicated = counts > 1
+    if not np.any(duplicated):
+        return basins, LayerDissolveDiagnostics(0, 0, 0)
+    geometries = basins.geometry.to_numpy()
+    dissolved: dict[int, Polygon | MultiPolygon] = {}
+    for stream_id in unique[duplicated].tolist():
+        parts = [geometries[i] for i in np.flatnonzero(ids == stream_id)]
+        dissolved[stream_id] = dissolve_identity_parts(stream_id, parts)
+    order = np.sort(first_index)
+    frame = basins.iloc[order].copy()
+    frame["geometry"] = gpd.GeoSeries(
+        [dissolved.get(int(stream_id), geometries[i]) for stream_id, i in zip(ids[order].tolist(), order.tolist(), strict=True)],
+        index=frame.index,
+        crs=basins.crs,
+    )
+    frame = frame.set_geometry("geometry")
+    return frame, LayerDissolveDiagnostics(
+        int(np.count_nonzero(duplicated)),
+        int(counts[duplicated].sum()),
+        int(counts.max()),
+    )
+
+
 def _validate_duplicate_ids(
     basin_linknos: list[int],
     stream_linknos: list[int],
@@ -1052,6 +1132,10 @@ def load_tdx_geopackages(
         basins = _load_single_geopackage(basins_path, "basins")
     with _record_phase(_memory_recorder, "streamnet_load"):
         streamnet = _load_single_geopackage(streamnet_path, "streamnet")
+    with _record_phase(_memory_recorder, "basins_dissolve"):
+        _require_columns(basins, "basins", {"streamID", basins.geometry.name})
+        _normalize_topology_column(basins, "basins", "streamID")
+        basins, basins_dissolve = _dissolve_basin_frame(basins)
     with _record_phase(_memory_recorder, "source_validate"):
         _require_columns(basins, "basins", {"streamID", basins.geometry.name})
         _require_columns(
@@ -1134,7 +1218,7 @@ def load_tdx_geopackages(
     return TdxSourceData(
         basins=basins,
         streamnet=streamnet,
-        diagnostics=IngestionDiagnostics(basins_clamp, streamnet_clamp, dscontarea),
+        diagnostics=IngestionDiagnostics(basins_clamp, streamnet_clamp, dscontarea, basins_dissolve),
     )
 
 
@@ -3303,6 +3387,82 @@ def _hilbert_for_series(series: gpd.GeoSeries) -> np.ndarray:
     return values
 
 
+def _dissolve_basin_spool(
+    raw_path: Path,
+    dissolved_path: Path,
+    *,
+    recorder: _CompileMemoryRecorder | None,
+) -> LayerDissolveDiagnostics | None:
+    """Rewrite a raw basins spool with one row per streamID, dissolving duplicated identities.
+
+    Returns None without writing when no streamID is duplicated. Rows whose
+    identity is unique pass through unchanged; the parts of a duplicated
+    identity are held only until its last part is read, then dissolved and
+    written once.
+
+    Raises:
+        ValueError: A duplicated identity's parts overlap in interior.
+    """
+    (native_all,) = _spool_numpy(raw_path, ("native_id",))
+    unique, counts = np.unique(native_all.astype("int64", copy=False), return_counts=True)
+    duplicated = unique[counts > 1]
+    if not len(duplicated):
+        return None
+    expected = dict(zip(duplicated.tolist(), counts[counts > 1].tolist(), strict=True))
+    pending: dict[int, list[bytes]] = {}
+    pending_bytes = 0
+    peak_pending_bytes = 0
+    schema = _basin_raw_spool_schema()
+    with pq.ParquetWriter(
+        dissolved_path, schema=schema, compression="snappy", write_statistics=True
+    ) as writer:
+        for batch in pq.ParquetFile(raw_path).iter_batches(batch_size=COMPILE_BATCH_SIZE):
+            native = batch.column(0).to_numpy(zero_copy_only=False).astype("int64", copy=False)
+            mask = np.isin(native, duplicated)
+            passthrough = batch.filter(pa.array(~mask))
+            if passthrough.num_rows:
+                writer.write_table(pa.Table.from_batches([passthrough], schema=schema))
+            dissolved_native: list[int] = []
+            dissolved_wkb: list[bytes] = []
+            geometry = batch.column(1)
+            for row in np.flatnonzero(mask).tolist():
+                stream_id = int(native[row])
+                wkb = geometry[row].as_py()
+                parts = pending.setdefault(stream_id, [])
+                parts.append(wkb)
+                pending_bytes += len(wkb)
+                peak_pending_bytes = max(peak_pending_bytes, pending_bytes)
+                if len(parts) == expected[stream_id]:
+                    del pending[stream_id]
+                    pending_bytes -= sum(len(value) for value in parts)
+                    dissolved_native.append(stream_id)
+                    dissolved_wkb.append(
+                        dissolve_identity_parts(stream_id, [from_wkb(value) for value in parts]).wkb
+                    )
+            if dissolved_native:
+                writer.write_table(
+                    pa.Table.from_arrays(
+                        [pa.array(dissolved_native, type=pa.int64()), pa.array(dissolved_wkb, type=pa.binary())],
+                        schema=schema,
+                    )
+                )
+    if pending:
+        raise ValueError(f"basins dissolve left {len(pending)} duplicated streamID group(s) incomplete")
+    diagnostics = LayerDissolveDiagnostics(
+        int(len(duplicated)), int(counts[counts > 1].sum()), int(counts.max())
+    )
+    LOGGER.info(
+        "basins_dissolve units=%d parts=%d max_parts=%d peak_pending_part_bytes=%d",
+        diagnostics.dissolved_unit_count,
+        diagnostics.dissolved_part_count,
+        diagnostics.max_part_count,
+        peak_pending_bytes,
+    )
+    if recorder is not None:
+        recorder.scratch_event("basin-dissolved-closed")
+    return diagnostics
+
+
 def _normalize_basin_spool(
     raw_path: Path,
     normalized_path: Path,
@@ -4088,6 +4248,15 @@ def _ingest_source_spools(
             batch_size=COMPILE_BATCH_SIZE,
             recorder=recorder,
         )
+    with recorder.phase("basins_dissolve"):
+        basin_dissolved = scratch_root / "basins.dissolved.parquet"
+        basins_dissolve = _dissolve_basin_spool(basin_raw, basin_dissolved, recorder=recorder)
+        if basins_dissolve is None:
+            basins_dissolve = LayerDissolveDiagnostics(0, 0, 0)
+        else:
+            basin_raw.unlink()
+            basin_raw = basin_dissolved
+            recorder.scratch_event("basin-raw-unlinked-after-dissolve")
     with recorder.phase("source_validate"):
         degenerate_before = _scan_raw_geometry_spool(
             stream_raw,
@@ -4255,6 +4424,7 @@ def _ingest_source_spools(
                 basins_clamp=basins_clamp,
                 streamnet_clamp=streamnet_clamp,
                 dscontarea=dscontarea,
+                basins_dissolve=basins_dissolve,
             ),
         ),
         basin_native_ids=basin_native,
@@ -5543,23 +5713,18 @@ def _distance_records(first: list[list[float]], second: list[list[float]], first
     return [{f"{first_name}_endpoint_index": i, f"{second_name}_endpoint_index": j, "distance_degrees": math.dist(a, b)} for i, a in enumerate(first) for j, b in enumerate(second)]
 
 
-def _derive_duplicate_verdict(
-    spatially_equal: bool,
-    coordinate_sequences_equal: bool,
-) -> tuple[BasinVerdict, str]:
-    if type(spatially_equal) is not bool or type(coordinate_sequences_equal) is not bool:
-        raise ValueError("duplicate geometry measurements must be booleans")
-    if not spatially_equal and coordinate_sequences_equal:
-        raise ValueError(
-            "duplicate geometry measurements are inconsistent: coordinate sequence equality requires spatial equality"
-        )
-    if (spatially_equal, coordinate_sequences_equal) == (True, True):
-        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
-    if (spatially_equal, coordinate_sequences_equal) == (True, False):
-        return BasinVerdict.ADAPTER_STRICTNESS, "same_ground"
-    if (spatially_equal, coordinate_sequences_equal) == (False, False):
-        return BasinVerdict.SOURCE_DEFECT, "different_ground"
-    raise ValueError("duplicate geometry measurements do not determine a verdict")
+def _derive_duplicate_verdict(interior_overlapping_pair_count: int) -> tuple[BasinVerdict, str]:
+    """Classify one duplicated identity from the count of part pairs whose interiors overlap.
+
+    Parts that overlap in interior contradict each other: source defect. Parts
+    that are disjoint or touch only at edges or corners are one catchment
+    stored as several single-part rows: adapter strictness.
+    """
+    if isinstance(interior_overlapping_pair_count, bool) or not isinstance(interior_overlapping_pair_count, Integral) or interior_overlapping_pair_count < 0:
+        raise ValueError("duplicate identity measurements must be a non-negative integer pair count")
+    if interior_overlapping_pair_count > 0:
+        return BasinVerdict.SOURCE_DEFECT, "interior_overlap"
+    return BasinVerdict.ADAPTER_STRICTNESS, "single_part_encoding"
 
 
 @dataclass(frozen=True)
@@ -5567,6 +5732,8 @@ class DuplicatedIdentityIndex:
     """Every streamID carried by more than one feature of a basins layer, with those features' IDs."""
 
     feature_count: int
+    distinct_stream_id_count: int
+    geometry_type: str
     feature_ids: Mapping[int, tuple[int, ...]]
 
     @property
@@ -5577,9 +5744,11 @@ class DuplicatedIdentityIndex:
     def duplicated_feature_count(self) -> int:
         return sum(len(value) for value in self.feature_ids.values())
 
-    def layer_summary(self) -> dict[str, int]:
+    def layer_summary(self) -> dict[str, object]:
         return {
+            "geometry_type": self.geometry_type,
             "feature_count": self.feature_count,
+            "distinct_stream_id_count": self.distinct_stream_id_count,
             "duplicated_stream_id_count": len(self.feature_ids),
             "features_carrying_duplicated_stream_ids": self.duplicated_feature_count,
         }
@@ -5594,10 +5763,11 @@ def index_duplicated_identities(source: SourceLayer) -> DuplicatedIdentityIndex:
         ValueError: The layer is unreadable or an identity is not an integer.
     """
     try:
-        fid_column = str(pyogrio.read_info(source.path, layer=source.layer_name)["fid_column"])
+        info = pyogrio.read_info(source.path, layer=source.layer_name)
+        fid_column, geometry_type = str(info["fid_column"]), str(info["geometry_type"])
     except Exception as error:
         raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}") from error
-    if not fid_column:
+    if not fid_column or not geometry_type:
         raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}")
     column = '"' + fid_column.replace('"', '""') + '"'
     rows = _read_adjudication_attributes(source, f'SELECT {column}, "streamID" FROM {_quoted_layer(source)} ORDER BY {column}')
@@ -5608,6 +5778,8 @@ def index_duplicated_identities(source: SourceLayer) -> DuplicatedIdentityIndex:
         by_stream_id.setdefault(row[1], []).append(row[0])
     return DuplicatedIdentityIndex(
         feature_count=len(rows),
+        distinct_stream_id_count=len(by_stream_id),
+        geometry_type=geometry_type,
         feature_ids={stream_id: tuple(fids) for stream_id, fids in by_stream_id.items() if len(fids) > 1},
     )
 
@@ -5618,6 +5790,13 @@ def _source_identity(source: SourceLayer) -> dict[str, object]:
 
 def _geodesic_area_km2(geod: Geod, geometry: Polygon | MultiPolygon) -> float:
     return abs(float(geod.geometry_area_perimeter(geometry)[0])) / 1_000_000.0
+
+
+def _streamnet_reach_count(streamnet: SourceLayer) -> int:
+    rows = _read_adjudication_attributes(streamnet, f"SELECT COUNT(*) FROM {_quoted_layer(streamnet)}")
+    if len(rows) != 1 or len(rows[0]) != 1 or not _is_int(rows[0][0]):
+        raise ValueError(f"{streamnet.processing_basin_id} {streamnet.product} acquired source is malformed: {streamnet.path}")
+    return rows[0][0]
 
 
 def _streamnet_link_feature_count(streamnet: SourceLayer, stream_id: int) -> int:
@@ -5634,18 +5813,21 @@ def adjudicate_duplicate_identity(
     source: SourceLayer,
     stream_id: int,
     index: DuplicatedIdentityIndex,
-    streamnet: SourceLayer | None = None,
+    streamnet: SourceLayer,
 ) -> AdjudicationVerdict:
     """Adjudicate one duplicated streamID of a basins layer from its geometry alone.
 
     Only the features the index names as carriers of `stream_id` are read. Rule
-    `duplicate-ground-equality-v1`: every feature covering the same ground is
-    adapter strictness; any feature covering different ground is a source
-    defect; invalid, non-finite, or inconsistent measurements refuse.
+    `duplicate-identity-part-overlap-v1`: parts whose interiors overlap
+    contradict each other and are a source defect; parts that are disjoint or
+    touch only at edges or corners are one catchment stored as single-part rows,
+    an adapter strictness the compile dissolve now handles. The streamnet
+    supplies the reach count and the LINKNO feature count that document the
+    encoding difference.
 
     Raises:
         ValueError: Fewer than two features carry the identity, a geometry is
-            structurally unusable, or the measurements contradict each other.
+            structurally unusable, or the feature identities drift.
     """
     basin_id = source.processing_basin_id
     label = f"{basin_id} streamID {stream_id}"
@@ -5663,12 +5845,9 @@ def adjudicate_duplicate_identity(
     geometries_valid = [_geometry_is_valid(value) for value in geometries]
     if not all(geometries_valid):
         raise ValueError(f"{label} geometry must be valid")
-    spatially_equal = all(bool(geometries[0].equals(value)) for value in geometries[1:])
-    coordinate_sequences_equal = all(coordinates[0] == value for value in coordinates[1:])
-    verdict, selected_branch = _derive_duplicate_verdict(
-        spatially_equal,
-        coordinate_sequences_equal,
-    )
+    overlapping = _interior_overlapping_pairs(geometries)
+    verdict, selected_branch = _derive_duplicate_verdict(len(overlapping))
+    dissolved_geometry_type = None if overlapping else dissolve_identity_parts(int(stream_id), geometries).geom_type
     geod = Geod(ellps="WGS84")
     areas = [_geodesic_area_km2(geod, value) for value in geometries]
     union_area = _geodesic_area_km2(geod, gpd.GeoSeries(geometries, crs=CRS).union_all())
@@ -5689,47 +5868,43 @@ def adjudicate_duplicate_identity(
         "overlap_area_km2": max(sum(areas) - union_area, 0.0),
         "coordinate_sequences_finite": coordinate_sequences_finite,
         "geometries_valid": geometries_valid,
-        "spatially_equal": spatially_equal,
-        "coordinate_sequences_equal": coordinate_sequences_equal,
+        "interior_overlapping_pairs": [[a, b] for a, b in overlapping],
+        "interior_overlapping_pair_count": len(overlapping),
+        "dissolved_geometry_type": dissolved_geometry_type,
         "source": _source_identity(source),
         "layer": index.layer_summary(),
+        "streamnet": {
+            **_source_identity(streamnet),
+            "reach_count": _streamnet_reach_count(streamnet),
+            "LINKNO": int(stream_id),
+            "LINKNO_feature_count": _streamnet_link_feature_count(streamnet, stream_id),
+        },
         "derivation": {
-            "rule_id": DUPLICATE_GROUND_EQUALITY_RULE_ID,
+            "rule_id": DUPLICATE_IDENTITY_PART_OVERLAP_RULE_ID,
             "inputs": [
                 "coordinate_sequences_finite",
                 "geometries_valid",
-                "spatially_equal",
-                "coordinate_sequences_equal",
+                "interior_overlapping_pair_count",
             ],
             "required_preconditions": {
                 "coordinate_sequences_finite": coordinate_sequences_finite,
                 "geometries_valid": geometries_valid,
             },
-            "consistency_requirement": {
-                "coordinate_sequences_equal_implies": "spatially_equal",
-            },
             "branches": [
                 {
-                    "branch": "same_ground",
-                    "spatially_equal": True,
-                    "verdict": "adapter strictness",
+                    "branch": "interior_overlap",
+                    "condition": "interior_overlapping_pair_count > 0",
+                    "verdict": "source defect",
                 },
                 {
-                    "branch": "different_ground",
-                    "spatially_equal": False,
-                    "coordinate_sequences_equal": False,
-                    "verdict": "source defect",
+                    "branch": "single_part_encoding",
+                    "condition": "interior_overlapping_pair_count == 0",
+                    "verdict": "adapter strictness",
                 },
             ],
             "selected_branch": selected_branch,
         },
     }
-    if streamnet is not None:
-        evidence["streamnet"] = {
-            **_source_identity(streamnet),
-            "LINKNO": int(stream_id),
-            "LINKNO_feature_count": _streamnet_link_feature_count(streamnet, stream_id),
-        }
     return AdjudicationVerdict(basin_id, verdict, AdjudicationEvidenceKind.ACQUIRED_SOURCE_GEOMETRY, evidence)
 
 
@@ -5744,14 +5919,21 @@ def _adjudicate_duplicate(root: Path, basin_id: str) -> AdjudicationVerdict:
     index = index_duplicated_identities(product)
     if not index.feature_ids:
         raise ValueError(f"{basin_id} basins source carries no duplicated streamID")
-    return adjudicate_duplicate_identity(product, min(index.feature_ids), index, _parse_acquired_product(root, basin_id, "streamnet"))
+    stream_id = min(index.feature_ids)
+    verdict = adjudicate_duplicate_identity(product, stream_id, index, _parse_acquired_product(root, basin_id, "streamnet"))
+    return AdjudicationVerdict(
+        verdict.processing_basin_id,
+        verdict.verdict,
+        verdict.evidence_kind,
+        {"historical_compile_refusal": f"duplicate unit identity for streamID {stream_id}", **verdict.evidence},
+    )
 
 
 def adjudicate_duplicate_identities(
     basins_path: Path,
     processing_basin_id: str,
+    streamnet_path: Path,
     stream_id: int | None = None,
-    streamnet_path: Path | None = None,
 ) -> dict[str, object]:
     """Adjudicate every duplicated streamID of one basins file, or one requested identity.
 
@@ -5761,7 +5943,7 @@ def adjudicate_duplicate_identities(
     """
     basin_id = str(processing_basin_id)
     source = _parse_source_layer(basins_path, basin_id, "basins")
-    streamnet = _parse_source_layer(streamnet_path, basin_id, "streamnet") if streamnet_path is not None else None
+    streamnet = _parse_source_layer(streamnet_path, basin_id, "streamnet")
     index = index_duplicated_identities(source)
     layer = index.layer_summary()
     if stream_id is None:
@@ -5963,8 +6145,9 @@ def _current_disposition_from_document(document_path: Path, acquired_evidence_ro
         or document.get("schema_version") != DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION
         or not isinstance(source, dict)
         or not isinstance(layer, dict)
-        or set(layer) != {"feature_count", "duplicated_stream_id_count", "features_carrying_duplicated_stream_ids"}
-        or not all(_is_int(value) for value in layer.values())
+        or set(layer) != {"geometry_type", "feature_count", "distinct_stream_id_count", "duplicated_stream_id_count", "features_carrying_duplicated_stream_ids"}
+        or not isinstance(layer.get("geometry_type"), str)
+        or not all(_is_int(value) for key, value in layer.items() if key != "geometry_type")
         or not isinstance(stream_ids, list)
         or not stream_ids
         or not isinstance(verdicts, list)
@@ -6114,8 +6297,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     duplicate_parser = subparsers.add_parser("adjudicate-duplicate-identity")
     duplicate_parser.add_argument("--basins", required=True, type=Path)
     duplicate_parser.add_argument("--processing-basin-id", required=True)
+    duplicate_parser.add_argument("--streamnet", required=True, type=Path)
     duplicate_parser.add_argument("--stream-id", type=int)
-    duplicate_parser.add_argument("--streamnet", type=Path)
     return parser
 
 
@@ -6198,8 +6381,8 @@ def main(argv: list[str] | None = None) -> int:
         result = adjudicate_duplicate_identities(
             arguments.basins,
             arguments.processing_basin_id,
+            arguments.streamnet,
             stream_id=arguments.stream_id,
-            streamnet_path=arguments.streamnet,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
     else:

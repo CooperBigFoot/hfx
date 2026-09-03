@@ -50,7 +50,9 @@ The adapter emits level-0 units only. A unit exists exactly when a basin polygon
 basins.streamID = streamnet.LINKNO
 ```
 
-Every basin polygon must join to one streamnet row. Missing or duplicate identities are fatal. There is no spatial fallback. Polygon-less streamnet links do not become drainage units, and `parent_id` is null for every emitted unit.
+Every basin polygon must join to one streamnet row. A missing identity is fatal. There is no spatial fallback. Polygon-less streamnet links do not become drainage units, and `parent_id` is null for every emitted unit.
+
+Some processing basins store a multipart catchment as several single-part `Polygon` rows that share one `streamID` (their `basins` layer declares geometry type `POLYGON`; basins that store native `MultiPolygon` rows declare `GEOMETRY`). Before any other source validation, the adapter dissolves every group of rows sharing a `streamID` into one unit whose geometry is the union of the parts, so the unit count equals the count of distinct `streamID` values and the dissolved unit follows the same clamp, area, Hilbert, outlet, and snap-stem path as a native `MultiPolygon` unit. Parts that are disjoint or touch only at edges or corners are the normal multipart case. Two parts whose interiors overlap contradict each other; that group, and with it the basin, is refused with `basins streamID N has K parts whose interiors overlap`. An invalid, empty, or three-dimensional part refuses before the overlap test. The report records `basins_dissolve.dissolved_unit_count`, `dissolved_part_count`, and `max_part_count`, all zero for a layer without shared identities.
 
 The native same-level relation is `LINKNO -> DSLINKNO`. For each polygon-bearing link, the adapter follows `DSLINKNO` through zero or more polygon-less links until it reaches the first polygon-bearing downstream link or `-1`. The former creates one contracted same-level edge; the latter makes the unit a root. The report distinguishes `contracted_edge_count`, `contracted_root_count`, and the total `contracted_link_traversal_count`.
 
@@ -136,6 +138,9 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.ingestion.dscontarea.signed_aggregate_relative_divergence`
 - `diagnostics.ingestion.dscontarea.absolute_aggregate_relative_divergence`
 - `diagnostics.ingestion.dscontarea.max_absolute_relative_divergence`
+- `diagnostics.ingestion.basins_dissolve.dissolved_unit_count`
+- `diagnostics.ingestion.basins_dissolve.dissolved_part_count`
+- `diagnostics.ingestion.basins_dissolve.max_part_count`
 - `diagnostics.streamnet.polygon_bearing_link_count`
 - `diagnostics.streamnet.polygonless_dropped_reach_count`
 - `diagnostics.streamnet.degenerate_reach_count`
@@ -185,7 +190,7 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.memory.selected_dtypes.hilbert`
 - `diagnostics.memory.selected_dtypes.flags`
 
-The phase keys are `basins_load`, `streamnet_load`, `source_validate`,
+The phase keys are `basins_load`, `streamnet_load`, `basins_dissolve`, `source_validate`,
 `basins_clamp`, `streamnet_clamp`, `source_post_clamp_validate`,
 `dscontarea_infer`, `topology`, `catchment_run_creation`,
 `catchment_graph_merge_write`, `snap_run_creation`, and `snap_merge_write`.
@@ -346,10 +351,12 @@ The acquired geometry sources and feature identities are:
 
 - `salvage/downloads/1020018110-basins.gpkg`, the smallest duplicated
   `streamID` found by an attribute-only index of the layer (`streamID 9`, the
-  identity the compile refusal names), with
-  `salvage/downloads/1020018110-streamnet.gpkg` supplying the `LINKNO 9`
-  feature count; the evidence `layer` counts record that 122,259 of the
-  layer's `streamID` values are duplicated across its 924,556 polygon rows
+  identity the historical compile refusal names, recorded as
+  `historical_compile_refusal`), with
+  `salvage/downloads/1020018110-streamnet.gpkg` supplying the reach count and
+  the `LINKNO 9` feature count; the evidence `layer` counts record that
+  122,259 of the layer's 515,349 distinct `streamID` values are shared across
+  its 924,556 `Polygon` rows
 - `salvage/downloads/2020003440-streamnet.gpkg`, `LINKNO 148956` and its
   `DSLINKNO` successor
 - `salvage/downloads/2020071190-streamnet.gpkg`, root `LINKNO 1104039` and every
@@ -377,8 +384,9 @@ and products:
 
 The ledger records every raw measurement consumed by the adjudicators and is
 the single verdict authority. The duplicate record's machine-readable
-`derivation` object supplies its preconditions, consistency rule, branches, and
-selected branch. For the non-root record, `adapter strictness` applies exactly
+`derivation` object supplies its preconditions, branches, and selected branch
+under rule `duplicate-identity-part-overlap-v1`, described below. For the
+non-root record, `adapter strictness` applies exactly
 when `endpoint_separation <= non_root_near_degenerate_limit`, `DSContArea <
 successor_DSContArea`, and any emitted tolerance match has
 `current_endpoint_index == 1`; every other measured combination yields `source
@@ -414,24 +422,42 @@ Before a document is accepted, its `source` `bytes`, `sha256`, and
 about other bytes refuses the whole ledger.
 
 In the committed ledger, `1020018110` and `5020049720` carry non-null current
-dispositions. `5020049720` was historically absent because its transfer failed
+dispositions, both `adapter strictness` under
+`duplicate-identity-part-overlap-v1`: each product stores multipart catchments
+as single-part rows, an encoding the compile dissolve now accepts.
+
+`1020018110` was historically absent because the compile refused
+`duplicate unit identity for streamID 9` (recorded as
+`historical_absence.evidence.historical_compile_refusal`). Two valid polygons
+carry `streamID 9`: one single cell and one 801-vertex catchment of about
+8.40 km² whose bounding box encloses it. Their interiors do not overlap
+(`interior_overlapping_pairs` is empty, `overlap_area_km2` is 0.0), they
+dissolve into one `MultiPolygon`, and the streamnet carries `LINKNO 9` exactly
+once. The schema 1 ledger classified this identity as `source defect` under the
+superseded rule `duplicate-ground-equality-v1`, which asked whether the rows
+covered the same ground; that question does not distinguish a multipart
+encoding from a contradiction.
+
+`5020049720` was historically absent because its transfer failed
 (`historical_absence.verdict` is `transfer failure`); the later compile of the
-acquired source refused `duplicate unit identity for streamID 24`, and its
-`current_disposition.verdict` is `source defect` under
-`duplicate-ground-equality-v1`: seventeen valid polygons carry `streamID 24`
-(sixteen single-cell polygons along a diagonal at about 142.108 E, 10.082 S
-plus one 1,009-vertex catchment of about 5.79 km² whose bounding box encloses
-them), they are pairwise disjoint (`overlap_area_km2` is 0.0), and the
-streamnet carries `LINKNO 24` exactly once. The recorded `layer` counts show
-the duplication is systemic in that product: 211,758 of its 933,755 distinct
-`streamID` values are carried by more than one of its 1,453,118 polygon rows,
-while the streamnet carries 933,991 unique `LINKNO` values. The `1020018110`
-product shows the same pattern at 122,259 duplicated identities. Whether
-disjoint single-part pieces of one catchment should be unioned into one
-drainage unit is a generic adapter decision that this ledger records but does
-not take. The
-other five basins carry `null` because their orientation refusals are
-adjudicated separately.
+acquired source refused `duplicate unit identity for streamID 24`. Seventeen
+valid polygons carry `streamID 24`: sixteen single-cell polygons along a
+diagonal at about 142.108 E, 10.082 S plus one 1,009-vertex catchment of about
+5.79 km² whose bounding box encloses them. No two interiors overlap, they
+dissolve into one `MultiPolygon`, and the streamnet carries `LINKNO 24` exactly
+once.
+
+The recorded `layer` and `streamnet` counts document the encoding difference:
+`5020049720` declares geometry type `Polygon` and carries 1,453,118 rows for
+933,755 distinct `streamID` values (211,758 of them shared) against 933,991
+reaches; `1020018110` declares `Polygon` and carries 924,556 rows for 515,349
+distinct values (122,259 shared) against 515,435 reaches. Control basin
+`7020000010` declares `Unknown`, carries 331,263 rows for 331,263 distinct
+values against 331,386 reaches, and stores its multipart catchments as native
+`MultiPolygon` rows. In all three, distinct `streamID` values fall slightly
+below the reach count, the ordinary polygon-less contraction case. The other
+five basins carry `null` because their orientation refusals are adjudicated
+separately.
 
 ### Duplicate identity adjudication
 
@@ -444,6 +470,7 @@ uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py \
   --basins <path>/5020049720-basins.gpkg \
   --processing-basin-id 5020049720 \
   --streamnet <path>/5020049720-streamnet.gpkg \
+  --stream-id 24 \
   > 5020049720-duplicate-identity.json
 ```
 
@@ -464,24 +491,26 @@ must be regular single-layer GeoPackages whose layer is `basins` or
 `TDX_streamnet_<processing-basin-id>_01`; a symlink, a multi-layer file, or a
 layer for another basin refuses.
 
-Rule `duplicate-ground-equality-v1` applies to every feature carrying the
-identity, however many there are: when every feature is spatially equal to the
-first, the features cover the same ground and the verdict is `adapter
-strictness`; otherwise they cover different ground under one identity and the
-verdict is `source defect`. A structurally unusable, invalid, or non-finite
-geometry refuses, as does a measurement set where coordinate sequences are
-equal but geometries are not. Each feature is recorded with its `identifier`,
+Rule `duplicate-identity-part-overlap-v1` is the same rule the compile
+dissolve applies. Every feature carrying the identity is a part. When no two
+parts overlap in interior, the parts are one catchment stored as single-part
+rows and the verdict is `adapter strictness`; the evidence records the
+dissolved geometry type. When any two parts overlap in interior, the identity
+is self-contradictory and the verdict is `source defect`; the evidence lists
+the overlapping part index pairs. A structurally unusable, invalid, or
+non-finite geometry refuses. Each feature is recorded with its `identifier`,
 `vertex_count`, `bbox`, geodesic `area_km2`, and full `coordinates`; the
-identity also records `union_area_km2` and `overlap_area_km2` so a reader can
-see whether the features overlap without recomputing geometry, and the
-`layer` counts so one identity is never mistaken for the only one.
+identity also records `union_area_km2` and `overlap_area_km2`, the `layer`
+counts (geometry type, rows, distinct and shared identities) and the streamnet
+reach count so the encoding difference is visible without reopening the
+source.
 
 The command emits one canonical JSON document to stdout with `adjudication_kind`
 `duplicate identity`, `schema_version` 1, the source identity, the `layer`
 counts, the selection mode (`discovered` or `requested`), the adjudicated
-identities, and one verdict
-per identity in the same evidence shape as the ledger's historical duplicate
-record. It never writes files, compiles, or contacts NGA.
+identities, and one verdict per identity in the same evidence shape as the
+ledger's historical duplicate record. `--streamnet` is required. The command
+never writes files, compiles, or contacts NGA.
 
 ## Campaign notes
 
