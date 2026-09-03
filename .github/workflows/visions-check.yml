@@ -1,0 +1,32 @@
+name: Vision checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    paths:
+      - 'planning/visions/**'
+      - 'scripts/verify_visions.py'
+      - 'scripts/test_verify_visions.py'
+      - '.github/workflows/visions-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  visions:
+    if: ${{ github.event.pull_request.draft == false }}
+    name: Canonical vision provenance
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify canonical visions
+        run: |
+          python3 -m unittest scripts/test_verify_visions.py -v
+          python3 scripts/verify_visions.py --repository "${{ github.repository }}"
