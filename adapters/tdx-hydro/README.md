@@ -317,6 +317,12 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 under which the seven processing basins are absent. The adjudicator at commit
 `bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
 
+The author-ready evidence packet for the confirmed `1020018110` source defect,
+with the two `streamID 9` polygons as GeoJSON and a sendable draft message, is
+kept under
+[`source-defect-reports/1020018110-streamid-9/`](source-defect-reports/1020018110-streamid-9/REPORT.md);
+the maintainer reviews and sends it, and nothing in this repository transmits it.
+
 The acquired geometry sources and fixed feature identities are:
 
 - `salvage/downloads/1020018110-basins.gpkg`, `streamID 9`
