@@ -17,7 +17,7 @@ strict-validated HFX v0.3.0 partial fabric with these recorded properties:
 | Region | `tdx-hydro-partial-4dbff0d6ec31` |
 | Format version | 0.3.0 |
 | Fabric version | `NGA-TDX-Hydro-20230126` |
-| Total exported bytes | 114,063,230,627 |
+| Exported dataset bytes | 114,063,230,627 |
 | Strict validation completed | 2026-08-07T04:57:16Z |
 | Export destination at campaign completion | `s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/` |
 
@@ -48,11 +48,11 @@ that mirror during the Program #103 record migration:
 5. The pipeline and assembly roster difference is exactly:
    `1020018110`, `2020003440`, `2020065840`, `2020071190`, `4020050470`,
    `5020049720`, and `6020000010`.
-6. Campaign-time state records `1020018110`, `2020003440`, and `2020071190` as
-   compile failures. The other four each exhausted two interrupted acquisition attempts
-   and remained pending compilation.
-7. `mirror/logs/export-deadline.log` records successful validation, six exported objects,
-   and 114,063,230,627 exported bytes.
+6. The campaign outcome record identifies `1020018110`, `2020003440`, and
+   `2020071190` as compile failures. The other four each exhausted two interrupted
+   acquisition attempts and remained pending compilation.
+7. `mirror/logs/export-deadline.log` records successful validation, six exported dataset
+   objects, and 114,063,230,627 dataset bytes.
 
 The strict validator path used by the campaign runs `hfx --strict --sample-pct 100`; see
 [`adapters/tdx-hydro/build_adapter.py`](../../adapters/tdx-hydro/build_adapter.py). The
