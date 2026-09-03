@@ -317,11 +317,22 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 under which the seven processing basins are absent. The adjudicator at commit
 `bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
 
-The author-ready evidence packet for the confirmed `1020018110` source defect,
-with the two `streamID 9` polygons as GeoJSON and a sendable draft message, is
-kept under
-[`source-defect-reports/1020018110-streamid-9/`](source-defect-reports/1020018110-streamid-9/REPORT.md);
-the maintainer reviews and sends it, and nothing in this repository transmits it.
+The `1020018110` duplicate `streamID` finding is an encoding inconsistency
+between NGA products. Every processing basin that compiles stores its `basins`
+layer with GeoPackage geometry type `Unknown`, mixing `Polygon` and
+`MultiPolygon` rows, with multipart catchments of up to 266 parts and one row
+per `streamID`. The `1020018110` and `5020049720` products store the layer with
+geometry type `Polygon` and one row per part: `1020018110` holds 924,556 rows,
+122,259 `streamID` values carried by more than one row, and 515,435 streamnet
+reaches; `5020049720` holds 1,453,118 rows, 211,758 `streamID` values carried by
+more than one row, and 933,991 reaches. The two `streamID 9` rows are one single
+cell and an 8.40 km2 catchment that share a vertex, and `streamID 24` in
+`5020049720` is 16 diagonal cells touching a 5.79 km2 catchment; the parts are
+pairwise disjoint in both cases. The identifiers are consistent within each
+product, so the finding is a single-part catchment encoding that the adapter
+unions into one `MultiPolygon` unit per `streamID`, refusing only on interior
+overlap. No source-defect report is warranted, and none was sent. The geometry
+evidence remains in [`seven-basin-verdicts.json`](seven-basin-verdicts.json).
 
 The acquired geometry sources and fixed feature identities are:
 

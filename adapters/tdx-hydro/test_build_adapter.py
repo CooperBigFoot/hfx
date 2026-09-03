@@ -6691,24 +6691,5 @@ class BasinAdjudicationTests(unittest.TestCase):
             self.assertEqual(before, (snapshot(acquired), snapshot(historical)))
 
 
-class SourceDefectReportPacketTests(unittest.TestCase):
-    def test_packet_geojson_matches_ledger_coordinates_exactly(self) -> None:
-        adapter_dir = Path(__file__).parent
-        ledger = json.loads((adapter_dir / "seven-basin-verdicts.json").read_text())
-        (verdict,) = [value for value in ledger["verdicts"] if value["processing_basin_id"] == "1020018110"]
-        packet = json.loads((adapter_dir / "source-defect-reports" / "1020018110-streamid-9" / "features.geojson").read_text())
-        self.assertEqual(verdict["verdict"], "source defect")
-        self.assertEqual(len(packet["features"]), 2)
-        self.assertEqual(
-            [feature["geometry"]["coordinates"] for feature in packet["features"]],
-            [feature["coordinates"] for feature in verdict["evidence"]["features"]],
-        )
-        self.assertEqual(
-            [feature["properties"] for feature in packet["features"]],
-            [{"streamID": verdict["evidence"]["streamID"], "feature_index": 1}, {"streamID": verdict["evidence"]["streamID"], "feature_index": 2}],
-        )
-        self.assertTrue(all(feature["geometry"]["type"] == "Polygon" for feature in packet["features"]))
-
-
 if __name__ == "__main__":
     unittest.main()
