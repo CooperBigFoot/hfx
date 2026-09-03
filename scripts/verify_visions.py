@@ -6,10 +6,15 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
-FILENAME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
-REPOSITORY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
+FILENAME_RE = re.compile(
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})-[a-z0-9]+(?:-[a-z0-9]+)*\.md"
+)
+REPOSITORY_RE = re.compile(
+    r"(?![A-Za-z0-9-]*--)[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}"
+)
 
 
 def verify(root: Path, repository: str) -> list[str]:
@@ -37,8 +42,14 @@ def verify(root: Path, repository: str) -> list[str]:
 
     seen_efforts: dict[str, Path] = {}
     for path in visions:
-        if FILENAME_RE.fullmatch(path.name) is None:
+        filename = FILENAME_RE.fullmatch(path.name)
+        if filename is None:
             errors.append(f"{path}: filename must use YYYY-MM-DD-lowercase-slug.md")
+        else:
+            try:
+                date.fromisoformat(filename.group("date"))
+            except ValueError:
+                errors.append(f"{path}: filename contains an invalid calendar date")
 
         lines = path.read_text(encoding="utf-8").splitlines()
         if not lines or not lines[0].startswith("# "):

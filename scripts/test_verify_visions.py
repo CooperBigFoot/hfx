@@ -66,6 +66,21 @@ class VerifyVisionsTests(unittest.TestCase):
         errors = self.verify_files({"Test Vision.md": vision()})
         self.assertTrue(any("filename must use" in error for error in errors))
 
+    def test_rejects_invalid_calendar_month(self) -> None:
+        errors = self.verify_files({"2026-13-01-test.md": vision()})
+        self.assertTrue(any("invalid calendar date" in error for error in errors))
+
+    def test_rejects_non_leap_year_february_29(self) -> None:
+        errors = self.verify_files({"2026-02-29-test.md": vision()})
+        self.assertTrue(any("invalid calendar date" in error for error in errors))
+
+    def test_accepts_valid_leap_day(self) -> None:
+        self.assertEqual(self.verify_files({"2028-02-29-test.md": vision()}), [])
+
+    def test_rejects_invalid_repository_owner(self) -> None:
+        errors = self.verify_files({"2026-09-03-test.md": vision()}, repository="bad-/repo")
+        self.assertTrue(any("malformed canonical repository" in error for error in errors))
+
     def test_current_repository_visions_pass(self) -> None:
         root = Path(__file__).resolve().parents[1] / "planning" / "visions"
         self.assertEqual(verify(root, REPOSITORY), [])
