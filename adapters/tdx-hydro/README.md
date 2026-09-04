@@ -241,6 +241,17 @@ uv run python build_adapter.py orient \
   --report ./out/7020000010-orient.json
 ```
 
+Compare two compiled outputs of one processing basin unit by unit against a maintainer-adjudicated outlet difference. `compare_unit_outlets.py` reads every row of `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet` of both roots and accepts the candidate only when every same-level graph edge, every polygon, every non-outlet attribute, the unit set, and the row order are identical to the reference, the set of units whose outlet differs equals exactly the native LINKNO set pinned in the `--expected` record, every shift lies within the pinned `max_shift_deg`, and snap stems differ only for units inside that set. It recomputes the orientation digest of each root from its own graph and outlet columns, which is the same byte layout `orient` digests from source topology, and requires the reference digest to equal `planetary_orientation_digest`, the candidate digest to equal `corrected_orientation_digest`, and an optional `--orient-report` to carry the candidate digest. The manifests must agree on everything except `created_at`. The report names every refusal and the process exits `1` on any of them. The tracked record for control basin `7020000010` is `scripts/hetzner/seven-basin-control-adjudication.json`:
+
+```bash
+uv run python compare_unit_outlets.py \
+  --reference /path/to/preserved/7020000010 \
+  --candidate /path/to/corrected/7020000010 \
+  --expected ../../scripts/hetzner/seven-basin-control-adjudication.json \
+  --orient-report ./out/7020000010-orient.json \
+  --report ./out/7020000010-compare-adjudicated-outlets.json
+```
+
 Assemble explicit compiled processing-basin roots into one HFX dataset:
 
 ```bash
