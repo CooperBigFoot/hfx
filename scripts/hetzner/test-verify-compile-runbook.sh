@@ -103,10 +103,10 @@ mutate() {
 mutated=$(mutate no-contract 's/<!-- BEGIN COMPILE CAMPAIGN CONTRACT\n.*?\nEND COMPILE CAMPAIGN CONTRACT -->\n//s')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'missing or repeated compile campaign contract'
-mutated=$(mutate malformed-contract 's/"schema": 3,/"schema": 3,,/')
+mutated=$(mutate malformed-contract 's/"schema": 4,/"schema": 4,,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'malformed compile campaign contract'
-mutated=$(mutate duplicate-key 's/"schema": 3,/"schema": 3,\n  "schema": 3,/')
+mutated=$(mutate duplicate-key 's/"schema": 4,/"schema": 4,\n  "schema": 4,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'duplicate contract key'
 pass 'a missing, malformed, or duplicate-key contract refuses'
@@ -117,6 +117,18 @@ assert_contains "$stderr" 'wrong campaign identity'
 mutated=$(mutate two-lifecycles 's/"lifecycles_authorized": 1/"lifecycles_authorized": 2/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'exactly one lifecycle'
+mutated=$(mutate second-consumed 's/"workload_dispatched": false}\n/"workload_dispatched": false},\n      {"date": "2026-09-05", "cause": "x", "workload_dispatched": true}\n/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'lifecycle ledger does not record exactly the consumed 2026-09-04 lifecycle'
+mutated=$(mutate two-authorized 's/"lifecycles": 1,/"lifecycles": 2,/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'current lifecycle authority is not the 2026-09-04 maintainer decision for one lifecycle'
+mutated=$(mutate pending-record 's/"record": "[^"]*"/"record": "PR-URL-PENDING"/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'current lifecycle authority does not name its record'
+mutated=$(mutate one-only-removed 's/The 2026-09-04 authorization covers one lifecycle only\. //')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'runbook omits required operational text'
 mutated=$(mutate extra-basin 's/"6020000010"\]/"6020000010", "9020000010"]/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'seven-basin scope is not exact'

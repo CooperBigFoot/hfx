@@ -135,9 +135,18 @@ require_phrase() {
 
 case $check in
     scope-permits-compilation)
-        require_field '.schema' 3 'unknown contract schema'
+        require_field '.schema' 4 'unknown contract schema'
         require_field '.campaign' "\"$HFX_EXPECTED_CAMPAIGN\"" 'wrong campaign identity'
         require_field '.lifecycles_authorized' 1 'contract must authorize exactly one lifecycle'
+        require_field '.lifecycle_ledger.consumed | map({date, cause, workload_dispatched})' \
+            '[{"date":"2026-09-04","cause":"hcloud-json-shape-mismatch","workload_dispatched":false}]' \
+            'lifecycle ledger does not record exactly the consumed 2026-09-04 lifecycle'
+        require_field '.lifecycle_ledger.current_authority | {maintainer, date, lifecycles}' \
+            '{"maintainer":"Nicolas Lazaro","date":"2026-09-04","lifecycles":1}' \
+            'current lifecycle authority is not the 2026-09-04 maintainer decision for one lifecycle'
+        jq -e '.lifecycle_ledger.current_authority.record | type == "string" and length > 0 and . != "PR-URL-PENDING"' <<<"$contract" >/dev/null 2>&1 ||
+            fail 'current lifecycle authority does not name its record'
+        require_phrase 'The 2026-09-04 authorization covers one lifecycle only.'
         require_field '.server_name' "\"$(hfx_server_name "$HFX_EXPECTED_CAMPAIGN")\"" 'wrong mutable server'
         require_field '.volume_name' "\"$(hfx_volume_name "$HFX_EXPECTED_CAMPAIGN")\"" 'wrong mutable volume'
         require_field '.out_of_scope_resources' '["pourpoint-web-1"]' 'pourpoint-web-1 is not declared out of scope'

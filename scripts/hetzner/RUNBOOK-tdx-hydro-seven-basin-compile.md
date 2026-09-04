@@ -8,12 +8,18 @@ version_policy is NONE: NO version bump, NO tag.
 
 <!-- BEGIN COMPILE CAMPAIGN CONTRACT
 {
-  "schema": 3,
+  "schema": 4,
   "campaign": "seven-basin-extension",
   "authority_ref": "69747055bcb1876d9d1fad48c60f5cae6a24ea60",
   "authority_document": "planning/visions/2026-09-03-close-the-seven-basin-coverage-gap.md",
   "authority_section": "Compute and preservation constraints",
   "lifecycles_authorized": 1,
+  "lifecycle_ledger": {
+    "consumed": [
+      {"date": "2026-09-04", "provisioning_request": "2026-09-04T10:46:18Z", "zero_footprint": "2026-09-04T10:50:58Z", "server_id": 164550505, "volume_id": 106790870, "cause": "hcloud-json-shape-mismatch", "workload_dispatched": false}
+    ],
+    "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/232", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
+  },
   "server_name": "hfx-build-seven-basin-extension",
   "volume_name": "hfx-build-seven-basin-extension-data",
   "server_type": "ccx33",
@@ -73,7 +79,11 @@ The permitted acts are the transfer of the preserved source corpus, reacquisitio
 
 The one lifecycle this contract authorizes was spent on 2026-09-04. Provisioning and bootstrap succeeded (provisioning request 10:46:18Z, bootstrap complete 10:50:23Z). The section 8 identity gate then read the server location through `.datacenter.location.name`, a path that hcloud v1.66.0 leaves null, so the recorded projection carried `"location": null`, the value gate returned false, and the strict-mode driver entered the cleanup path. No workload was dispatched. Exact-resource teardown removed server `164550505` and volume `106790870`, zero footprint was proven at 10:50:58Z, and `pourpoint-web-1` was untouched. The billed interval was under five minutes, so the gross cost is negligible. The operator record is `seven-basin-extension/OPERATOR-LOG.md` under the evidence root.
 
-The gate now projects every identity through the tracked `scripts/hetzner/hcloud-identity.jq`, and section 6 proves that projection against the installed CLI before any provisioning request. Running this runbook again requires new maintainer authority recorded in the authority document before provisioning. This record grants none.
+The gate now projects every identity through the tracked `scripts/hetzner/hcloud-identity.jq`, and section 6 proves that projection against the installed CLI before any provisioning request. This consumed-lifecycle record grants nothing by itself; the authority for the next lifecycle is the maintainer decision recorded below.
+
+### Second lifecycle authorized on 2026-09-04
+
+After that lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 exactly one further bounded lifecycle under the same limits: one `ccx33` in `fsn1`, one 600 GB volume, strictly under 72 hours from the provisioning request, strictly under EUR 40.00 projected and actual, and exact-resource teardown. The authority is that maintainer decision, recorded in the pull request named by `lifecycle_ledger.current_authority.record` in the contract, together with the vision on `main`. The contract's `lifecycles_authorized` stays at one because each authority grants one lifecycle and the ledger records which one is current. The 2026-09-04 authorization covers one lifecycle only. When it is spent, the ledger must record it as consumed, and any further lifecycle again requires new maintainer authority before provisioning.
 
 ## 2. Fixed ceilings and retention
 
@@ -136,12 +146,15 @@ CORPUS_MANIFEST="$HFX_CAMPAIGN_EVIDENCE/attempt21-source-remote-sha256.txt"
 PLANETARY_MIRROR="$PWD/tdx-m5-planetary-evidence/mirror"
 PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
 mkdir -p -- "$LOCAL_EVIDENCE_DIR"
-chmod 700 -- "$LOCAL_EVIDENCE_DIR"
+chmod 700 "$LOCAL_EVIDENCE_DIR"
+rsync --version | head -n 1 | grep -E '^rsync +version 3\.[1-9]'
 
 printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be displayed):' >&2
 IFS= read -r S3_ENV_FILE
 test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
 ```
+
+The workstation is macOS. Its BSD `chmod` reads `--` after the mode as a file name, so the mode line above carries no `--`; the first 2026-09-04 launch died on that line before any cloud call. Its bundled `/usr/bin/rsync` is openrsync, which rejects the `--info=progress2` flag the section 9 transfer fence uses, so GNU rsync 3.1 or later must be first on `PATH` (Homebrew installs it as `/opt/homebrew/bin/rsync`); the version line above refuses otherwise. The workstation-side digest commands use `shasum -a 256` and `stat -f`, which are the BSD forms; the `sha256sum` and `stat -c` forms appear only inside `ssh` heredocs that run on the Debian VM.
 
 The shell sets `IFS` to newline and tab, so the seven absent basins are held in a Bash array and every loop iterates `"${ABSENT_IDS[@]}"`; a space-separated string would be one word under that `IFS`. The count check above proves the array holds seven entries.
 
