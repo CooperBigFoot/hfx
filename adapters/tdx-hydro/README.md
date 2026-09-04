@@ -50,7 +50,9 @@ The adapter emits level-0 units only. A unit exists exactly when a basin polygon
 basins.streamID = streamnet.LINKNO
 ```
 
-Every basin polygon must join to one streamnet row. Missing or duplicate identities are fatal. There is no spatial fallback. Polygon-less streamnet links do not become drainage units, and `parent_id` is null for every emitted unit.
+Every basin polygon must join to one streamnet row. A missing identity is fatal. There is no spatial fallback. Polygon-less streamnet links do not become drainage units, and `parent_id` is null for every emitted unit.
+
+Some processing basins store a multipart catchment as several single-part `Polygon` rows that share one `streamID`. Their `basins` layer declares the GeoPackage geometry type `POLYGON`, which pyogrio reports as `Polygon`; basins that store native `MultiPolygon` rows declare `GEOMETRY`, which pyogrio reports as `Unknown`. This README uses the pyogrio names, `Polygon` and `Unknown`, because the ledger records them. Before any other source validation, the adapter dissolves every group of rows sharing a `streamID` into one unit whose geometry is the union of the parts, so the unit count equals the count of distinct `streamID` values and the dissolved unit follows the same clamp, area, Hilbert, outlet, and snap-stem path as a native `MultiPolygon` unit. Parts that are disjoint or touch only at edges or corners are the normal multipart case. Two parts whose interiors overlap contradict each other; that group, and with it the basin, is refused with `basins streamID N has K parts whose interiors overlap`. An invalid, empty, or three-dimensional part refuses before the overlap test. The report records `basins_dissolve.dissolved_unit_count`, `dissolved_part_count`, and `max_part_count`, all zero for a layer without shared identities.
 
 The native same-level relation is `LINKNO -> DSLINKNO`. For each polygon-bearing link, the adapter follows `DSLINKNO` through zero or more polygon-less links until it reaches the first polygon-bearing downstream link or `-1`. The former creates one contracted same-level edge; the latter makes the unit a root. The report distinguishes `contracted_edge_count`, `contracted_root_count`, and the total `contracted_link_traversal_count`.
 
@@ -136,6 +138,9 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.ingestion.dscontarea.signed_aggregate_relative_divergence`
 - `diagnostics.ingestion.dscontarea.absolute_aggregate_relative_divergence`
 - `diagnostics.ingestion.dscontarea.max_absolute_relative_divergence`
+- `diagnostics.ingestion.basins_dissolve.dissolved_unit_count`
+- `diagnostics.ingestion.basins_dissolve.dissolved_part_count`
+- `diagnostics.ingestion.basins_dissolve.max_part_count`
 - `diagnostics.streamnet.polygon_bearing_link_count`
 - `diagnostics.streamnet.polygonless_dropped_reach_count`
 - `diagnostics.streamnet.degenerate_reach_count`
@@ -185,7 +190,7 @@ weight_semantics = "Drainage-area weight equals inclusive DSContArea in km2; hig
 - `diagnostics.memory.selected_dtypes.hilbert`
 - `diagnostics.memory.selected_dtypes.flags`
 
-The phase keys are `basins_load`, `streamnet_load`, `source_validate`,
+The phase keys are `basins_load`, `streamnet_load`, `basins_dissolve`, `source_validate`,
 `basins_clamp`, `streamnet_clamp`, `source_post_clamp_validate`,
 `dscontarea_infer`, `topology`, `catchment_run_creation`,
 `catchment_graph_merge_write`, `snap_run_creation`, and `snap_merge_write`.
@@ -283,8 +288,14 @@ processing basins from two local, read-only evidence trees:
 ```bash
 uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py adjudicate \
   --acquired-evidence-root tdx-m5-seven-acquire-evidence \
-  --historical-evidence-root tdx-m5-planetary-evidence
+  --historical-evidence-root tdx-m5-planetary-evidence \
+  --current-disposition 1020018110-duplicate-identity.json \
+  --current-disposition 5020049720-duplicate-identity.json
 ```
+
+Each `--current-disposition` argument names one document written by the
+`adjudicate-duplicate-identity` command described below. The flag is optional
+and repeatable; at most one document per processing basin is accepted.
 
 The fixed processing-basin order is `1020018110`, `2020003440`, `2020065840`,
 `2020071190`, `4020050470`, `5020049720`, and `6020000010`. Acquired products
@@ -315,28 +326,24 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 `adapter.git_revision` value
 `bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
 under which the seven processing basins are absent. The adjudicator at commit
-`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the ledger verdicts.
+`bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the schema 1 ledger; the
+adjudicator at commit `6c22080` regenerated it as schema 2 with the two
+duplicate-identity documents named above, each produced by the same commit.
 
-The `1020018110` duplicate `streamID` finding is an encoding inconsistency
-between NGA products. Every processing basin that compiles stores its `basins`
-layer with GeoPackage geometry type `Unknown`, mixing `Polygon` and
-`MultiPolygon` rows, with multipart catchments of up to 266 parts and one row
-per `streamID`. The `1020018110` and `5020049720` products store the layer with
-geometry type `Polygon` and one row per part: `1020018110` holds 924,556 rows,
-122,259 `streamID` values carried by more than one row, and 515,435 streamnet
-reaches; `5020049720` holds 1,453,118 rows, 211,758 `streamID` values carried by
-more than one row, and 933,991 reaches. The two `streamID 9` rows are one single
-cell and an 8.40 km2 catchment that share a vertex, and `streamID 24` in
-`5020049720` is 16 diagonal cells touching a 5.79 km2 catchment; the parts are
-pairwise disjoint in both cases. The identifiers are consistent within each
-product, so the finding is a single-part catchment encoding that the adapter
-unions into one `MultiPolygon` unit per `streamID`, refusing only on interior
-overlap. No source-defect report is warranted, and none was sent. The geometry
-evidence remains in [`seven-basin-verdicts.json`](seven-basin-verdicts.json).
+The `1020018110` and `5020049720` duplicate `streamID` findings are one
+encoding inconsistency between NGA products, described under "Ledger schema 2"
+below. No source-defect report is warranted for either, and none was sent.
 
-The acquired geometry sources and fixed feature identities are:
+The acquired geometry sources and feature identities are:
 
-- `salvage/downloads/1020018110-basins.gpkg`, `streamID 9`
+- `salvage/downloads/1020018110-basins.gpkg`, the smallest duplicated
+  `streamID` found by an attribute-only index of the layer (`streamID 9`, the
+  identity the historical compile refusal names, recorded as
+  `historical_compile_refusal`), with
+  `salvage/downloads/1020018110-streamnet.gpkg` supplying the reach count and
+  the `LINKNO 9` feature count; the evidence `layer` counts record that
+  122,259 of the layer's 515,349 distinct `streamID` values are shared across
+  its 924,556 `Polygon` rows
 - `salvage/downloads/2020003440-streamnet.gpkg`, `LINKNO 148956` and its
   `DSLINKNO` successor
 - `salvage/downloads/2020071190-streamnet.gpkg`, root `LINKNO 1104039` and every
@@ -364,8 +371,9 @@ and products:
 
 The ledger records every raw measurement consumed by the adjudicators and is
 the single verdict authority. The duplicate record's machine-readable
-`derivation` object supplies its preconditions, consistency rule, branches, and
-selected branch. For the non-root record, `adapter strictness` applies exactly
+`derivation` object supplies its preconditions, branches, and selected branch
+under rule `duplicate-identity-part-overlap-v1`, described below. For the
+non-root record, `adapter strictness` applies exactly
 when `endpoint_separation <= non_root_near_degenerate_limit`, `DSContArea <
 successor_DSContArea`, and any emitted tolerance match has
 `current_endpoint_index == 1`; every other measured combination yields `source
@@ -377,6 +385,140 @@ of exactly one historical product plus successful later acquisition identities
 for both products yields `transfer failure`.
 
 Both evidence trees remained read-only, and no bulk evidence is committed.
+
+### Ledger schema 2: historical reason and current disposition
+
+Every ledger entry carries two distinct fields:
+
+- `historical_absence` records why the processing basin was absent from the
+  55-basin campaign as `verdict`, `evidence_kind`, and `evidence`. For six of
+  the seven basins the object is byte-identical to the schema 1 entry (the
+  committed-ledger test pins their canonical sha256). For `1020018110` it
+  carries three distinct facts: the compile refusal that caused the absence
+  (`evidence.historical_compile_refusal`), the superseded schema 1 adjudication
+  recorded verbatim (`evidence.superseded_adjudication`), and the
+  classification re-derived under the current rule (`verdict` and the rest of
+  `evidence`).
+- `current_disposition` records the basin's current source-backed disposition,
+  or `null` when this ledger holds none. `null` means no duplicate-identity
+  document was supplied for that basin; the historical reason remains its
+  latest classification. A non-null disposition carries `verdict`,
+  `evidence_kind` (always `acquired source geometry`), `adjudication_kind`
+  (`duplicate identity`), and `evidence` with the document's `source`,
+  `stream_id_selection`, `duplicated_stream_ids`, and one `identities` entry
+  per duplicated identity. Its `verdict` is `source defect` when any identity
+  is a source defect and `adapter strictness` otherwise.
+
+Before a document is accepted, its `source` `bytes`, `sha256`, and
+`layer_name` must equal the acquired basins evidence attested in
+`salvage/state/basins/<processing-basin-id>/current.json`, so a disposition
+about other bytes refuses the whole ledger.
+
+In the committed ledger, `1020018110` and `5020049720` carry non-null current
+dispositions, both `adapter strictness` under
+`duplicate-identity-part-overlap-v1`.
+
+The finding is an encoding inconsistency between NGA products. Every
+processing basin that compiles stores its `basins` layer with geometry type
+`Unknown`, mixing `Polygon` and `MultiPolygon` rows, with multipart catchments
+of up to 266 parts and one row per `streamID`. The `1020018110` and
+`5020049720` products store the layer with geometry type `Polygon` and one row
+per part. The recorded `layer` and `streamnet` counts document it:
+`5020049720` carries 1,453,118 rows for 933,755 distinct `streamID` values
+(211,758 of them shared) against 933,991 reaches; `1020018110` carries 924,556
+rows for 515,349 distinct values (122,259 shared) against 515,435 reaches.
+Control basin `7020000010` declares `Unknown` and carries 331,263 rows for
+331,263 distinct values against 331,386 reaches. In all three, distinct
+`streamID` values fall slightly below the reach count, the ordinary
+polygon-less contraction case. The identifiers are consistent within each
+product, so several rows under one `streamID` are one multipart catchment in a
+different encoding, which the compile dissolve now accepts, refusing only on
+interior overlap.
+
+`1020018110` was historically absent because the compile refused
+`duplicate unit identity for streamID 9`, recorded as
+`historical_absence.evidence.historical_compile_refusal`. Two valid polygons
+carry `streamID 9`: one single cell and one 801-vertex catchment of about
+8.40 km² whose bounding box encloses it; they share a vertex. Their interiors
+do not overlap (`interior_overlapping_pairs` is empty, `overlap_area_km2` is
+0.0), they dissolve into one `MultiPolygon`, and the streamnet carries
+`LINKNO 9` exactly once. The schema 1 ledger classified this identity as
+`source defect` under the superseded rule `duplicate-ground-equality-v1`,
+which asked whether the rows covered the same ground; that question does not
+distinguish a multipart encoding from a contradiction. That classification is
+preserved verbatim as `historical_absence.evidence.superseded_adjudication`
+(verdict, rule id, the adapter git revision `bca87d8` it examined, ledger
+schema version 1), a recorded value the adjudicator never re-derives, while
+`historical_absence.verdict` is re-derived under the current rule.
+
+`5020049720` was historically absent because its transfer failed
+(`historical_absence.verdict` is `transfer failure`, byte-identical to schema
+1); the later compile of the acquired source refused
+`duplicate unit identity for streamID 24`. Seventeen valid polygons carry
+`streamID 24`: sixteen single-cell polygons along a diagonal at about
+142.108 E, 10.082 S touching one 1,009-vertex catchment of about 5.79 km²
+whose bounding box encloses them. No two interiors overlap, they dissolve into
+one `MultiPolygon`, and the streamnet carries `LINKNO 24` exactly once.
+
+The other five basins carry `null` because their orientation refusals are
+adjudicated separately. `test_build_adapter.py` reads the committed ledger and
+checks these invariants (`CommittedVerdictLedgerTests`): schema version 2,
+the seven entries in order, the six schema 1 historical entries byte-identical
+to a pinned canonical sha256, the two current dispositions with their rule
+id, counts, and reach counts, and the recorded superseded adjudication.
+
+### Duplicate identity adjudication
+
+Any duplicated `streamID` in any processing basin's `basins` product can be
+adjudicated from source geometry alone, without campaign state:
+
+```bash
+uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py \
+  adjudicate-duplicate-identity \
+  --basins <path>/5020049720-basins.gpkg \
+  --processing-basin-id 5020049720 \
+  --streamnet <path>/5020049720-streamnet.gpkg \
+  --stream-id 24 \
+  > 5020049720-duplicate-identity.json
+```
+
+In both modes the command first indexes the layer's duplicated `streamID`
+values and their feature IDs in one attribute-only pass over the feature ID
+and `streamID` columns, run through the standard library `sqlite3` module in
+read-only, immutable mode, so no geometry is loaded and no journal file is
+created; the counts are recorded under `layer`. Without
+`--stream-id`, every discovered duplicated `streamID` is adjudicated, and the
+command refuses when none is duplicated. With `--stream-id N`, only that
+identity is adjudicated, and the command refuses when fewer than two features
+carry it. Only the features carrying an adjudicated identity are ever read
+from the layer, by feature ID, so a basin with many duplicated identities
+should be examined one requested identity at a time. The required
+`--streamnet` argument supplies the reach count and, per identity, how many
+streamnet features carry the matching `LINKNO`; it never changes the verdict. Both files
+must be regular single-layer GeoPackages whose layer is `basins` or
+`TDX_streamnet_<processing-basin-id>_01`; a symlink, a multi-layer file, or a
+layer for another basin refuses.
+
+Rule `duplicate-identity-part-overlap-v1` is the same rule the compile
+dissolve applies. Every feature carrying the identity is a part. When no two
+parts overlap in interior, the parts are one catchment stored as single-part
+rows and the verdict is `adapter strictness`; the evidence records the
+dissolved geometry type. When any two parts overlap in interior, the identity
+is self-contradictory and the verdict is `source defect`; the evidence lists
+the overlapping part index pairs. A structurally unusable, invalid, or
+non-finite geometry refuses. Each feature is recorded with its `identifier`,
+`vertex_count`, `bbox`, geodesic `area_km2`, and full `coordinates`; the
+identity also records `union_area_km2` and `overlap_area_km2`, the `layer`
+counts (geometry type, rows, distinct and shared identities) and the streamnet
+reach count so the encoding difference is visible without reopening the
+source.
+
+The command emits one canonical JSON document to stdout with `adjudication_kind`
+`duplicate identity`, `schema_version` 1, the source identity, the `layer`
+counts, the selection mode (`discovered` or `requested`), the adjudicated
+identities, and one verdict per identity in the same evidence shape as the
+ledger's historical duplicate record. `--streamnet` is required. The command
+never writes files, compiles, or contacts NGA.
 
 ## Campaign notes
 
