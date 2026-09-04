@@ -327,8 +327,7 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 `bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
 under which the seven processing basins are absent. The adjudicator at commit
 `bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the schema 1 ledger; the
-adjudicator at commit `80349e0` plus the superseded-adjudication record
-regenerated it as schema 2 with the two
+adjudicator at commit `6c22080` regenerated it as schema 2 with the two
 duplicate-identity documents named above, each produced by the same commit.
 
 The `1020018110` and `5020049720` duplicate `streamID` findings are one
