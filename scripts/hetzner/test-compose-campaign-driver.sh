@@ -197,4 +197,83 @@ assert_contains "$tmp/f17/basin-outputs-verification.txt" 'no basin output was p
 [[ ! -s "$tmp/f17/compiled-absent-basins.txt" ]] || die 'compiled-absent-basins.txt should be empty when every compile failed'
 pass 'an empty basin-outputs manifest records a truthful empty outcome instead of aborting'
 
+# Every `bash -s --` fence must send its arguments as the quoted remote_args array, and the
+# composer must refuse any other form (the 2026-09-04 rehearsal died on a space-joined argument).
+sed 's|bash -s -- "$(remote_tokens "${remote_args\[@\]}")" <<'"'"'REMOTE'"'"' 2>&1 \| tee "$LOCAL_EVIDENCE_DIR/converge.log"|bash -s -- "$GROUND_TRUTH_REF" "$(remote_tokens "${remote_args[@]}")" <<'"'"'REMOTE'"'"' 2>\&1 \| tee "$LOCAL_EVIDENCE_DIR/converge.log"|' "$runbook" >"$tmp/unquoted-runbook.md"
+grep -q 'bash -s -- "$GROUND_TRUTH_REF" "$(remote_tokens' "$tmp/unquoted-runbook.md" || die 'mutation did not apply'
+expect_failure --runbook "$tmp/unquoted-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'sends remote arguments that are not the quoted remote_args array'
+perl -0pe 's/  remote_args=\("\$CAMPAIGN_DIR" "\$CONTROL_ROOT"\)\n//' "$runbook" >"$tmp/no-assignment-runbook.md"
+grep -q 'remote_args=("$CAMPAIGN_DIR" "$CONTROL_ROOT")' "$tmp/no-assignment-runbook.md" && die 'mutation did not apply'
+expect_failure --runbook "$tmp/no-assignment-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'has no remote_args assignment immediately before its ssh line'
+pass 'the composer refuses a bash -s fence with unquoted arguments or without a remote_args assignment'
+
+# Execute every bash -s fence's argument construction through a fake ssh that joins its remote
+# command into one string and re-splits it, exactly as the real ssh and remote login shell do,
+# then run the remote script's positional validation and dump what arrived.
+mkdir -p "$tmp/fake-ssh/bin"
+cat >"$tmp/fake-ssh/bin/ssh" <<'FAKE'
+#!/usr/bin/env bash
+# Drop options and the host, join the remaining words with spaces, and let a shell re-split them.
+while (($#)); do
+    case $1 in
+        -o) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift   # host
+joined="$*"
+exec bash -c "$joined"
+FAKE
+chmod +x "$tmp/fake-ssh/bin/ssh"
+# A resolved rehearsal contract: the tracked record's DERIVED placeholders replaced by numbers.
+contract=$tmp/fake-ssh/contract.json
+jq '.baseline.exported_bytes = 13184 | .baseline.object_count = 6 | .source_corpus.total_bytes = 786432' "$SCRIPT_DIR/rehearsal-campaign-contract.json" >"$contract"
+run_fence_arguments() {
+    local number=$1 fence=$tmp/full/fence-proof/driver-$1.sh site=0
+    local ssh_lines
+    ssh_lines=$(grep -n 'bash -s -- "$(remote_tokens "${remote_args\[@\]}")"' "$fence" | cut -d: -f1)
+    [[ -n "$ssh_lines" ]] || die "fence $number has no bash -s site"
+    for ssh_line in $ssh_lines; do
+        site=$((site + 1))
+        local assignment_line=$((ssh_line - 1)) heredoc_start=$((ssh_line + 1)) heredoc_end header_end
+        sed -n "${assignment_line}p" "$fence" | grep -q 'remote_args=(' || assignment_line=$((ssh_line - 2))
+        heredoc_end=$(awk -v start="$heredoc_start" 'NR >= start && /^REMOTE$/ { print NR; exit }' "$fence")
+        header_end=$(awk -v start="$heredoc_start" -v end="$heredoc_end" 'NR >= start && NR < end && /^test "\$#" -eq [0-9]+$/ { print NR; exit }' "$fence")
+        [[ -n "$heredoc_end" && -n "$header_end" ]] || die "fence $number site $site lacks a heredoc or its positional count check"
+        local expected_count
+        expected_count=$(sed -n "${header_end}p" "$fence" | sed -E 's/.* -eq ([0-9]+)$/\1/')
+        {
+            printf 'set -Eeuo pipefail\nIFS=$'"'"'\\n\\t'"'"'\n'
+            printf 'contract_value() { jq -er "$1" %s; }\n' "$contract"
+            printf 'remote_tokens() { local token; for token in "$@"; do printf '"'"'%%q '"'"' "$token"; done; }\n'
+            printf 'GROUND_TRUTH_REF=0123456789abcdef0123456789abcdef01234567\nSERVER_IP=127.0.0.1\nLOCAL_EVIDENCE_DIR=%s\n' "$tmp/fake-ssh/evidence"
+            printf 'CAMPAIGN=campaign-rehearsal\nCAMPAIGN_DIR="/mnt/hfx/work/tdx-hydro-campaign-rehearsal"\nCONTROL_ROOT="/mnt/hfx/work/control builds"\nBASELINE_ROOT="/mnt/hfx/work/base line"\n'
+            printf 'CONTROL_ID=7020000010\nCONTROL_FABRIC_VERSION="0.3.0 (rehearsal)"\nCONTROL_REFERENCE=vm-planetary-build\nFABRIC_VERSION="NGA-TDX-Hydro-20230126 rehearsal"\n'
+            printf 'BASELINE_PREFIX="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal/base line"\nEXTENSION_PREFIX="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal"\nS3_ENDPOINT=https://fsn1.your-objectstorage.com\n'
+            sed -n "${assignment_line}p" "$fence"
+            printf 'printf '"'"'%%s\\n'"'"' "${remote_args[@]}" > %s\n' "$tmp/fake-ssh/expected-$number-$site.txt"
+            printf 'ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'"'"'REMOTE'"'"'\n'
+            sed -n "${heredoc_start},${header_end}p" "$fence"
+            printf 'printf '"'"'%%s\\n'"'"' "$@" > %s\n' "$tmp/fake-ssh/arrived-$number-$site.txt"
+            printf 'REMOTE\n'
+        } >"$tmp/fake-ssh/harness-$number-$site.sh"
+        mkdir -p "$tmp/fake-ssh/evidence"
+        PATH="$tmp/fake-ssh/bin:$PATH" bash "$tmp/fake-ssh/harness-$number-$site.sh" >"$stdout" 2>"$stderr" ||
+            die "fence $number site $site: the remote side refused the arguments it received ($(cat "$stderr"))"
+        diff -u "$tmp/fake-ssh/expected-$number-$site.txt" "$tmp/fake-ssh/arrived-$number-$site.txt" >/dev/null ||
+            die "fence $number site $site: the VM would receive different arguments than the fence sent"
+        [[ $(wc -l <"$tmp/fake-ssh/arrived-$number-$site.txt" | tr -d ' ') == "$expected_count" ]] ||
+            die "fence $number site $site: arrived count differs from the remote positional count check"
+    done
+}
+for number in 08 12 13 17 18 21 22 23; do run_fence_arguments "$number"; done
+[[ $(wc -l <"$tmp/fake-ssh/arrived-08-1.txt" | tr -d ' ') == 6 ]] || die 'fence 8 did not deliver six positionals'
+grep -q '^10000000000$' "$tmp/fake-ssh/arrived-08-1.txt" || die 'fence 8 root disk reserve did not arrive intact'
+grep -q '^2000000000$' "$tmp/fake-ssh/arrived-08-1.txt" || die 'fence 8 required memory did not arrive intact'
+grep -q '^/mnt/hfx/work/control builds$' "$tmp/fake-ssh/arrived-22-1.txt" || die 'a path with a space did not survive the remote split'
+pass 'every bash -s fence delivers each argument intact through a joined and re-split ssh command, including fence 8 sizing'
+
 printf '1..%d\n' "$passed"

@@ -38,7 +38,7 @@ FENCES: tuple[tuple[int, str, str], ...] = (
     (5, 'read-only-preflight', 'git fetch origin main'),
     (6, 'cleanup-trap', 'cleanup_running=0'),
     (7, 'provision', 'test ! -e "$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt"'),
-    (8, 'converge', 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" \\'),
+    (8, 'converge', 'remote_args=("$GROUND_TRUTH_REF" "$(contract_value \'.workload_sizing.root_disk_reserve_bytes\')" "$(contract_value \'.workload_sizing.root_swap_bytes_max\')" "$(contract_value \'.workload_sizing.volume_swap_bytes\')" "$(contract_value \'.workload_sizing.required_available_disk_bytes\')" "$(contract_value \'.workload_sizing.required_memory_bytes\')")'),
     (9, 'init', 'campaign_gate pre-init "$(contract_value \'.gate_reserve_hours["pre-init"]\')"'),
     (10, 'corpus-transfer', 'transfer_start=$(date +%s)'),
     (11, 'acquire', 'campaign_gate pre-acquire "$(contract_value \'.gate_reserve_hours["pre-acquire"]\')"'),
@@ -47,7 +47,7 @@ FENCES: tuple[tuple[int, str, str], ...] = (
     (14, 'compile-start', 'campaign_gate pre-compile "$(contract_value \'.gate_reserve_hours["pre-compile"]\')"'),
     (15, 'compile-monitor', 'campaign_gate compile-monitor "$(contract_value \'.gate_reserve_hours["compile-monitor"]\')"'),
     (16, 'compile-finish', 'ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-tdx-compile.log" \\'),
-    (17, 'basin-preserve', 'ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" <<\'REMOTE\''),
+    (17, 'basin-preserve', 'remote_args=("$CAMPAIGN_DIR")'),
     (18, 'baseline-pull', 'campaign_gate pre-baseline "$(contract_value \'.gate_reserve_hours["pre-baseline"]\')"'),
     (19, 'assemble-start', 'test -s "$LOCAL_EVIDENCE_DIR/compiled-absent-basins.txt"'),
     (20, 'assemble-wait', 'until ssh -o BatchMode=yes "root@$SERVER_IP" test -d "$CAMPAIGN_DIR/assembly/dataset"; do'),
@@ -104,7 +104,42 @@ def extract_fences(text: str) -> list[str]:
         actual = fences[number - 1].split("\n", 1)[0]
         if actual != first_line:
             raise ComposeError(f"fence {number} ({label}) starts with {actual!r}, expected {first_line!r}")
+        check_remote_arguments(number, label, fences[number - 1])
     return fences
+
+
+REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'
+REMOTE_ARGS_ASSIGNMENT = re.compile(r"^\s*remote_args=\(.*\)\s*$")
+
+
+def check_remote_arguments(number: int, label: str, fence: str) -> None:
+    """Refuse a `bash -s --` line whose arguments are not the quoted remote_args array.
+
+    ssh joins its remote command arguments into one string that the remote shell
+    splits again, so only `printf '%q'`-quoted tokens survive; the 2026-09-04
+    rehearsal died on a space-joined sizing argument at the converge fence.
+    """
+    lines = fence.split("\n")
+    for index, line in enumerate(lines):
+        if "bash -s --" not in line:
+            continue
+        expected_tail = REMOTE_ARGUMENT_FORM
+        position = line.find("bash -s --")
+        if not line[position:].startswith(expected_tail):
+            raise ComposeError(
+                f"fence {number} ({label}) line {index + 1} sends remote arguments that are not the quoted remote_args array: {line.strip()!r}"
+            )
+        rest = line[position + len(expected_tail):]
+        if not (rest == "" or rest.startswith(" <<'REMOTE'")):
+            raise ComposeError(f"fence {number} ({label}) line {index + 1} carries extra remote arguments: {line.strip()!r}")
+        preceding = [candidate for candidate in lines[:index] if candidate.strip()]
+        # The ssh line may continue a `ssh ... \\` line; the assignment sits just before that.
+        assignment_index = index - 1
+        if assignment_index >= 0 and lines[assignment_index].rstrip().endswith("\\"):
+            assignment_index -= 1
+        if assignment_index < 0 or not REMOTE_ARGS_ASSIGNMENT.match(lines[assignment_index]):
+            raise ComposeError(f"fence {number} ({label}) line {index + 1} has no remote_args assignment immediately before its ssh line")
+        del preceding
 
 
 def fence_block(number: int, body: str) -> str:

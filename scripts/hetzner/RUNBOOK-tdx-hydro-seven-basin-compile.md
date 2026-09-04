@@ -19,7 +19,15 @@ version_policy is NONE: NO version bump, NO tag.
       {"date": "2026-09-04", "provisioning_request": "2026-09-04T10:46:18Z", "zero_footprint": "2026-09-04T10:50:58Z", "server_id": 164550505, "volume_id": 106790870, "cause": "hcloud-json-shape-mismatch", "workload_dispatched": false},
       {"date": "2026-09-04", "provisioning_request": "2026-09-04T12:51:01Z", "zero_footprint": "2026-09-04T16:00:57Z", "server_id": 164562279, "volume_id": 106791727, "cause": "control-transfer-parent-directory-absent", "workload_dispatched": true}
     ],
-    "rehearsal_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "campaign": "campaign-rehearsal", "contract": "scripts/hetzner/rehearsal-campaign-contract.json", "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual, exact-resource teardown"},
+    "rehearsal_authority": {
+      "maintainer": "Nicolas Lazaro", "date": "2026-09-04", "record": "https://github.com/CooperBigFoot/hfx/pull/234", "campaign": "campaign-rehearsal", "contract": "scripts/hetzner/rehearsal-campaign-contract.json",
+      "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual per run, exact-resource teardown",
+      "reruns": "permitted after each merged, reviewed fix while the cumulative estimated rehearsal spend stays below the cumulative ceiling",
+      "cumulative_ceiling_eur": 1.0,
+      "runs": [
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01}
+      ]
+    },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
   },
   "requires_passing_rehearsal": true,
@@ -125,7 +133,11 @@ The second lifecycle ran from the provisioning request at 12:51:01Z (server `164
 
 ### Rehearsal and third lifecycle authorized on 2026-09-04
 
-After the second lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 exactly one rehearsal lifecycle and, conditional on it, exactly one further production lifecycle. The rehearsal runs the same fences on a synthetic corpus under the limits pinned in `lifecycle_ledger.rehearsal_authority`: one `cx23` in `fsn1`, one 10 GB volume, strictly under 6 hours, strictly under EUR 1.00, and exact-resource teardown; its parameters are the tracked `scripts/hetzner/rehearsal-campaign-contract.json`. The production lifecycle keeps the limits above and is recorded in `lifecycle_ledger.current_authority`; its `precondition` names the passing rehearsal record that the production preflight requires. Both authorities are the maintainer decision recorded in the pull request named by their `record` fields, together with the vision on `main`. The 2026-09-04 authorization covers one lifecycle only. A rehearsal that fails consumes the rehearsal authority; a new rehearsal needs new maintainer authority.
+After the second lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 a rehearsal lifecycle and, conditional on it, exactly one further production lifecycle. The rehearsal runs the same fences on a synthetic corpus under the limits pinned in `lifecycle_ledger.rehearsal_authority`: one `cx23` in `fsn1`, one 10 GB volume, strictly under 6 hours, strictly under EUR 1.00 per run, and exact-resource teardown; its parameters are the tracked `scripts/hetzner/rehearsal-campaign-contract.json`. Later on 2026-09-04 the maintainer made the rehearsal repeatable: after each merged, reviewed fix a rehearsal may run again under the same limits as long as the cumulative estimated rehearsal spend recorded in `rehearsal_authority.runs` stays below `cumulative_ceiling_eur`; the verifier refuses a rehearsal once the estimates reach that ceiling. The production lifecycle keeps the limits above and is recorded in `lifecycle_ledger.current_authority`; its `precondition` names the passing rehearsal record that the production preflight requires. Both authorities are the maintainer decision recorded in the pull request named by their `record` fields, together with the vision on `main`. The 2026-09-04 authorization covers one lifecycle only. A rehearsal that fails is recorded in `rehearsal_authority.runs` with its cause and estimated cost; the next rehearsal waits for a merged, reviewed fix and for the cumulative estimate to remain below the ceiling.
+
+### Rehearsal run 1 consumed on 2026-09-04
+
+Rehearsal run 1 ran from the provisioning request at 20:51:00Z (server `164601847`, volume `106794141`) to zero footprint at 21:04:28Z, about 13 minutes and an estimated EUR 0.01. Provisioning (with the reused-address `known_hosts` rerun of section 8), bootstrap on the `cx23`, and the identity gate all passed. The converge fence then sent the five `workload_sizing` values to the VM as one space-joined argument; `ssh` joins its remote command arguments into a single string that the remote login shell splits again, so the VM received five positional parameters, the remote `read` filled one variable, and the numeric guard ended the shell before any output. The runbook's own cleanup performed exact-resource teardown. The repair is the `remote_tokens` rule stated in section 4 and enforced by the composer in section 20.
 
 ## 2. Fixed ceilings and retention
 
@@ -174,6 +186,7 @@ else
   CAMPAIGN_CONTRACT_JSON=$(sed -n '/^<!-- BEGIN COMPILE CAMPAIGN CONTRACT$/,/^END COMPILE CAMPAIGN CONTRACT -->$/p' "$RUNBOOK" | sed '1d;$d')
 fi
 contract_value() { jq -er "$1" <<<"$CAMPAIGN_CONTRACT_JSON"; }
+remote_tokens() { local token; for token in "$@"; do printf '%q ' "$token"; done; }
 test "$(contract_value '.schema')" -eq 5
 CAMPAIGN=$(contract_value '.campaign')
 [[ "$CAMPAIGN" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]
@@ -228,6 +241,8 @@ printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be d
 IFS= read -r S3_ENV_FILE
 test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
 ```
+
+`remote_tokens` quotes every argument a fence sends to the VM with `printf '%q'`. `ssh` joins its remote command arguments into one string that the remote login shell splits again, so an unquoted argument holding a space arrives as several positional parameters; on 2026-09-04 at 21:03:54Z the rehearsal's converge fence sent five sizing values as one space-joined argument, the VM saw five parameters, the remote `read` filled one variable, and the numeric guard ended the lifecycle before any output. Every `bash -s --` fence therefore builds a `remote_args` array, sends exactly `"$(remote_tokens "${remote_args[@]}")"`, and the remote script assigns and validates each positional it expects before doing anything else; section 20's composer refuses any other form.
 
 Every campaign parameter comes from one campaign contract: the JSON block at the top of this runbook for the production campaign, or the file named by `HFX_CAMPAIGN_CONTRACT` for the rehearsal campaign of section 20. The shell copies the contract it used into `$LOCAL_EVIDENCE_DIR/campaign-contract.json`, so the evidence records which parameters ran. No fence carries a campaign-specific literal; the same fences run both campaigns.
 
@@ -524,13 +539,15 @@ Converge two checkouts on the VM, build `hfx` from the corrected revision, apply
 Require a clean detached worktree at planetary revision `43a98aff8c15a1a196f47b10217ad2f5553b6611`. Apply only the path-scoped diff from pinned hotpatch commit `bde61149d3fefc5e3f30435bf7ed3d0bb32a519c`. Refuse unless the pre-patch blob is `41d6df3f10030a481b2227a878837c7f23f3e658`. Refuse unless the post-patch blob is `d227920a7ac0ab98ffcc80aac2c72a5dfc9c2429`.
 
 ```bash
+remote_args=("$GROUND_TRUTH_REF" "$(contract_value '.workload_sizing.root_disk_reserve_bytes')" "$(contract_value '.workload_sizing.root_swap_bytes_max')" "$(contract_value '.workload_sizing.volume_swap_bytes')" "$(contract_value '.workload_sizing.required_available_disk_bytes')" "$(contract_value '.workload_sizing.required_memory_bytes')")
 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" \
-  bash -s -- "$GROUND_TRUTH_REF" "$(contract_value '.workload_sizing | [.root_disk_reserve_bytes, .root_swap_bytes_max, .volume_swap_bytes, .required_available_disk_bytes, .required_memory_bytes] | map(tostring) | join(" ")')" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/converge.log"
+  bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/converge.log"
 set -Eeuo pipefail
 set +x
-ground_truth_ref=$1
-read -r root_disk_reserve_bytes root_swap_bytes_max volume_swap_bytes required_available_disk_bytes required_memory_bytes <<<"$2"
+ground_truth_ref=$1; root_disk_reserve_bytes=$2; root_swap_bytes_max=$3; volume_swap_bytes=$4; required_available_disk_bytes=$5; required_memory_bytes=$6
+[[ "$ground_truth_ref" =~ ^[0-9a-f]{40}$ ]]
 for sizing in "$root_disk_reserve_bytes" "$root_swap_bytes_max" "$volume_swap_bytes" "$required_available_disk_bytes" "$required_memory_bytes"; do [[ "$sizing" =~ ^[0-9]+$ ]]; done
+test "$#" -eq 6
 planetary_ref=43a98aff8c15a1a196f47b10217ad2f5553b6611
 hotpatch_ref=bde61149d3fefc5e3f30435bf7ed3d0bb32a519c
 hotpatch_path=scripts/hetzner/tdx-hydro-campaign.sh
@@ -678,10 +695,13 @@ if test "$CONTROL_REFERENCE" = preserved-off-vm; then
   scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json"
   scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/control-adjudication.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/control-adjudication.json"
 else
-  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-reference-build.log"
+  remote_args=("$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION")
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-reference-build.log"
 set -Eeuo pipefail
 set +x
 control_id=$1; campaign_dir=$2; control_root=$3; control_fabric_version=$4
+[[ "$control_id" =~ ^[0-9]{10}$ && "$campaign_dir" == /* && "$control_root" == /* && -n "$control_fabric_version" ]]
+test "$#" -eq 4
 test ! -e "$control_root/preserved/$control_id"
 /opt/hfx-geo/bin/python /root/hfx-planetary/adapters/tdx-hydro/build_adapter.py build \
   --basins "$campaign_dir/downloads/$control_id-basins.gpkg" \
@@ -718,10 +738,14 @@ Both control builds pass the contract's `control_fabric_version` (`0.3.0` in pro
 
 ```bash
 campaign_gate pre-control-builds "$(contract_value '.gate_reserve_hours["pre-control-builds"]')"
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" "$CONTROL_REFERENCE" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-builds.log"
+remote_args=("$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" "$CONTROL_REFERENCE")
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-builds.log"
 set -Eeuo pipefail
 set +x
 control_id=$1; campaign_dir=$2; control_root=$3; control_fabric_version=$4; control_reference=$5
+[[ "$control_id" =~ ^[0-9]{10}$ && "$campaign_dir" == /* && "$control_root" == /* && -n "$control_fabric_version" ]]
+[[ "$control_reference" == preserved-off-vm || "$control_reference" == vm-planetary-build ]]
+test "$#" -eq 5
 python=/opt/hfx-geo/bin/python
 hfx=/root/hfx/target/release/hfx
 adjudication=/mnt/hfx/work/sha256/control-adjudication.json
@@ -864,9 +888,13 @@ grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/c
 Every refusal is terminal evidence. The runner records `failed` with the adapter's message in `state/basins/<id>/current.json`, keeps any build report, and the workload log holds the traceback. Nothing is guessed around and nothing is retried with different inputs. Preserve the per-basin results before assembly:
 
 ```bash
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" <<'REMOTE'
+remote_args=("$CAMPAIGN_DIR")
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE'
 set -Eeuo pipefail
-cd "$1"
+campaign_dir=$1
+[[ "$campaign_dir" == /* ]]
+test "$#" -eq 1
+cd "$campaign_dir"
 find basin-outputs -type f -print0 | sort -z | xargs -0 -r sha256sum > /mnt/hfx/work/sha256/basin-outputs-sha256.txt
 REMOTE
 mkdir -p "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
@@ -894,11 +922,14 @@ Section 12 runs only when `compile_exit_zero` is `1` and `compiled-absent-basins
 
 ```bash
 campaign_gate pre-baseline "$(contract_value '.gate_reserve_hours["pre-baseline"]')"
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$BASELINE_ROOT" "$BASELINE_PREFIX" "$S3_ENDPOINT" "$(contract_value '.baseline | [.region, (.unit_count|tostring), (.exported_bytes|tostring), (.object_count|tostring)] | join(" ")')" "$FABRIC_VERSION" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/baseline-pull.log"
+remote_args=("$BASELINE_ROOT" "$BASELINE_PREFIX" "$S3_ENDPOINT" "$(contract_value '.baseline.region')" "$(contract_value '.baseline.unit_count')" "$(contract_value '.baseline.exported_bytes')" "$(contract_value '.baseline.object_count')" "$FABRIC_VERSION")
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/baseline-pull.log"
 set -Eeuo pipefail
 set +x
-baseline_root=$1; prefix=$2; endpoint=$3; fabric_version=$5
-read -r baseline_region baseline_unit_count baseline_exported_bytes baseline_object_count <<<"$4"
+baseline_root=$1; prefix=$2; endpoint=$3; baseline_region=$4; baseline_unit_count=$5; baseline_exported_bytes=$6; baseline_object_count=$7; fabric_version=$8
+[[ "$baseline_root" == /* && "$prefix" == s3://* && "$endpoint" == https://* && -n "$baseline_region" && -n "$fabric_version" ]]
+for count in "$baseline_unit_count" "$baseline_exported_bytes" "$baseline_object_count"; do [[ "$count" =~ ^[0-9]+$ ]]; done
+test "$#" -eq 8
 set -a; source /etc/pourpoint-hfx.env; set +a
 mkdir -p "$baseline_root"
 aws s3 ls "$prefix/dataset/" --recursive --endpoint-url "$endpoint" --region fsn1 > "$baseline_root/remote-listing.txt"
@@ -910,9 +941,12 @@ test "$(find "$baseline_root/dataset" -type f -exec stat -c '%s' {} + | awk '{s+
 (cd "$baseline_root/dataset" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/baseline-sha256.txt
 REMOTE
 scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/baseline-roster.json" "root@$SERVER_IP:$BASELINE_ROOT/roster.json"
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$BASELINE_ROOT" "$(contract_value '.baseline.roster_digest_prefix')" <<'REMOTE'
+remote_args=("$BASELINE_ROOT" "$(contract_value '.baseline.roster_digest_prefix')")
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE'
 set -Eeuo pipefail
 baseline_root=$1; roster_digest_prefix=$2
+[[ "$baseline_root" == /* && "$roster_digest_prefix" =~ ^[0-9a-f]{12}$ ]]
+test "$#" -eq 2
 test "$(jq -r 'join(",")' "$baseline_root/roster.json" | tr -d '\n' | sha256sum | cut -c1-12)" = "$roster_digest_prefix"
 if test -s "$baseline_root/evidence-assembly.json"; then
   test "$(jq -c '.input_basin_ids | sort | unique' "$baseline_root/evidence-assembly.json")" = "$(jq -c '.' "$baseline_root/roster.json")"
@@ -962,11 +996,15 @@ An interrupted or OOM-killed validation is recorded as `incomplete`, never as pa
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign "$CAMPAIGN" status --workload tdx-assemble || test "$?" -eq 3
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$CAMPAIGN" <<'REMOTE' > "$LOCAL_EVIDENCE_DIR/validation-evidence.txt"
+remote_args=("$CAMPAIGN_DIR" "$CAMPAIGN")
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' > "$LOCAL_EVIDENCE_DIR/validation-evidence.txt"
 set -Eeuo pipefail
-cat "$1/state/assembly.json"
+campaign_dir=$1; campaign=$2
+[[ "$campaign_dir" == /* && "$campaign" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]
+test "$#" -eq 2
+cat "$campaign_dir/state/assembly.json"
 dmesg -T 2>/dev/null | grep -i -E 'out of memory|killed process' || true
-grep -E 'return code|hfx: error|validation' "/mnt/hfx/logs/hfx-$2-tdx-assemble.log" | tail -n 40 || true
+grep -E 'return code|hfx: error|validation' "/mnt/hfx/logs/hfx-$campaign-tdx-assemble.log" | tail -n 40 || true
 REMOTE
 ```
 
@@ -986,15 +1024,19 @@ Preserve in this order, each root with a SHA-256 manifest computed on the VM and
 campaign_gate pre-preservation "$(contract_value '.gate_reserve_hours["pre-preservation"]')"
 preservation_status=1
 for preservation_attempt in 1 2 3; do
-  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$CONTROL_ROOT" <<'REMOTE'
+  remote_args=("$CAMPAIGN_DIR" "$CONTROL_ROOT")
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE'
 set -Eeuo pipefail
-cd "$1"
+campaign_dir=$1; control_root=$2
+[[ "$campaign_dir" == /* && "$control_root" == /* ]]
+test "$#" -eq 2
+cd "$campaign_dir"
 for root in state reports basin-outputs assembly/dataset; do
   test -d "$root" || continue
   find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum > "/mnt/hfx/work/sha256/campaign-$(printf '%s' "$root" | tr / -)-sha256.txt"
 done
 (cd /mnt/hfx && find logs -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/logs-sha256.txt
-(cd "$2" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/control-builds-sha256.txt
+(cd "$control_root" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/control-builds-sha256.txt
 REMOTE
   for root in state reports basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done
   copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
@@ -1024,10 +1066,13 @@ Copy the extended artifact, when it exists, to a new prefix under the campaign's
 
 ```bash
 if ssh -o BatchMode=yes "root@$SERVER_IP" test -d "$CAMPAIGN_DIR/assembly/dataset"; then
-  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$EXTENSION_PREFIX" "$S3_ENDPOINT" "$CONTROL_ROOT" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/extension-s3-preservation.log"
+  remote_args=("$CAMPAIGN_DIR" "$EXTENSION_PREFIX" "$S3_ENDPOINT" "$CONTROL_ROOT")
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/extension-s3-preservation.log"
 set -Eeuo pipefail
 set +x
 campaign_dir=$1; prefix=$2; endpoint=$3; control_root=$4
+[[ "$campaign_dir" == /* && "$prefix" == s3://* && "$endpoint" == https://* && "$control_root" == /* ]]
+test "$#" -eq 4
 set -a; source /etc/pourpoint-hfx.env; set +a
 test -z "$(aws s3 ls "$prefix/extension-hfx-v0-3-0/" --endpoint-url "$endpoint" --region fsn1)"
 aws s3 cp "$campaign_dir/assembly/dataset/" "$prefix/extension-hfx-v0-3-0/dataset/" --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
@@ -1206,4 +1251,4 @@ diff -q "$HFX_CAMPAIGN_EVIDENCE/composed/fence-diff-proof.txt" <(python3 scripts
 printf '%s\n' "$S3_ENV_FILE_PATH" | caffeinate -i -s bash "$HFX_CAMPAIGN_EVIDENCE/composed/campaign-driver.sh"
 ```
 
-The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.
+The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The composer also refuses any `bash -s --` line whose arguments are not exactly `"$(remote_tokens "${remote_args[@]}")"` preceded by a `remote_args=(...)` assignment, and its test suite runs every such fence's argument construction through a fake `ssh` that joins and re-splits the command string the way the real one does, proving on the workstation that each remote script receives every positional it validates. Other remote invocations (`mkdir -p`, `tail -n 1`, the `du`, `sha256sum -c`, and `rm -f` command strings of section 9, the `tmux kill-session` loop of the trap, and every `rsync` remote path) carry only constant paths, validated identifiers, or names matched by a fixed pattern, so they contain no character the remote shell could split. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.

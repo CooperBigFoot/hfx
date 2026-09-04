@@ -163,7 +163,7 @@ case $check in
             fail 'current lifecycle authority is not conditional on a passing rehearsal record'
         require_field '.requires_passing_rehearsal' true 'production contract must require a passing rehearsal'
         require_phrase 'The 2026-09-04 authorization covers one lifecycle only.'
-        require_phrase 'A rehearsal that fails consumes the rehearsal authority; a new rehearsal needs new maintainer authority.'
+        require_phrase 'A rehearsal that fails is recorded in `rehearsal_authority.runs` with its cause and estimated cost; the next rehearsal waits for a merged, reviewed fix and for the cumulative estimate to remain below the ceiling.'
         require_field '.gate_reserve_hours | keys' "$HFX_EXPECTED_GATE_PHASES" 'gate reserves are not pinned for every gate phase'
         require_field '.server_name' "\"$(hfx_server_name "$HFX_EXPECTED_CAMPAIGN")\"" 'wrong mutable server'
         require_field '.volume_name' "\"$(hfx_volume_name "$HFX_EXPECTED_CAMPAIGN")\"" 'wrong mutable volume'
@@ -312,9 +312,19 @@ case $check in
         require_phrase "$authority_ref"
         ;;
     rehearsal-record-is-pinned)
-        require_field '.lifecycle_ledger.rehearsal_authority | {maintainer, date, lifecycles, campaign, contract}' \
-            "{\"maintainer\":\"Nicolas Lazaro\",\"date\":\"2026-09-04\",\"lifecycles\":1,\"campaign\":\"$HFX_REHEARSAL_CAMPAIGN\",\"contract\":\"$HFX_REHEARSAL_CONTRACT_REL\"}" \
-            'rehearsal authority is not the 2026-09-04 maintainer decision for one rehearsal lifecycle'
+        require_field '.lifecycle_ledger.rehearsal_authority | {maintainer, date, campaign, contract}' \
+            "{\"maintainer\":\"Nicolas Lazaro\",\"date\":\"2026-09-04\",\"campaign\":\"$HFX_REHEARSAL_CAMPAIGN\",\"contract\":\"$HFX_REHEARSAL_CONTRACT_REL\"}" \
+            'rehearsal authority is not the 2026-09-04 maintainer decision for the rehearsal campaign'
+        jq -e '.lifecycle_ledger.rehearsal_authority
+            | (.cumulative_ceiling_eur | type == "number" and . > 0)
+            and (.reruns | type == "string" and test("merged, reviewed fix"))
+            and (.runs | type == "array" and all(.[];
+                (.date | type == "string") and (.provisioning_request | type == "string") and (.zero_footprint | type == "string")
+                and (.server_id | type == "number") and (.volume_id | type == "number") and (.cause | type == "string" and length > 0)
+                and (.workload_dispatched | type == "boolean") and (.estimated_cost_eur | type == "number" and . >= 0)))' <<<"$contract" >/dev/null 2>&1 ||
+            fail 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'
+        jq -e '.lifecycle_ledger.rehearsal_authority | ([.runs[].estimated_cost_eur] | add // 0) < .cumulative_ceiling_eur' <<<"$contract" >/dev/null 2>&1 ||
+            fail 'cumulative estimated rehearsal spend has reached the rehearsal ceiling; a new rehearsal needs new maintainer authority'
         jq -e '.lifecycle_ledger.rehearsal_authority.record | type == "string" and length > 0 and . != "RECORD-URL"' <<<"$contract" >/dev/null 2>&1 ||
             fail 'rehearsal authority does not name its record'
         if [[ -z "$rehearsal_contract" ]]; then
