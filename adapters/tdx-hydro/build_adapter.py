@@ -291,6 +291,83 @@ class StreamnetUnit:
     outlet_lat: float
 
 
+BASIN_POLARITY_RULE_ID = "basin-polarity-unanimous-proven-outlet-index-v1"
+
+
+class BasinPolarityState(Enum):
+    """Whether one basin's proven reaches agree on the outlet endpoint index."""
+
+    UNANIMOUS = "unanimous"
+    ABSENT = "absent"
+    SPLIT = "split"
+
+
+@dataclass(frozen=True)
+class BasinPolarity:
+    """Outlet endpoint index shared by every reach one basin proves.
+
+    polarity : (ProvenOutletIndexCounts, ExactCoincidenceOutletIndexCounts)
+               -> Unanimous(index) | Absent | Split        (pure, total)
+
+    The counts come from reaches proven by a unique endpoint coincidence and
+    from every exact endpoint coincidence between two healthy reaches. The
+    index is set only when one endpoint index has a positive total and the
+    other has zero.
+    """
+
+    rule_id: str
+    state: str
+    downstream_endpoint_index: int | None
+    proven_downstream_endpoint_index_counts: dict[str, int]
+    exact_coincidence_downstream_endpoint_index_counts: dict[str, int]
+
+
+def _basin_polarity(
+    proven_index_counts: np.ndarray, exact_index_counts: np.ndarray
+) -> BasinPolarity:
+    totals = proven_index_counts + exact_index_counts
+    positive = [index for index in (0, 1) if totals[index] > 0]
+    if len(positive) == 1:
+        state, index = BasinPolarityState.UNANIMOUS, positive[0]
+    elif positive:
+        state, index = BasinPolarityState.SPLIT, None
+    else:
+        state, index = BasinPolarityState.ABSENT, None
+    return BasinPolarity(
+        rule_id=BASIN_POLARITY_RULE_ID,
+        state=state.value,
+        downstream_endpoint_index=index,
+        proven_downstream_endpoint_index_counts={
+            "0": int(proven_index_counts[0]),
+            "1": int(proven_index_counts[1]),
+        },
+        exact_coincidence_downstream_endpoint_index_counts={
+            "0": int(exact_index_counts[0]),
+            "1": int(exact_index_counts[1]),
+        },
+    )
+
+
+def _polarity_downstream_endpoint_index(polarity: BasinPolarity, native_id: int) -> int:
+    """Endpoint index for a root without predecessor evidence; refuses unless unanimous."""
+    if polarity.downstream_endpoint_index is not None:
+        return polarity.downstream_endpoint_index
+    if polarity.state == BasinPolarityState.ABSENT.value:
+        raise ValueError(
+            f"orientation proof for root LINKNO {native_id} cannot use basin "
+            "polarity: no reach in the basin is proven by unique endpoint "
+            "coincidence or exact coincidence"
+        )
+    proven = polarity.proven_downstream_endpoint_index_counts
+    exact = polarity.exact_coincidence_downstream_endpoint_index_counts
+    raise ValueError(
+        f"orientation proof for root LINKNO {native_id} cannot use basin "
+        "polarity: proven outlet endpoint indexes are split, unique coincidence "
+        f"counts index 0 {proven['0']} and index 1 {proven['1']}, exact "
+        f"coincidence counts index 0 {exact['0']} and index 1 {exact['1']}"
+    )
+
+
 @dataclass(frozen=True)
 class StreamnetDiagnostics:
     polygon_bearing_link_count: int
@@ -311,11 +388,13 @@ class StreamnetDiagnostics:
     contracted_link_traversal_count: int
     endpoint_coincidence_proven_link_count: int
     predecessor_orientation_proven_root_count: int
-    trusted_orientation_isolated_root_count: int
-    trusted_orientation_isolated_root_native_linknos: tuple[int, ...]
-    trusted_orientation_polygon_bearing_isolated_root_count: int
-    trusted_orientation_polygon_bearing_isolated_root_native_linknos: tuple[int, ...]
+    isolated_root_count: int
+    isolated_root_native_linknos: tuple[int, ...]
+    polygon_bearing_isolated_root_count: int
+    polygon_bearing_isolated_root_native_linknos: tuple[int, ...]
     orientation_tolerance: float
+    # Absent when the topology was derived from a StreamnetModel.
+    basin_polarity: BasinPolarity | None = None
 
 
 @dataclass(frozen=True)
@@ -1472,7 +1551,7 @@ class _OrientationResolution:
     downstream_endpoints: np.ndarray
     endpoint_coincidence_proven_link_count: int
     predecessor_orientation_proven_root_count: int
-    trusted_orientation_isolated_root_native_linknos: tuple[int, ...]
+    isolated_root_native_linknos: tuple[int, ...]
     short_successor_resolved_reach_native_linknos: tuple[int, ...]
     reach_side_near_degenerate_resolved_reach_native_linknos: tuple[int, ...]
 
@@ -1627,7 +1706,7 @@ def _resolve_native_orientation(
         downstream_endpoints=downstream_endpoints,
         endpoint_coincidence_proven_link_count=endpoint_coincidence_proven_links,
         predecessor_orientation_proven_root_count=predecessor_proven_roots,
-        trusted_orientation_isolated_root_native_linknos=tuple(
+        isolated_root_native_linknos=tuple(
             sorted(trusted_isolated_roots)
         ),
         short_successor_resolved_reach_native_linknos=tuple(
@@ -1751,7 +1830,7 @@ def build_streamnet_model(
             if unit.downstream_linkno == TDX_LINKNO_SENTINEL
         )
     )
-    trusted_isolated_ids = orientation.trusted_orientation_isolated_root_native_linknos
+    trusted_isolated_ids = orientation.isolated_root_native_linknos
     trusted_polygon_bearing_ids = tuple(
         linkno for linkno in trusted_isolated_ids if linkno in polygon_bearing_links
     )
@@ -1802,12 +1881,12 @@ def build_streamnet_model(
         predecessor_orientation_proven_root_count=(
             orientation.predecessor_orientation_proven_root_count
         ),
-        trusted_orientation_isolated_root_count=len(trusted_isolated_ids),
-        trusted_orientation_isolated_root_native_linknos=trusted_isolated_ids,
-        trusted_orientation_polygon_bearing_isolated_root_count=len(
+        isolated_root_count=len(trusted_isolated_ids),
+        isolated_root_native_linknos=trusted_isolated_ids,
+        polygon_bearing_isolated_root_count=len(
             trusted_polygon_bearing_ids
         ),
-        trusted_orientation_polygon_bearing_isolated_root_native_linknos=(
+        polygon_bearing_isolated_root_native_linknos=(
             trusted_polygon_bearing_ids
         ),
         orientation_tolerance=tolerance,
@@ -1825,10 +1904,10 @@ def build_streamnet_model(
         "roots=%d contracted_edges=%d "
         "contracted_roots=%d contracted_link_traversals=%d "
         "endpoint_coincidence_proven_links=%d predecessor_orientation_proven_roots=%d "
-        "trusted_orientation_isolated_roots=%d "
-        "trusted_orientation_isolated_root_native_linknos=%s "
-        "trusted_orientation_polygon_bearing_isolated_roots=%d "
-        "trusted_orientation_polygon_bearing_isolated_root_native_linknos=%s "
+        "isolated_roots=%d "
+        "isolated_root_native_linknos=%s "
+        "polygon_bearing_isolated_roots=%d "
+        "polygon_bearing_isolated_root_native_linknos=%s "
         "orientation_tolerance=%s polygonless_dropped_reach_count=%d",
         diagnostics.polygon_bearing_link_count,
         diagnostics.degenerate_reach_count,
@@ -1847,10 +1926,10 @@ def build_streamnet_model(
         diagnostics.contracted_link_traversal_count,
         diagnostics.endpoint_coincidence_proven_link_count,
         diagnostics.predecessor_orientation_proven_root_count,
-        diagnostics.trusted_orientation_isolated_root_count,
-        diagnostics.trusted_orientation_isolated_root_native_linknos,
-        diagnostics.trusted_orientation_polygon_bearing_isolated_root_count,
-        diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+        diagnostics.isolated_root_count,
+        diagnostics.isolated_root_native_linknos,
+        diagnostics.polygon_bearing_isolated_root_count,
+        diagnostics.polygon_bearing_isolated_root_native_linknos,
         diagnostics.orientation_tolerance,
         diagnostics.polygonless_dropped_reach_count,
     )
@@ -3854,8 +3933,7 @@ class ReachResolution(Enum):
     SUCCESSOR_SIDE_PROVEN = "successor-side-proven"
     EXACT_COINCIDENCE_PROVEN = "exact-coincidence-proven"
     ROOT_PREDECESSOR_PROVEN = "root-predecessor-proven"
-    ROOT_SOURCE_ORDER_TRUSTED = "root-source-order-trusted"
-    ROOT_ISOLATED_TRUSTED = "root-isolated-trusted"
+    ROOT_BASIN_POLARITY = "root-basin-polarity"
 
 
 _REACH_RESOLUTION_CODES = tuple(ReachResolution)
@@ -3951,12 +4029,13 @@ def _build_compact_topology(
     admitted pairing with the successor, else the unique candidate on the
     successor's established upstream endpoint, else the candidate exactly
     coincident with that endpoint; root upstream endpoints come from predecessor
-    evidence collected first. The function refuses whenever that evidence is
-    absent, tied, or conflicting, except for the two inherited root conventions
-    recorded as `ReachResolution.ROOT_SOURCE_ORDER_TRUSTED` and
-    `ReachResolution.ROOT_ISOLATED_TRUSTED`. Units, global IDs, contracted edges,
-    outlets, and upstream adjacency are then pure functions of the orientation
-    and the polygon join.
+    evidence collected first. A root whose predecessor evidence names no
+    endpoint takes the basin polarity, the outlet endpoint index shared
+    unanimously by every reach proven by unique or exact coincidence
+    (`ReachResolution.ROOT_BASIN_POLARITY`). The function refuses whenever the
+    evidence it consults is absent, tied, split, or conflicting. Units, global
+    IDs, contracted edges, outlets, and upstream adjacency are then pure
+    functions of the orientation and the polygon join.
     """
     tolerance = _positive_finite_tolerance(endpoint_tolerance)
     polygon_positions = np.searchsorted(stream_native_ids, basin_native_ids)
@@ -4003,6 +4082,8 @@ def _build_compact_topology(
     short_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     near_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     endpoint_proven = 0
+    proven_index_counts = np.zeros(2, dtype="int64")
+    exact_index_counts = np.zeros(2, dtype="int64")
     connected_matches: list[list[tuple[int, int, float]] | None] = [
         None
     ] * len(stream_native_ids)
@@ -4029,6 +4110,16 @@ def _build_compact_topology(
                 f"{int(stream_native_ids[successor])} is non-coincident"
             )
         connected_matches[row] = matches
+        # An exact coincidence is a shared raster cell: it names the current
+        # reach's outlet and the successor's upstream end, so it counts toward
+        # the basin polarity for each healthy reach it touches.
+        for current_index, successor_index, separation in matches:
+            if separation != 0.0:
+                continue
+            if not degenerate[row]:
+                exact_index_counts[current_index] += 1
+            if not degenerate[successor]:
+                exact_index_counts[1 - successor_index] += 1
 
     # Root upstream endpoints from predecessor evidence: a predecessor with
     # exactly one admitted pairing names the root endpoint it drains into, and
@@ -4083,6 +4174,7 @@ def _build_compact_topology(
                 )
             else:
                 endpoint_proven += 1
+                proven_index_counts[current_index] += 1
                 resolution[row] = _REACH_RESOLUTION_CODES.index(
                     ReachResolution.ENDPOINT_PROVEN
                 )
@@ -4164,8 +4256,9 @@ def _build_compact_topology(
             ):
                 short_resolved[row] = True
 
+    polarity = _basin_polarity(proven_index_counts, exact_index_counts)
     predecessor_proven_roots = 0
-    trusted_roots: list[int] = []
+    isolated_roots: list[int] = []
     for row in np.flatnonzero(downstream_rows < 0):
         native_id = int(stream_native_ids[row])
         root_upstream_index = int(root_upstream_endpoints[row])
@@ -4191,9 +4284,9 @@ def _build_compact_topology(
                 ReachResolution.ROOT_PREDECESSOR_PROVEN
             )
         elif indeterminate[row]:
-            # Inherited convention: predecessors coincide within tolerance with
-            # both ends of a near-degenerate root and none exactly; the final
-            # source vertex is taken as the outlet after DSContArea guards.
+            # Predecessors coincide within tolerance with both ends of a
+            # near-degenerate root and none exactly; after the DSContArea
+            # guards the basin polarity names the outlet.
             separation = math.dist(endpoints[row, 0], endpoints[row, 1])
             if separation > 2.0 * tolerance:
                 predecessor_ids = tuple(
@@ -4235,18 +4328,18 @@ def _build_compact_topology(
                         f"{predecessor_id} DSContArea {predecessor_area!r} km2 "
                         f"exceeds root DSContArea {root_area!r} km2"
                     )
-            chosen_index[row] = 1
+            chosen_index[row] = _polarity_downstream_endpoint_index(polarity, native_id)
             near_resolved[row] = True
             resolution[row] = _REACH_RESOLUTION_CODES.index(
-                ReachResolution.ROOT_SOURCE_ORDER_TRUSTED
+                ReachResolution.ROOT_BASIN_POLARITY
             )
         else:
-            # Inherited convention: an isolated root has no coincidence
-            # evidence; the final source vertex is taken as the outlet.
-            chosen_index[row] = 1
-            trusted_roots.append(native_id)
+            # An isolated root has no coincidence evidence of its own; the
+            # basin polarity names its outlet or the basin refuses.
+            chosen_index[row] = _polarity_downstream_endpoint_index(polarity, native_id)
+            isolated_roots.append(native_id)
             resolution[row] = _REACH_RESOLUTION_CODES.index(
-                ReachResolution.ROOT_ISOLATED_TRUSTED
+                ReachResolution.ROOT_BASIN_POLARITY
             )
         downstream_endpoints[row] = endpoints[row, int(chosen_index[row])]
 
@@ -4324,10 +4417,10 @@ def _build_compact_topology(
     )
     short_ids = tuple(int(value) for value in stream_native_ids[short_resolved])
     near_ids = tuple(int(value) for value in stream_native_ids[near_resolved])
-    trusted_ids = tuple(sorted(trusted_roots))
-    trusted_polygon_ids = tuple(
+    isolated_ids = tuple(sorted(isolated_roots))
+    isolated_polygon_ids = tuple(
         value
-        for value in trusted_ids
+        for value in isolated_ids
         if polygon_mask[int(np.searchsorted(stream_native_ids, value))]
     )
     diagnostics = StreamnetDiagnostics(
@@ -4349,15 +4442,12 @@ def _build_compact_topology(
         contracted_link_traversal_count=int(contracted.sum()),
         endpoint_coincidence_proven_link_count=endpoint_proven,
         predecessor_orientation_proven_root_count=predecessor_proven_roots,
-        trusted_orientation_isolated_root_count=len(trusted_ids),
-        trusted_orientation_isolated_root_native_linknos=trusted_ids,
-        trusted_orientation_polygon_bearing_isolated_root_count=len(
-            trusted_polygon_ids
-        ),
-        trusted_orientation_polygon_bearing_isolated_root_native_linknos=(
-            trusted_polygon_ids
-        ),
+        isolated_root_count=len(isolated_ids),
+        isolated_root_native_linknos=isolated_ids,
+        polygon_bearing_isolated_root_count=len(isolated_polygon_ids),
+        polygon_bearing_isolated_root_native_linknos=isolated_polygon_ids,
         orientation_tolerance=tolerance,
+        basin_polarity=polarity,
     )
     return _CompactTopology(
         native_ids=unit_native_ids,
@@ -5587,12 +5677,12 @@ def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
             "reach_side_near_degenerate_resolved_reach_native_linknos",
         ),
         (
-            "trusted_orientation_isolated_root_count",
-            "trusted_orientation_isolated_root_native_linknos",
+            "isolated_root_count",
+            "isolated_root_native_linknos",
         ),
         (
-            "trusted_orientation_polygon_bearing_isolated_root_count",
-            "trusted_orientation_polygon_bearing_isolated_root_native_linknos",
+            "polygon_bearing_isolated_root_count",
+            "polygon_bearing_isolated_root_native_linknos",
         ),
     ):
         count = getattr(streamnet, field_name)
@@ -5666,6 +5756,7 @@ def orient_topology(
     geometry overlap check), runs the same identity checks and compact
     topology step as `build`, and reports
     per-class resolution counts, the proven-outlet endpoint index histogram,
+    the basin polarity record,
     the orientation digest, and on refusal the exact message with its LINKNO
     pair. Orientation compares DSContArea only by order, so raw DSContArea is
     used without unit inference.
@@ -5738,6 +5829,9 @@ def orient_topology(
         "0": int(proven_index_counts[0]),
         "1": int(proven_index_counts[1]),
     }
+    if topology.diagnostics.basin_polarity is None:
+        raise RuntimeError("compact topology did not record the basin polarity")
+    report["basin_polarity"] = asdict(topology.diagnostics.basin_polarity)
     report["orientation_digest"] = _orientation_digest(topology)
     report["streamnet_diagnostics"] = asdict(topology.diagnostics)
     return report

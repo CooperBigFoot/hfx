@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import hashlib
 import io
@@ -98,6 +99,22 @@ GOLDEN_M2_SHA256 = {
     "manifest.json": "33cf21e5373f7a42c8012bd9d294978045b5c67fe21ba42ac14329c75d1ccd3e",
 }
 GOLDEN_KM2_SHA256 = dict(GOLDEN_M2_SHA256)
+
+
+def polarity_report(
+    index: int | None,
+    state: str,
+    proven: tuple[int, int],
+    exact: tuple[int, int],
+) -> dict[str, object]:
+    """Expected `basin_polarity` record of a build or orient report."""
+    return {
+        "rule_id": "basin-polarity-unanimous-proven-outlet-index-v1",
+        "state": state,
+        "downstream_endpoint_index": index,
+        "proven_downstream_endpoint_index_counts": {"0": proven[0], "1": proven[1]},
+        "exact_coincidence_downstream_endpoint_index_counts": {"0": exact[0], "1": exact[1]},
+    }
 
 
 def adjudication_frames(processing_basin_id: str) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
@@ -876,11 +893,12 @@ Path(sys.argv[5]).write_text(json.dumps(events))
                 "contracted_link_traversal_count": 1,
                 "endpoint_coincidence_proven_link_count": 8_192,
                 "predecessor_orientation_proven_root_count": 1,
-                "trusted_orientation_isolated_root_count": 0,
-                "trusted_orientation_isolated_root_native_linknos": [],
-                "trusted_orientation_polygon_bearing_isolated_root_count": 0,
-                "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                "isolated_root_count": 0,
+                "isolated_root_native_linknos": [],
+                "polygon_bearing_isolated_root_count": 0,
+                "polygon_bearing_isolated_root_native_linknos": [],
                 "orientation_tolerance": 0.001,
+                "basin_polarity": polarity_report(1, "unanimous", (0, 8_192), (0, 16_384)),
             },
         )
         memory = report["diagnostics"]["memory"]
@@ -2075,7 +2093,7 @@ class ReachOrientationEvidenceTests(unittest.TestCase):
         assert resolutions is not None
         np.testing.assert_array_equal(resolutions.native_ids, [100, 200, 300, 400])
         np.testing.assert_array_equal(
-            resolutions.downstream_endpoint_index, [0, 0, 0, 1]
+            resolutions.downstream_endpoint_index, [0, 0, 0, 0]
         )
         self.assertEqual(
             self.resolution_counts(topology),
@@ -2083,13 +2101,149 @@ class ReachOrientationEvidenceTests(unittest.TestCase):
                 "endpoint-proven": 1,
                 "exact-coincidence-proven": 1,
                 "root-predecessor-proven": 1,
-                "root-isolated-trusted": 1,
+                "root-basin-polarity": 1,
             },
         )
         self.assertEqual(
-            topology.diagnostics.trusted_orientation_isolated_root_native_linknos,
+            topology.diagnostics.isolated_root_native_linknos,
             (400,),
         )
+
+    def polarity_record(
+        self, index: int | None, state: str, proven: tuple[int, int], exact: tuple[int, int]
+    ) -> build_adapter.BasinPolarity:
+        return build_adapter.BasinPolarity(
+            rule_id="basin-polarity-unanimous-proven-outlet-index-v1",
+            state=state,
+            downstream_endpoint_index=index,
+            proven_downstream_endpoint_index_counts={"0": proven[0], "1": proven[1]},
+            exact_coincidence_downstream_endpoint_index_counts={
+                "0": exact[0],
+                "1": exact[1],
+            },
+        )
+
+    def test_basin_polarity_orients_isolated_roots_from_proven_reaches(self) -> None:
+        outlet_first = [
+            [(0.0015, 0.0), (0.0018, 0.0)],
+            [(0.01, 0.0), (0.0015, 0.0)],
+            [(0.02, 0.0), (0.01, 0.0)],
+            [(5.0, 5.0), (5.1, 5.0)],
+        ]
+        outlet_last = [list(reversed(reach)) for reach in outlet_first]
+        for endpoints, index in ((outlet_first, 0), (outlet_last, 1)):
+            with self.subTest(downstream_endpoint_index=index):
+                topology = self.build_compact(
+                    [100, 200, 300, 400],
+                    [200, 300, -1, -1],
+                    endpoints,
+                    [10.0, 20.0, 30.0, 1.0],
+                )
+                np.testing.assert_allclose(
+                    topology.outlet_lons, [0.0015, 0.01, 0.02, 5.0]
+                )
+                np.testing.assert_allclose(topology.outlet_lats, [0.0, 0.0, 0.0, 5.0])
+                self.assertEqual(
+                    self.resolution_counts(topology),
+                    {
+                        "endpoint-proven": 1,
+                        "exact-coincidence-proven": 1,
+                        "root-predecessor-proven": 1,
+                        "root-basin-polarity": 1,
+                    },
+                )
+                self.assertEqual(
+                    topology.diagnostics.basin_polarity,
+                    self.polarity_record(
+                        index,
+                        "unanimous",
+                        (1, 0) if index == 0 else (0, 1),
+                        (4, 0) if index == 0 else (0, 4),
+                    ),
+                )
+                self.assertEqual(
+                    topology.diagnostics.isolated_root_native_linknos, (400,)
+                )
+
+    def test_basin_polarity_orients_a_root_whose_predecessor_matches_both_ends(
+        self,
+    ) -> None:
+        # Predecessor 100 has one outlet within tolerance of both ends of the
+        # short root 300 and exactly on neither; the polarity names the outlet.
+        topology = self.build_compact(
+            [100, 300],
+            [300, -1],
+            [
+                [(0.0004, 0.0), (0.01, 0.0)],
+                [(0.0, 0.0), (0.0008, 0.0)],
+            ],
+            [10.0, 20.0],
+        )
+        np.testing.assert_allclose(topology.outlet_lons, [0.0004, 0.0])
+        self.assertEqual(
+            self.resolution_counts(topology),
+            {"endpoint-proven": 1, "root-basin-polarity": 1},
+        )
+        self.assertEqual(
+            topology.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (300,),
+        )
+        self.assertEqual(topology.diagnostics.isolated_root_native_linknos, ())
+
+    def test_isolated_roots_without_a_proven_reach_refuse(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^orientation proof for root LINKNO 100 cannot use basin polarity: "
+            r"no reach in the basin is proven by unique endpoint coincidence or "
+            r"exact coincidence$",
+        ):
+            self.build_compact(
+                [100, 200],
+                [-1, -1],
+                [
+                    [(0.0, 0.0), (1.0, 0.0)],
+                    [(5.0, 0.0), (6.0, 0.0)],
+                ],
+                [1.0, 2.0],
+            )
+
+    def test_split_basin_polarity_refuses_isolated_roots_only(self) -> None:
+        stream_native_ids = [100, 300, 500, 700]
+        downstream_native_ids = [300, -1, 700, -1]
+        endpoints = [
+            [(0.0015, 0.0), (0.01, 0.0)],
+            [(0.0, 0.0), (0.0015, 0.0)],
+            [(1.0, 0.0), (1.01, 0.0)],
+            [(1.01, 0.0), (1.02, 0.0)],
+        ]
+        areas = [10.0, 20.0, 10.0, 20.0]
+        with self.subTest(roots="proven by coincidence"):
+            topology = self.build_compact(
+                stream_native_ids, downstream_native_ids, endpoints, areas
+            )
+            np.testing.assert_allclose(topology.outlet_lons, [0.0015, 0.0, 1.01, 1.02])
+            self.assertEqual(
+                self.resolution_counts(topology),
+                {"endpoint-proven": 2, "root-predecessor-proven": 2},
+            )
+            self.assertEqual(
+                topology.diagnostics.basin_polarity,
+                self.polarity_record(None, "split", (1, 1), (2, 2)),
+            )
+        with self.subTest(roots="one isolated"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^orientation proof for root LINKNO 900 cannot use basin polarity: "
+                r"proven outlet endpoint indexes are split, unique coincidence "
+                r"counts index 0 1 and index 1 1, exact coincidence counts "
+                r"index 0 2 and index 1 2$",
+            ):
+                self.build_compact(
+                    [*stream_native_ids, 900],
+                    [*downstream_native_ids, -1],
+                    [*endpoints, [(5.0, 5.0), (5.1, 5.0)]],
+                    [*areas, 1.0],
+                )
 
 
 class OrientCliTests(unittest.TestCase):
@@ -2132,6 +2286,19 @@ class OrientCliTests(unittest.TestCase):
             )
             self.assertEqual(
                 report["proven_downstream_endpoint_index_counts"], {"0": 0, "1": 1}
+            )
+            self.assertEqual(
+                report["basin_polarity"],
+                {
+                    "rule_id": "basin-polarity-unanimous-proven-outlet-index-v1",
+                    "state": "unanimous",
+                    "downstream_endpoint_index": 1,
+                    "proven_downstream_endpoint_index_counts": {"0": 0, "1": 1},
+                    "exact_coincidence_downstream_endpoint_index_counts": {"0": 0, "1": 2},
+                },
+            )
+            self.assertEqual(
+                report["streamnet_diagnostics"]["basin_polarity"], report["basin_polarity"]
             )
             self.assertRegex(report["orientation_digest"], r"^[0-9a-f]{64}$")
             self.assertEqual(
@@ -2277,7 +2444,22 @@ class StreamnetModelTests(unittest.TestCase):
         )
         units = sorted(model.units, key=lambda unit: unit.linkno)
 
-        self.assertEqual(compact.diagnostics, model.diagnostics)
+        # The StreamnetModel path records no basin polarity; the compact path
+        # records the polarity of this fixture, which is outlet last.
+        self.assertEqual(
+            dataclasses.replace(compact.diagnostics, basin_polarity=None),
+            model.diagnostics,
+        )
+        self.assertEqual(
+            compact.diagnostics.basin_polarity,
+            build_adapter.BasinPolarity(
+                rule_id="basin-polarity-unanimous-proven-outlet-index-v1",
+                state="unanimous",
+                downstream_endpoint_index=1,
+                proven_downstream_endpoint_index_counts={"0": 0, "1": 1},
+                exact_coincidence_downstream_endpoint_index_counts={"0": 0, "1": 1},
+            ),
+        )
         np.testing.assert_array_equal(
             compact.native_ids, [unit.linkno for unit in units]
         )
@@ -2344,10 +2526,10 @@ class StreamnetModelTests(unittest.TestCase):
                 contracted_link_traversal_count=0,
                 endpoint_coincidence_proven_link_count=0,
                 predecessor_orientation_proven_root_count=0,
-                trusted_orientation_isolated_root_count=0,
-                trusted_orientation_isolated_root_native_linknos=(),
-                trusted_orientation_polygon_bearing_isolated_root_count=0,
-                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                isolated_root_count=0,
+                isolated_root_native_linknos=(),
+                polygon_bearing_isolated_root_count=0,
+                polygon_bearing_isolated_root_native_linknos=(),
                 orientation_tolerance=0.001,
             ),
         )
@@ -2397,10 +2579,10 @@ class StreamnetModelTests(unittest.TestCase):
                 contracted_link_traversal_count=0,
                 endpoint_coincidence_proven_link_count=1,
                 predecessor_orientation_proven_root_count=0,
-                trusted_orientation_isolated_root_count=0,
-                trusted_orientation_isolated_root_native_linknos=(),
-                trusted_orientation_polygon_bearing_isolated_root_count=0,
-                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                isolated_root_count=0,
+                isolated_root_native_linknos=(),
+                polygon_bearing_isolated_root_count=0,
+                polygon_bearing_isolated_root_native_linknos=(),
                 orientation_tolerance=0.001,
             ),
         )
@@ -2486,16 +2668,16 @@ class StreamnetModelTests(unittest.TestCase):
         )
         self.assertEqual(model.diagnostics.endpoint_coincidence_proven_link_count, 1)
         self.assertEqual(model.diagnostics.predecessor_orientation_proven_root_count, 0)
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 0)
+        self.assertEqual(model.diagnostics.isolated_root_count, 0)
         self.assertEqual(
-            model.diagnostics.trusted_orientation_isolated_root_native_linknos, ()
+            model.diagnostics.isolated_root_native_linknos, ()
         )
         self.assertEqual(
-            model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count,
+            model.diagnostics.polygon_bearing_isolated_root_count,
             0,
         )
         self.assertEqual(
-            model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            model.diagnostics.polygon_bearing_isolated_root_native_linknos,
             (),
         )
         self.assertEqual(model.diagnostics.orientation_tolerance, 0.001)
@@ -2563,10 +2745,10 @@ class StreamnetModelTests(unittest.TestCase):
                 contracted_link_traversal_count=3,
                 endpoint_coincidence_proven_link_count=5,
                 predecessor_orientation_proven_root_count=2,
-                trusted_orientation_isolated_root_count=0,
-                trusted_orientation_isolated_root_native_linknos=(),
-                trusted_orientation_polygon_bearing_isolated_root_count=0,
-                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                isolated_root_count=0,
+                isolated_root_native_linknos=(),
+                polygon_bearing_isolated_root_count=0,
+                polygon_bearing_isolated_root_native_linknos=(),
                 orientation_tolerance=0.001,
             ),
         )
@@ -2584,10 +2766,10 @@ class StreamnetModelTests(unittest.TestCase):
             "roots=2 contracted_edges=1 "
             "contracted_roots=1 contracted_link_traversals=3 "
             "endpoint_coincidence_proven_links=5 predecessor_orientation_proven_roots=2 "
-            "trusted_orientation_isolated_roots=0 "
-            "trusted_orientation_isolated_root_native_linknos=() "
-            "trusted_orientation_polygon_bearing_isolated_roots=0 "
-            "trusted_orientation_polygon_bearing_isolated_root_native_linknos=() "
+            "isolated_roots=0 "
+            "isolated_root_native_linknos=() "
+            "polygon_bearing_isolated_roots=0 "
+            "polygon_bearing_isolated_root_native_linknos=() "
             "orientation_tolerance=0.001",
             "\n".join(captured.output),
         )
@@ -2630,8 +2812,8 @@ class StreamnetModelTests(unittest.TestCase):
             model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
             (),
         )
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 0)
-        self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 0)
+        self.assertEqual(model.diagnostics.isolated_root_count, 0)
+        self.assertEqual(model.diagnostics.polygon_bearing_isolated_root_count, 0)
         self.assertEqual(model.diagnostics.orientation_tolerance, 0.001)
 
     def test_proves_reach_when_one_current_endpoint_matches_both_short_successor_endpoints(
@@ -2682,10 +2864,10 @@ class StreamnetModelTests(unittest.TestCase):
                 contracted_link_traversal_count=0,
                 endpoint_coincidence_proven_link_count=2,
                 predecessor_orientation_proven_root_count=1,
-                trusted_orientation_isolated_root_count=0,
-                trusted_orientation_isolated_root_native_linknos=(),
-                trusted_orientation_polygon_bearing_isolated_root_count=0,
-                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                isolated_root_count=0,
+                isolated_root_native_linknos=(),
+                polygon_bearing_isolated_root_count=0,
+                polygon_bearing_isolated_root_native_linknos=(),
                 orientation_tolerance=0.001,
             ),
         )
@@ -2731,10 +2913,10 @@ class StreamnetModelTests(unittest.TestCase):
                 contracted_link_traversal_count=0,
                 endpoint_coincidence_proven_link_count=0,
                 predecessor_orientation_proven_root_count=1,
-                trusted_orientation_isolated_root_count=0,
-                trusted_orientation_isolated_root_native_linknos=(),
-                trusted_orientation_polygon_bearing_isolated_root_count=0,
-                trusted_orientation_polygon_bearing_isolated_root_native_linknos=(),
+                isolated_root_count=0,
+                isolated_root_native_linknos=(),
+                polygon_bearing_isolated_root_count=0,
+                polygon_bearing_isolated_root_native_linknos=(),
                 orientation_tolerance=0.001,
             ),
         )
@@ -2831,10 +3013,10 @@ class StreamnetOrientationRejectionTests(unittest.TestCase):
             model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
             (),
         )
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 1)
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_native_linknos, (100,))
-        self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 1)
-        self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos, (100,))
+        self.assertEqual(model.diagnostics.isolated_root_count, 1)
+        self.assertEqual(model.diagnostics.isolated_root_native_linknos, (100,))
+        self.assertEqual(model.diagnostics.polygon_bearing_isolated_root_count, 1)
+        self.assertEqual(model.diagnostics.polygon_bearing_isolated_root_native_linknos, (100,))
 
     def test_distinguishes_polygonless_isolated_root_diagnostic(self) -> None:
         basins = pd.DataFrame({"streamID": [100]})
@@ -2860,10 +3042,10 @@ class StreamnetOrientationRejectionTests(unittest.TestCase):
             model.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
             (),
         )
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_count, 2)
-        self.assertEqual(model.diagnostics.trusted_orientation_isolated_root_native_linknos, (100, 900))
-        self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 1)
-        self.assertEqual(model.diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos, (100,))
+        self.assertEqual(model.diagnostics.isolated_root_count, 2)
+        self.assertEqual(model.diagnostics.isolated_root_native_linknos, (100, 900))
+        self.assertEqual(model.diagnostics.polygon_bearing_isolated_root_count, 1)
+        self.assertEqual(model.diagnostics.polygon_bearing_isolated_root_native_linknos, (100,))
         self.assertEqual((model.units[0].outlet_lon, model.units[0].outlet_lat), (1.0, 0.0))
 
     def test_rejects_conflicting_root_predecessors(self) -> None:
@@ -5029,15 +5211,15 @@ class CoreHfxCompilationTests(unittest.TestCase):
         self.assertEqual(diagnostics.contracted_link_traversal_count, 0)
         self.assertEqual(diagnostics.endpoint_coincidence_proven_link_count, 1)
         self.assertEqual(diagnostics.predecessor_orientation_proven_root_count, 1)
-        self.assertEqual(diagnostics.trusted_orientation_isolated_root_count, 0)
+        self.assertEqual(diagnostics.isolated_root_count, 0)
         self.assertEqual(
-            diagnostics.trusted_orientation_isolated_root_native_linknos, ()
+            diagnostics.isolated_root_native_linknos, ()
         )
         self.assertEqual(
-            diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 0
+            diagnostics.polygon_bearing_isolated_root_count, 0
         )
         self.assertEqual(
-            diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            diagnostics.polygon_bearing_isolated_root_native_linknos,
             (),
         )
         self.assertEqual(diagnostics.orientation_tolerance, 0.001)
@@ -5370,15 +5552,15 @@ class CoreHfxCompilationTests(unittest.TestCase):
             diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
             (),
         )
-        self.assertEqual(diagnostics.trusted_orientation_isolated_root_count, 2)
+        self.assertEqual(diagnostics.isolated_root_count, 2)
         self.assertEqual(
-            diagnostics.trusted_orientation_isolated_root_native_linknos, (100, 200)
+            diagnostics.isolated_root_native_linknos, (100, 200)
         )
         self.assertEqual(
-            diagnostics.trusted_orientation_polygon_bearing_isolated_root_count, 2
+            diagnostics.polygon_bearing_isolated_root_count, 2
         )
         self.assertEqual(
-            diagnostics.trusted_orientation_polygon_bearing_isolated_root_native_linknos,
+            diagnostics.polygon_bearing_isolated_root_native_linknos,
             (100, 200),
         )
 
@@ -5597,14 +5779,12 @@ class BuildCliTests(unittest.TestCase):
                     )
                 )
 
-    def expected_report(self, output: Path, *, isolated: bool = False) -> dict[str, object]:
-        ingestion_area = (
-            2461814.409986507 if isolated else 3692721.6149797607
-        )
-        raw_area = 2.4618144099865074 if isolated else 3.692721614979761
+    def expected_report(self, output: Path) -> dict[str, object]:
+        ingestion_area = 3692721.6149797607
+        raw_area = 3.692721614979761
         streamnet = {
             "polygon_bearing_link_count": 2,
-            "polygonless_dropped_reach_count": 0 if isolated else 1,
+            "polygonless_dropped_reach_count": 1,
             "degenerate_reach_count": 0,
             "degenerate_reach_native_linknos": [],
             "degenerate_polygon_bearing_reach_count": 0,
@@ -5615,17 +5795,21 @@ class BuildCliTests(unittest.TestCase):
             "short_successor_resolved_reach_native_linknos": [],
             "reach_side_near_degenerate_resolved_reach_count": 0,
             "reach_side_near_degenerate_resolved_reach_native_linknos": [],
-            "root_count": 2 if isolated else 1,
-            "contracted_edge_count": 0 if isolated else 1,
+            "root_count": 1,
+            "contracted_edge_count": 1,
             "contracted_root_count": 0,
-            "contracted_link_traversal_count": 0 if isolated else 1,
-            "endpoint_coincidence_proven_link_count": 0 if isolated else 2,
-            "predecessor_orientation_proven_root_count": 0 if isolated else 1,
-            "trusted_orientation_isolated_root_count": 2 if isolated else 0,
-            "trusted_orientation_isolated_root_native_linknos": [100, 200] if isolated else [],
-            "trusted_orientation_polygon_bearing_isolated_root_count": 2 if isolated else 0,
-            "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [100, 200] if isolated else [],
+            "contracted_link_traversal_count": 1,
+            "endpoint_coincidence_proven_link_count": 2,
+            "predecessor_orientation_proven_root_count": 1,
+            "isolated_root_count": 0,
+            "isolated_root_native_linknos": [],
+            "polygon_bearing_isolated_root_count": 0,
+            "polygon_bearing_isolated_root_native_linknos": [],
             "orientation_tolerance": 0.001,
+            # The polygon-less connector 150 of this fixture runs head first
+            # while 100 and 200 run outlet first, so the polarity is split; the
+            # build still succeeds because no root consults it.
+            "basin_polarity": polarity_report(None, "split", (1, 1), (1, 3)),
         }
         return {
             "build_identity": {
@@ -5668,11 +5852,11 @@ class BuildCliTests(unittest.TestCase):
                     "scratch_measurement_available": True,
                     "scratch_unavailable_reason": None,
                     "basins_rows": 2,
-                    "streamnet_rows": 3 if not isolated else 2,
+                    "streamnet_rows": 3,
                     "basins_geometry_count": 2,
-                    "streamnet_geometry_count": 3 if not isolated else 2,
+                    "streamnet_geometry_count": 3,
                     "basins_coordinate_count": 10,
-                    "streamnet_coordinate_count": 6 if not isolated else 4,
+                    "streamnet_coordinate_count": 6,
                     "basins_input_bytes": None,
                     "streamnet_input_bytes": None,
                     "selected_dtypes": {
@@ -5793,11 +5977,12 @@ class BuildCliTests(unittest.TestCase):
                     "contracted_link_traversal_count": 0,
                     "endpoint_coincidence_proven_link_count": 1,
                     "predecessor_orientation_proven_root_count": 0,
-                    "trusted_orientation_isolated_root_count": 0,
-                    "trusted_orientation_isolated_root_native_linknos": [],
-                    "trusted_orientation_polygon_bearing_isolated_root_count": 0,
-                    "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                    "isolated_root_count": 0,
+                    "isolated_root_native_linknos": [],
+                    "polygon_bearing_isolated_root_count": 0,
+                    "polygon_bearing_isolated_root_native_linknos": [],
                     "orientation_tolerance": 0.001,
+                    "basin_polarity": polarity_report(1, "unanimous", (0, 1), (0, 1)),
                 },
             )
             snap = pq.read_table(output / "aux/snap_stems.parquet")
@@ -6221,11 +6406,12 @@ class BuildCliTests(unittest.TestCase):
                     "contracted_link_traversal_count": 0,
                     "endpoint_coincidence_proven_link_count": 1,
                     "predecessor_orientation_proven_root_count": 0,
-                    "trusted_orientation_isolated_root_count": 0,
-                    "trusted_orientation_isolated_root_native_linknos": [],
-                    "trusted_orientation_polygon_bearing_isolated_root_count": 0,
-                    "trusted_orientation_polygon_bearing_isolated_root_native_linknos": [],
+                    "isolated_root_count": 0,
+                    "isolated_root_native_linknos": [],
+                    "polygon_bearing_isolated_root_count": 0,
+                    "polygon_bearing_isolated_root_native_linknos": [],
                     "orientation_tolerance": 0.001,
+                    "basin_polarity": polarity_report(1, "unanimous", (0, 1), (0, 0)),
                 },
             )
             catchments = pq.read_table(output / "catchments.parquet")
@@ -6262,7 +6448,7 @@ class BuildCliTests(unittest.TestCase):
             )
             self.assertFalse(
                 any(
-                    "diagnostic=trusted_orientation_isolated_root_count" in message
+                    "diagnostic=isolated_root_count" in message
                     for message in messages
                 )
             )
@@ -6367,7 +6553,7 @@ class BuildCliTests(unittest.TestCase):
                     for message in messages
                 )
             )
-            self.assertFalse(any("trusted_orientation" in message for message in messages))
+            self.assertFalse(any("isolated_root" in message for message in messages))
             self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
 
     def test_build_cli_rejects_report_inside_dataset_before_compiling(self) -> None:
@@ -6432,7 +6618,7 @@ class BuildCliTests(unittest.TestCase):
                     self.assertFalse(report.exists())
                     self.assert_no_temporary_entries(root, report.parent)
 
-    def test_build_cli_reports_trusted_isolated_roots(self) -> None:
+    def test_build_cli_refuses_isolated_roots_without_basin_polarity(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / "source"
@@ -6442,44 +6628,15 @@ class BuildCliTests(unittest.TestCase):
             streamnet["DSContArea"] = [area_200_m2 / 1_000_000, area_100_m2 / 1_000_000]
             basins_path, streamnet_path = write_pair(source, basins, streamnet)
             output, report = root / "output", root / "report.json"
-            with patch("build_adapter._utc_now", return_value=self.created_at):
-                with self.assertLogs("tdx-hydro", level="WARNING") as captured:
-                    self.assertEqual(main(self.build_args(basins_path, streamnet_path, output, report)), 0)
-            self.assert_report_equal(
-                json.loads(report.read_text()),
-                self.expected_report(output, isolated=True),
-            )
-            snap = pq.read_table(output / "aux/snap_stems.parquet")
-            self.assertEqual(snap["id"].to_pylist(), [1, 2])
-            self.assertEqual(snap["unit_id"].to_pylist(), [710000200, 710000100])
-            self.assertEqual(
-                snap["weight"].to_pylist(),
-                [1.2309072017669678, 1.2309072017669678],
-            )
-            self.assertEqual(snap["stem_role"].to_pylist(), [None, None])
-            self.assertEqual(
-                snap["geometry"].to_pylist(),
-                [
-                    LineString([(0.01, 0.0), (0.02, 0.0)]).wkb,
-                    LineString([(0.0, 0.0), (0.01, 0.0)]).wkb,
-                ],
-            )
-            messages = [record.getMessage() for record in captured.records]
-            self.assertTrue(any("diagnostic=trusted_orientation_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
-            self.assertTrue(any("diagnostic=trusted_orientation_polygon_bearing_isolated_root_count count=2" in message and "native_ids=(100, 200)" in message for message in messages))
-            self.assertFalse(
-                any(
-                    "short_successor_resolved_reach_count" in message
-                    for message in messages
-                )
-            )
-            self.assertFalse(
-                any(
-                    "reach_side_near_degenerate_resolved_reach_count" in message
-                    for message in messages
-                )
-            )
-            self.assertFalse(any("trusted" in message and "proven" in message for message in messages))
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^orientation proof for root LINKNO 100 cannot use basin polarity: "
+                r"no reach in the basin is proven by unique endpoint coincidence or "
+                r"exact coincidence$",
+            ):
+                main(self.build_args(basins_path, streamnet_path, output, report))
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
 
     def test_validate_cli_runs_explicit_binary_and_all_dataset_layer_checks(self) -> None:
         with TemporaryDirectory() as temp_dir:
