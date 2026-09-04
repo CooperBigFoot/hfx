@@ -2166,7 +2166,7 @@ class OrientCliTests(unittest.TestCase):
             report["orientation_digest"], build_adapter._orientation_digest(topology)
         )
 
-    def test_orient_reports_duplicate_identity_before_topology(self) -> None:
+    def test_orient_dissolves_repeated_stream_ids_like_build(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             basins, streamnet, _, _ = canonical_frames()
@@ -2178,17 +2178,19 @@ class OrientCliTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 status = main(self.orient_args(basins_path, streamnet_path, report_path))
             report = json.loads(report_path.read_text())
-            self.assertEqual(status, 1)
-            self.assertEqual(report["outcome"], "refused")
+            self.assertEqual(status, 0)
+            self.assertEqual(report["outcome"], "resolved")
+            self.assertEqual(report["rows"], {"basins": 3, "streamnet": 2})
+            self.assertEqual(report["unit_count"], 2)
             self.assertEqual(
-                report["refusal"],
+                report["basins_identity_dissolve"],
                 {
-                    "message": "duplicate unit identity for streamID 100",
-                    "native_linkno": None,
-                    "downstream_linkno": None,
+                    "dissolved_unit_count": 1,
+                    "dissolved_part_count": 2,
+                    "dissolved_stream_ids": [100],
+                    "geometry_checked": False,
                 },
             )
-            self.assertNotIn("resolution_counts", report)
 
     def test_orient_reports_orientation_refusal_with_linkno_pair(self) -> None:
         with TemporaryDirectory() as temp_dir:

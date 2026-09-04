@@ -5661,8 +5661,10 @@ def orient_topology(
     orient : (BasinIdentities, StreamnetTopologyColumns, HeaderNumber, Tolerance)
              -> OrientationReport                 (total: resolved or refused)
 
-    Reads only `basins.streamID` and the streamnet topology columns, runs the
-    same identity checks and compact topology step as `build`, and reports
+    Reads only `basins.streamID` and the streamnet topology columns, treats
+    repeated streamIDs as one dissolved unit the way `build` does (without the
+    geometry overlap check), runs the same identity checks and compact
+    topology step as `build`, and reports
     per-class resolution counts, the proven-outlet endpoint index histogram,
     the orientation digest, and on refusal the exact message with its LINKNO
     pair. Orientation compares DSContArea only by order, so raw DSContArea is
@@ -5689,8 +5691,20 @@ def orient_topology(
             "streamnet": int(len(columns.native_ids)),
         }
         report["streamnet_clamp"] = asdict(columns.clamp)
+        # `build` dissolves rows sharing one streamID into one unit; the
+        # preflight reads no geometry, so it takes the distinct identities as
+        # the polygon-bearing set and reports the dissolve it assumes. The
+        # interior-overlap check of the dissolve is left to `build`.
+        unique_identities, part_counts = np.unique(basin_native_input, return_counts=True)
+        duplicated = part_counts > 1
+        report["basins_identity_dissolve"] = {
+            "dissolved_unit_count": int(np.count_nonzero(duplicated)),
+            "dissolved_part_count": int(part_counts[duplicated].sum()),
+            "dissolved_stream_ids": [int(value) for value in unique_identities[duplicated]],
+            "geometry_checked": False,
+        }
         basin_native, stream_native, downstream_native = _validated_native_identities(
-            basin_native_input, columns.native_ids, columns.downstream_native_ids
+            unique_identities, columns.native_ids, columns.downstream_native_ids
         )
         order = np.argsort(columns.native_ids, kind="stable")
         topology = _build_compact_topology(
