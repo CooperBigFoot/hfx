@@ -105,7 +105,30 @@ def extract_fences(text: str) -> list[str]:
         if actual != first_line:
             raise ComposeError(f"fence {number} ({label}) starts with {actual!r}, expected {first_line!r}")
         check_remote_arguments(number, label, fences[number - 1])
+    check_adjudication_reads(fences[12])
     return fences
+
+
+def check_adjudication_reads(fence: str) -> None:
+    """Refuse a control-build fence that reads the adjudication record before deriving it unguarded.
+
+    Under `vm-planetary-build` the record exists only after `--derive-expected`
+    runs; rehearsal run 3 ended on an unguarded read before that point.
+    """
+    guarded = False
+    for index, line in enumerate(fence.split("\n")):
+        stripped = line.strip()
+        if "--derive-expected" in stripped:
+            return
+        if stripped.startswith("if ") and "preserved-off-vm" in stripped:
+            guarded = "fi" not in stripped.split(";")[-1]
+            continue
+        if stripped == "fi":
+            guarded = False
+            continue
+        if '"$adjudication"' in stripped and not stripped.startswith("adjudication=") and not guarded and "preserved-off-vm" not in stripped:
+            raise ComposeError(f"fence 13 (control-builds) line {index + 1} reads the adjudication record before it is derived and outside the preserved-off-vm guard")
+    raise ComposeError("fence 13 (control-builds) never derives the adjudication record")
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'

@@ -26,7 +26,8 @@ version_policy is NONE: NO version bump, NO tag.
       "cumulative_ceiling_eur": 1.0,
       "runs": [
         {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01},
-        {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-log-flush-race", "workload_dispatched": true, "estimated_cost_eur": 0.01}
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-log-flush-race", "workload_dispatched": true, "estimated_cost_eur": 0.01},
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T22:23:13Z", "zero_footprint": "2026-09-04T22:40:06Z", "server_id": 164611503, "volume_id": 106794635, "cause": "orient-digest-gate-read-underived-record", "workload_dispatched": true, "estimated_cost_eur": 0.01}
       ]
     },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
@@ -143,6 +144,10 @@ Rehearsal run 1 ran from the provisioning request at 20:51:00Z (server `16460184
 ### Rehearsal run 2 consumed on 2026-09-04
 
 Rehearsal run 2 ran from the provisioning request at 21:44:40Z (server `164608352`, volume `106794390`) to zero footprint at 22:00:48Z, about 16 minutes and an estimated EUR 0.01. Provisioning, bootstrap, the repaired converge fence, and the init workload all passed; the runner exited 0. The operator driver then read the init canonical log's last line the instant `launch.sh status` reported the session gone and found the runner's last status line instead of the `launch: finished` record: `launch.sh` wrote its logs through a `tee` process substitution that tmux killed with the pane before the last line was written, so the record never reached either log. `launch.sh` now closes its output and waits for `tee` before exiting, and every finish-record read polls for the line. The runbook's own cleanup performed exact-resource teardown.
+
+### Rehearsal run 3 consumed on 2026-09-04
+
+Rehearsal run 3 ran from the provisioning request at 22:23:13Z (server `164611503`, volume `106794635`) to zero footprint at 22:40:06Z, about 17 minutes and an estimated EUR 0.01. Convergence, initialization, the corpus transfer, the adopting acquisition, and the VM-built reference control of section 10 all passed for the first time. Section 10's control-build fence then compared the `orient` digest against the adjudication record before the record had been derived under `vm-planetary-build`, and `jq` failed on the absent file. The comparison is now guarded by the reference mode, and the composer refuses a fence that reads the record before deriving it outside that guard. The runbook's own cleanup performed exact-resource teardown.
 
 ## 2. Fixed ceilings and retention
 
@@ -737,7 +742,7 @@ The adjudicated comparison replaces byte identity as the gate for the corrected 
 
 ### Orientation preflight, builds, and comparisons
 
-Run the read-only `orient` preflight against the control's source inputs before either build. Its orientation digest must equal the pinned corrected digest; a different digest means the checked-out adapter is not the adjudicated one, and the campaign stops before spending build time. Then build the control with the corrected adapter, because its result decides whether any per-basin output can be trusted, and rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. The remote fence records which branch it took in `created-at-record.json` under the control root. When the flag was passed, the corrected build's `manifest.json` must be byte-identical to the preserved one. Only when the flag was unavailable may the manifest differ solely in `created_at`, and the record states that this tolerance applied. The planetary rebuild has no such flag at its revision, so its comparison always carries the allowance and its `manifest.json` is expected to differ only in `created_at`.
+Run the read-only `orient` preflight against the control's source inputs before either build. Under `preserved-off-vm` its orientation digest must equal the pinned corrected digest; a different digest means the checked-out adapter is not the adjudicated one, and the campaign stops before spending build time. Under `vm-planetary-build` no record exists before the builds, so that pre-build comparison is skipped; the record derived after both builds takes its corrected digest from the corrected build, the pinned comparison then requires the `orient` report digest to equal it, and the workstation check after this fence compares the copied-back record against the report. Rehearsal run 3 ended on 2026-09-04 at 22:39:24Z because this comparison read the record before it was derived. Then build the control with the corrected adapter, because its result decides whether any per-basin output can be trusted, and rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. The remote fence records which branch it took in `created-at-record.json` under the control root. When the flag was passed, the corrected build's `manifest.json` must be byte-identical to the preserved one. Only when the flag was unavailable may the manifest differ solely in `created_at`, and the record states that this tolerance applied. The planetary rebuild has no such flag at its revision, so its comparison always carries the allowance and its `manifest.json` is expected to differ only in `created_at`.
 
 Both control builds pass the contract's `control_fabric_version` (`0.3.0` in production) because the preserved control was built with that value and the manifest embeds it; the per-basin compiles in section 11 use the contract's `fabric_version` (`NGA-TDX-Hydro-20230126` in production) because the baseline artifact carries that value and extension assembly requires the inputs to agree with it. The manifest also embeds `adapter_version`, which is `0.1.0` at both revisions today; a later bump would surface as a `manifest.json` difference and stops the work like any other difference.
 
@@ -765,7 +770,9 @@ mkdir -p "$control_root/corrected" "$control_root/planetary"
   --streamnet "$campaign_dir/downloads/$control_id-streamnet.gpkg" \
   --processing-basin-id "$control_id" \
   --report "$control_root/corrected/$control_id-orient.json" >/dev/null
-test "$(jq -r '.orientation_digest' "$control_root/corrected/$control_id-orient.json")" = "$(jq -r '.corrected_orientation_digest' "$adjudication")"
+if [ "$control_reference" = preserved-off-vm ]; then
+  test "$(jq -r '.orientation_digest' "$control_root/corrected/$control_id-orient.json")" = "$(jq -r '.corrected_orientation_digest' "$adjudication")"
+fi
 
 created_at_args=()
 created_at_flag_used=false

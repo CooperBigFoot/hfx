@@ -104,6 +104,11 @@ sed '/^campaign_gate pre-compile /,/^```$/d' "$runbook" >"$tmp/dropped-runbook.m
 expect_failure --runbook "$tmp/dropped-runbook.md" --mode full --out "$tmp/bad"
 assert_contains "$stderr" 'expected 25 fences'
 pass 'argument errors and a moved, renamed, or dropped fence refuse before composing'
+perl -0pe 's/if \[ "\$control_reference" = preserved-off-vm \]; then\n  test "\$\(jq -r .\.orientation_digest. "\$control_root\/corrected\/\$control_id-orient\.json"\)" = "\$\(jq -r .\.corrected_orientation_digest. "\$adjudication"\)"\nfi\n/test "\$(jq -r \x27.orientation_digest\x27 "\$control_root\/corrected\/\$control_id-orient.json")" = "\$(jq -r \x27.corrected_orientation_digest\x27 "\$adjudication")"\n/' "$runbook" >"$tmp/unguarded-runbook.md"
+grep -q '^test "$(jq -r '"'"'.orientation_digest'"'"'' "$tmp/unguarded-runbook.md" || die 'unguarded mutation did not apply'
+expect_failure --runbook "$tmp/unguarded-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived and outside the preserved-off-vm guard'
+pass 'the composer refuses a control-build fence that reads the adjudication record before deriving it'
 
 # The exit-trap wrapper must reach campaign_cleanup with the original failing status even though
 # errexit is in force inside an EXIT trap. Extract the wrapper from the driver and drive it with stubs.
