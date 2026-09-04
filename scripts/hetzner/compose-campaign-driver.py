@@ -189,6 +189,11 @@ finish_record() {
     sleep 5
   done
   cat "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"
+  if ! grep -q -E -- '^launch: finished at ' "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"; then
+    ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 40 "/mnt/hfx/logs/hfx-$CAMPAIGN-$1.log" > "$LOCAL_EVIDENCE_DIR/$1-log-tail-without-finish-record.txt" || true
+    oplog "workload $1 ended without a finish record after 60 s; log tail preserved; refusing"
+    return 1
+  fi
 }
 require_finish_exit_zero() { grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"; }
 {

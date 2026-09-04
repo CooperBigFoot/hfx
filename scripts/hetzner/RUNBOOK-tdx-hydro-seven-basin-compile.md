@@ -26,7 +26,7 @@ version_policy is NONE: NO version bump, NO tag.
       "cumulative_ceiling_eur": 1.0,
       "runs": [
         {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01},
-        {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-finish-record-lost", "workload_dispatched": true, "estimated_cost_eur": 0.01}
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-log-flush-race", "workload_dispatched": true, "estimated_cost_eur": 0.01}
       ]
     },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
@@ -876,7 +876,7 @@ campaign_gate pre-compile "$(contract_value '.gate_reserve_hours["pre-compile"]'
   --fabric-version "$FABRIC_VERSION"
 ```
 
-Poll with the gate before every status check and repeat the pair until status exits 3. The reserve (20 hours in production) covers assembly, preservation, and teardown. When status reports the session finished, read the canonical log's last line, polling for up to a minute for the runner finish record (the runner now waits for its `tee` before exiting, but a late line must never be read as a failed compile), and require it to carry exit `0`; any other exit sets `compile_exit_zero` to `0`, is preserved as evidence, and the campaign continues at section 14 without assembly:
+Poll with the gate before every status check and repeat the pair until status exits 3. The reserve (20 hours in production) covers assembly, preservation, and teardown. When status reports the session finished, read the canonical log's last line, polling for up to a minute for the runner finish record (the runner now waits for its `tee` before exiting, but a late line must never be read as a failed compile); a log that still carries no finish record after the bound is preserved as `compile-log-tail-without-finish-record.txt` and counts as a nonzero exit. Require the record to carry exit `0`; any other exit sets `compile_exit_zero` to `0`, is preserved as evidence, and the campaign continues at section 14 without assembly:
 
 ```bash
 campaign_gate compile-monitor "$(contract_value '.gate_reserve_hours["compile-monitor"]')"
@@ -890,6 +890,8 @@ for finish_attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 5
 done
 cat "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt"
+grep -q -E -- '^launch: finished at ' "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt" ||
+  ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 40 "/mnt/hfx/logs/hfx-$CAMPAIGN-tdx-compile.log" > "$LOCAL_EVIDENCE_DIR/compile-log-tail-without-finish-record.txt" || true
 compile_exit_zero=1
 grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt" || compile_exit_zero=0
 ```
