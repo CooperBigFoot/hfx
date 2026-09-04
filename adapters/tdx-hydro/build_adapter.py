@@ -744,8 +744,9 @@ def dissolve_identity_parts(stream_id: int, parts: Sequence[Polygon | MultiPolyg
     """dissolve : (streamID, parts) -> unit geometry, total on interior-disjoint parts.
 
     Rule `duplicate-identity-part-overlap-v1`, shared with the adjudicator.
-    Several single-part rows carrying one streamID encode one multipart
-    catchment. Parts that touch only at edges or corners dissolve into one
+    Parts are unioned in WKB byte order, so the unit geometry is independent
+    of source row order. Several single-part rows carrying one streamID encode
+    one multipart catchment. Parts that touch only at edges or corners dissolve into one
     Polygon or MultiPolygon. Parts whose interiors overlap contradict each
     other and refuse.
 
@@ -767,7 +768,7 @@ def dissolve_identity_parts(stream_id: int, parts: Sequence[Polygon | MultiPolyg
             f"basins streamID {stream_id} has {len(parts)} parts whose interiors overlap: "
             f"{len(overlapping)} part pair(s) such as {shown}"
         )
-    geometry = union_all(list(parts))
+    geometry = union_all(sorted(parts, key=lambda part: part.wkb))
     if not isinstance(geometry, (Polygon, MultiPolygon)) or geometry.is_empty or not geometry.is_valid:
         raise ValueError(
             f"basins streamID {stream_id} parts do not dissolve into a valid Polygon or MultiPolygon"
@@ -5659,30 +5660,30 @@ def _quoted_layer(source: SourceLayer) -> str:
 
 
 def _read_adjudication_features(
-    product: SourceLayer,
+    source: SourceLayer,
     columns: Sequence[str],
     where: str | None = None,
     fids: Sequence[int] | None = None,
 ) -> gpd.GeoDataFrame:
     """Read the named columns and geometry of the features selected by `where` or by `fids`."""
     if (where is None) == (fids is None):
-        raise ValueError(f"{product.processing_basin_id} {product.product} feature selection requires exactly one of where or fids")
+        raise ValueError(f"{source.processing_basin_id} {source.product} feature selection requires exactly one of where or fids")
     try:
         if fids is not None:
-            frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), fids=[int(value) for value in fids])
+            frame = pyogrio.read_dataframe(source.path, layer=source.layer_name, columns=list(columns), fids=[int(value) for value in fids])
         else:
-            frame = pyogrio.read_dataframe(product.path, layer=product.layer_name, columns=list(columns), where=where)
+            frame = pyogrio.read_dataframe(source.path, layer=source.layer_name, columns=list(columns), where=where)
     except Exception as error:
-        raise ValueError(f"{product.processing_basin_id} {product.product} acquired source is malformed: {product.path}") from error
+        raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}") from error
     if not isinstance(frame, gpd.GeoDataFrame) or frame.crs is None:
-        raise ValueError(f"{product.processing_basin_id} {product.product} acquired source is malformed: {product.path}")
+        raise ValueError(f"{source.processing_basin_id} {source.product} acquired source is malformed: {source.path}")
     if frame.crs.to_epsg() != 4326:
         try:
             frame = frame.to_crs(CRS)
         except Exception as error:
-            raise ValueError(f"{product.processing_basin_id} {product.product} CRS does not resolve to {CRS}: {product.path}") from error
+            raise ValueError(f"{source.processing_basin_id} {source.product} CRS does not resolve to {CRS}: {source.path}") from error
     if frame.crs is None or frame.crs.to_epsg() != 4326:
-        raise ValueError(f"{product.processing_basin_id} {product.product} CRS does not resolve to {CRS}: {product.path}")
+        raise ValueError(f"{source.processing_basin_id} {source.product} CRS does not resolve to {CRS}: {source.path}")
     return frame
 
 

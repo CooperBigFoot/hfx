@@ -1681,6 +1681,31 @@ class SinglePartCatchmentEncodingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^basins streamID 7 part 0 must be a non-empty Polygon or MultiPolygon$"):
             build_adapter.dissolve_identity_parts(7, [LineString([(0.0, 0.0), (1.0, 1.0)]), square])
 
+    def test_dissolve_is_invariant_to_part_order(self) -> None:
+        import itertools
+
+        parts = [
+            Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]),
+            Polygon([(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 0.0)]),
+            Polygon([(2.0, 1.0), (3.0, 1.0), (3.0, 2.0), (2.0, 2.0), (2.0, 1.0)]),
+            Polygon([(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 6.0), (5.0, 5.0)]),
+        ]
+        expected = build_adapter.dissolve_identity_parts(7, parts).wkb
+        for permutation in itertools.permutations(parts):
+            self.assertEqual(build_adapter.dissolve_identity_parts(7, list(permutation)).wkb, expected)
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet = self.frames("touching")
+            reversed_rows = gpd.GeoDataFrame(pd.concat([basins.iloc[[2, 1, 0]], basins.iloc[3:]], ignore_index=True), crs=basins.crs)
+            (root / "a").mkdir()
+            (root / "b").mkdir()
+            forward = load_tdx_geopackages(*write_pair(root / "a", basins, streamnet))
+            backward = load_tdx_geopackages(*write_pair(root / "b", reversed_rows, streamnet))
+            self.assertEqual(
+                [geometry.wkb for geometry in forward.basins.geometry],
+                [geometry.wkb for geometry in backward.basins.geometry],
+            )
+
 
 class HeaderCrosswalkTests(unittest.TestCase):
     def test_loads_vendored_crosswalk(self) -> None:
@@ -5925,6 +5950,62 @@ class BuildCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "return code 7"):
                     main(["validate", str(output), "--hfx-binary", str(failing)])
             validator.assert_not_called()
+
+
+class CommittedVerdictLedgerTests(unittest.TestCase):
+    """The committed seven-basin-verdicts.json satisfies its documented invariants."""
+
+    LEDGER_PATH = Path(__file__).resolve().parent / "seven-basin-verdicts.json"
+    SCHEMA_1_HISTORICAL_SHA256 = "a1c9f5d721c65a05c5745b8087a949616bae069e9109ebf74863734ed955269c"
+
+    @staticmethod
+    def canonical(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+    def test_committed_ledger_invariants(self) -> None:
+        ledger = json.loads(self.LEDGER_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(ledger), ["adapter", "endpoint_tolerance", "schema_version", "verdicts"])
+        self.assertEqual(ledger["schema_version"], 2)
+        self.assertEqual(ledger["adapter"], {"adapter_version": "0.1.0", "git_revision": "bca87d8adb0651d130bde9c7dfcf3947427cfa24"})
+        entries = ledger["verdicts"]
+        self.assertEqual([entry["processing_basin_id"] for entry in entries], list(build_adapter.ABSENT_PROCESSING_BASIN_IDS))
+        self.assertTrue(all(sorted(entry) == ["current_disposition", "historical_absence", "processing_basin_id"] for entry in entries))
+        build_adapter._validate_adjudication_result(entries)
+        six = [{"processing_basin_id": entry["processing_basin_id"], **entry["historical_absence"]} for entry in entries if entry["processing_basin_id"] != "1020018110"]
+        self.assertEqual(hashlib.sha256(self.canonical(six)).hexdigest(), self.SCHEMA_1_HISTORICAL_SHA256)
+        by_id = {entry["processing_basin_id"]: entry for entry in entries}
+        self.assertEqual({basin_id for basin_id, entry in by_id.items() if entry["current_disposition"] is not None}, {"1020018110", "5020049720"})
+        for basin_id, stream_id in (("1020018110", 9), ("5020049720", 24)):
+            current = by_id[basin_id]["current_disposition"]
+            self.assertEqual([current["verdict"], current["evidence_kind"], current["adjudication_kind"]], ["adapter strictness", "acquired source geometry", "duplicate identity"])
+            self.assertEqual(current["evidence"]["duplicated_stream_ids"], [stream_id])
+            self.assertEqual(current["evidence"]["stream_id_selection"], "requested")
+            self.assertEqual(current["evidence"]["layer"]["geometry_type"], "Polygon")
+            (identity,) = current["evidence"]["identities"]
+            self.assertEqual([identity["verdict"], identity["evidence"]["derivation"]["rule_id"], identity["evidence"]["derivation"]["selected_branch"]], ["adapter strictness", "duplicate-identity-part-overlap-v1", "single_part_encoding"])
+            self.assertEqual(identity["evidence"]["interior_overlapping_pairs"], [])
+            self.assertEqual(identity["evidence"]["dissolved_geometry_type"], "MultiPolygon")
+            self.assertEqual(identity["evidence"]["streamnet"]["LINKNO_feature_count"], 1)
+            self.assertEqual(identity["evidence"]["source"], current["evidence"]["source"])
+        historical = by_id["1020018110"]["historical_absence"]
+        self.assertEqual([historical["verdict"], historical["evidence_kind"]], ["adapter strictness", "acquired source geometry"])
+        self.assertEqual(historical["evidence"]["historical_compile_refusal"], "duplicate unit identity for streamID 9")
+        self.assertEqual(
+            historical["evidence"]["superseded_adjudication"],
+            {"verdict": "source defect", "rule_id": "duplicate-ground-equality-v1", "adapter_git_revision": "bca87d8adb0651d130bde9c7dfcf3947427cfa24", "ledger_schema_version": 1},
+        )
+        self.assertEqual(historical["evidence"]["streamID"], 9)
+        self.assertEqual(historical["evidence"]["derivation"]["rule_id"], "duplicate-identity-part-overlap-v1")
+        self.assertEqual(by_id["5020049720"]["historical_absence"]["verdict"], "transfer failure")
+        self.assertEqual(
+            [by_id[basin_id]["historical_absence"]["evidence"]["layer"]["distinct_stream_id_count"] for basin_id in ("1020018110",)]
+            + [by_id[basin_id]["current_disposition"]["evidence"]["layer"]["distinct_stream_id_count"] for basin_id in ("1020018110", "5020049720")],
+            [515349, 515349, 933755],
+        )
+        self.assertEqual(
+            [by_id[basin_id]["current_disposition"]["evidence"]["identities"][0]["evidence"]["streamnet"]["reach_count"] for basin_id in ("1020018110", "5020049720")],
+            [515435, 933991],
+        )
 
 
 class BasinAdjudicationTests(unittest.TestCase):
