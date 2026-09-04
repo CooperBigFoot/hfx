@@ -229,6 +229,15 @@ expect_failure --runbook "$mutated" --check baseline-is-pinned
 assert_contains "$stderr" 'extension scratch prefix is not pinned'
 pass 'hotpatch, control digest, baseline, and extension prefix drift refuses'
 
+mutated=$(mutate rehearsal-ceiling-reached 's/"estimated_cost_eur": 0\.01/"estimated_cost_eur": 1.0/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'cumulative estimated rehearsal spend has reached the rehearsal ceiling'
+mutated=$(mutate rehearsal-run-incomplete 's/"cause": "ssh-remote-argument-flattening", //')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'
+mutated=$(mutate rehearsal-rerun-rule-removed 's/"reruns": "[^"]*",/"reruns": "never",/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'
 mutated=$(mutate rehearsal-record-pending 's/("rehearsal_authority": \{[^}]*"record": )"[^"]*"/${1}"RECORD-URL"/')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'rehearsal authority does not name its record'
