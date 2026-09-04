@@ -17,6 +17,7 @@
     }
   },
   "requires_passing_rehearsal": false,
+  "requires_passing_dry_run": true,
   "server_name": "hfx-build-campaign-rehearsal",
   "volume_name": "hfx-build-campaign-rehearsal-data",
   "server_type": "cx23",

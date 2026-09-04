@@ -56,10 +56,11 @@ Checks:
   authority-is-current        authority ref is an ancestor of HEAD and names the vision section
   rehearsal-record-is-pinned  the rehearsal authority names the tracked rehearsal contract and both are consistent
   rehearsal-passed            a passing lifecycle-result.json for the rehearsal exists under --evidence-root
+  dry-run-passed              campaign-dry-run-result.json under --evidence-root records a pass at HEAD
 
 Options:
   --runbook <path>        runbook to verify; default is the tracked runbook in this checkout
-  --evidence-root <path>  required by approval-is-a-precondition and rehearsal-passed
+  --evidence-root <path>  required by approval-is-a-precondition, rehearsal-passed, and dry-run-passed
   --adjudication-record <path>
                           control adjudication record to verify; default is the tracked record
   --rehearsal-contract <path>
@@ -162,6 +163,7 @@ case $check in
         jq -e '.lifecycle_ledger.current_authority.precondition | type == "string" and test("lifecycle-result.json") and test("campaign-rehearsal")' <<<"$contract" >/dev/null 2>&1 ||
             fail 'current lifecycle authority is not conditional on a passing rehearsal record'
         require_field '.requires_passing_rehearsal' true 'production contract must require a passing rehearsal'
+        require_field '.requires_passing_dry_run' true 'production contract must require a passing local dry run'
         require_phrase 'The 2026-09-04 authorization covers one lifecycle only.'
         require_phrase 'A rehearsal that fails is recorded in `rehearsal_authority.runs` with its cause and estimated cost; the next rehearsal waits for a merged, reviewed fix and for the cumulative estimate to remain below the ceiling.'
         require_field '.gate_reserve_hours | keys' "$HFX_EXPECTED_GATE_PHASES" 'gate reserves are not pinned for every gate phase'
@@ -342,6 +344,7 @@ case $check in
             and .campaign == $campaign
             and .server_name == "hfx-build-" + $campaign and .volume_name == "hfx-build-" + $campaign + "-data"
             and .requires_passing_rehearsal == false
+            and .requires_passing_dry_run == true
             and .lifecycles_authorized == 1
             and (.lifecycle_ledger.consumed == [])
             and (.server_type | test("^cx[0-9]+$"))
@@ -399,6 +402,20 @@ case $check in
         rehearsal_ref=$(jq -r '.ground_truth_ref' "$result")
         git -C "$repo_root" merge-base --is-ancestor "$HFX_RUNNER_FIX_REF" "$rehearsal_ref" 2>/dev/null ||
             fail "rehearsal ran on a ref that does not descend from the runner fix $HFX_RUNNER_FIX_REF"
+        ;;
+    dry-run-passed)
+        [[ -n "$evidence_root" ]] || fail 'evidence root is required'
+        [[ "$evidence_root" == /* ]] || fail 'evidence root must be absolute'
+        [[ -d "$evidence_root" && ! -L "$evidence_root" ]] || fail 'evidence root must be an existing non-symlink directory'
+        dry_run=$evidence_root/campaign-dry-run-result.json
+        [[ -f "$dry_run" && ! -L "$dry_run" && -s "$dry_run" ]] || fail 'campaign dry-run result is missing; run scripts/hetzner/campaign-dry-run.sh --record first'
+        jq -e 'type == "object"' "$dry_run" >/dev/null 2>&1 || fail 'malformed campaign dry-run result'
+        jq -e '.schema_version == 1 and .kind == "campaign-dry-run" and .result == "passed"
+            and .lifecycle_result.result == "passed" and .lifecycle_result.strict_validation == "passed" and .lifecycle_result.zero_footprint == true
+            and (.ground_truth_ref | type == "string" and test("^[0-9a-f]{40}$"))' "$dry_run" >/dev/null 2>&1 ||
+            fail 'campaign dry-run result is not a passing record'
+        [[ $(jq -r '.ground_truth_ref' "$dry_run") == $(git -C "$repo_root" rev-parse HEAD) ]] ||
+            fail 'campaign dry-run result was recorded at another ref than HEAD; rerun the dry run at this ref'
         ;;
     *) fail 'unknown check' ;;
 esac
