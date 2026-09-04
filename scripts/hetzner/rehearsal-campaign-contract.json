@@ -7,7 +7,7 @@
   "lifecycles_authorized": 1,
   "lifecycle_ledger": {
     "consumed": [],
-    "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "RECORD-URL", "precondition": "none", "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual, exact-resource teardown"}
+    "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "none", "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual, exact-resource teardown"}
   },
   "requires_passing_rehearsal": false,
   "server_name": "hfx-build-campaign-rehearsal",

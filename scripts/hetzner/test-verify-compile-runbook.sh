@@ -232,7 +232,7 @@ pass 'hotpatch, control digest, baseline, and extension prefix drift refuses'
 mutated=$(mutate rehearsal-record-pending 's/("rehearsal_authority": \{[^}]*"record": )"[^"]*"/${1}"RECORD-URL"/')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'rehearsal authority does not name its record'
-mutated=$(mutate rehearsal-phrase-removed 's/The rehearsal never names the production baseline prefix\. //')
+mutated=$(mutate rehearsal-phrase-removed 's/The rehearsal never names the production baseline prefix\.//')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'runbook omits required operational text'
 mkdir "$tmp/rehearsal-evidence" "$tmp/rehearsal-evidence/campaign-rehearsal"
@@ -275,10 +275,19 @@ expect_failure --runbook "$tmp/runbook-link.md" --check scope-permits-compilatio
 assert_contains "$stderr" 'not a regular file'
 pass 'a relative or symlinked runbook path refuses'
 
-# The runbook shell sets IFS to newline and tab; the absent-basin list must be an
-# array so loops enumerate seven ids instead of one space-joined word.
-array_line=$(grep -E '^ABSENT_IDS=\(' "$runbook") || die 'runbook does not define ABSENT_IDS as an array'
-enumerated=$(bash -c "set -Eeuo pipefail; IFS=\$'\n\t'; $array_line; for id in \"\${ABSENT_IDS[@]}\"; do printf '%s\n' \"\$id\"; done")
+# The runbook shell sets IFS to newline and tab; the absent-basin list is built from
+# the contract into an array so loops enumerate seven ids instead of one space-joined word.
+grep -q -E '^ABSENT_IDS=\(\)$' "$runbook" || die 'runbook does not define ABSENT_IDS as an array'
+cat >"$tmp/enumerate.sh" <<'ENUMERATE'
+set -Eeuo pipefail
+IFS=$'\n\t'
+CAMPAIGN_CONTRACT_JSON=$(sed -n '/^<!-- BEGIN COMPILE CAMPAIGN CONTRACT$/,/^END COMPILE CAMPAIGN CONTRACT -->$/p' "$1" | sed '1d;$d')
+contract_value() { jq -er "$1" <<<"$CAMPAIGN_CONTRACT_JSON"; }
+ABSENT_IDS=()
+while IFS= read -r absent_id; do ABSENT_IDS+=("$absent_id"); done < <(contract_value '.absent_basins[]')
+for id in "${ABSENT_IDS[@]}"; do printf '%s\n' "$id"; done
+ENUMERATE
+enumerated=$(bash "$tmp/enumerate.sh" "$runbook")
 [[ $(printf '%s\n' "$enumerated" | wc -l | tr -d ' ') == 7 ]] || die 'ABSENT_IDS did not enumerate seven ids under the runbook IFS'
 [[ $(printf '%s\n' "$enumerated" | sort -u | grep -c -E '^[0-9]{10}$') == 7 ]] || die 'ABSENT_IDS entries are not seven distinct ten-digit ids'
 ! grep -E -- '\$ABSENT_IDS([^\[]|$)' "$runbook" >/dev/null || die 'runbook still expands ABSENT_IDS as a scalar'

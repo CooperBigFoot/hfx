@@ -84,7 +84,8 @@ roster_basin=$(jq -er '.baseline.basin_ids[0]' "$contract")
 [[ "$(jq -r '.baseline.basin_ids | length' "$contract")" == 1 ]] || hfx_die 'the rehearsal baseline roster must hold exactly one basin'
 [[ "$baseline_prefix" == "s3://pourpoint-hfx/scratch/tdx-hydro-$campaign/"* ]] || hfx_die 'rehearsal baseline prefix is outside the rehearsal scratch namespace'
 [[ "$baseline_prefix" != *tdx-m5-planetary* ]] || hfx_die 'rehearsal baseline prefix names the production baseline'
-mapfile -t selected_ids < <(jq -r '.absent_basins[], .control_basin, .baseline.basin_ids[]' "$contract" | sort -u)
+selected_ids=()
+while IFS= read -r selected_id; do selected_ids+=("$selected_id"); done < <(jq -r '.absent_basins[], .control_basin, .baseline.basin_ids[]' "$contract" | sort -u)
 
 corpus_dir=$evidence_root/off-vm/acquired-source
 preserved_root=$evidence_root/off-vm/control-builds/planetary/$control_id
