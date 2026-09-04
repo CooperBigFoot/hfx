@@ -327,7 +327,8 @@ from adjudicator stdout. Its `adapter.adapter_version` value `0.1.0` and
 `bca87d8adb0651d130bde9c7dfcf3947427cfa24` identify the examined adapter build
 under which the seven processing basins are absent. The adjudicator at commit
 `bd2606c1dd268eee8f87327008411bf73a08d1b7` derived the schema 1 ledger; the
-adjudicator at commit `4375f62` regenerated it as schema 2 with the two
+adjudicator at commit `80349e0` plus the superseded-adjudication record
+regenerated it as schema 2 with the two
 duplicate-identity documents named above, each produced by the same commit.
 
 The `1020018110` duplicate `streamID` finding is an encoding inconsistency
@@ -436,7 +437,12 @@ dissolve into one `MultiPolygon`, and the streamnet carries `LINKNO 9` exactly
 once. The schema 1 ledger classified this identity as `source defect` under the
 superseded rule `duplicate-ground-equality-v1`, which asked whether the rows
 covered the same ground; that question does not distinguish a multipart
-encoding from a contradiction.
+encoding from a contradiction. That classification is preserved verbatim as
+`historical_absence.evidence.superseded_adjudication` (verdict, rule id, the
+adapter git revision `bca87d8` it examined, ledger schema version 1), a
+recorded value the adjudicator never re-derives, so the entry shows three
+distinct facts: the historical reason for absence (the compile refusal), the
+superseded historical adjudication, and the current disposition.
 
 `5020049720` was historically absent because its transfer failed
 (`historical_absence.verdict` is `transfer failure`); the later compile of the

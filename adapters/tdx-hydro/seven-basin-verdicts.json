@@ -6698,6 +6698,12 @@
             "reach_count": 515435,
             "sha256": "b7bdd31f3c4ec06c57a557fea2c8f76fc42f9e4731881b7ed455f50a1918e1ac"
           },
+          "superseded_adjudication": {
+            "adapter_git_revision": "bca87d8adb0651d130bde9c7dfcf3947427cfa24",
+            "ledger_schema_version": 1,
+            "rule_id": "duplicate-ground-equality-v1",
+            "verdict": "source defect"
+          },
           "union_area_km2": 8.400877554838875
         },
         "evidence_kind": "acquired source geometry",

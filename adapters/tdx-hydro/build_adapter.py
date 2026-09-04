@@ -102,6 +102,17 @@ VERDICT_LEDGER_SCHEMA_VERSION = 2
 DUPLICATE_IDENTITY_ADJUDICATION_KIND = "duplicate identity"
 DUPLICATE_IDENTITY_ADJUDICATION_SCHEMA_VERSION = 1
 DUPLICATE_IDENTITY_PART_OVERLAP_RULE_ID = "duplicate-identity-part-overlap-v1"
+# Recorded values from the schema 1 ledger, kept verbatim so the ledger shows the
+# historical reason for absence, the superseded adjudication, and the current
+# disposition as three distinct facts. Never re-derived.
+SUPERSEDED_DUPLICATE_ADJUDICATIONS: Mapping[str, Mapping[str, object]] = {
+    "1020018110": {
+        "verdict": "source defect",
+        "rule_id": "duplicate-ground-equality-v1",
+        "adapter_git_revision": ADJUDICATED_ADAPTER_GIT_REVISION,
+        "ledger_schema_version": 1,
+    },
+}
 
 
 class BasinVerdict(Enum):
@@ -5922,12 +5933,11 @@ def _adjudicate_duplicate(root: Path, basin_id: str) -> AdjudicationVerdict:
         raise ValueError(f"{basin_id} basins source carries no duplicated streamID")
     stream_id = min(index.feature_ids)
     verdict = adjudicate_duplicate_identity(product, stream_id, index, _parse_acquired_product(root, basin_id, "streamnet"))
-    return AdjudicationVerdict(
-        verdict.processing_basin_id,
-        verdict.verdict,
-        verdict.evidence_kind,
-        {"historical_compile_refusal": f"duplicate unit identity for streamID {stream_id}", **verdict.evidence},
-    )
+    evidence: dict[str, object] = {"historical_compile_refusal": f"duplicate unit identity for streamID {stream_id}"}
+    if basin_id in SUPERSEDED_DUPLICATE_ADJUDICATIONS:
+        evidence["superseded_adjudication"] = dict(SUPERSEDED_DUPLICATE_ADJUDICATIONS[basin_id])
+    evidence.update(verdict.evidence)
+    return AdjudicationVerdict(verdict.processing_basin_id, verdict.verdict, verdict.evidence_kind, evidence)
 
 
 def adjudicate_duplicate_identities(

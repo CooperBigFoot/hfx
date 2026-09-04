@@ -6022,6 +6022,10 @@ class BasinAdjudicationTests(unittest.TestCase):
             self.assertEqual(entry["historical_absence"]["verdict"], "adapter strictness")
             self.assertEqual(entry["historical_absence"]["evidence_kind"], "acquired source geometry")
             self.assertEqual(evidence["historical_compile_refusal"], "duplicate unit identity for streamID 9")
+            self.assertEqual(
+                evidence["superseded_adjudication"],
+                {"verdict": "source defect", "rule_id": "duplicate-ground-equality-v1", "adapter_git_revision": "bca87d8adb0651d130bde9c7dfcf3947427cfa24", "ledger_schema_version": 1},
+            )
             self.assertEqual(evidence["streamID"], 9)
             self.assertEqual(evidence["feature_count"], 2)
             self.assertEqual([value["coordinates"] for value in evidence["features"]], [first, second])
@@ -6229,7 +6233,14 @@ class BasinAdjudicationTests(unittest.TestCase):
         ):
             historical = build_adapter._adjudicate_duplicate(root, "1020018110")
         self.assertEqual((historical.processing_basin_id, historical.verdict, historical.evidence_kind), ("1020018110", sentinel.verdict, sentinel.evidence_kind))
-        self.assertEqual(historical.evidence, {"historical_compile_refusal": "duplicate unit identity for streamID 9", "streamID": 9})
+        self.assertEqual(
+            historical.evidence,
+            {
+                "historical_compile_refusal": "duplicate unit identity for streamID 9",
+                "superseded_adjudication": {"verdict": "source defect", "rule_id": "duplicate-ground-equality-v1", "adapter_git_revision": "bca87d8adb0651d130bde9c7dfcf3947427cfa24", "ledger_schema_version": 1},
+                "streamID": 9,
+            },
+        )
         self.assertEqual([call.args for call in parse.call_args_list], [(root, "1020018110", "basins"), (root, "1020018110", "streamnet")])
         index.assert_called_once_with(basins_product)
         adjudicate.assert_called_once_with(basins_product, 9, many, streamnet_product)
