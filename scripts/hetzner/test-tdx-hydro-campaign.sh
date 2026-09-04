@@ -2819,6 +2819,23 @@ if [ -n "${HFX_TEST_REENTRY_TAMPER-}" ] &&
             ;;
     esac
 fi
+if [ "${HFX_TEST_ACQUIRE_WRITE_TAMPER-}" = 1 ]; then
+    tamper_write=0
+    previous_argument=
+    for jq_argument in "$@"; do
+        if [ "$previous_argument" = --argjson ] && [ "$jq_argument" = evidence ]; then
+            tamper_write=1
+        fi
+        previous_argument=$jq_argument
+    done
+    if [ "$tamper_write" -eq 1 ] && [ "${!#}" != "${!#%/current.json}" ]; then
+        "${HFX_TEST_REAL_JQ:?}" "$@" |
+            "${HFX_TEST_REAL_JQ:?}" '.stages |= with_entries(
+                if .value.status == "succeeded" and (.value | has("evidence"))
+                then .value.evidence = null else . end)'
+        exit $?
+    fi
+fi
 exec "${HFX_TEST_REAL_JQ:?}" "$@"
 FAKE_JQ
 sed >"$test_tmp/fake-adapter" <<'FAKE_ADAPTER'
@@ -3239,6 +3256,70 @@ bounded_acquisition_case() {
     [[ ! -e "$test_tmp/transfer-state/events" ]] ||
         die 'valid finals at the ceiling started a transfer'
     pass 'bounded acquisition inspects valid finals before exhausting a stage'
+
+    new_bounded_campaign bounded-adopt-fresh
+    state=$bounded_dir/state/basins/1020000010/current.json
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-basins.gpkg"
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-streamnet.gpkg"
+    reset_bounded_transfers
+    run_runner acquire --campaign bounded-adopt-fresh --workspace-root "$bounded_root" \
+        --max-parallel 2 --product-attempt-ceiling 3 >"$case_stdout" 2>"$case_stderr"
+    jq -e '
+      .schema_version == 5 and .acquisition == {product_attempt_ceiling:3} and
+      .stages.acquire_basins == {status:"succeeded",attempts:0,failure_reason:null,evidence:{bytes:24,
+        sha256:"00000000000000000000000000000000000000000000000000000000bcb2f999",
+        sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"1020000010-basins"}} and
+      .stages.acquire_streamnet == {status:"succeeded",attempts:0,failure_reason:null,evidence:{bytes:24,
+        sha256:"00000000000000000000000000000000000000000000000000000000bcb2f999",
+        sqlite_identity:"53514c69746520666f726d6174203300",layer_name:"1020000010-streamnet"}} and
+      .stages.compile == {status:"pending",attempts:0,failure_reason:null,diagnostic_report:null}
+    ' "$state" >/dev/null || die 'fresh adoption state differs'
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'fresh adoption started a transfer'
+    [[ $(grep -c ' status=reused retry_count=0 ' "$case_stderr") -eq 2 ]] ||
+        die 'fresh adoption summaries differ'
+    assert_zero_ere 'fresh adoption left a temporary state' 'current\.json\.tmp\.' \
+        <(find "$bounded_dir/state/basins" -type f)
+    [[ ! -e "$bounded_dir/reports/1020000010-basins-acquisition.json" ]] ||
+        die 'fresh adoption wrote an acquisition report'
+    run_runner status --campaign bounded-adopt-fresh --workspace-root "$bounded_root" >"$case_stdout"
+    assert_contains "$case_stdout" acquire_basins_succeeded=1
+    assert_contains "$case_stdout" acquire_streamnet_succeeded=1
+    run_runner acquire --campaign bounded-adopt-fresh --workspace-root "$bounded_root" \
+        --max-parallel 1 >"$case_stdout" 2>"$case_stderr"
+    jq -e '[.stages.acquire_basins,.stages.acquire_streamnet] |
+      all(.status == "succeeded" and .attempts == 0 and .evidence.bytes == 24)' \
+        "$state" >/dev/null || die 'adopted state was not reused unchanged'
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'adopted state rerun started a transfer'
+    [[ $(grep -c ' status=reused ' "$case_stderr") -eq 2 ]] || die 'adopted rerun summaries differ'
+    pass 'fresh bounded acquisition adopts pre-staged finals with zero attempts and validating state'
+
+    new_bounded_campaign bounded-adopt-refused
+    state=$bounded_dir/state/basins/1020000010/current.json
+    cp "$state" "$test_tmp/bounded-adopt-refused-before"
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-basins.gpkg"
+    cp "$test_tmp/geopackage-template" "$bounded_dir/downloads/1020000010-streamnet.gpkg"
+    reset_bounded_transfers
+    HFX_TEST_ACQUIRE_WRITE_TAMPER=1 HFX_TDX_JQ=$test_tmp/fake-jq \
+        expect_failure 'refused adoption state install' acquire --campaign bounded-adopt-refused \
+        --workspace-root "$bounded_root" --max-parallel 1 --product-attempt-ceiling 3
+    assert_contains "$case_stderr" 'basin state is malformed for 1020000010: '
+    assert_contains "$case_stderr" 'refused to install state at '
+    assert_contains "$case_stderr" 'the invalid temporary was removed'
+    assert_contains "$case_stderr" 'an acquisition worker could not atomically record state'
+    assert_zero_ere 'refused install left a temporary state' 'current\.json\.tmp\.' \
+        <(find "$bounded_dir/state/basins" -type f)
+    jq -e '.schema_version == 5 and
+      ([.stages.acquire_basins,.stages.acquire_streamnet] | all(. == {status:"pending",attempts:0,failure_reason:null,evidence:null}))' \
+        "$state" >/dev/null || die 'refused install changed the durable basin state'
+    [[ ! -e "$test_tmp/transfer-state/events" ]] || die 'refused install started a transfer'
+    run_runner acquire --campaign bounded-adopt-refused --workspace-root "$bounded_root" \
+        --max-parallel 1 >"$case_stdout" 2>"$case_stderr"
+    jq -e '[.stages.acquire_basins,.stages.acquire_streamnet] |
+      all(.status == "succeeded" and .attempts == 0 and .evidence.bytes == 24)' \
+        "$state" >/dev/null || die 'acquisition after a refused install did not adopt the finals'
+    assert_zero_ere 'proceeding after refusal left a temporary state' 'current\.json\.tmp\.' \
+        <(find "$bounded_dir/state/basins" -type f)
+    pass 'a refused state install removes its temporary, keeps durable state, and the campaign proceeds'
 
     new_bounded_campaign bounded-retry-success
     reset_bounded_transfers
