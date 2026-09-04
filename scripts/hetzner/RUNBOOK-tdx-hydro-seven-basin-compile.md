@@ -8,12 +8,18 @@ version_policy is NONE: NO version bump, NO tag.
 
 <!-- BEGIN COMPILE CAMPAIGN CONTRACT
 {
-  "schema": 3,
+  "schema": 4,
   "campaign": "seven-basin-extension",
   "authority_ref": "69747055bcb1876d9d1fad48c60f5cae6a24ea60",
   "authority_document": "planning/visions/2026-09-03-close-the-seven-basin-coverage-gap.md",
   "authority_section": "Compute and preservation constraints",
   "lifecycles_authorized": 1,
+  "lifecycle_ledger": {
+    "consumed": [
+      {"date": "2026-09-04", "provisioning_request": "2026-09-04T10:46:18Z", "zero_footprint": "2026-09-04T10:50:58Z", "server_id": 164550505, "volume_id": 106790870, "cause": "hcloud-json-shape-mismatch", "workload_dispatched": false}
+    ],
+    "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/232", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
+  },
   "server_name": "hfx-build-seven-basin-extension",
   "volume_name": "hfx-build-seven-basin-extension-data",
   "server_type": "ccx33",
@@ -68,6 +74,16 @@ Only the named campaign server and volume may be mutated. Those are server `hfx-
 Mandatory exact-resource teardown of the named server and volume is the sole permitted destructive operation. This campaign deletes no source data, no output, no evidence, no S3 object, and no other server or volume. The baseline prefix is read-only; nothing under it is modified or deleted. No produced output may remain unique to the VM or volume.
 
 The permitted acts are the transfer of the preserved source corpus, reacquisition of a selected product only when its integrity check fails, both control builds and their comparisons, the per-basin compiles, a read-only pull of the baseline, one extension assembly, one strict validation attempt, off-VM preservation, read-only audits, and exact-resource teardown. Adjudication, defect-report transmission, publication under `hfx/`, and adapter changes are outside this runbook.
+
+### Lifecycle consumed on 2026-09-04
+
+The one lifecycle this contract authorizes was spent on 2026-09-04. Provisioning and bootstrap succeeded (provisioning request 10:46:18Z, bootstrap complete 10:50:23Z). The section 8 identity gate then read the server location through `.datacenter.location.name`, a path that hcloud v1.66.0 leaves null, so the recorded projection carried `"location": null`, the value gate returned false, and the strict-mode driver entered the cleanup path. No workload was dispatched. Exact-resource teardown removed server `164550505` and volume `106790870`, zero footprint was proven at 10:50:58Z, and `pourpoint-web-1` was untouched. The billed interval was under five minutes, so the gross cost is negligible. The operator record is `seven-basin-extension/OPERATOR-LOG.md` under the evidence root.
+
+The gate now projects every identity through the tracked `scripts/hetzner/hcloud-identity.jq`, and section 6 proves that projection against the installed CLI before any provisioning request. This consumed-lifecycle record grants nothing by itself; the authority for the next lifecycle is the maintainer decision recorded below.
+
+### Second lifecycle authorized on 2026-09-04
+
+After that lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 exactly one further bounded lifecycle under the same limits: one `ccx33` in `fsn1`, one 600 GB volume, strictly under 72 hours from the provisioning request, strictly under EUR 40.00 projected and actual, and exact-resource teardown. The authority is that maintainer decision, recorded in the pull request named by `lifecycle_ledger.current_authority.record` in the contract, together with the vision on `main`. The contract's `lifecycles_authorized` stays at one because each authority grants one lifecycle and the ledger records which one is current. The 2026-09-04 authorization covers one lifecycle only. When it is spent, the ledger must record it as consumed, and any further lifecycle again requires new maintainer authority before provisioning.
 
 ## 2. Fixed ceilings and retention
 
@@ -130,12 +146,15 @@ CORPUS_MANIFEST="$HFX_CAMPAIGN_EVIDENCE/attempt21-source-remote-sha256.txt"
 PLANETARY_MIRROR="$PWD/tdx-m5-planetary-evidence/mirror"
 PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
 mkdir -p -- "$LOCAL_EVIDENCE_DIR"
-chmod 700 -- "$LOCAL_EVIDENCE_DIR"
+chmod 700 "$LOCAL_EVIDENCE_DIR"
+rsync --version | head -n 1 | grep -E '^rsync +version 3\.[1-9]'
 
 printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be displayed):' >&2
 IFS= read -r S3_ENV_FILE
 test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
 ```
+
+The workstation is macOS. Its BSD `chmod` reads `--` after the mode as a file name, so the mode line above carries no `--`; the first 2026-09-04 launch died on that line before any cloud call. Its bundled `/usr/bin/rsync` is openrsync, which rejects the `--info=progress2` flag the section 9 transfer fence uses, so GNU rsync 3.1 or later must be first on `PATH` (Homebrew installs it as `/opt/homebrew/bin/rsync`); the version line above refuses otherwise. The workstation-side digest commands use `shasum -a 256` and `stat -f`, which are the BSD forms; the `sha256sum` and `stat -c` forms appear only inside `ssh` heredocs that run on the Debian VM.
 
 The shell sets `IFS` to newline and tab, so the seven absent basins are held in a Bash array and every loop iterates `"${ABSENT_IDS[@]}"`; a space-separated string would be one word under that `IFS`. The count check above proves the array holds seven entries.
 
@@ -254,9 +273,15 @@ jq -e --arg name "$SERVER_NAME" '[.[] | select(.name == $name)] == []' "$LOCAL_E
 jq -e --arg name "$VOLUME_NAME" '[.[] | select(.name == $name)] == []' "$LOCAL_EVIDENCE_DIR/preflight-volumes.json"
 jq -e '[.[] | select(.server_type.name | startswith("ccx"))] == []' "$LOCAL_EVIDENCE_DIR/preflight-servers.json"
 jq -e 'length == 0' "$LOCAL_EVIDENCE_DIR/preflight-volumes.json"
+
+./scripts/hetzner/verify-campaign-inputs.sh --check hcloud-json-shape | tee "$LOCAL_EVIDENCE_DIR/preflight-hcloud-shape.txt"
+hcloud --context pourpoint server describe pourpoint-web-1 -o json | jq --arg kind server -f scripts/hetzner/hcloud-identity.jq > "$LOCAL_EVIDENCE_DIR/preflight-shape-witness.json"
+jq -e '.name == "pourpoint-web-1" and .location == "fsn1"' "$LOCAL_EVIDENCE_DIR/preflight-shape-witness.json"
 ```
 
 The project quota is 8 dedicated cores, so one `ccx33` is the only dedicated server that fits. `pourpoint-web-1` is a shared `cx33` and consumes no dedicated quota; it must appear unchanged in every listing.
+
+The shape check is the last preflight before the trap and the provisioning request. It describes `pourpoint-web-1`, the `ccx33` server type, and the `fsn1` location read-only and projects each through `scripts/hetzner/hcloud-identity.jq`, the same file the section 8 gate applies to the provisioned server and volume. The projection raises an error for any field that is absent, null, or of the wrong type, so a CLI whose JSON shape has moved refuses here with zero cloud mutation. The witness record is the proof that `.location.name` resolved on the installed CLI. No volume exists at this point, because the quota preflight above requires an empty volume listing; the volume projection reads the same `.location.name`, `.size`, and `.server` paths that `provision.sh` validates on the live volume description, and the tracked test proves it against the recorded attached-volume shape.
 
 ## 7. Fail-closed preservation and mandatory teardown trap
 
@@ -371,13 +396,14 @@ date +%s > "$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt"
 ./scripts/hetzner/bootstrap.sh --campaign "$CAMPAIGN" \
   2>&1 | tee "$LOCAL_EVIDENCE_DIR/bootstrap.log"
 remote_ip
-hcloud --context pourpoint server describe "$SERVER_NAME" -o json | jq '{id,name,server_type:.server_type.name,location:.datacenter.location.name,volumes}' > "$LOCAL_EVIDENCE_DIR/provisioned-server.json"
-hcloud --context pourpoint volume describe "$VOLUME_NAME" -o json | jq '{id,name,size,location:.location.name,server}' > "$LOCAL_EVIDENCE_DIR/provisioned-volume.json"
-jq -e '.server_type == "ccx33" and .location == "fsn1"' "$LOCAL_EVIDENCE_DIR/provisioned-server.json"
-jq -e '.size == 600 and .location == "fsn1"' "$LOCAL_EVIDENCE_DIR/provisioned-volume.json"
+hcloud --context pourpoint server describe "$SERVER_NAME" -o json | jq --arg kind server -f scripts/hetzner/hcloud-identity.jq > "$LOCAL_EVIDENCE_DIR/provisioned-server.json"
+hcloud --context pourpoint volume describe "$VOLUME_NAME" -o json | jq --arg kind volume -f scripts/hetzner/hcloud-identity.jq > "$LOCAL_EVIDENCE_DIR/provisioned-volume.json"
+jq -e --arg name "$SERVER_NAME" '.name == $name and .server_type == "ccx33" and .location == "fsn1"' "$LOCAL_EVIDENCE_DIR/provisioned-server.json"
+jq -e --arg name "$VOLUME_NAME" '.name == $name and .size == 600 and .location == "fsn1"' "$LOCAL_EVIDENCE_DIR/provisioned-volume.json"
+jq -e --slurpfile server "$LOCAL_EVIDENCE_DIR/provisioned-server.json" '.server == $server[0].id and $server[0].volumes == [.id]' "$LOCAL_EVIDENCE_DIR/provisioned-volume.json"
 ```
 
-Both earlier compile lifecycles needed a second `provision.sh` run after SSH readiness timed out, and one hit a `known_hosts` mismatch on a reused address. Rerunning `provision.sh` with identical arguments is the documented remedy; it reuses the exact existing resources by name and ID. The two `describe` records above are the exact identities that teardown must later match.
+Both earlier compile lifecycles needed a second `provision.sh` run after SSH readiness timed out, and one hit a `known_hosts` mismatch on a reused address. Rerunning `provision.sh` with identical arguments is the documented remedy; it reuses the exact existing resources by name and ID. The two `describe` records above are the exact identities that teardown must later match. Both come from `scripts/hetzner/hcloud-identity.jq`, the projection section 6 proved against the installed CLI, so every path this gate reads has already resolved to a non-null value of the expected type before the provisioning request. The final line proves the volume is attached to this server and that the server carries this volume alone.
 
 Converge two checkouts on the VM, build `hfx` from the corrected revision, apply the recorded ARG_MAX hotpatch to the planetary worktree, and enable swap. The hotpatch touches only the campaign runner, so the planetary adapter's bytes come from revision `43a98aff8c15a1a196f47b10217ad2f5553b6611` itself; the hotpatch is applied so the provenance matches the recorded control build exactly.
 
@@ -912,7 +938,7 @@ The stage plan behind those points is approximately: provisioning and convergenc
 
 ## 19. Author-only review and landing gates
 
-This section is documentation-author work completed before merge. It never executes the campaign. The tracked write set is this runbook, `seven-basin-control-adjudication.json`, `verify-compile-runbook.sh`, `verify-campaign-inputs.sh`, `price-preflight.sh`, `compare-dataset-trees.sh`, `adapters/tdx-hydro/compare_unit_outlets.py`, their tests, and one README index entry.
+This section is documentation-author work completed before merge. It never executes the campaign. The tracked write set is this runbook, `seven-basin-control-adjudication.json`, `verify-compile-runbook.sh`, `verify-campaign-inputs.sh`, `hcloud-identity.jq` with its recorded fixtures under `fixtures/hcloud/`, `price-preflight.sh`, `compare-dataset-trees.sh`, `adapters/tdx-hydro/compare_unit_outlets.py`, their tests, and one README index entry.
 
 ```bash
 bash scripts/hetzner/test-verify-compile-runbook.sh
