@@ -25,7 +25,8 @@ version_policy is NONE: NO version bump, NO tag.
       "reruns": "permitted after each merged, reviewed fix while the cumulative estimated rehearsal spend stays below the cumulative ceiling",
       "cumulative_ceiling_eur": 1.0,
       "runs": [
-        {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01}
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01},
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-finish-record-lost", "workload_dispatched": true, "estimated_cost_eur": 0.01}
       ]
     },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
@@ -138,6 +139,10 @@ After the second lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04
 ### Rehearsal run 1 consumed on 2026-09-04
 
 Rehearsal run 1 ran from the provisioning request at 20:51:00Z (server `164601847`, volume `106794141`) to zero footprint at 21:04:28Z, about 13 minutes and an estimated EUR 0.01. Provisioning (with the reused-address `known_hosts` rerun of section 8), bootstrap on the `cx23`, and the identity gate all passed. The converge fence then sent the five `workload_sizing` values to the VM as one space-joined argument; `ssh` joins its remote command arguments into a single string that the remote login shell splits again, so the VM received five positional parameters, the remote `read` filled one variable, and the numeric guard ended the shell before any output. The runbook's own cleanup performed exact-resource teardown. The repair is the `remote_tokens` rule stated in section 4 and enforced by the composer in section 20.
+
+### Rehearsal run 2 consumed on 2026-09-04
+
+Rehearsal run 2 ran from the provisioning request at 21:44:40Z (server `164608352`, volume `106794390`) to zero footprint at 22:00:48Z, about 16 minutes and an estimated EUR 0.01. Provisioning, bootstrap, the repaired converge fence, and the init workload all passed; the runner exited 0. The operator driver then read the init canonical log's last line the instant `launch.sh status` reported the session gone and found the runner's last status line instead of the `launch: finished` record: `launch.sh` wrote its logs through a `tee` process substitution that tmux killed with the pane before the last line was written, so the record never reached either log. `launch.sh` now closes its output and waits for `tee` before exiting, and every finish-record read polls for the line. The runbook's own cleanup performed exact-resource teardown.
 
 ## 2. Fixed ceilings and retention
 
@@ -871,7 +876,7 @@ campaign_gate pre-compile "$(contract_value '.gate_reserve_hours["pre-compile"]'
   --fabric-version "$FABRIC_VERSION"
 ```
 
-Poll with the gate before every status check and repeat the pair until status exits 3. The reserve (20 hours in production) covers assembly, preservation, and teardown. When status reports the session finished, require the canonical log to end with the runner finish record carrying exit `0`; any other exit sets `compile_exit_zero` to `0`, is preserved as evidence, and the campaign continues at section 14 without assembly:
+Poll with the gate before every status check and repeat the pair until status exits 3. The reserve (20 hours in production) covers assembly, preservation, and teardown. When status reports the session finished, read the canonical log's last line, polling for up to a minute for the runner finish record (the runner now waits for its `tee` before exiting, but a late line must never be read as a failed compile), and require it to carry exit `0`; any other exit sets `compile_exit_zero` to `0`, is preserved as evidence, and the campaign continues at section 14 without assembly:
 
 ```bash
 campaign_gate compile-monitor "$(contract_value '.gate_reserve_hours["compile-monitor"]')"
@@ -879,8 +884,12 @@ campaign_gate compile-monitor "$(contract_value '.gate_reserve_hours["compile-mo
 ```
 
 ```bash
-ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-tdx-compile.log" \
-  | tee "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt"
+for finish_attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-tdx-compile.log" > "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt" || true
+  grep -q -E -- '^launch: finished at ' "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt" && break
+  sleep 5
+done
+cat "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt"
 compile_exit_zero=1
 grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/compile-finish-record.txt" || compile_exit_zero=0
 ```
@@ -1228,6 +1237,7 @@ bash scripts/hetzner/test-verify-campaign-inputs.sh
 bash scripts/hetzner/test-price-preflight.sh
 bash scripts/hetzner/test-compare-dataset-trees.sh
 bash scripts/hetzner/test-compose-campaign-driver.sh
+bash scripts/hetzner/test-launch.sh
 bash scripts/hetzner/test-tdx-hydro-campaign.sh
 uv run --frozen --project adapters/tdx-hydro python adapters/tdx-hydro/test_compare_unit_outlets.py
 uv run --frozen --project adapters/tdx-hydro python adapters/tdx-hydro/test_synthesize_rehearsal_corpus.py

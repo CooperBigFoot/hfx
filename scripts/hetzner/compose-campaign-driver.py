@@ -46,7 +46,7 @@ FENCES: tuple[tuple[int, str, str], ...] = (
     (13, 'control-builds', 'campaign_gate pre-control-builds "$(contract_value \'.gate_reserve_hours["pre-control-builds"]\')"'),
     (14, 'compile-start', 'campaign_gate pre-compile "$(contract_value \'.gate_reserve_hours["pre-compile"]\')"'),
     (15, 'compile-monitor', 'campaign_gate compile-monitor "$(contract_value \'.gate_reserve_hours["compile-monitor"]\')"'),
-    (16, 'compile-finish', 'ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-tdx-compile.log" \\'),
+    (16, 'compile-finish', 'for finish_attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do'),
     (17, 'basin-preserve', 'remote_args=("$CAMPAIGN_DIR")'),
     (18, 'baseline-pull', 'campaign_gate pre-baseline "$(contract_value \'.gate_reserve_hours["pre-baseline"]\')"'),
     (19, 'assemble-start', 'test -s "$LOCAL_EVIDENCE_DIR/compiled-absent-basins.txt"'),
@@ -180,7 +180,16 @@ wait_workload() {
     esac
   done
 }
-finish_record() { ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-$1.log" | tee "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"; }
+finish_record() {
+  # The runner writes the finish line before its session ends; poll briefly so a late line is not read as a failure.
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    ssh -o BatchMode=yes "root@$SERVER_IP" tail -n 1 "/mnt/hfx/logs/hfx-$CAMPAIGN-$1.log" > "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt" || true
+    grep -q -E -- '^launch: finished at ' "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt" && break
+    sleep 5
+  done
+  cat "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"
+}
 require_finish_exit_zero() { grep -E -- '^launch: finished at [0-9T:Z-]+ with exit 0$' "$LOCAL_EVIDENCE_DIR/$1-finish-record.txt"; }
 {
   printf '\n- %s driver start; mode %s; worktree %s; HEAD %s\n' "$(now_utc)" "__MODE__" "$PWD" "$(git rev-parse HEAD)"
