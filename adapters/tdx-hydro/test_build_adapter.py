@@ -1592,6 +1592,7 @@ class SinglePartCatchmentEncodingTests(unittest.TestCase):
                 ]),
                 0,
             )
+        validate_with_release_hfx(output)
         catchments = gpd.read_parquet(output / "catchments.parquet")
         return json.loads(report.read_text()), catchments
 

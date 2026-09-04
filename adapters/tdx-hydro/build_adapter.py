@@ -732,6 +732,7 @@ def _interior_overlapping_pairs(parts: Sequence[Polygon | MultiPolygon]) -> list
 def dissolve_identity_parts(stream_id: int, parts: Sequence[Polygon | MultiPolygon]) -> Polygon | MultiPolygon:
     """dissolve : (streamID, parts) -> unit geometry, total on interior-disjoint parts.
 
+    Rule `duplicate-identity-part-overlap-v1`, shared with the adjudicator.
     Several single-part rows carrying one streamID encode one multipart
     catchment. Parts that touch only at edges or corners dissolve into one
     Polygon or MultiPolygon. Parts whose interiors overlap contradict each
