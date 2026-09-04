@@ -35,11 +35,11 @@ hotpatch_available=1
 git -C "$repo_root" cat-file -e 'bde61149d3fefc5e3f30435bf7ed3d0bb32a519c^{commit}' 2>/dev/null || hotpatch_available=0
 git -C "$repo_root" cat-file -e '43a98aff8c15a1a196f47b10217ad2f5553b6611^{commit}' 2>/dev/null || hotpatch_available=0
 
-for check in scope-permits-compilation ceilings-and-kill-switches control-digests-are-pinned baseline-is-pinned; do
+for check in scope-permits-compilation ceilings-and-kill-switches control-digests-are-pinned control-adjudication-is-pinned baseline-is-pinned; do
     expect_pass --check "$check"
     assert_contains "$stdout" "PASS $check"
 done
-pass 'tracked runbook passes the scope, ceiling, digest, and baseline checks'
+pass 'tracked runbook passes the scope, ceiling, digest, adjudication, and baseline checks'
 
 if ((hotpatch_available == 1)); then
     expect_pass --check control-hotpatch-is-pinned
@@ -103,10 +103,10 @@ mutate() {
 mutated=$(mutate no-contract 's/<!-- BEGIN COMPILE CAMPAIGN CONTRACT\n.*?\nEND COMPILE CAMPAIGN CONTRACT -->\n//s')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'missing or repeated compile campaign contract'
-mutated=$(mutate malformed-contract 's/"schema": 2,/"schema": 2,,/')
+mutated=$(mutate malformed-contract 's/"schema": 3,/"schema": 3,,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'malformed compile campaign contract'
-mutated=$(mutate duplicate-key 's/"schema": 2,/"schema": 2,\n  "schema": 2,/')
+mutated=$(mutate duplicate-key 's/"schema": 3,/"schema": 3,\n  "schema": 3,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'duplicate contract key'
 pass 'a missing, malformed, or duplicate-key contract refuses'
@@ -162,6 +162,41 @@ assert_contains "$stderr" 'control ARG_MAX hotpatch is not pinned'
 mutated=$(mutate wrong-digest 's/"graph\.parquet": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5"/"graph.parquet": "0000000000000000000000000000000000000000000000000000000000000000"/')
 expect_failure --runbook "$mutated" --check control-digests-are-pinned
 assert_contains "$stderr" 'preserved planetary control digests are not pinned'
+adjudication_record=$SCRIPT_DIR/seven-basin-control-adjudication.json
+mutate_record() {
+    local name=$1
+    local jq_expression=$2
+    jq "$jq_expression" "$adjudication_record" >"$tmp/$name.json"
+    printf '%s\n' "$tmp/$name.json"
+}
+mutated=$(mutate record-unpinned 's|"control_adjudication_record": "scripts/hetzner/seven-basin-control-adjudication.json"|"control_adjudication_record": "scripts/hetzner/other.json"|')
+expect_failure --runbook "$mutated" --check control-adjudication-is-pinned
+assert_contains "$stderr" 'control adjudication record is not pinned'
+expect_failure --adjudication-record "$tmp/absent.json" --check control-adjudication-is-pinned
+assert_contains "$stderr" 'not a nonempty regular file'
+expect_failure --adjudication-record relative.json --check control-adjudication-is-pinned
+assert_contains "$stderr" '--adjudication-record must be an absolute path'
+printf '{\n' >"$tmp/broken.json"
+expect_failure --adjudication-record "$tmp/broken.json" --check control-adjudication-is-pinned
+assert_contains "$stderr" 'malformed control adjudication record'
+jq '.status = "PENDING polarity PR"' "$adjudication_record" >"$tmp/pending.json"
+expect_failure --adjudication-record "$tmp/pending.json" --check control-adjudication-is-pinned
+assert_contains "$stderr" 'PENDING placeholder'
+for mutation in '.outlet_differences += 1' '.downstream_differences = 1' '.unit_count = 1' \
+    '.processing_basin_id = "1020018110"' '.planetary_revision = "0000000000000000000000000000000000000000"' \
+    '.adjudication.date = "2026-09-03"' '.corrected_orientation_digest = .planetary_orientation_digest' \
+    '.outlet_difference_native_linknos = []' '.outlet_difference_native_linknos |= (. + [.[0]])' \
+    '.outlet_difference_native_linknos |= reverse' '.max_shift_deg = 0' '.differences_by_class = {}'; do
+    record=$(mutate_record inconsistent "$mutation")
+    expect_failure --adjudication-record "$record" --check control-adjudication-is-pinned
+    assert_contains "$stderr" 'control adjudication record is incomplete or inconsistent'
+done
+mutated=$(mutate adjudication-phrase-removed 's/The set of units whose outlet differs must equal exactly the adjudicated set pinned in the tracked record\. //')
+expect_failure --runbook "$mutated" --check control-adjudication-is-pinned
+assert_contains "$stderr" 'runbook omits required operational text'
+expect_pass --adjudication-record "$adjudication_record" --check control-adjudication-is-pinned
+pass 'an unpinned, missing, malformed, pending, inconsistent, or undocumented control adjudication record refuses'
+
 mutated=$(mutate wrong-baseline 's/"unit_count": 12748154/"unit_count": 12748155/')
 expect_failure --runbook "$mutated" --check baseline-is-pinned
 assert_contains "$stderr" 'baseline artifact is not pinned'
