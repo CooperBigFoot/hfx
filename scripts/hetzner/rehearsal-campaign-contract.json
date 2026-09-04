@@ -7,7 +7,14 @@
   "lifecycles_authorized": 1,
   "lifecycle_ledger": {
     "consumed": [],
-    "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "none", "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual, exact-resource teardown"}
+    "current_authority": {
+      "maintainer": "Nicolas Lazaro",
+      "date": "2026-09-04",
+      "lifecycles": 1,
+      "record": "https://github.com/CooperBigFoot/hfx/pull/234",
+      "precondition": "none",
+      "limits": "one cx23 in fsn1, one 10 GB volume, under 6 hours from the provisioning request, under EUR 1.00 projected and actual, exact-resource teardown"
+    }
   },
   "requires_passing_rehearsal": false,
   "server_name": "hfx-build-campaign-rehearsal",
@@ -19,35 +26,65 @@
   "gross_cost_ceiling_eur": 1.0,
   "billable_outbound_bytes": 1000000000,
   "price_source": "https://api.hetzner.cloud/v1/pricing",
-  "decision_points_hours": [2, 4, 5],
-  "gate_reserve_hours": {"pre-init": 5.5, "pre-acquire": 5, "pre-control-builds": 4.5, "pre-compile": 3.5, "compile-monitor": 2.5, "pre-baseline": 2, "pre-assemble": 1.5, "assemble-monitor": 1, "pre-preservation": 0.5},
+  "decision_points_hours": [
+    2,
+    4,
+    5
+  ],
+  "gate_reserve_hours": {
+    "pre-init": 5.5,
+    "pre-acquire": 5,
+    "pre-control-builds": 4.5,
+    "pre-compile": 3.5,
+    "compile-monitor": 2.5,
+    "pre-baseline": 2,
+    "pre-assemble": 1.5,
+    "assemble-monitor": 1,
+    "pre-preservation": 0.5
+  },
   "retention_policy": "retain-all-produced-output-off-vm-before-exact-resource-teardown",
   "approval_record": "provisioner-transfer-approval.txt",
-  "out_of_scope_resources": ["pourpoint-web-1"],
-  "absent_basins": ["1020018110", "2020003440"],
+  "out_of_scope_resources": [
+    "pourpoint-web-1"
+  ],
+  "absent_basins": [
+    "1020018110",
+    "2020003440"
+  ],
   "control_basin": "7020000010",
   "control_unit_count": 2,
   "fabric_version": "NGA-TDX-Hydro-20230126",
   "control_fabric_version": "0.3.0",
-  "source_corpus": {"file_count": 6, "total_bytes": "DERIVED", "manifest": "source-sha256.txt"},
-  "control_builds": ["corrected-adapter", "planetary-revision-43a98aff8c15a1a196f47b10217ad2f5553b6611-with-recorded-ARG_MAX-hotpatch"],
+  "source_corpus": {
+    "file_count": 8,
+    "total_bytes": "DERIVED",
+    "manifest": "source-sha256.txt"
+  },
+  "control_builds": [
+    "corrected-adapter",
+    "planetary-revision-43a98aff8c15a1a196f47b10217ad2f5553b6611-with-recorded-ARG_MAX-hotpatch"
+  ],
   "control_hotpatch": {
     "commit": "bde61149d3fefc5e3f30435bf7ed3d0bb32a519c",
     "path": "scripts/hetzner/tdx-hydro-campaign.sh",
     "pre_patch_blob": "41d6df3f10030a481b2227a878837c7f23f3e658",
     "post_patch_blob": "d227920a7ac0ab98ffcc80aac2c72a5dfc9c2429"
   },
-  "control_digests": "DERIVED",
-  "control_adjudication_record": "DERIVED",
+  "control_digests": "DERIVED-ON-VM",
+  "control_adjudication_record": "DERIVED-ON-VM",
+  "control_reference": "vm-planetary-build",
   "baseline": {
     "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal/baseline-hfx-v0-3-0/dataset/",
-    "region": "tdx-hydro-partial-c6ae2a815d47",
-    "basin_count": 1,
-    "unit_count": 2,
+    "region": "tdx-hydro-partial-2a5e43402ae3",
+    "basin_count": 2,
+    "unit_count": 4,
     "exported_bytes": "DERIVED",
     "object_count": "DERIVED",
-    "roster_digest_prefix": "c6ae2a815d47",
-    "basin_ids": ["4020050470"]
+    "roster_digest_prefix": "2a5e43402ae3",
+    "basin_ids": [
+      "4020050470",
+      "7020000010"
+    ]
   },
   "extension_scratch_prefix": "scratch/tdx-hydro-campaign-rehearsal/",
   "workload_sizing": {
@@ -65,7 +102,27 @@
     "required_available_disk_bytes": 5000000000,
     "required_memory_bytes": 2000000000
   },
-  "derived_at_preparation": ["source_corpus.total_bytes", "control_digests", "control_adjudication_record", "baseline.exported_bytes", "baseline.object_count"],
-  "permitted_acts": ["transfer-preserved-source-corpus", "reacquire-selected-source-on-integrity-failure", "compile-both-control-builds", "compare-control-outputs", "compile-selected-basins", "pull-baseline-read-only", "assemble-extension", "attempt-strict-validation", "preserve-all-produced-output-off-vm", "read-only-audit", "exact-resource-teardown"],
-  "sole_destructive_act": "exact-resource-teardown"
+  "derived_at_preparation": [
+    "source_corpus.total_bytes",
+    "baseline.exported_bytes",
+    "baseline.object_count"
+  ],
+  "permitted_acts": [
+    "transfer-preserved-source-corpus",
+    "reacquire-selected-source-on-integrity-failure",
+    "compile-both-control-builds",
+    "compare-control-outputs",
+    "compile-selected-basins",
+    "pull-baseline-read-only",
+    "assemble-extension",
+    "attempt-strict-validation",
+    "preserve-all-produced-output-off-vm",
+    "read-only-audit",
+    "exact-resource-teardown"
+  ],
+  "sole_destructive_act": "exact-resource-teardown",
+  "derived_on_vm": [
+    "control_digests",
+    "control_adjudication_record"
+  ]
 }

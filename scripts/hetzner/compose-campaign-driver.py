@@ -222,6 +222,8 @@ def compose(fences: list[str], mode: str, resume_at: str | None) -> str:
     add("# Composed by scripts/hetzner/compose-campaign-driver.py from RUNBOOK-tdx-hydro-seven-basin-compile.md.\n")
     add(f"# Mode: {mode}{' at ' + resume_at if resume_at else ''}. Every runbook fence is embedded verbatim between its markers.\n")
     add("# Invocation: printf '%s\\n' <s3-env-path> | caffeinate -i -s bash <this file>   (from the repository root)\n")
+    if mode == "resume":
+        add("export HFX_CAMPAIGN_RESUME=1   # OPERATOR (resume): keep the evidence directory that holds the recorded epoch\n")
     add(fence_block(1, fences[0]))
     add(OPERATOR_HELPERS.replace("__MODE__", mode + (" at " + resume_at if resume_at else "")))
 
@@ -287,15 +289,16 @@ milestone 03-corpus-verified-on-vm "remote sha256 after acquisition: $(grep -c '
     if first <= 14:
         add(fence_block(14, fences[13]))
     if first <= 17:
-        add(r'''# OPERATOR: repeat the compile-monitor pair until status exits 3 (runbook section 11); second decision point.
+        add(r'''# OPERATOR: one verbatim compile-monitor pair, then the same pair repeated by wait_workload with its
+# ten-transient tolerance until status exits 3 (runbook sections 11 and 18); second decision point.
 compile_stopped_at_decision_point=0
-while :; do
 ''')
         add(fence_block(15, fences[14]))
-        add(r'''./scripts/hetzner/launch.sh --campaign "$CAMPAIGN" status --workload tdx-compile >/dev/null 2>&1 || break
-if ! before_hour "$(decision_point 1)"; then oplog "decision point $(decision_point 1)h reached with compile running; stopping"; stop_dispatches || true; compile_stopped_at_decision_point=1; sleep 10; break; fi
-sleep "$POLL_SECONDS"
-done
+        add(r'''if wait_workload tdx-compile compile-monitor "$(gate_reserve compile-monitor)" "$(decision_point 1)"; then :; else
+  wait_rc=$?; test "$wait_rc" -eq 2
+  oplog "decision point $(decision_point 1)h reached with compile running; stopping"
+  stop_dispatches || true; compile_stopped_at_decision_point=1; sleep 10
+fi
 ''')
         add(fence_block(16, fences[15]))
         add('if test "$compile_stopped_at_decision_point" -eq 1; then compile_exit_zero=0; fi\n')

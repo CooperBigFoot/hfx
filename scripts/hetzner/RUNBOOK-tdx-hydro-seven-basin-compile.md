@@ -57,6 +57,7 @@ version_policy is NONE: NO version bump, NO tag.
     "manifest.json": "8ca5b2135d19c18a4b8fba6c93c63ffb7a784a2749867483ea6c0c49c46560c4"
   },
   "control_adjudication_record": "scripts/hetzner/seven-basin-control-adjudication.json",
+  "control_reference": "preserved-off-vm",
   "baseline": {
     "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/",
     "region": "tdx-hydro-partial-4dbff0d6ec31",
@@ -210,7 +211,14 @@ CORPUS_DIR="$HFX_CAMPAIGN_EVIDENCE/off-vm/acquired-source"
 CORPUS_MANIFEST="$HFX_CAMPAIGN_EVIDENCE/$(contract_value '.source_corpus.manifest')"
 PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
 CONTROL_ADJUDICATION_SOURCE=$(contract_value '.control_adjudication_record')
+CONTROL_REFERENCE=$(contract_value '.control_reference')
+test "$CONTROL_REFERENCE" = preserved-off-vm || test "$CONTROL_REFERENCE" = vm-planetary-build
 LOCAL_EVIDENCE_DIR="$HFX_CAMPAIGN_EVIDENCE/$CAMPAIGN"
+if test -e "$LOCAL_EVIDENCE_DIR" && test "${HFX_CAMPAIGN_RESUME:-0}" != 1; then
+  test -d "$LOCAL_EVIDENCE_DIR" && test ! -L "$LOCAL_EVIDENCE_DIR"
+  mv -- "$LOCAL_EVIDENCE_DIR" "$LOCAL_EVIDENCE_DIR-superseded-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+if test "${HFX_CAMPAIGN_RESUME:-0}" = 1; then test -f "$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt"; fi
 mkdir -p -- "$LOCAL_EVIDENCE_DIR"
 chmod 700 "$LOCAL_EVIDENCE_DIR"
 printf '%s\n' "$CAMPAIGN_CONTRACT_JSON" > "$LOCAL_EVIDENCE_DIR/campaign-contract.json"
@@ -227,7 +235,7 @@ The workstation is macOS. Its BSD `chmod` reads `--` after the mode as a file na
 
 The shell sets `IFS` to newline and tab, so the absent basins are held in a Bash array and every loop iterates `"${ABSENT_IDS[@]}"`; a space-separated string would be one word under that `IFS`. The count check above proves the array holds exactly the contract's entries.
 
-`HFX_CAMPAIGN_EVIDENCE` is the existing evidence root that holds the approval record, the preserved corpus, and the preserved planetary control output. New records go under `$LOCAL_EVIDENCE_DIR`, named by the campaign, so the earlier lifecycles' records stay intact.
+`HFX_CAMPAIGN_EVIDENCE` is the existing evidence root that holds the approval record, the preserved corpus, and the preserved planetary control output. New records go under `$LOCAL_EVIDENCE_DIR`, named by the campaign. A fresh start finds that directory already holding an earlier lifecycle's records (the consumed 2026-09-04 lifecycles left theirs there) and moves it aside by rename to `<name>-superseded-<UTC timestamp>` before it writes anything, so earlier records stay intact and a stale `provisioning-request-epoch.txt` cannot refuse the provisioning fence after the trap is armed. Only a resume (`HFX_CAMPAIGN_RESUME=1`, set by the composed resume driver) keeps the directory, and it then requires the recorded epoch to be present.
 
 Verify the tracked contract, the operator inputs, and the preserved inputs before any cloud action:
 
@@ -240,8 +248,10 @@ if test "$(contract_value '.requires_passing_rehearsal')" = true; then
   test -n "${HFX_REHEARSAL_EVIDENCE:-}"
   ./scripts/hetzner/verify-compile-runbook.sh --evidence-root "$HFX_REHEARSAL_EVIDENCE" --check rehearsal-passed
 fi
-cp -- "$CONTROL_ADJUDICATION_SOURCE" "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
-jq -e --arg id "$CONTROL_ID" --argjson units "$CONTROL_UNIT_COUNT" '.processing_basin_id == $id and .unit_count == $units' "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+if test "$CONTROL_REFERENCE" = preserved-off-vm; then
+  cp -- "$CONTROL_ADJUDICATION_SOURCE" "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+  jq -e --arg id "$CONTROL_ID" --argjson units "$CONTROL_UNIT_COUNT" '.processing_basin_id == $id and .unit_count == $units' "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+fi
 ./scripts/hetzner/verify-campaign-inputs.sh --evidence-root "$LOCAL_EVIDENCE_DIR" --check evidence-root-writable
 ./scripts/hetzner/verify-campaign-inputs.sh --s3-env-file "$S3_ENV_FILE" --check credential-file-authenticates
 ./scripts/hetzner/verify-campaign-inputs.sh --check hcloud-context-resolves
@@ -251,9 +261,14 @@ test -f "$CORPUS_MANIFEST" && test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPU
 test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt")" -eq "$CORPUS_FILE_COUNT"
 test "$(find "$CORPUS_DIR" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s}')" -eq "$CORPUS_TOTAL_BYTES"
 
-contract_value '.control_digests' > "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"
-(cd "$PRESERVED_CONTROL" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" | shasum -a 256 -c) | tee "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
-test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
+if test "$CONTROL_REFERENCE" = preserved-off-vm; then
+  contract_value '.control_digests' > "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"
+  (cd "$PRESERVED_CONTROL" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" | shasum -a 256 -c) | tee "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
+  test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
+else
+  test ! -e "$PRESERVED_CONTROL"
+  test "$(contract_value '.control_digests')" = DERIVED-ON-VM && test "$CONTROL_ADJUDICATION_SOURCE" = DERIVED-ON-VM
+fi
 
 contract_value '.baseline.basin_ids | sort | unique' | jq -c . > "$LOCAL_EVIDENCE_DIR/baseline-roster.json"
 test "$(jq 'length' "$LOCAL_EVIDENCE_DIR/baseline-roster.json")" -eq "$(contract_value '.baseline.basin_count')"
@@ -267,7 +282,7 @@ The production corpus is the preserved 16-GeoPackage set, 84,101,885,952 bytes, 
 
 The production run also requires `rehearsal-passed`: `HFX_REHEARSAL_EVIDENCE` names the rehearsal evidence root, and the verifier requires the `lifecycle-result.json` that section 16 writes there to carry `result` `passed` for `campaign-rehearsal`. The rehearsal contract sets `requires_passing_rehearsal` to `false`, so the rehearsal itself skips that check. The maintainer's third-lifecycle authority in the contract is conditional on that record.
 
-The control adjudication record is the tracked file `scripts/hetzner/seven-basin-control-adjudication.json` for the production campaign and the derived record named by the rehearsal contract for the rehearsal. It pins the corrected control's orientation digest, the exact set of units whose outlet is allowed to differ from the planetary control, the maximum shift, and the decision. Section 10 consumes the copy made above. The verifier refuses a production record that is missing, untracked, malformed, internally inconsistent, or still carrying a placeholder.
+The contract's `control_reference` says where the reference control comes from. `preserved-off-vm` (production) verifies the preserved planetary control and the tracked adjudication record here; `vm-planetary-build` (rehearsal) has no reference yet, requires the digests and record fields to read `DERIVED-ON-VM`, and lets section 10 build the reference and derive the record on the VM, so the byte-for-byte planetary gate never depends on float identity between the workstation and the server. The control adjudication record is the tracked file `scripts/hetzner/seven-basin-control-adjudication.json` for the production campaign and the record derived on the VM for the rehearsal. It pins the corrected control's orientation digest, the exact set of units whose outlet is allowed to differ from the planetary control, the maximum shift, and the decision. Section 10 consumes the copy made above. The verifier refuses a production record that is missing, untracked, malformed, internally inconsistent, or still carrying a placeholder.
 
 The baseline roster is the contract's `baseline.basin_ids`, the 55 basins the frozen artifact was assembled from, pinned inline so no untracked mirror is needed. Its sorted comma-joined SHA-256 prefix must equal the partial-region suffix `4dbff0d6ec31` recorded in `CAMPAIGN-tdx-hydro-planetary.md`, every roster and absent basin must exist in the authoritative inventory, and no absent basin may sit in the roster; the verifier's `baseline-is-pinned` check additionally requires the production roster's complement in the inventory to be exactly the seven absent basins. Section 12 rechecks the roster against the pulled baseline on the VM.
 
@@ -653,14 +668,40 @@ Reacquisition from NGA is a fallback for an integrity failure or a stalled trans
 
 ## 10. Two control builds and the adjudicated comparison
 
-Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests:
+Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests. When the contract's `control_reference` is `vm-planetary-build`, the fence instead builds the reference on the VM with the planetary adapter worktree that section 8 converged, records its digests as `expected-control-sha256.json`, copies the reference tree off the VM as the campaign's preserved control, and writes the digests into the evidence copy of the contract; the planetary rebuild in the next fence then compares two builds of the same adapter on the same machine, so no workstation float result is ever the byte reference:
 
 ```bash
 ssh -o BatchMode=yes "root@$SERVER_IP" mkdir -p "$CONTROL_ROOT/preserved"
-rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
-  "$PRESERVED_CONTROL/" "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/"
-scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json"
-scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/control-adjudication.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/control-adjudication.json"
+if test "$CONTROL_REFERENCE" = preserved-off-vm; then
+  rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
+    "$PRESERVED_CONTROL/" "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/"
+  scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json"
+  scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/control-adjudication.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/control-adjudication.json"
+else
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-reference-build.log"
+set -Eeuo pipefail
+set +x
+control_id=$1; campaign_dir=$2; control_root=$3; control_fabric_version=$4
+test ! -e "$control_root/preserved/$control_id"
+/opt/hfx-geo/bin/python /root/hfx-planetary/adapters/tdx-hydro/build_adapter.py build \
+  --basins "$campaign_dir/downloads/$control_id-basins.gpkg" \
+  --streamnet "$campaign_dir/downloads/$control_id-streamnet.gpkg" \
+  --out "$control_root/preserved/$control_id" \
+  --report "$control_root/preserved/$control_id-build-report.json" \
+  --processing-basin-id "$control_id" --fabric-version "$control_fabric_version"
+/opt/hfx-geo/bin/python /root/hfx/adapters/tdx-hydro/build_adapter.py validate "$control_root/preserved/$control_id" --hfx-binary /root/hfx/target/release/hfx
+(cd "$control_root/preserved/$control_id" && find . -type f | sort | sed 's#^\./##' | while IFS= read -r file; do printf '%s %s\n' "$file" "$(sha256sum -- "$file" | cut -c1-64)"; done) \
+  | jq -R -n '[inputs | split(" ") | {key: .[0], value: .[1]}] | from_entries' > /mnt/hfx/work/sha256/expected-control-sha256.json
+REMOTE
+  mkdir -p -- "$PRESERVED_CONTROL"
+  rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
+    "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/" "$PRESERVED_CONTROL/"
+  scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json" "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"
+  (cd "$PRESERVED_CONTROL" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" | shasum -a 256 -c) | tee "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
+  test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
+  jq --slurpfile digests "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" '.control_digests = $digests[0]' "$LOCAL_EVIDENCE_DIR/campaign-contract.json" > "$LOCAL_EVIDENCE_DIR/campaign-contract.json.tmp"
+  mv -- "$LOCAL_EVIDENCE_DIR/campaign-contract.json.tmp" "$LOCAL_EVIDENCE_DIR/campaign-contract.json"
+fi
 ```
 
 ### Maintainer adjudication of 2026-09-04
@@ -677,16 +718,17 @@ Both control builds pass the contract's `control_fabric_version` (`0.3.0` in pro
 
 ```bash
 campaign_gate pre-control-builds "$(contract_value '.gate_reserve_hours["pre-control-builds"]')"
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-builds.log"
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CONTROL_ID" "$CAMPAIGN_DIR" "$CONTROL_ROOT" "$CONTROL_FABRIC_VERSION" "$CONTROL_REFERENCE" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-builds.log"
 set -Eeuo pipefail
 set +x
-control_id=$1; campaign_dir=$2; control_root=$3; control_fabric_version=$4
+control_id=$1; campaign_dir=$2; control_root=$3; control_fabric_version=$4; control_reference=$5
 python=/opt/hfx-geo/bin/python
 hfx=/root/hfx/target/release/hfx
 adjudication=/mnt/hfx/work/sha256/control-adjudication.json
+planetary_ref=43a98aff8c15a1a196f47b10217ad2f5553b6611
 preserved_created_at=$(jq -r '.created_at' "$control_root/preserved/$control_id/manifest.json")
 (cd "$control_root/preserved/$control_id" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' /mnt/hfx/work/sha256/expected-control-sha256.json | sha256sum -c)
-jq -e --arg id "$control_id" '.processing_basin_id == $id' "$adjudication" >/dev/null
+if [ "$control_reference" = preserved-off-vm ]; then jq -e --arg id "$control_id" '.processing_basin_id == $id' "$adjudication" >/dev/null; else test ! -e "$adjudication"; fi
 
 mkdir -p "$control_root/corrected" "$control_root/planetary"
 "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py orient \
@@ -698,7 +740,7 @@ test "$(jq -r '.orientation_digest' "$control_root/corrected/$control_id-orient.
 
 created_at_args=()
 created_at_flag_used=false
-if "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py build --help 2>/dev/null | grep -q -- '--created-at'; then
+if "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py build --help 2>/dev/null | grep -c -- '--created-at' >/dev/null; then
   created_at_args=(--created-at "$preserved_created_at")
   created_at_flag_used=true
 fi
@@ -738,6 +780,14 @@ fi
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/corrected/$control_id" --right "$control_root/planetary/$control_id" \
   --allow-created-at-difference > "$control_root/compare-corrected-planetary.json" || true
+if [ "$control_reference" = vm-planetary-build ]; then
+  "$python" /root/hfx/adapters/tdx-hydro/compare_unit_outlets.py \
+    --reference "$control_root/preserved/$control_id" \
+    --candidate "$control_root/corrected/$control_id" \
+    --derive-expected "$adjudication" --planetary-revision "$planetary_ref" --processing-basin-id "$control_id" \
+    --orient-report "$control_root/corrected/$control_id-orient.json" \
+    --report "$control_root/derive-adjudicated-outlets.json" >/dev/null
+fi
 "$python" /root/hfx/adapters/tdx-hydro/compare_unit_outlets.py \
   --reference "$control_root/preserved/$control_id" \
   --candidate "$control_root/corrected/$control_id" \
@@ -747,6 +797,10 @@ fi
 jq -r '.verdict' "$control_root/compare-corrected.json" "$control_root/compare-planetary.json" "$control_root/compare-corrected-planetary.json" "$control_root/compare-adjudicated-outlets.json"
 REMOTE
 scp -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/compare-*.json" "root@$SERVER_IP:$CONTROL_ROOT/created-at-record.json" "root@$SERVER_IP:$CONTROL_ROOT/corrected/$CONTROL_ID-orient.json" "$LOCAL_EVIDENCE_DIR/"
+if test "$CONTROL_REFERENCE" = vm-planetary-build; then
+  scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/control-adjudication.json" "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+  jq -e --arg id "$CONTROL_ID" --argjson units "$CONTROL_UNIT_COUNT" '.processing_basin_id == $id and .unit_count == $units' "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+fi
 jq -e '.corrected_build_created_at_flag_used | type == "boolean"' "$LOCAL_EVIDENCE_DIR/created-at-record.json"
 jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-planetary.json"
 jq -e '.left_matches_expected_sha256 == true' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
@@ -777,7 +831,7 @@ test "$(jq -r '.orientation_digest' "$LOCAL_EVIDENCE_DIR/$CONTROL_ID-orient.json
 
 The planetary rebuild must reproduce the preserved digests: its three data files must equal the pinned digests exactly and its `manifest.json` may differ only in `created_at`. That reproduction proves the VM toolchain against the recorded build.
 
-The corrected control build is accepted only when the adjudicated comparison reports `accepted`. The comparison reads every row of `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet` of both builds. Every same-level graph edge, every polygon, and every non-outlet attribute must be identical between the two builds. The set of units whose outlet differs must equal exactly the adjudicated set pinned in the tracked record. Every outlet shift must lie within the pinned maximum. Snap stems may differ only for units inside that set; the report counts them. The orientation digest recomputed from the preserved control's graph and outlet columns must equal the pinned planetary digest, the digest recomputed from the corrected build must equal the pinned corrected digest, and the VM `orient` report must carry that same digest. The corrected build's `manifest.json` follows the `created-at-record.json` rule above, and its `catchments.parquet` is expected to differ in bytes because outlet columns moved; the byte verdicts of `graph.parquet` and `aux/snap_stems.parquet` are recorded in `compare-corrected.json` for the campaign record. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees, both build reports, the orient report, and the four comparison records, then go to section 14 and section 16.
+Under `vm-planetary-build` the fence first derives the adjudication record on the VM from the two builds (`compare_unit_outlets.py --derive-expected`), then runs the same pinned comparison against that record and copies it off the VM; the record is therefore accepted by construction on the outlet set, while every polygon, attribute, graph, manifest, and unit-set difference still refuses. The corrected control build is accepted only when the adjudicated comparison reports `accepted`. The comparison reads every row of `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet` of both builds. Every same-level graph edge, every polygon, and every non-outlet attribute must be identical between the two builds. The set of units whose outlet differs must equal exactly the adjudicated set pinned in the tracked record. Every outlet shift must lie within the pinned maximum. Snap stems may differ only for units inside that set; the report counts them. The orientation digest recomputed from the preserved control's graph and outlet columns must equal the pinned planetary digest, the digest recomputed from the corrected build must equal the pinned corrected digest, and the VM `orient` report must carry that same digest. The corrected build's `manifest.json` follows the `created-at-record.json` rule above, and its `catchments.parquet` is expected to differ in bytes because outlet columns moved; the byte verdicts of `graph.parquet` and `aux/snap_stems.parquet` are recorded in `compare-corrected.json` for the campaign record. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees, both build reports, the orient report, and the four comparison records, then go to section 14 and section 16.
 
 A corrected build that refuses, or an `orient` preflight whose digest differs from the pinned one, is the same stop: the refusal, its report if any, and the log are preserved as the campaign's terminal evidence, and no per-basin compile starts.
 
@@ -821,8 +875,12 @@ copy_remote_root "$CAMPAIGN_DIR/reports" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
 copy_remote_root "$CAMPAIGN_DIR/state" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
 copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
 copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
-(cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
-! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+if test -s "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt"; then
+  (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+  ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+else
+  printf 'no basin output was produced; nothing to verify\n' | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+fi
 compiled_absent=$(for id in "${ABSENT_IDS[@]}"; do jq -r --arg id "$id" 'select(.stages.compile.status == "succeeded") | $id' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done)
 printf '%s\n' "$compiled_absent" | sed '/^$/d' > "$LOCAL_EVIDENCE_DIR/compiled-absent-basins.txt"
 test "$(for id in "${ABSENT_IDS[@]}"; do test -f "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json" && printf '%s\n' "$id"; done | wc -l | tr -d ' ')" -eq "${#ABSENT_IDS[@]}"
@@ -904,11 +962,11 @@ An interrupted or OOM-killed validation is recorded as `incomplete`, never as pa
 
 ```bash
 ./scripts/hetzner/launch.sh --campaign "$CAMPAIGN" status --workload tdx-assemble || test "$?" -eq 3
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" <<'REMOTE' > "$LOCAL_EVIDENCE_DIR/validation-evidence.txt"
+ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$CAMPAIGN" <<'REMOTE' > "$LOCAL_EVIDENCE_DIR/validation-evidence.txt"
 set -Eeuo pipefail
 cat "$1/state/assembly.json"
 dmesg -T 2>/dev/null | grep -i -E 'out of memory|killed process' || true
-grep -E 'return code|hfx: error|validation' /mnt/hfx/logs/hfx-seven-basin-extension-tdx-assemble.log | tail -n 40 || true
+grep -E 'return code|hfx: error|validation' "/mnt/hfx/logs/hfx-$2-tdx-assemble.log" | tail -n 40 || true
 REMOTE
 ```
 
@@ -916,7 +974,7 @@ The extended artifact and the complete validation record are preserved whatever 
 
 ## 14. Preservation before teardown
 
-Preserve in this order, each root with a SHA-256 manifest computed on the VM and recomputed after transfer. A copy counts only when relative paths and digests match on both sides. The order follows value per byte so an interruption loses the least:
+Preserve in this order, each root with a SHA-256 manifest computed on the VM and recomputed after transfer. A copy counts only when relative paths and digests match on both sides. The first pass runs while strict validation may still be writing the canonical log and `state/assembly.json`, so the fence repeats the digest, copy, and verification up to three times until every root verifies unchanged; a root with no files (no basin output at all) verifies as empty instead of aborting, because an empty outcome is a truthful outcome. The order follows value per byte so an interruption loses the least:
 
 1. campaign `state`, `reports`, and `/mnt/hfx/logs`
 2. both control builds, their reports, the orient report, and the four comparison records
@@ -926,7 +984,9 @@ Preserve in this order, each root with a SHA-256 manifest computed on the VM and
 
 ```bash
 campaign_gate pre-preservation "$(contract_value '.gate_reserve_hours["pre-preservation"]')"
-ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$CONTROL_ROOT" <<'REMOTE'
+preservation_status=1
+for preservation_attempt in 1 2 3; do
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$CAMPAIGN_DIR" "$CONTROL_ROOT" <<'REMOTE'
 set -Eeuo pipefail
 cd "$1"
 for root in state reports basin-outputs assembly/dataset; do
@@ -936,18 +996,28 @@ done
 (cd /mnt/hfx && find logs -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/logs-sha256.txt
 (cd "$2" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/control-builds-sha256.txt
 REMOTE
-for root in state reports basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done
-copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
-copy_remote_root "$CONTROL_ROOT" "$LOCAL_EVIDENCE_DIR/off-vm"
-copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
-for manifest in campaign-state campaign-reports campaign-basin-outputs; do
-  (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$manifest-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt"
-  ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt"
+  for root in state reports basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done
+  copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
+  copy_remote_root "$CONTROL_ROOT" "$LOCAL_EVIDENCE_DIR/off-vm"
+  copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
+  preservation_status=0
+  for manifest in campaign-state campaign-reports campaign-basin-outputs; do
+    if test -s "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$manifest-sha256.txt"; then
+      (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$manifest-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt" || preservation_status=1
+      grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt" >/dev/null && preservation_status=1
+    else
+      printf 'no files under this root; nothing to verify\n' > "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt"
+    fi
+  done
+  (cd "$LOCAL_EVIDENCE_DIR/off-vm" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/logs-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-logs.txt" || preservation_status=1
+  grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-logs.txt" >/dev/null && preservation_status=1
+  (cd "$LOCAL_EVIDENCE_DIR/off-vm/control-builds" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/control-builds-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt" || preservation_status=1
+  grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt" >/dev/null && preservation_status=1
+  if test "$preservation_status" -eq 0; then break; fi
+  printf 'preservation attempt %s found a root that changed between digest and copy; repeating\n' "$preservation_attempt" >> "$LOCAL_EVIDENCE_DIR/preservation-retries.log"
+  sleep 30
 done
-(cd "$LOCAL_EVIDENCE_DIR/off-vm" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/logs-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/verify-logs.txt"
-! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-logs.txt"
-(cd "$LOCAL_EVIDENCE_DIR/off-vm/control-builds" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/control-builds-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt"
-! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt"
+test "$preservation_status" -eq 0
 ```
 
 Copy the extended artifact, when it exists, to a new prefix under the campaign's scratch namespace and prove the S3 copy by listing sizes and by reading every object back and recomputing its digest. When the volume has room for a second copy of the artifact plus 10 GB, the read-back lands in a scratch directory on the VM exactly as before; otherwise each object is streamed from S3 through `sha256sum` without touching the disk, and the record line `readback_mode=streamed` in `extension-s3-preservation.log` says so. The production volume cannot hold that second copy (section 8), so the streamed mode is the expected production path. The prefix is named by content. The baseline prefix is never written.
@@ -1128,7 +1198,7 @@ Review every Bash fence for strict-mode behavior, quoting, secret-path nondisclo
 
 The operator does not retype the fences. `scripts/hetzner/compose-campaign-driver.py` extracts every Bash fence of this runbook, embeds each one verbatim into one driver script, and writes a fence proof (`fence-proof/runbook-NN.sh`, `fence-proof/driver-NN.sh`, and `fence-diff-proof.txt`) that must show every fence identical. The composer adds only what the prose already requires and no fence can carry: the operator log and milestone markers, the poll loops that repeat a gate-and-status pair until the workload finishes, the decision-point checks from the contract's `decision_points_hours`, and an exit-trap wrapper that turns errexit off before it calls `campaign_cleanup`, because errexit stays in force inside an `EXIT` trap and on 2026-09-04 the first wrapper ended the shell at `(exit "$rc")` before cleanup ran. Modes: `--mode full` runs sections 4 to 16; `--mode preflight` runs sections 4 to 6 and exits before the trap; `--mode resume --resume-at <stage>` reuses a recorded provisioning epoch and both provisioned identities, re-arms the watchdog, re-proves the live identities through `hcloud-identity.jq`, and continues from the named stage (`converge`, `acquire`, `controls`, `compile`, `baseline`, `preserve`). The composed driver is placed in the evidence directory and executed from the repository root with the credential path on standard input, exactly as section 4 reads it.
 
-The rehearsal lifecycle runs the same driver under the rehearsal contract. `scripts/hetzner/prepare-rehearsal-campaign.sh` builds the rehearsal evidence root on the workstation from tiny data: it synthesizes one control basin and two absent basins with `adapters/tdx-hydro/synthesize_rehearsal_corpus.py` (the adapter test fixture shifted per basin), writes their SHA-256 manifest, builds the preserved control with the planetary adapter revision `43a98aff8c15a1a196f47b10217ad2f5553b6611` in a temporary worktree, builds the corrected control with the checked-out adapter, derives the control adjudication record from those two builds with `compare_unit_outlets.py --derive-expected`, compiles the roster basin and assembles it into the tiny baseline, uploads that baseline read-only-thereafter to the rehearsal baseline prefix under `scratch/`, and writes the resolved rehearsal contract (the tracked record plus the derived digests, byte totals, and counts) that `HFX_CAMPAIGN_CONTRACT` names. The maintainer places the approval record in the rehearsal evidence root by hand; the preparation refuses without it and never creates it. Every later stage then runs for real on the `cx23`: transfer and remote SHA-256, convergence with the hotpatch, both control builds and both gates, the `orient` digest gate, the per-basin compiles, extension assembly, strict validation, preservation to the rehearsal scratch prefix with digest read-back, and exact-resource teardown with the zero-footprint audit. The rehearsal never names the production baseline prefix.
+The rehearsal lifecycle runs the same driver under the rehearsal contract. `scripts/hetzner/prepare-rehearsal-campaign.sh` builds the rehearsal evidence root on the workstation from tiny data: it synthesizes the control basin, the two absent basins, and the second roster basin with `adapters/tdx-hydro/synthesize_rehearsal_corpus.py` (the adapter test fixture shifted per basin, eight GeoPackages), writes their SHA-256 manifest, compiles both roster basins with the checked-out adapter and assembles them into the tiny baseline (the control sits in the rehearsal roster exactly as it sits in the production roster, because extension assembly excludes the control from the roster), uploads that baseline read-only-thereafter to the rehearsal baseline prefix under `scratch/`, and writes the resolved rehearsal contract (the tracked record plus the byte totals and counts) that `HFX_CAMPAIGN_CONTRACT` names. The reference control and the adjudication record are not prepared here; section 10 builds and derives them on the VM. The maintainer places the approval record in the rehearsal evidence root by hand; the preparation refuses without it and never creates it. Every later stage then runs for real on the `cx23`: transfer and remote SHA-256, convergence with the hotpatch, both control builds and both gates, the `orient` digest gate, the per-basin compiles, extension assembly, strict validation, preservation to the rehearsal scratch prefix with digest read-back, and exact-resource teardown with the zero-footprint audit. The rehearsal never names the production baseline prefix.
 
 ```bash
 python3 scripts/hetzner/compose-campaign-driver.py --mode full --out "$HFX_CAMPAIGN_EVIDENCE/composed"
@@ -1136,4 +1206,4 @@ diff -q "$HFX_CAMPAIGN_EVIDENCE/composed/fence-diff-proof.txt" <(python3 scripts
 printf '%s\n' "$S3_ENV_FILE_PATH" | caffeinate -i -s bash "$HFX_CAMPAIGN_EVIDENCE/composed/campaign-driver.sh"
 ```
 
-The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.
+The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.

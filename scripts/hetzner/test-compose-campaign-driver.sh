@@ -60,6 +60,7 @@ assert_contains "$tmp/full/campaign-driver.sh" 'decision_point 2'
 assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-init'
 assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-acquire'
 assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-assemble'
+assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-compile compile-monitor'
 pass 'full mode embeds all 25 fences byte for byte, twice for preservation, with milestones, gates, and decision points'
 
 compose --mode preflight --out "$tmp/preflight" || die "preflight composition failed: $(cat "$stderr")"
@@ -86,6 +87,8 @@ for index in "${!stages[@]}"; do
     ! grep -q 'DIFFERS' "$tmp/resume-$stage/fence-diff-proof.txt" || die "resume $stage proof reports a differing fence"
 done
 assert_contains "$tmp/resume-preserve/campaign-driver.sh" 'compile_exit_zero=1   # OPERATOR (resume)'
+for stage in "${stages[@]}"; do assert_contains "$tmp/resume-$stage/campaign-driver.sh" 'export HFX_CAMPAIGN_RESUME=1'; done
+assert_not_contains "$tmp/full/campaign-driver.sh" 'export HFX_CAMPAIGN_RESUME=1'
 pass 'resume modes skip the provisioning fence, re-arm the watchdog, re-prove identities, and start at the named stage'
 
 expect_failure --mode resume --out "$tmp/bad"
@@ -127,5 +130,71 @@ assert_contains "$tmp/trap-evidence/cleanup.txt" 'cleanup-saw-status=1'
 assert_contains "$tmp/trap-evidence/oplog.txt" 'exit trap entered with status 1'
 assert_contains "$tmp/trap-evidence/milestones.txt" '99-torn-down'
 pass 'the exit-trap wrapper turns errexit off and hands the failing status to campaign_cleanup, which runs to teardown'
+
+# wait_workload tolerates up to ten consecutive transient status failures (a lost SSH connection during a
+# 7 to 14 hour compile) and returns 0 when the workload finishes.
+sed -n '/^wait_workload() {$/,/^}$/p' "$tmp/full/campaign-driver.sh" >"$tmp/wait_workload.sh"
+[[ -s "$tmp/wait_workload.sh" ]] || die 'wait_workload was not found in the driver'
+mkdir -p "$tmp/poll/scripts/hetzner"
+cat >"$tmp/poll/scripts/hetzner/launch.sh" <<'LAUNCH'
+#!/usr/bin/env bash
+count_file=$HFX_TEST_POLL_COUNT
+count=$(( $(cat "$count_file") + 1 ))
+printf '%s\n' "$count" >"$count_file"
+if ((count <= 3)); then printf 'hfx: error: ssh lost\n' >&2; exit 1; fi
+if ((count <= 5)); then printf 'launch: session is running\n'; exit 0; fi
+printf 'launch: session is not running\n'; exit 3
+LAUNCH
+chmod +x "$tmp/poll/scripts/hetzner/launch.sh"
+printf '0\n' >"$tmp/poll/count"
+cat >"$tmp/poll-harness.sh" <<HARNESS
+set -Eeuo pipefail
+cd "$tmp/poll"
+export HFX_TEST_POLL_COUNT=$tmp/poll/count
+LOCAL_EVIDENCE_DIR=$tmp/poll
+CAMPAIGN=campaign-rehearsal
+POLL_SECONDS=0
+campaign_gate() { return 0; }
+before_hour() { return 0; }
+oplog() { printf '%s\n' "\$*" >>"$tmp/poll/oplog.txt"; }
+sleep() { :; }
+source "$tmp/wait_workload.sh"
+wait_workload tdx-compile compile-monitor 20 48
+HARNESS
+bash "$tmp/poll-harness.sh" >"$stdout" 2>"$stderr" || die "wait_workload did not return 0 after transient failures ($(cat "$stderr"))"
+[[ $(cat "$tmp/poll/count") == 6 ]] || die 'wait_workload did not keep polling through three transient failures'
+[[ $(grep -c 'transient' "$tmp/poll/oplog.txt") == 3 ]] || die 'transient failures were not logged'
+printf '0\n' >"$tmp/poll/count"
+cat >"$tmp/poll/scripts/hetzner/launch.sh" <<'LAUNCH'
+#!/usr/bin/env bash
+printf 'hfx: error: ssh lost\n' >&2; exit 1
+LAUNCH
+status=0
+bash "$tmp/poll-harness.sh" >"$stdout" 2>"$stderr" || status=$?
+[[ "$status" -eq 1 ]] || die "wait_workload should return 1 after ten persistent failures, returned $status"
+pass 'the compile monitor rides through transient status failures and gives up only after ten in a row'
+
+# Fence 17 must record an empty basin-outputs manifest as a truthful outcome instead of aborting.
+mkdir -p "$tmp/f17/off-vm/sha256" "$tmp/f17/off-vm/campaign"
+: >"$tmp/f17/off-vm/sha256/basin-outputs-sha256.txt"
+for id in 1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010 7020000010; do
+    mkdir -p "$tmp/f17/off-vm/campaign/state/basins/$id"
+    printf '{"stages":{"compile":{"status":"failed"}}}\n' >"$tmp/f17/off-vm/campaign/state/basins/$id/current.json"
+done
+cat >"$tmp/f17-harness.sh" <<HARNESS
+set -Eeuo pipefail
+IFS=\$'\n\t'
+LOCAL_EVIDENCE_DIR=$tmp/f17
+CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-x
+SERVER_IP=127.0.0.1
+ABSENT_IDS=(1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010)
+ssh() { cat >/dev/null; return 0; }
+copy_remote_root() { return 0; }
+source "$tmp/full/fence-proof/driver-17.sh"
+HARNESS
+bash "$tmp/f17-harness.sh" >"$stdout" 2>"$stderr" || die "fence 17 aborted on an empty basin-outputs manifest ($(cat "$stderr"))"
+assert_contains "$tmp/f17/basin-outputs-verification.txt" 'no basin output was produced'
+[[ ! -s "$tmp/f17/compiled-absent-basins.txt" ]] || die 'compiled-absent-basins.txt should be empty when every compile failed'
+pass 'an empty basin-outputs manifest records a truthful empty outcome instead of aborting'
 
 printf '1..%d\n' "$passed"

@@ -41,7 +41,8 @@ readonly HFX_EXPECTED_GATE_PHASES='["assemble-monitor","compile-monitor","pre-ac
 usage() {
     cat <<'USAGE'
 Usage: verify-compile-runbook.sh [--runbook <absolute-path>] [--evidence-root <absolute-path>]
-                                 [--adjudication-record <absolute-path>] --check <name>
+                                 [--adjudication-record <absolute-path>] [--rehearsal-contract <absolute-path>]
+                                 --check <name>
 
 Checks:
   scope-permits-compilation   campaign identity, exact resources, basins, permitted acts
@@ -61,6 +62,8 @@ Options:
   --evidence-root <path>  required by approval-is-a-precondition and rehearsal-passed
   --adjudication-record <path>
                           control adjudication record to verify; default is the tracked record
+  --rehearsal-contract <path>
+                          rehearsal contract to verify; default is the tracked contract
   -h, --help              print usage and exit 0
 USAGE
 }
@@ -76,6 +79,7 @@ hfx_require_command git
 runbook=
 evidence_root=
 adjudication_record=
+rehearsal_contract=
 check=
 seen=' '
 while (($#)); do
@@ -84,7 +88,7 @@ while (($#)); do
             usage
             exit 0
             ;;
-        --runbook | --evidence-root | --adjudication-record | --check)
+        --runbook | --evidence-root | --adjudication-record | --rehearsal-contract | --check)
             [[ "$seen" != *" $1 "* ]] || hfx_die "option $1 may not be repeated"
             seen="$seen$1 "
             (($# >= 2)) || hfx_die "option $1 requires a value"
@@ -93,6 +97,7 @@ while (($#)); do
                 --runbook) runbook=$2 ;;
                 --evidence-root) evidence_root=$2 ;;
                 --adjudication-record) adjudication_record=$2 ;;
+                --rehearsal-contract) rehearsal_contract=$2 ;;
                 --check) check=$2 ;;
             esac
             shift 2
@@ -312,9 +317,14 @@ case $check in
             'rehearsal authority is not the 2026-09-04 maintainer decision for one rehearsal lifecycle'
         jq -e '.lifecycle_ledger.rehearsal_authority.record | type == "string" and length > 0 and . != "RECORD-URL"' <<<"$contract" >/dev/null 2>&1 ||
             fail 'rehearsal authority does not name its record'
-        rehearsal=$repo_root/$HFX_REHEARSAL_CONTRACT_REL
-        git -C "$repo_root" ls-files --error-unmatch -- "$HFX_REHEARSAL_CONTRACT_REL" >/dev/null 2>&1 ||
-            fail 'rehearsal contract is not tracked'
+        if [[ -z "$rehearsal_contract" ]]; then
+            rehearsal=$repo_root/$HFX_REHEARSAL_CONTRACT_REL
+            git -C "$repo_root" ls-files --error-unmatch -- "$HFX_REHEARSAL_CONTRACT_REL" >/dev/null 2>&1 ||
+                fail 'rehearsal contract is not tracked'
+        else
+            [[ "$rehearsal_contract" == /* ]] || hfx_die '--rehearsal-contract must be an absolute path'
+            rehearsal=$rehearsal_contract
+        fi
         [[ -f "$rehearsal" && ! -L "$rehearsal" && -s "$rehearsal" ]] || fail 'rehearsal contract is not a nonempty regular file'
         jq -e 'type == "object"' "$rehearsal" >/dev/null 2>&1 || fail 'malformed rehearsal contract'
         jq -e --slurpfile inventory "$repo_root/$HFX_INVENTORY_REL" --arg campaign "$HFX_REHEARSAL_CAMPAIGN" --argjson production "$contract" '
@@ -332,9 +342,15 @@ case $check in
             and (.gate_reserve_hours | keys == ($production.gate_reserve_hours | keys) and all(.[]; type == "number" and . < 6))
             and (.absent_basins | length >= 1 and all(.[]; $inventory[0][.] != null))
             and ($inventory[0][.control_basin] != null)
-            and (.baseline.basin_ids | length >= 1 and all(.[]; $inventory[0][.] != null) and index(.[0]) != null)
+            and (.baseline.basin_ids | length >= 1 and all(.[]; $inventory[0][.] != null) and . == (sort | unique))
             and ((.absent_basins - (.absent_basins - .baseline.basin_ids)) == [])
-            and (.baseline.basin_ids | index($production.control_basin) == null or true)
+            and (.baseline.basin_ids | index($production.control_basin) != null)
+            and .control_basin == $production.control_basin
+            and (.baseline.basin_count == (.baseline.basin_ids | length))
+            and (.source_corpus.file_count == 2 * ((.absent_basins + [.control_basin] + .baseline.basin_ids) | unique | length))
+            and .control_reference == "vm-planetary-build"
+            and .control_digests == "DERIVED-ON-VM" and .control_adjudication_record == "DERIVED-ON-VM"
+            and ([paths(. == "DERIVED-ON-VM") | join(".")] | sort) == (.derived_on_vm | sort)
             and (.baseline.prefix | startswith("s3://pourpoint-hfx/scratch/tdx-hydro-" + $campaign + "/") and endswith("/dataset/"))
             and (.baseline.prefix | contains("tdx-m5-planetary") | not)
             and (.extension_scratch_prefix == "scratch/tdx-hydro-" + $campaign + "/")
@@ -346,7 +362,8 @@ case $check in
             and (.retention_policy == $production.retention_policy)
             and (.derived_at_preparation | type == "array" and length > 0)
             and ([paths(. == "DERIVED") | join(".")] | sort) == (.derived_at_preparation | sort)
-        ' "$rehearsal" >/dev/null 2>&1 || fail 'rehearsal contract is inconsistent with the production contract or the inventory'
+        ' "$rehearsal" >/dev/null 2>&1 || fail 'rehearsal contract is inconsistent with the production contract, the inventory, or its own corpus and roster'
+        jq -e '.control_reference == "preserved-off-vm"' <<<"$contract" >/dev/null 2>&1 || fail 'production contract must use the preserved off-VM control reference'
         [[ $(jq -r '.baseline.basin_ids | join(",")' "$rehearsal" | tr -d '\n' | shasum -a 256 | cut -c1-12) == $(jq -r '.baseline.roster_digest_prefix' "$rehearsal") ]] ||
             fail 'rehearsal roster digest prefix does not match its roster'
         [[ $(jq -r '.baseline.region' "$rehearsal") == "tdx-hydro-partial-$(jq -r '.baseline.roster_digest_prefix' "$rehearsal")" ]] ||
@@ -371,7 +388,7 @@ case $check in
         ' "$result" >/dev/null 2>&1 || fail 'rehearsal lifecycle result is not a passing record'
         rehearsal_ref=$(jq -r '.ground_truth_ref' "$result")
         git -C "$repo_root" merge-base --is-ancestor "$HFX_RUNNER_FIX_REF" "$rehearsal_ref" 2>/dev/null ||
-            fail 'rehearsal ran on a ref that lacks the repaired runner and runbook'
+            fail "rehearsal ran on a ref that does not descend from the runner fix $HFX_RUNNER_FIX_REF"
         ;;
     *) fail 'unknown check' ;;
 esac

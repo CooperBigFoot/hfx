@@ -232,6 +232,27 @@ pass 'hotpatch, control digest, baseline, and extension prefix drift refuses'
 mutated=$(mutate rehearsal-record-pending 's/("rehearsal_authority": \{[^}]*"record": )"[^"]*"/${1}"RECORD-URL"/')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'rehearsal authority does not name its record'
+rehearsal_contract=$SCRIPT_DIR/rehearsal-campaign-contract.json
+mutate_rehearsal() {
+    local name=$1
+    local jq_expression=$2
+    jq "$jq_expression" "$rehearsal_contract" >"$tmp/$name.json"
+    printf '%s\n' "$tmp/$name.json"
+}
+for mutation in '.source_corpus.file_count = 6' '.baseline.basin_ids = ["4020050470"] | .baseline.basin_count = 1' \
+    '.baseline.basin_ids = ["7020000010", "4020050470"]' '.control_reference = "preserved-off-vm"' \
+    '.control_digests = {"manifest.json": "0000000000000000000000000000000000000000000000000000000000000000"}' \
+    '.absent_basins += ["4020050470"]' '.server_type = "ccx33"' '.gross_cost_ceiling_eur = 2' \
+    '.baseline.prefix = "s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/"'; do
+    record=$(mutate_rehearsal inconsistent-rehearsal "$mutation")
+    expect_failure --rehearsal-contract "$record" --check rehearsal-record-is-pinned
+    assert_contains "$stderr" 'rehearsal contract is inconsistent'
+done
+record=$(mutate_rehearsal roster-digest-wrong '.baseline.roster_digest_prefix = "000000000000"')
+expect_failure --rehearsal-contract "$record" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'rehearsal roster digest prefix does not match its roster'
+expect_pass --rehearsal-contract "$rehearsal_contract" --check rehearsal-record-is-pinned
+pass 'a rehearsal contract whose corpus count, roster, control reference, ceilings, or prefixes drift refuses'
 mutated=$(mutate rehearsal-phrase-removed 's/The rehearsal never names the production baseline prefix\.//')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'runbook omits required operational text'
@@ -248,6 +269,12 @@ write_result() {
 write_result not-passed incomplete
 expect_failure --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
 assert_contains "$stderr" 'rehearsal lifecycle result is not a passing record'
+jq '.ground_truth_ref = "0000000000000000000000000000000000000000"' "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json" >"$tmp/result-old-ref.json"
+mv "$tmp/result-old-ref.json" "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json"
+write_result_old() { jq '.result = "passed" | .strict_validation = "passed" | .ground_truth_ref = "0000000000000000000000000000000000000000"' "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json" >"$tmp/r.json" && mv "$tmp/r.json" "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json"; }
+write_result_old
+expect_failure --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
+assert_contains "$stderr" 'does not descend from the runner fix'
 write_result passed passed
 if git -C "$repo_root" merge-base --is-ancestor 0ffa2d048ce5d748c0ab4c71fbe6f5862478107d HEAD 2>/dev/null; then
     expect_pass --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
