@@ -2,13 +2,13 @@
 
 This runbook is an instruction document. Authoring, reviewing, and verifying it provisions nothing, contacts neither NGA nor S3, performs no compile or teardown, and writes nothing to object storage.
 
-This campaign consumes the one remaining approved bounded Hetzner lifecycle for Effort #195. It builds two control outputs for basin `7020000010`, compares them byte for byte, compiles the seven absent basins with the corrected adapter, extends the frozen 55-basin artifact with every newly compiled basin, attempts strict whole-dataset validation, preserves everything off the VM with digests, and tears down by exact resource identity.
+This campaign consumes the one remaining approved bounded Hetzner lifecycle for Effort #195. It builds two control outputs for basin `7020000010`, proves the planetary rebuild byte for byte against the preserved control, proves the corrected build against the maintainer-adjudicated difference record, compiles the seven absent basins with the corrected adapter, extends the frozen 55-basin artifact with every newly compiled basin, attempts strict whole-dataset validation, preserves everything off the VM with digests, and tears down by exact resource identity.
 
 version_policy is NONE: NO version bump, NO tag.
 
 <!-- BEGIN COMPILE CAMPAIGN CONTRACT
 {
-  "schema": 2,
+  "schema": 3,
   "campaign": "seven-basin-extension",
   "authority_ref": "69747055bcb1876d9d1fad48c60f5cae6a24ea60",
   "authority_document": "planning/visions/2026-09-03-close-the-seven-basin-coverage-gap.md",
@@ -42,6 +42,7 @@ version_policy is NONE: NO version bump, NO tag.
     "graph.parquet": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5",
     "manifest.json": "8ca5b2135d19c18a4b8fba6c93c63ffb7a784a2749867483ea6c0c49c46560c4"
   },
+  "control_adjudication_record": "scripts/hetzner/seven-basin-control-adjudication.json",
   "baseline": {
     "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/",
     "region": "tdx-hydro-partial-4dbff0d6ec31",
@@ -66,7 +67,7 @@ Only the named campaign server and volume may be mutated. Those are server `hfx-
 
 Mandatory exact-resource teardown of the named server and volume is the sole permitted destructive operation. This campaign deletes no source data, no output, no evidence, no S3 object, and no other server or volume. The baseline prefix is read-only; nothing under it is modified or deleted. No produced output may remain unique to the VM or volume.
 
-The permitted acts are the transfer of the preserved source corpus, reacquisition of a selected product only when its integrity check fails, both control builds and their comparison, the per-basin compiles, a read-only pull of the baseline, one extension assembly, one strict validation attempt, off-VM preservation, read-only audits, and exact-resource teardown. Adjudication, defect-report transmission, publication under `hfx/`, and adapter changes are outside this runbook.
+The permitted acts are the transfer of the preserved source corpus, reacquisition of a selected product only when its integrity check fails, both control builds and their comparisons, the per-basin compiles, a read-only pull of the baseline, one extension assembly, one strict validation attempt, off-VM preservation, read-only audits, and exact-resource teardown. Adjudication, defect-report transmission, publication under `hfx/`, and adapter changes are outside this runbook.
 
 ## 2. Fixed ceilings and retention
 
@@ -143,10 +144,12 @@ The shell sets `IFS` to newline and tab, so the seven absent basins are held in 
 Verify the tracked contract, the operator inputs, and the preserved inputs before any cloud action:
 
 ```bash
-for check in scope-permits-compilation ceilings-and-kill-switches control-hotpatch-is-pinned control-digests-are-pinned baseline-is-pinned authority-is-current; do
+for check in scope-permits-compilation ceilings-and-kill-switches control-hotpatch-is-pinned control-digests-are-pinned control-adjudication-is-pinned baseline-is-pinned authority-is-current; do
   ./scripts/hetzner/verify-compile-runbook.sh --check "$check"
 done
 ./scripts/hetzner/verify-compile-runbook.sh --evidence-root "$HFX_CAMPAIGN_EVIDENCE" --check approval-is-a-precondition
+cp -- scripts/hetzner/seven-basin-control-adjudication.json "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
+jq -e --arg id "$CONTROL_ID" '.processing_basin_id == $id and .unit_count == 331263' "$LOCAL_EVIDENCE_DIR/control-adjudication.json"
 ./scripts/hetzner/verify-campaign-inputs.sh --evidence-root "$LOCAL_EVIDENCE_DIR" --check evidence-root-writable
 ./scripts/hetzner/verify-campaign-inputs.sh --s3-env-file "$S3_ENV_FILE" --check credential-file-authenticates
 ./scripts/hetzner/verify-campaign-inputs.sh --check hcloud-context-resolves
@@ -168,6 +171,8 @@ jq -e --slurpfile roster "$LOCAL_EVIDENCE_DIR/baseline-roster.json" '(keys - $ro
 ```
 
 The corpus is the preserved 16-GeoPackage set, 84,101,885,952 bytes, whose SHA-256 manifest was recorded on both sides of the earlier transfer. Its local integrity proof takes roughly 10 to 30 minutes. A corpus that fails this proof is not transferred; section 9 names the reacquisition fallback.
+
+The control adjudication record is the tracked file `scripts/hetzner/seven-basin-control-adjudication.json`. It pins the corrected control's orientation digest, the exact set of units whose outlet is allowed to differ from the planetary control, the maximum shift, and the maintainer's decision. Section 10 consumes the copy made above. The verifier refuses a record that is missing, untracked, malformed, internally inconsistent, or still carrying a placeholder.
 
 The baseline roster is derived from the local planetary mirror's assembly state, which lists the 55 basins the frozen artifact was assembled from. Its sorted comma-joined SHA-256 prefix must equal the partial-region suffix `4dbff0d6ec31` recorded in `CAMPAIGN-tdx-hydro-planetary.md`, and its complement in the authoritative inventory must be exactly the seven absent basins. Section 12 rechecks the roster against the pulled baseline on the VM.
 
@@ -488,17 +493,26 @@ campaign_gate pre-acquire 60
 
 A transferred file that fails the remote SHA-256 check is removed from the VM's `downloads` directory only, never from the preserved corpus, and the acquisition rerun fetches it from NGA. Reacquisition from NGA is a fallback for an integrity failure or a stalled transfer. After the workload finishes, require every selected basin to have both products `succeeded`; an `exhausted` product excludes that basin from compilation and is recorded in section 15.
 
-## 10. Two control builds and byte comparison
+## 10. Two control builds and the adjudicated comparison
 
-Transfer the preserved planetary control output to the VM as the byte-for-byte reference and reverify it there:
+Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. Reverify it there and place the control adjudication record beside the expected digests:
 
 ```bash
 rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
   "$PRESERVED_CONTROL/" "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/"
 scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json"
+scp -o BatchMode=yes "$LOCAL_EVIDENCE_DIR/control-adjudication.json" "root@$SERVER_IP:/mnt/hfx/work/sha256/control-adjudication.json"
 ```
 
-Build the control with the corrected adapter first, because its result decides whether any per-basin output can be trusted. Then rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. The remote fence records which branch it took in `created-at-record.json` under the control root. When the flag was passed, the corrected comparison runs without any allowance and must report `identical` for every file including `manifest.json`. Only when the flag was unavailable does the comparison tolerate a manifest that differs solely in `created_at`, and the record states that this tolerance applied. The planetary rebuild has no such flag at its revision, so its comparison always carries the allowance and its `manifest.json` is expected to differ only in `created_at`.
+### Maintainer adjudication of 2026-09-04
+
+On 2026-09-04 Nicolas Lazaro adjudicated the difference between the corrected control build and the preserved planetary control. TDX-Hydro reaches are digitized outlet first: on the preserved corpus every reach proven by endpoint coincidence has its first vertex at the outlet. Planetary revision `43a98aff8c15a1a196f47b10217ad2f5553b6611` trusted the final source vertex as the outlet of near-degenerate reaches and of isolated roots. The corrected adapter orients every connected reach from endpoint coincidence evidence and every isolated root from basin-wide polarity, and it refuses when that evidence is absent, contradictory, or tied. The maintainer accepted the consequence: the corrected control keeps every same-level graph edge, every polygon, and every non-outlet attribute identical to the planetary control, and the outlets of an enumerated set of units move by a bounded amount. That set, its size, the maximum shift, the orientation digest of the corrected build, and the decision text are pinned in the tracked record `scripts/hetzner/seven-basin-control-adjudication.json`. The frozen 55-basin fabric keeps the earlier final-vertex convention for near-degenerate reaches and isolated roots, and the extension states this at delivery under Effort #108.
+
+The adjudicated comparison replaces byte identity as the gate for the corrected build. The planetary rebuild keeps the byte-for-byte gate, because its reproduction of the pinned digests proves the VM toolchain. Every other gate in this runbook stands unchanged.
+
+### Orientation preflight, builds, and comparisons
+
+Run the read-only `orient` preflight against the control's source inputs before either build. Its orientation digest must equal the pinned corrected digest; a different digest means the checked-out adapter is not the adjudicated one, and the campaign stops before spending build time. Then build the control with the corrected adapter, because its result decides whether any per-basin output can be trusted, and rebuild the control with the planetary adapter so the VM's reproduction of the recorded digests is on record. Each build writes to its own output root; no tree is overwritten. Pass the preserved manifest's `created_at` when the corrected adapter's `build` accepts `--created-at`; the manifest embeds that timestamp, and only a pinned value can make `manifest.json` byte-identical. The remote fence records which branch it took in `created-at-record.json` under the control root. When the flag was passed, the corrected build's `manifest.json` must be byte-identical to the preserved one. Only when the flag was unavailable may the manifest differ solely in `created_at`, and the record states that this tolerance applied. The planetary rebuild has no such flag at its revision, so its comparison always carries the allowance and its `manifest.json` is expected to differ only in `created_at`.
 
 Both control builds pass `--fabric-version 0.3.0` because the preserved control was built with that value and the manifest embeds it; the per-basin compiles in section 11 use `NGA-TDX-Hydro-20230126` because the baseline artifact carries that value and extension assembly requires the inputs to agree with it. The manifest also embeds `adapter_version`, which is `0.1.0` at both revisions today; a later bump would surface as a `manifest.json` difference and stops the work like any other difference.
 
@@ -510,10 +524,19 @@ set +x
 control_id=$1; campaign_dir=$2; control_root=$3
 python=/opt/hfx-geo/bin/python
 hfx=/root/hfx/target/release/hfx
+adjudication=/mnt/hfx/work/sha256/control-adjudication.json
 preserved_created_at=$(jq -r '.created_at' "$control_root/preserved/$control_id/manifest.json")
 (cd "$control_root/preserved/$control_id" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' /mnt/hfx/work/sha256/expected-control-sha256.json | sha256sum -c)
+jq -e --arg id "$control_id" '.processing_basin_id == $id' "$adjudication" >/dev/null
 
 mkdir -p "$control_root/corrected" "$control_root/planetary"
+"$python" /root/hfx/adapters/tdx-hydro/build_adapter.py orient \
+  --basins "$campaign_dir/downloads/$control_id-basins.gpkg" \
+  --streamnet "$campaign_dir/downloads/$control_id-streamnet.gpkg" \
+  --processing-basin-id "$control_id" \
+  --report "$control_root/corrected/$control_id-orient.json" >/dev/null
+test "$(jq -r '.orientation_digest' "$control_root/corrected/$control_id-orient.json")" = "$(jq -r '.corrected_orientation_digest' "$adjudication")"
+
 created_at_args=()
 created_at_flag_used=false
 if "$python" /root/hfx/adapters/tdx-hydro/build_adapter.py build --help 2>/dev/null | grep -q -- '--created-at'; then
@@ -548,29 +571,56 @@ fi
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/preserved/$control_id" --right "$control_root/corrected/$control_id" \
   --expected-sha256 /mnt/hfx/work/sha256/expected-control-sha256.json \
-  ${corrected_allowance[@]+"${corrected_allowance[@]}"} > "$control_root/compare-corrected.json"
+  ${corrected_allowance[@]+"${corrected_allowance[@]}"} > "$control_root/compare-corrected.json" || true
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/preserved/$control_id" --right "$control_root/planetary/$control_id" \
   --expected-sha256 /mnt/hfx/work/sha256/expected-control-sha256.json \
   --allow-created-at-difference > "$control_root/compare-planetary.json"
 /root/hfx/scripts/hetzner/compare-dataset-trees.sh \
   --left "$control_root/corrected/$control_id" --right "$control_root/planetary/$control_id" \
-  --allow-created-at-difference > "$control_root/compare-corrected-planetary.json"
-jq -r '.verdict' "$control_root/compare-corrected.json" "$control_root/compare-planetary.json" "$control_root/compare-corrected-planetary.json"
+  --allow-created-at-difference > "$control_root/compare-corrected-planetary.json" || true
+"$python" /root/hfx/adapters/tdx-hydro/compare_unit_outlets.py \
+  --reference "$control_root/preserved/$control_id" \
+  --candidate "$control_root/corrected/$control_id" \
+  --expected "$adjudication" \
+  --orient-report "$control_root/corrected/$control_id-orient.json" \
+  --report "$control_root/compare-adjudicated-outlets.json" >/dev/null
+jq -r '.verdict' "$control_root/compare-corrected.json" "$control_root/compare-planetary.json" "$control_root/compare-corrected-planetary.json" "$control_root/compare-adjudicated-outlets.json"
 REMOTE
-scp -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/compare-*.json" "root@$SERVER_IP:$CONTROL_ROOT/created-at-record.json" "$LOCAL_EVIDENCE_DIR/"
+scp -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/compare-*.json" "root@$SERVER_IP:$CONTROL_ROOT/created-at-record.json" "root@$SERVER_IP:$CONTROL_ROOT/corrected/$CONTROL_ID-orient.json" "$LOCAL_EVIDENCE_DIR/"
 jq -e '.corrected_build_created_at_flag_used | type == "boolean"' "$LOCAL_EVIDENCE_DIR/created-at-record.json"
-if jq -e '.corrected_build_created_at_flag_used' "$LOCAL_EVIDENCE_DIR/created-at-record.json" >/dev/null; then
-  jq -e '.verdict == "identical" and .created_at_difference_allowed == false' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
-else
-  jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
-fi
 jq -e '.verdict == "identical" or (.verdict == "created-at-only" and (.files | map(select(.path != "manifest.json")) | all(.verdict == "identical")))' "$LOCAL_EVIDENCE_DIR/compare-planetary.json"
+jq -e '.left_matches_expected_sha256 == true' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+if jq -e '.corrected_build_created_at_flag_used' "$LOCAL_EVIDENCE_DIR/created-at-record.json" >/dev/null; then
+  jq -e '.files[] | select(.path == "manifest.json") | .verdict == "identical"' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+else
+  jq -e '.files[] | select(.path == "manifest.json") | .verdict == "identical" or .verdict == "created-at-only"' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+fi
+jq -e '(.files | map(.path)) == ["aux/snap_stems.parquet","catchments.parquet","graph.parquet","manifest.json"] and all(.files[]; .verdict != "missing")' "$LOCAL_EVIDENCE_DIR/compare-corrected.json"
+jq -e --slurpfile expected "$LOCAL_EVIDENCE_DIR/control-adjudication.json" '
+  .verdict == "accepted"
+  and (.refusals | length == 0)
+  and .unit_count == $expected[0].unit_count
+  and .downstream_differences == $expected[0].downstream_differences
+  and .outlet_differences == $expected[0].outlet_differences
+  and .outlet_differences_outside_adjudicated_set == 0
+  and .adjudicated_units_without_difference == 0
+  and .snap_stem_differences_outside_adjudicated_set == 0
+  and .catchment_geometry_differences == 0
+  and (.catchment_attribute_differences | all(.[]; . == 0))
+  and (.graph_differences | all(.[]; . == 0))
+  and .max_shift_deg <= $expected[0].max_shift_deg
+  and .reference_orientation_digest == $expected[0].planetary_orientation_digest
+  and .candidate_orientation_digest == $expected[0].corrected_orientation_digest
+  and .orient_report_digest == $expected[0].corrected_orientation_digest' "$LOCAL_EVIDENCE_DIR/compare-adjudicated-outlets.json"
+test "$(jq -r '.orientation_digest' "$LOCAL_EVIDENCE_DIR/$CONTROL_ID-orient.json")" = "$(jq -r '.corrected_orientation_digest' "$LOCAL_EVIDENCE_DIR/control-adjudication.json")"
 ```
 
-The three data files, `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet`, must equal the preserved digests exactly in both builds. `manifest.json` must equal the preserved digest when `--created-at` was passed, and may differ only in `created_at` when the flag was unavailable; `created-at-record.json` states which case occurred and the local check above enforces the matching rule. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees and both build reports, then go to section 14 and section 16.
+The planetary rebuild must reproduce the preserved digests: its three data files must equal the pinned digests exactly and its `manifest.json` may differ only in `created_at`. That reproduction proves the VM toolchain against the recorded build.
 
-A corrected build that refuses is the same stop: the refusal, its build report if any, and the log are preserved as the campaign's terminal evidence, and no per-basin compile starts.
+The corrected control build is accepted only when the adjudicated comparison reports `accepted`. The comparison reads every row of `catchments.parquet`, `graph.parquet`, and `aux/snap_stems.parquet` of both builds. Every same-level graph edge, every polygon, and every non-outlet attribute must be identical between the two builds. The set of units whose outlet differs must equal exactly the adjudicated set pinned in the tracked record. Every outlet shift must lie within the pinned maximum. Snap stems may differ only for units inside that set; the report counts them. The orientation digest recomputed from the preserved control's graph and outlet columns must equal the pinned planetary digest, the digest recomputed from the corrected build must equal the pinned corrected digest, and the VM `orient` report must carry that same digest. The corrected build's `manifest.json` follows the `created-at-record.json` rule above, and its `catchments.parquet` is expected to differ in bytes because outlet columns moved; the byte verdicts of `graph.parquet` and `aux/snap_stems.parquet` are recorded in `compare-corrected.json` for the campaign record. Any other difference stops the work for adjudication. Do not explain a difference away, do not rerun with different arguments, and do not continue to per-basin compilation. Preserve both trees, both build reports, the orient report, and the four comparison records, then go to section 14 and section 16.
+
+A corrected build that refuses, or an `orient` preflight whose digest differs from the pinned one, is the same stop: the refusal, its report if any, and the log are preserved as the campaign's terminal evidence, and no per-basin compile starts.
 
 ## 11. Per-basin compile with the corrected adapter
 
@@ -708,7 +758,7 @@ The extended artifact and the complete validation record are preserved whatever 
 Preserve in this order, each root with a SHA-256 manifest computed on the VM and recomputed after transfer. A copy counts only when relative paths and digests match on both sides. The order follows value per byte so an interruption loses the least:
 
 1. campaign `state`, `reports`, and `/mnt/hfx/logs`
-2. both control builds, their reports, and the three comparison records
+2. both control builds, their reports, the orient report, and the four comparison records
 3. every per-basin output
 4. the extended artifact, first to the extension scratch prefix, then to the operator
 5. the VM-side digest manifests
@@ -782,6 +832,7 @@ jq -n \
   --arg ground_truth_ref "$(cat "$LOCAL_EVIDENCE_DIR/ground-truth-ref.txt")" \
   --slurpfile corrected "$(record_or_empty compare-corrected.json)" \
   --slurpfile planetary "$(record_or_empty compare-planetary.json)" \
+  --slurpfile adjudicated "$(record_or_empty compare-adjudicated-outlets.json)" \
   --slurpfile created_at_record "$(record_or_empty created-at-record.json)" \
   --slurpfile assembly "$(record_or_empty off-vm/campaign/state/assembly.json)" \
   --arg validation_outcome "$VALIDATION_OUTCOME" \
@@ -792,6 +843,8 @@ jq -n \
     control_builds: {
       corrected_versus_preserved: ($corrected[0].verdict // "not-attempted"),
       planetary_versus_preserved: ($planetary[0].verdict // "not-attempted"),
+      corrected_adjudicated_comparison: ($adjudicated[0].verdict // "not-attempted"),
+      corrected_outlet_differences: ($adjudicated[0].outlet_differences // null),
       preserved_matches_pinned_digests: ($corrected[0].left_matches_expected_sha256 // null),
       corrected_build_created_at_flag_used: ($created_at_record[0].corrected_build_created_at_flag_used // null)
     },
@@ -845,7 +898,8 @@ The stage plan behind those points is approximately: provisioning and convergenc
 | Class | Required action |
 | --- | --- |
 | Corpus integrity failure on either side | Remove only the VM copy of the failed file, reacquire from NGA with the bounded acquisition, record the digest mismatch |
-| Corrected control build refusal or any digest difference beyond `created_at` | Preserve both trees and reports, stop all compilation, tear down, hand to adjudication |
+| Corrected control build refusal, an `orient` digest that differs from the pinned one, or an adjudicated comparison that is not `accepted` | Preserve both trees, reports, the orient report, and the comparison records, stop all compilation, tear down, hand to adjudication |
+| Planetary rebuild with any digest difference beyond `created_at` | Preserve both trees and reports, stop all compilation, tear down, hand to adjudication |
 | Per-basin compile refusal | Preserve the refusal, its report, and the log; continue with other basins |
 | No absent basin compiles | Skip assembly; record the baseline as the final fabric; preserve and tear down |
 | Extension assembly refusal | Preserve the runner diagnostic and state; record no extended artifact; tear down |
@@ -858,7 +912,7 @@ The stage plan behind those points is approximately: provisioning and convergenc
 
 ## 19. Author-only review and landing gates
 
-This section is documentation-author work completed before merge. It never executes the campaign. The tracked write set is this runbook, `verify-compile-runbook.sh`, `verify-campaign-inputs.sh`, `price-preflight.sh`, `compare-dataset-trees.sh`, their tests, and one README index entry.
+This section is documentation-author work completed before merge. It never executes the campaign. The tracked write set is this runbook, `seven-basin-control-adjudication.json`, `verify-compile-runbook.sh`, `verify-campaign-inputs.sh`, `price-preflight.sh`, `compare-dataset-trees.sh`, `adapters/tdx-hydro/compare_unit_outlets.py`, their tests, and one README index entry.
 
 ```bash
 bash scripts/hetzner/test-verify-compile-runbook.sh
@@ -866,7 +920,8 @@ bash scripts/hetzner/test-verify-campaign-inputs.sh
 bash scripts/hetzner/test-price-preflight.sh
 bash scripts/hetzner/test-compare-dataset-trees.sh
 bash scripts/hetzner/test-tdx-hydro-campaign.sh
-for check in scope-permits-compilation ceilings-and-kill-switches control-hotpatch-is-pinned control-digests-are-pinned baseline-is-pinned authority-is-current; do
+uv run --frozen --project adapters/tdx-hydro python adapters/tdx-hydro/test_compare_unit_outlets.py
+for check in scope-permits-compilation ceilings-and-kill-switches control-hotpatch-is-pinned control-digests-are-pinned control-adjudication-is-pinned baseline-is-pinned authority-is-current; do
   bash scripts/hetzner/verify-compile-runbook.sh --check "$check"
 done
 git diff --check

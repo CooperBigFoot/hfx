@@ -4,7 +4,8 @@
 # Proves that the tracked seven-basin compile runbook still carries the
 # machine-readable contract the campaign operator relies on: exact scope,
 # fixed ceilings, the approval precondition, the pinned control hotpatch, the
-# pinned control digests, the pinned baseline, and a current authority ref.
+# pinned control digests, the pinned control adjudication record, the pinned
+# baseline, and a current authority ref.
 # Reading the runbook performs no cloud action. The approval record is only
 # tested for existence, regular-file-ness, and non-emptiness.
 
@@ -18,6 +19,9 @@ source "$SCRIPT_DIR/common.sh"
 
 readonly HFX_RUNBOOK_REL=scripts/hetzner/RUNBOOK-tdx-hydro-seven-basin-compile.md
 readonly HFX_PLANETARY_RECORD_REL=scripts/hetzner/CAMPAIGN-tdx-hydro-planetary.md
+readonly HFX_CONTROL_ADJUDICATION_REL=scripts/hetzner/seven-basin-control-adjudication.json
+readonly HFX_EXPECTED_CONTROL_UNIT_COUNT=331263
+readonly HFX_EXPECTED_CONTROL_ADJUDICATION_DATE=2026-09-04
 readonly HFX_CONTRACT_BEGIN='<!-- BEGIN COMPILE CAMPAIGN CONTRACT'
 readonly HFX_CONTRACT_END='END COMPILE CAMPAIGN CONTRACT -->'
 readonly HFX_EXPECTED_CAMPAIGN=seven-basin-extension
@@ -31,7 +35,7 @@ readonly HFX_EXPECTED_BASELINE='{"prefix":"s3://pourpoint-hfx/scratch/tdx-hydro-
 usage() {
     cat <<'USAGE'
 Usage: verify-compile-runbook.sh [--runbook <absolute-path>] [--evidence-root <absolute-path>]
-                                 --check <name>
+                                 [--adjudication-record <absolute-path>] --check <name>
 
 Checks:
   scope-permits-compilation   campaign identity, exact resources, basins, permitted acts
@@ -39,12 +43,16 @@ Checks:
   approval-is-a-precondition  approval record pinned and present under --evidence-root
   control-hotpatch-is-pinned  ARG_MAX hotpatch commit, path, and blobs match Git objects
   control-digests-are-pinned  preserved planetary control digests are pinned
+  control-adjudication-is-pinned
+                              adjudicated corrected-control difference record is tracked and complete
   baseline-is-pinned          baseline prefix, region, counts match the merged campaign record
   authority-is-current        authority ref is an ancestor of HEAD and names the vision section
 
 Options:
   --runbook <path>        runbook to verify; default is the tracked runbook in this checkout
   --evidence-root <path>  required by approval-is-a-precondition
+  --adjudication-record <path>
+                          control adjudication record to verify; default is the tracked record
   -h, --help              print usage and exit 0
 USAGE
 }
@@ -59,6 +67,7 @@ hfx_require_command git
 
 runbook=
 evidence_root=
+adjudication_record=
 check=
 seen=' '
 while (($#)); do
@@ -67,7 +76,7 @@ while (($#)); do
             usage
             exit 0
             ;;
-        --runbook | --evidence-root | --check)
+        --runbook | --evidence-root | --adjudication-record | --check)
             [[ "$seen" != *" $1 "* ]] || hfx_die "option $1 may not be repeated"
             seen="$seen$1 "
             (($# >= 2)) || hfx_die "option $1 requires a value"
@@ -75,6 +84,7 @@ while (($#)); do
             case $1 in
                 --runbook) runbook=$2 ;;
                 --evidence-root) evidence_root=$2 ;;
+                --adjudication-record) adjudication_record=$2 ;;
                 --check) check=$2 ;;
             esac
             shift 2
@@ -125,7 +135,7 @@ require_phrase() {
 
 case $check in
     scope-permits-compilation)
-        require_field '.schema' 2 'unknown contract schema'
+        require_field '.schema' 3 'unknown contract schema'
         require_field '.campaign' "\"$HFX_EXPECTED_CAMPAIGN\"" 'wrong campaign identity'
         require_field '.lifecycles_authorized' 1 'contract must authorize exactly one lifecycle'
         require_field '.server_name' "\"$(hfx_server_name "$HFX_EXPECTED_CAMPAIGN")\"" 'wrong mutable server'
@@ -200,6 +210,46 @@ case $check in
         require_field '.control_digests' "$HFX_EXPECTED_CONTROL_DIGESTS" 'preserved planetary control digests are not pinned'
         require_phrase 'Any other difference stops the work for adjudication.'
         require_phrase 'Do not explain a difference away'
+        ;;
+    control-adjudication-is-pinned)
+        require_field '.control_adjudication_record' "\"$HFX_CONTROL_ADJUDICATION_REL\"" 'control adjudication record is not pinned'
+        if [[ -z "$adjudication_record" ]]; then
+            adjudication=$repo_root/$HFX_CONTROL_ADJUDICATION_REL
+            git -C "$repo_root" ls-files --error-unmatch -- "$HFX_CONTROL_ADJUDICATION_REL" >/dev/null 2>&1 ||
+                fail 'control adjudication record is not tracked'
+        else
+            [[ "$adjudication_record" == /* ]] || hfx_die '--adjudication-record must be an absolute path'
+            adjudication=$adjudication_record
+        fi
+        [[ -f "$adjudication" && ! -L "$adjudication" && -s "$adjudication" ]] ||
+            fail 'control adjudication record is not a nonempty regular file'
+        jq -e 'type == "object"' "$adjudication" >/dev/null 2>&1 || fail 'malformed control adjudication record'
+        ! grep -F -q -- 'PENDING' "$adjudication" || fail 'control adjudication record still carries a PENDING placeholder'
+        jq -e --arg basin "$HFX_EXPECTED_CONTROL_BASIN" --arg revision "$HFX_EXPECTED_PLANETARY_REF" \
+            --argjson units "$HFX_EXPECTED_CONTROL_UNIT_COUNT" --arg date "$HFX_EXPECTED_CONTROL_ADJUDICATION_DATE" '
+            .schema_version == 1
+            and .processing_basin_id == $basin
+            and .planetary_revision == $revision
+            and .unit_count == $units
+            and .adjudication.date == $date
+            and (.adjudication.maintainer | type == "string" and length > 0)
+            and (.adjudication.decision | type == "string" and length > 0)
+            and (.planetary_orientation_digest | type == "string" and test("^[0-9a-f]{64}$"))
+            and (.corrected_orientation_digest | type == "string" and test("^[0-9a-f]{64}$"))
+            and .planetary_orientation_digest != .corrected_orientation_digest
+            and .downstream_differences == 0
+            and (.max_shift_deg | type == "number" and . > 0)
+            and (.outlet_difference_native_linknos | type == "array" and length > 0
+                 and all(.[]; type == "number" and . == floor and . > 0)
+                 and . == (unique | sort))
+            and .outlet_differences == (.outlet_difference_native_linknos | length)
+            and (.differences_by_class | type == "object" and length > 0 and all(.[]; type == "number"))
+            and (.differences_by_class | [.[]] | add) == (.outlet_difference_native_linknos | length)
+        ' "$adjudication" >/dev/null 2>&1 || fail 'control adjudication record is incomplete or inconsistent'
+        require_phrase 'The corrected control build is accepted only when the adjudicated comparison reports `accepted`.'
+        require_phrase 'Every same-level graph edge, every polygon, and every non-outlet attribute must be identical between the two builds.'
+        require_phrase 'The set of units whose outlet differs must equal exactly the adjudicated set pinned in the tracked record.'
+        require_phrase 'Any other difference stops the work for adjudication.'
         ;;
     baseline-is-pinned)
         require_field '.baseline' "$HFX_EXPECTED_BASELINE" 'baseline artifact is not pinned'
