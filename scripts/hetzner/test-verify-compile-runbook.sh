@@ -35,11 +35,11 @@ hotpatch_available=1
 git -C "$repo_root" cat-file -e 'bde61149d3fefc5e3f30435bf7ed3d0bb32a519c^{commit}' 2>/dev/null || hotpatch_available=0
 git -C "$repo_root" cat-file -e '43a98aff8c15a1a196f47b10217ad2f5553b6611^{commit}' 2>/dev/null || hotpatch_available=0
 
-for check in scope-permits-compilation ceilings-and-kill-switches control-digests-are-pinned control-adjudication-is-pinned baseline-is-pinned; do
+for check in scope-permits-compilation ceilings-and-kill-switches control-digests-are-pinned control-adjudication-is-pinned baseline-is-pinned rehearsal-record-is-pinned; do
     expect_pass --check "$check"
     assert_contains "$stdout" "PASS $check"
 done
-pass 'tracked runbook passes the scope, ceiling, digest, adjudication, and baseline checks'
+pass 'tracked runbook passes the scope, ceiling, digest, adjudication, baseline, and rehearsal-record checks'
 
 if ((hotpatch_available == 1)); then
     expect_pass --check control-hotpatch-is-pinned
@@ -103,10 +103,10 @@ mutate() {
 mutated=$(mutate no-contract 's/<!-- BEGIN COMPILE CAMPAIGN CONTRACT\n.*?\nEND COMPILE CAMPAIGN CONTRACT -->\n//s')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'missing or repeated compile campaign contract'
-mutated=$(mutate malformed-contract 's/"schema": 4,/"schema": 4,,/')
+mutated=$(mutate malformed-contract 's/"schema": 5,/"schema": 5,,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'malformed compile campaign contract'
-mutated=$(mutate duplicate-key 's/"schema": 4,/"schema": 4,\n  "schema": 4,/')
+mutated=$(mutate duplicate-key 's/"schema": 5,/"schema": 5,\n  "schema": 5,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'duplicate contract key'
 pass 'a missing, malformed, or duplicate-key contract refuses'
@@ -117,15 +117,24 @@ assert_contains "$stderr" 'wrong campaign identity'
 mutated=$(mutate two-lifecycles 's/"lifecycles_authorized": 1/"lifecycles_authorized": 2/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'exactly one lifecycle'
-mutated=$(mutate second-consumed 's/"workload_dispatched": false}\n/"workload_dispatched": false},\n      {"date": "2026-09-05", "cause": "x", "workload_dispatched": true}\n/')
+mutated=$(mutate third-consumed 's/"workload_dispatched": true}\n/"workload_dispatched": true},\n      {"date": "2026-09-05", "cause": "x", "workload_dispatched": true}\n/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
-assert_contains "$stderr" 'lifecycle ledger does not record exactly the consumed 2026-09-04 lifecycle'
-mutated=$(mutate two-authorized 's/"lifecycles": 1,/"lifecycles": 2,/')
+assert_contains "$stderr" 'lifecycle ledger does not record exactly the two consumed 2026-09-04 lifecycles'
+mutated=$(mutate two-authorized 's/("current_authority": \{[^}]*"lifecycles": )1,/${1}2,/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'current lifecycle authority is not the 2026-09-04 maintainer decision for one lifecycle'
-mutated=$(mutate pending-record 's/"record": "[^"]*"/"record": "PR-URL-PENDING"/')
+mutated=$(mutate pending-record 's/("current_authority": \{[^}]*"record": )"[^"]*"/${1}"PR-URL-PENDING"/')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'current lifecycle authority does not name its record'
+mutated=$(mutate unconditional-authority 's/("current_authority": \{[^}]*"precondition": )"[^"]*"/${1}"none"/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'current lifecycle authority is not conditional on a passing rehearsal record'
+mutated=$(mutate rehearsal-not-required 's/"requires_passing_rehearsal": true/"requires_passing_rehearsal": false/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'production contract must require a passing rehearsal'
+mutated=$(mutate gate-phase-dropped 's/"pre-preservation": 6\}/"pre-preserve": 6}/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'gate reserves are not pinned for every gate phase'
 mutated=$(mutate one-only-removed 's/The 2026-09-04 authorization covers one lifecycle only\. //')
 expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'runbook omits required operational text'
@@ -212,11 +221,69 @@ pass 'an unpinned, missing, malformed, pending, inconsistent, or undocumented co
 mutated=$(mutate wrong-baseline 's/"unit_count": 12748154/"unit_count": 12748155/')
 expect_failure --runbook "$mutated" --check baseline-is-pinned
 assert_contains "$stderr" 'baseline artifact is not pinned'
+mutated=$(mutate roster-swapped 's/"9020000010"\n    \]/"9020000011"\n    ]/')
+expect_failure --runbook "$mutated" --check baseline-is-pinned
+assert_contains "$stderr" 'baseline roster digest does not match the partial-region suffix'
 mutated=$(mutate baseline-prefix-written 's|"extension_scratch_prefix": "scratch/tdx-hydro-seven-basin-extension/"|"extension_scratch_prefix": "scratch/tdx-hydro-tdx-m5-planetary/"|')
 expect_failure --runbook "$mutated" --check baseline-is-pinned
 assert_contains "$stderr" 'extension scratch prefix is not pinned'
 pass 'hotpatch, control digest, baseline, and extension prefix drift refuses'
 
+mutated=$(mutate rehearsal-record-pending 's/("rehearsal_authority": \{[^}]*"record": )"[^"]*"/${1}"RECORD-URL"/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'rehearsal authority does not name its record'
+rehearsal_contract=$SCRIPT_DIR/rehearsal-campaign-contract.json
+mutate_rehearsal() {
+    local name=$1
+    local jq_expression=$2
+    jq "$jq_expression" "$rehearsal_contract" >"$tmp/$name.json"
+    printf '%s\n' "$tmp/$name.json"
+}
+for mutation in '.source_corpus.file_count = 6' '.baseline.basin_ids = ["4020050470"] | .baseline.basin_count = 1' \
+    '.baseline.basin_ids = ["7020000010", "4020050470"]' '.control_reference = "preserved-off-vm"' \
+    '.control_digests = {"manifest.json": "0000000000000000000000000000000000000000000000000000000000000000"}' \
+    '.absent_basins += ["4020050470"]' '.server_type = "ccx33"' '.gross_cost_ceiling_eur = 2' \
+    '.baseline.prefix = "s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/"'; do
+    record=$(mutate_rehearsal inconsistent-rehearsal "$mutation")
+    expect_failure --rehearsal-contract "$record" --check rehearsal-record-is-pinned
+    assert_contains "$stderr" 'rehearsal contract is inconsistent'
+done
+record=$(mutate_rehearsal roster-digest-wrong '.baseline.roster_digest_prefix = "000000000000"')
+expect_failure --rehearsal-contract "$record" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'rehearsal roster digest prefix does not match its roster'
+expect_pass --rehearsal-contract "$rehearsal_contract" --check rehearsal-record-is-pinned
+pass 'a rehearsal contract whose corpus count, roster, control reference, ceilings, or prefixes drift refuses'
+mutated=$(mutate rehearsal-phrase-removed 's/The rehearsal never names the production baseline prefix\.//')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'runbook omits required operational text'
+mkdir "$tmp/rehearsal-evidence" "$tmp/rehearsal-evidence/campaign-rehearsal"
+expect_failure --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
+assert_contains "$stderr" 'rehearsal lifecycle result is missing'
+head_ref=$(git -C "$repo_root" rev-parse HEAD)
+write_result() {
+    jq -n --arg ref "$head_ref" --arg result "$1" --arg validation "$2" '{schema_version: 1, campaign: "campaign-rehearsal", ground_truth_ref: $ref,
+        provisioning_request_epoch: 1788526261, finished_at: "2026-09-05T00:00:00Z", strict_validation: $validation, zero_footprint: true,
+        control_gates: {planetary_versus_preserved: "created-at-only", corrected_adjudicated_comparison: "accepted"}, result: $result}' \
+        >"$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json"
+}
+write_result not-passed incomplete
+expect_failure --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
+assert_contains "$stderr" 'rehearsal lifecycle result is not a passing record'
+jq '.ground_truth_ref = "0000000000000000000000000000000000000000"' "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json" >"$tmp/result-old-ref.json"
+mv "$tmp/result-old-ref.json" "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json"
+write_result_old() { jq '.result = "passed" | .strict_validation = "passed" | .ground_truth_ref = "0000000000000000000000000000000000000000"' "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json" >"$tmp/r.json" && mv "$tmp/r.json" "$tmp/rehearsal-evidence/campaign-rehearsal/lifecycle-result.json"; }
+write_result_old
+expect_failure --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
+assert_contains "$stderr" 'does not descend from the runner fix'
+write_result passed passed
+if git -C "$repo_root" merge-base --is-ancestor 0ffa2d048ce5d748c0ab4c71fbe6f5862478107d HEAD 2>/dev/null; then
+    expect_pass --evidence-root "$tmp/rehearsal-evidence" --check rehearsal-passed
+    assert_contains "$stdout" 'PASS rehearsal-passed'
+    pass 'a rehearsal result passes only when it records passed validation, zero footprint, and a ref carrying the repaired runner'
+else
+    passed=$((passed + 1))
+    printf 'ok %d - rehearsal result # SKIP runner fix commit is not an ancestor of this checkout\n' "$passed"
+fi
 mutated=$(mutate short-authority 's/"authority_ref": "69747055bcb1876d9d1fad48c60f5cae6a24ea60"/"authority_ref": "6974705"/')
 expect_failure --runbook "$mutated" --check authority-is-current
 assert_contains "$stderr" 'authority ref is not a full commit hash'
@@ -235,10 +302,19 @@ expect_failure --runbook "$tmp/runbook-link.md" --check scope-permits-compilatio
 assert_contains "$stderr" 'not a regular file'
 pass 'a relative or symlinked runbook path refuses'
 
-# The runbook shell sets IFS to newline and tab; the absent-basin list must be an
-# array so loops enumerate seven ids instead of one space-joined word.
-array_line=$(grep -E '^ABSENT_IDS=\(' "$runbook") || die 'runbook does not define ABSENT_IDS as an array'
-enumerated=$(bash -c "set -Eeuo pipefail; IFS=\$'\n\t'; $array_line; for id in \"\${ABSENT_IDS[@]}\"; do printf '%s\n' \"\$id\"; done")
+# The runbook shell sets IFS to newline and tab; the absent-basin list is built from
+# the contract into an array so loops enumerate seven ids instead of one space-joined word.
+grep -q -E '^ABSENT_IDS=\(\)$' "$runbook" || die 'runbook does not define ABSENT_IDS as an array'
+cat >"$tmp/enumerate.sh" <<'ENUMERATE'
+set -Eeuo pipefail
+IFS=$'\n\t'
+CAMPAIGN_CONTRACT_JSON=$(sed -n '/^<!-- BEGIN COMPILE CAMPAIGN CONTRACT$/,/^END COMPILE CAMPAIGN CONTRACT -->$/p' "$1" | sed '1d;$d')
+contract_value() { jq -er "$1" <<<"$CAMPAIGN_CONTRACT_JSON"; }
+ABSENT_IDS=()
+while IFS= read -r absent_id; do ABSENT_IDS+=("$absent_id"); done < <(contract_value '.absent_basins[]')
+for id in "${ABSENT_IDS[@]}"; do printf '%s\n' "$id"; done
+ENUMERATE
+enumerated=$(bash "$tmp/enumerate.sh" "$runbook")
 [[ $(printf '%s\n' "$enumerated" | wc -l | tr -d ' ') == 7 ]] || die 'ABSENT_IDS did not enumerate seven ids under the runbook IFS'
 [[ $(printf '%s\n' "$enumerated" | sort -u | grep -c -E '^[0-9]{10}$') == 7 ]] || die 'ABSENT_IDS entries are not seven distinct ten-digit ids'
 ! grep -E -- '\$ABSENT_IDS([^\[]|$)' "$runbook" >/dev/null || die 'runbook still expands ABSENT_IDS as a scalar'

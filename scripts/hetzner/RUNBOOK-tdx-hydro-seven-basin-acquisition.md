@@ -592,7 +592,7 @@ Terminal bounded form is status `exhausted`, attempts equal to `3`, evidence `nu
 
 ## 9. Terminal checks and acquisition-only campaign record
 
-Every absent basin must have both `basins` and `streamnet` in `succeeded` or `exhausted`. A succeeded stage carries the runner-inspected positive byte count, SHA-256, SQLite identity, and layer name. An exhausted stage carries attempts `3`, null evidence, and the exact failure reason. Any other shape refuses and enters salvage and teardown.
+Every absent basin must have both `basins` and `streamnet` in `succeeded` or `exhausted`. A succeeded stage carries the runner-inspected positive byte count, SHA-256, SQLite identity, and layer name; its attempt count is the number of transfers this campaign made, and zero means the runner adopted a final file that was already present and verified (the runner change merged as `0ffa2d048ce5d748c0ab4c71fbe6f5862478107d` made that state installable). An exhausted stage carries attempts `3`, null evidence, and the exact failure reason. Any other shape refuses and enters salvage and teardown.
 
 Generate the record atomically from the eight explicit states:
 
@@ -605,7 +605,7 @@ test ! -e "$temporary" && test ! -L "$temporary"
 jq -s '
   def product($name): .stages["acquire_" + $name];
   def valid_stage:
-    (.status == "succeeded" and .attempts > 0 and .failure_reason == null and
+    (.status == "succeeded" and (.attempts | type == "number" and . >= 0) and .failure_reason == null and
       (.evidence.bytes | type == "number" and . > 0) and
       (.evidence.sha256 | test("^[0-9a-f]{64}$")) and .evidence.sqlite_identity == "53514c69746520666f726d6174203300" and
       (.evidence.layer_name | type == "string" and length > 0)) or
@@ -665,7 +665,7 @@ for basin_id in 1020018110 2020003440 2020065840 2020071190 4020050470 502004972
       expected_sha=$(jq -er --arg stage "$stage" '.stages[$stage].evidence.sha256' "$state")
       test "$(shasum -a 256 "$final" | awk '{print $1}')" = "$expected_sha"
       test "$(dd if="$final" bs=16 count=1 2>/dev/null | xxd -p)" = 53514c69746520666f726d6174203300
-      jq -e --arg stage "$stage" '.stages[$stage].attempts > 0 and .stages[$stage].failure_reason == null and .stages[$stage].evidence.sqlite_identity == "53514c69746520666f726d6174203300" and (.stages[$stage].evidence.layer_name | type == "string" and length > 0)' "$state"
+      jq -e --arg stage "$stage" '(.stages[$stage].attempts | type == "number" and . >= 0) and .stages[$stage].failure_reason == null and .stages[$stage].evidence.sqlite_identity == "53514c69746520666f726d6174203300" and (.stages[$stage].evidence.layer_name | type == "string" and length > 0)' "$state"
     elif test "$status" = exhausted; then
       test ! -e "$final" && test ! -L "$final"
       jq -e --arg stage "$stage" '.stages[$stage].attempts == 3 and .stages[$stage].evidence == null and .stages[$stage].failure_reason == "product attempt ceiling exhausted; retryable acquisition did not succeed"' "$state"

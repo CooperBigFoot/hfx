@@ -3,6 +3,9 @@
 
 compare : (ReferenceDataset, CandidateDataset, AdjudicatedOutletDifference, OrientReport?)
           -> Accepted | Refused                        (total; refuses on any unpinned difference)
+derive  : (ReferenceDataset, CandidateDataset, ProcessingBasinId, PlanetaryRevision)
+          -> AdjudicatedOutletDifference               (the observed outlet set, pinned mechanically)
+          then compare with that record as expected    (accepted unless a non-outlet difference exists)
 
 Both datasets are per-basin HFX outputs of the same TDX-Hydro processing
 basin. The comparison accepts the candidate only when every drainage unit,
@@ -12,7 +15,10 @@ exactly the adjudicated set of native LINKNOs pinned in the expected record,
 with every shift within the pinned maximum. Snap stems may differ only for
 units inside that set. The orientation digest of each dataset is recomputed
 from its own graph and outlet columns and must equal the pinned digest for its
-side. Nothing is written except the report.
+side. In `--expected` mode nothing is written except the report. In
+`--derive-expected` mode the record is derived from the two builds and written
+first; the comparison then accepts by construction unless the builds differ in
+a way no record can adjudicate (unit set, polygon, attribute, graph, manifest).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -37,6 +44,7 @@ EXPECTED_SCHEMA_VERSION = 1
 GEOMETRY_BATCH_SIZE = 4096
 SHIFT_TOLERANCE_DEGREES = 1e-12
 _SHA256_HEX_LENGTH = 64
+_GIT_REVISION_HEX_LENGTH = 40
 
 CATCHMENT_OUTLET_COLUMNS = ("outlet_lon", "outlet_lat")
 CATCHMENT_ATTRIBUTE_COLUMNS = ("level", "parent_id", "area_km2", "up_area_km2", "bbox")
@@ -331,6 +339,79 @@ def _manifest_without_timestamp(manifest: Mapping[str, object]) -> str:
     )
 
 
+def observed_outlet_movement(
+    reference: DatasetUnits, candidate: DatasetUnits, offset: int
+) -> tuple[np.ndarray, list[int], float]:
+    """Rows whose outlet moved, their sorted native LINKNOs, and the largest shift in degrees.
+
+    Both datasets must carry the same ids in the same row order.
+    """
+    outlet_moved = (reference.outlet_lons != candidate.outlet_lons) | (
+        reference.outlet_lats != candidate.outlet_lats
+    )
+    moved_rows = np.flatnonzero(outlet_moved)
+    observed_linknos = sorted(int(value) for value in (reference.ids[moved_rows] - offset).tolist())
+    shifts = np.hypot(
+        candidate.outlet_lons[moved_rows] - reference.outlet_lons[moved_rows],
+        candidate.outlet_lats[moved_rows] - reference.outlet_lats[moved_rows],
+    )
+    max_shift = float(shifts.max()) if len(shifts) else 0.0
+    return moved_rows, observed_linknos, max_shift
+
+
+DERIVED_DIFFERENCE_CLASS = "derived"
+DERIVED_MAINTAINER = "derived from two control builds; not a maintainer adjudication"
+DERIVED_DECISION = (
+    "This record was derived mechanically from the reference and candidate builds "
+    "and pins every observed outlet difference between them."
+)
+
+
+def derive_expected_record(
+    reference: DatasetUnits,
+    candidate: DatasetUnits,
+    *,
+    processing_basin_id: str,
+    header_number: int,
+    planetary_revision: str,
+    date: str,
+) -> dict[str, object]:
+    """Pin the observed outlet difference between two builds as a schema-1 adjudication record.
+
+    Refuses when the unit sets or row orders differ, or when the ids do not
+    carry the header number of `processing_basin_id`; those differences are
+    never adjudicable.
+    """
+    if len(candidate.ids) != len(reference.ids) or not np.array_equal(reference.ids, candidate.ids):
+        raise ComparisonRefusal("candidate unit ids or row order differ from reference")
+    offset = header_number * 10_000_000
+    _, reference_downstream = downstream_native_ids(reference, header_number)
+    _, candidate_downstream = downstream_native_ids(candidate, header_number)
+    downstream_differences = int(np.count_nonzero(reference_downstream != candidate_downstream))
+    _, observed_linknos, max_shift = observed_outlet_movement(reference, candidate, offset)
+    outlet_differences = len(observed_linknos)
+    return {
+        "schema_version": EXPECTED_SCHEMA_VERSION,
+        "adjudication": {
+            "date": date,
+            "maintainer": DERIVED_MAINTAINER,
+            "decision": DERIVED_DECISION,
+        },
+        "processing_basin_id": processing_basin_id,
+        "planetary_revision": planetary_revision,
+        "unit_count": int(len(reference.ids)),
+        "planetary_orientation_digest": orientation_digest(reference, header_number),
+        "corrected_orientation_digest": orientation_digest(candidate, header_number),
+        "downstream_differences": downstream_differences,
+        "outlet_differences": outlet_differences,
+        "max_shift_deg": max_shift,
+        "differences_by_class": (
+            {DERIVED_DIFFERENCE_CLASS: outlet_differences} if outlet_differences > 0 else {}
+        ),
+        "outlet_difference_native_linknos": observed_linknos,
+    }
+
+
 def compare_unit_outlets(
     reference: DatasetUnits,
     candidate: DatasetUnits,
@@ -401,11 +482,7 @@ def compare_unit_outlets(
             f"downstream differences {downstream_differences} differ from pinned {expected.downstream_differences}"
         )
 
-    outlet_moved = (reference.outlet_lons != candidate.outlet_lons) | (
-        reference.outlet_lats != candidate.outlet_lats
-    )
-    moved_rows = np.flatnonzero(outlet_moved)
-    observed_linknos = sorted(int(value) for value in (reference.ids[moved_rows] - offset).tolist())
+    moved_rows, observed_linknos, max_shift = observed_outlet_movement(reference, candidate, offset)
     expected_linknos = list(expected.outlet_difference_native_linknos)
     unexpected = sorted(set(observed_linknos) - set(expected_linknos))
     missing = sorted(set(expected_linknos) - set(observed_linknos))
@@ -413,11 +490,6 @@ def compare_unit_outlets(
         refusals.append(f"{len(unexpected)} units moved outlets outside the adjudicated set: {unexpected[:10]}")
     if missing:
         refusals.append(f"{len(missing)} adjudicated units kept their reference outlet: {missing[:10]}")
-    shifts = np.hypot(
-        candidate.outlet_lons[moved_rows] - reference.outlet_lons[moved_rows],
-        candidate.outlet_lats[moved_rows] - reference.outlet_lats[moved_rows],
-    )
-    max_shift = float(shifts.max()) if len(shifts) else 0.0
     if max_shift > expected.max_shift_deg + SHIFT_TOLERANCE_DEGREES:
         refusals.append(f"max outlet shift {max_shift!r} deg exceeds pinned {expected.max_shift_deg!r}")
 
@@ -487,6 +559,21 @@ def _orient_report_digest(path: Path) -> str:
     return digest
 
 
+def _require_derive_arguments(arguments: argparse.Namespace) -> None:
+    revision = arguments.planetary_revision
+    if revision is None:
+        raise ComparisonRefusal("--derive-expected requires --planetary-revision")
+    if len(revision) != _GIT_REVISION_HEX_LENGTH or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ComparisonRefusal("--planetary-revision must be a 40-character lowercase hex git revision")
+    basin_id = arguments.processing_basin_id
+    if basin_id is None:
+        raise ComparisonRefusal("--derive-expected requires --processing-basin-id")
+    if not basin_id.isdigit():
+        raise ComparisonRefusal("--processing-basin-id must be a digit string")
+
+
 def _write_report(report: Mapping[str, object], path: Path) -> None:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -499,7 +586,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--reference", required=True, type=Path, help="reference per-basin HFX root")
     parser.add_argument("--candidate", required=True, type=Path, help="candidate per-basin HFX root")
-    parser.add_argument("--expected", required=True, type=Path, help="adjudicated difference record (JSON)")
+    record_source = parser.add_mutually_exclusive_group(required=True)
+    record_source.add_argument("--expected", type=Path, help="adjudicated difference record (JSON)")
+    record_source.add_argument(
+        "--derive-expected",
+        type=Path,
+        metavar="PATH",
+        help="derive the record from the two builds, write it here, then compare against it",
+    )
     parser.add_argument("--report", required=True, type=Path, help="comparison report to write (JSON)")
     parser.add_argument(
         "--orient-report",
@@ -507,10 +601,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="orient report whose orientation_digest must equal the candidate's",
     )
+    parser.add_argument(
+        "--planetary-revision",
+        default=None,
+        help="40-hex git revision of the planetary build (required with --derive-expected)",
+    )
+    parser.add_argument(
+        "--processing-basin-id",
+        default=None,
+        help="processing basin of both builds (required with --derive-expected)",
+    )
     arguments = parser.parse_args(argv)
     try:
-        expected = load_expected_record(arguments.expected)
-        header_number = load_header_crosswalk()[expected.processing_basin_id]
+        if arguments.derive_expected is not None:
+            _require_derive_arguments(arguments)
+            processing_basin_id = arguments.processing_basin_id
+        else:
+            expected = load_expected_record(arguments.expected)
+            processing_basin_id = expected.processing_basin_id
+        header_number = load_header_crosswalk()[processing_basin_id]
         reference_root = _dataset_root(arguments.reference, "reference")
         candidate_root = _dataset_root(arguments.candidate, "candidate")
         if reference_root == candidate_root:
@@ -518,9 +627,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         orient_digest = (
             _orient_report_digest(arguments.orient_report) if arguments.orient_report is not None else None
         )
+        reference = read_dataset_units(reference_root)
+        candidate = read_dataset_units(candidate_root)
+        if arguments.derive_expected is not None:
+            record = derive_expected_record(
+                reference,
+                candidate,
+                processing_basin_id=processing_basin_id,
+                header_number=header_number,
+                planetary_revision=arguments.planetary_revision,
+                date=datetime.now(timezone.utc).date().isoformat(),
+            )
+            _write_report(record, arguments.derive_expected)
+            expected = AdjudicatedOutletDifference.from_record(record)
         report = compare_unit_outlets(
-            read_dataset_units(reference_root),
-            read_dataset_units(candidate_root),
+            reference,
+            candidate,
             expected,
             header_number=header_number,
             orient_report_digest=orient_digest,

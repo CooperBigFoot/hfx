@@ -205,6 +205,37 @@ class Fixture:
         return status, json.loads(report_path.read_text()), stderr.getvalue()
 
 
+    def run_derive(
+        self,
+        candidate: Path | None = None,
+        *extra: str,
+        revision: str | None = "a" * 40,
+        basin_id: str | None = BASIN_ID,
+    ) -> tuple[int, dict[str, object], Path, str]:
+        report_path = self.directory / "derived-report.json"
+        derived_path = self.directory / "derived.json"
+        argv = [
+            "--reference",
+            str(self.reference),
+            "--candidate",
+            str(candidate or self.candidate),
+            "--derive-expected",
+            str(derived_path),
+            "--report",
+            str(report_path),
+            *extra,
+        ]
+        if revision is not None:
+            argv.extend(["--planetary-revision", revision])
+        if basin_id is not None:
+            argv.extend(["--processing-basin-id", basin_id])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = compare.main(argv)
+        return status, json.loads(report_path.read_text()), derived_path, stderr.getvalue()
+
+
 class ComparisonTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -408,6 +439,137 @@ class ExpectedRecordTests(unittest.TestCase):
             path.write_text("[]")
             with self.assertRaises(compare.ComparisonRefusal):
                 compare.load_expected_record(path)
+
+
+class DeriveExpectedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fixture = Fixture(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_derive_pins_the_single_moved_outlet_and_expected_mode_accepts_it(self) -> None:
+        units = copy.deepcopy(self.fixture.reference_units)
+        move_outlet(units, 3, 0.0006, -0.0008)
+        candidate = self.fixture.write_candidate(units)
+        status, report, derived_path, stderr = self.fixture.run_derive(candidate)
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(report["verdict"], "accepted")
+        record = json.loads(derived_path.read_text())
+        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(record["processing_basin_id"], BASIN_ID)
+        self.assertEqual(record["planetary_revision"], "a" * 40)
+        self.assertEqual(record["unit_count"], 5)
+        self.assertEqual(record["outlet_difference_native_linknos"], [3])
+        self.assertEqual(record["outlet_differences"], 1)
+        self.assertEqual(record["downstream_differences"], 0)
+        self.assertEqual(record["differences_by_class"], {"derived": 1})
+        self.assertAlmostEqual(record["max_shift_deg"], 0.001, places=12)
+        self.assertEqual(record["adjudication"]["maintainer"], compare.DERIVED_MAINTAINER)
+        self.assertEqual(record["adjudication"]["decision"], compare.DERIVED_DECISION)
+        self.assertRegex(record["adjudication"]["date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(
+            record["planetary_orientation_digest"],
+            compare.orientation_digest(compare.read_dataset_units(self.fixture.reference), HEADER_NUMBER),
+        )
+        self.assertEqual(
+            record["corrected_orientation_digest"],
+            compare.orientation_digest(compare.read_dataset_units(candidate), HEADER_NUMBER),
+        )
+        self.assertNotEqual(record["planetary_orientation_digest"], record["corrected_orientation_digest"])
+        self.assertEqual(
+            sorted(record),
+            sorted(json.loads(Path(__file__).resolve().parents[2].joinpath(
+                "scripts", "hetzner", "seven-basin-control-adjudication.json"
+            ).read_text())),
+        )
+
+        status, report, _ = self.fixture.run(candidate, derived_path)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["verdict"], "accepted")
+        self.assertEqual(report["outlet_differences"], 1)
+
+    def test_derive_without_differences_yields_an_empty_set_and_accepts(self) -> None:
+        candidate = self.fixture.write_candidate(self.fixture.reference_units)
+        status, report, derived_path, stderr = self.fixture.run_derive(candidate)
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(report["verdict"], "accepted")
+        record = json.loads(derived_path.read_text())
+        self.assertEqual(record["outlet_differences"], 0)
+        self.assertEqual(record["outlet_difference_native_linknos"], [])
+        self.assertEqual(record["differences_by_class"], {})
+        self.assertEqual(record["max_shift_deg"], 0.0)
+        self.assertEqual(record["planetary_orientation_digest"], record["corrected_orientation_digest"])
+        status, report, _ = self.fixture.run(candidate, derived_path)
+        self.assertEqual(status, 0, report)
+
+    def test_derive_still_refuses_a_polygon_change(self) -> None:
+        units = copy.deepcopy(self.fixture.candidate_units)
+        for unit in units:
+            if unit["native"] == 5:
+                unit["geometry"] = Polygon([(0, 0.04), (0.02, 0.04), (0.02, 0.06), (0, 0.06)]).wkb
+        status, report, derived_path, stderr = self.fixture.run_derive(self.fixture.write_candidate(units))
+        self.assertEqual(status, 1)
+        self.assertEqual(report["verdict"], "refused")
+        self.assertEqual(report["catchment_geometry_differences"], 1)
+        self.assertIn("geometry differs for 1 units", stderr)
+        self.assertEqual(report["outlet_differences_outside_adjudicated_set"], 0)
+        self.assertEqual(json.loads(derived_path.read_text())["outlet_difference_native_linknos"], [2, 3])
+
+    def test_derive_refuses_unit_set_and_header_mismatch(self) -> None:
+        units = copy.deepcopy(self.fixture.candidate_units)
+        units.append(_unit(6, 1, 0.5, 0.5))
+        status, _, derived_path, stderr = self.fixture.run_derive(self.fixture.write_candidate(units))
+        self.assertEqual(status, 1)
+        self.assertIn("unit ids or row order differ", stderr)
+        self.assertFalse(derived_path.exists())
+
+        status, _, derived_path, stderr = self.fixture.run_derive(None, basin_id="1020000010")
+        self.assertEqual(status, 1)
+        self.assertIn("do not carry header number", stderr)
+        self.assertFalse(derived_path.exists())
+
+    def test_expected_and_derive_together_refuse(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            compare.main(
+                [
+                    "--reference", str(self.fixture.reference),
+                    "--candidate", str(self.fixture.candidate),
+                    "--expected", str(self.fixture.expected_path),
+                    "--derive-expected", str(self.fixture.directory / "derived.json"),
+                    "--report", str(self.fixture.directory / "report.json"),
+                    "--planetary-revision", "a" * 40,
+                    "--processing-basin-id", BASIN_ID,
+                ]
+            )
+        self.assertEqual(raised.exception.code, 2)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            compare.main(
+                [
+                    "--reference", str(self.fixture.reference),
+                    "--candidate", str(self.fixture.candidate),
+                    "--report", str(self.fixture.directory / "report.json"),
+                ]
+            )
+
+    def test_derive_without_revision_or_basin_refuses(self) -> None:
+        status, report, derived_path, stderr = self.fixture.run_derive(None, revision=None)
+        self.assertEqual(status, 1)
+        self.assertEqual(report["verdict"], "refused")
+        self.assertIn("requires --planetary-revision", stderr)
+        self.assertFalse(derived_path.exists())
+        status, _, _, stderr = self.fixture.run_derive(None, revision="xyz")
+        self.assertEqual(status, 1)
+        self.assertIn("40-character", stderr)
+        status, _, _, stderr = self.fixture.run_derive(None, basin_id=None)
+        self.assertEqual(status, 1)
+        self.assertIn("requires --processing-basin-id", stderr)
+
+    def test_expected_mode_cli_is_unchanged(self) -> None:
+        status, report, _ = self.fixture.run()
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["verdict"], "accepted")
 
 
 if __name__ == "__main__":
