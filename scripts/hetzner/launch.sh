@@ -193,6 +193,7 @@ runner='canonical_log=$1
 run_log=$2
 shift 2
 exec > >(tee -a -- "$canonical_log" "$run_log") 2>&1
+tee_pid=$!
 printf "launch: started at %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf "launch: command:"
 printf " %q" "$@"
@@ -202,6 +203,8 @@ set +e
 command_status=$?
 set -e
 printf "launch: finished at %s with exit %d\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$command_status"
+exec >&- 2>&-
+wait "$tee_pid"
 exit "$command_status"'
 if ! tmux new-session -d -s "$session" -- bash -c "$runner" bash "$canonical_log" "$run_log" "$@"; then
     if tmux has-session -t "=$session" 2>/dev/null; then

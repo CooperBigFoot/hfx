@@ -191,7 +191,11 @@ command's combined output to canonical log
 `/mnt/hfx/logs/hfx-<campaign>-<workload>.log` and timestamped log
 `/mnt/hfx/logs/hfx-<campaign>-<workload>-YYYYMMDDTHHMMSSZ.log`. It prints the
 session, canonical log, and timestamped run log paths. The logs include start
-time, shell-quoted command, finish time, and command exit status.
+time, shell-quoted command, finish time, and command exit status. The
+runner closes its output and waits for its `tee` before it exits, so the
+finish record is in both logs before tmux can destroy the pane; on 2026-09-04
+rehearsal run 2 lost that line when the pane died first, and the operator
+driver read the workload as unfinished.
 
 `attach` targets the exact running session. Default `tail` selects the newest
 timestamped log for the campaign and follows it from its last 50 lines. Named
