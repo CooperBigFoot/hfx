@@ -391,9 +391,11 @@ state also has `retention`, with the existing exact policy and
 schema-version-4 shape. Acquisition stages retain `attempts`, `evidence`,
 `failure_reason`, and `status`.
 
-An inspected `succeeded` acquisition has a positive attempt count, null
-failure reason, and complete byte count, SHA-256, SQLite identity, and layer
-evidence. An `exhausted` acquisition has the ceiling attempt count, null
+An inspected `succeeded` acquisition has null failure reason and complete
+byte count, SHA-256, SQLite identity, and layer evidence. Its attempt count is
+the number of transfers this campaign made for the product. A count of zero
+means the final file was already present and passed inspection before any
+transfer, so the runner adopted it without a network request. An `exhausted` acquisition has the ceiling attempt count, null
 evidence, and exact reason
 `product attempt ceiling exhausted; retryable acquisition did not succeed`.
 The two states are mechanically distinct. A retryable failure at the ceiling

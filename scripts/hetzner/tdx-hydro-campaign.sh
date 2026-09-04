@@ -453,7 +453,7 @@ validate_basin_json() {
             keys == ["attempts","evidence","failure_reason","status"] and
             (.attempts | type == "number" and . == floor and . >= 0) and
             if .status == "succeeded" then
-                .attempts > 0 and .failure_reason == null and (.evidence | valid_evidence)
+                .failure_reason == null and (.evidence | valid_evidence)
             elif .status == "failed" then
                 (.failure_reason | type == "string" and length > 0) and .evidence == null
             elif .status == "running" then
@@ -539,10 +539,13 @@ atomic_install() {
     local validator_arg=${4-}
     [[ -f "$temporary" && ! -L "$temporary" ]] || hfx_die "temporary state is not a regular file: $temporary"
     if [[ -n "$validator_arg" ]]; then
-        "$validator" "$temporary" "$validator_arg"
+        ("$validator" "$temporary" "$validator_arg")
     else
-        "$validator" "$temporary"
-    fi
+        ("$validator" "$temporary")
+    fi || {
+        "$RM" -f -- "$temporary"
+        hfx_die "refused to install state at $destination; the invalid temporary was removed"
+    }
     "$CHMOD" 0644 "$temporary" || hfx_die "could not set state mode on $temporary"
     "$MV" "$temporary" "$destination" || hfx_die "atomic state replacement failed for $destination"
 }
