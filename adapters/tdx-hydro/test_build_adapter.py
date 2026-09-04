@@ -1724,6 +1724,514 @@ class GlobalLinknoTests(unittest.TestCase):
         self.assertEqual(global_linkno(-1, 71), -1)
 
 
+class ReachOrientationEvidenceTests(unittest.TestCase):
+    """Orientation rules exercised directly on compact topology inputs.
+
+    Fixtures follow the polarity measured on the preserved TDX-Hydro corpus:
+    a reach's first vertex sits exactly on its successor's last vertex, which
+    is the successor's upstream end. Rules never consult vertex order.
+    """
+
+    def build_compact(
+        self,
+        stream_native_ids: list[int],
+        downstream_native_ids: list[int],
+        endpoints: list[list[tuple[float, float]]],
+        areas: list[float],
+        *,
+        polygon_native_ids: list[int] | None = None,
+        degenerate: list[bool] | None = None,
+    ) -> build_adapter._CompactTopology:
+        native_ids = np.asarray(stream_native_ids, dtype="int64")
+        polygon_ids = np.asarray(
+            stream_native_ids if polygon_native_ids is None else polygon_native_ids,
+            dtype="int64",
+        )
+        return build_adapter._build_compact_topology(
+            polygon_ids,
+            native_ids,
+            np.asarray(downstream_native_ids, dtype="int64"),
+            np.asarray(endpoints, dtype="float64"),
+            np.asarray(
+                [False] * len(stream_native_ids) if degenerate is None else degenerate,
+                dtype=bool,
+            ),
+            np.asarray(areas, dtype="float64"),
+            71,
+            0.001,
+        )
+
+    def resolution_counts(
+        self, topology: build_adapter._CompactTopology
+    ) -> dict[str, int]:
+        assert topology.reach_resolutions is not None
+        return {
+            name: count
+            for name, count in topology.reach_resolutions.counts().items()
+            if count
+        }
+
+    def test_unique_root_evidence_is_independent_of_predecessor_order(self) -> None:
+        fixtures = (
+            (
+                [
+                    [(0.0015, 0.0), (0.01, 0.0)],
+                    [(0.0024, 0.0), (0.0001, 0.0)],
+                    [(0.0, 0.0), (0.0015, 0.0)],
+                ],
+                [10.0, 20.0, 40.0],
+                [0.0015, 0.0024, 0.0],
+            ),
+            (
+                [
+                    [(0.0024, 0.0), (0.0001, 0.0)],
+                    [(0.0015, 0.0), (0.01, 0.0)],
+                    [(0.0, 0.0), (0.0015, 0.0)],
+                ],
+                [20.0, 10.0, 40.0],
+                [0.0024, 0.0015, 0.0],
+            ),
+        )
+        for endpoints, areas, expected_outlets in fixtures:
+            with self.subTest(endpoints=endpoints):
+                topology = self.build_compact(
+                    [100, 200, 300], [300, 300, -1], endpoints, areas
+                )
+                np.testing.assert_allclose(topology.outlet_lons, expected_outlets)
+                self.assertEqual(
+                    self.resolution_counts(topology),
+                    {
+                        "endpoint-proven": 1,
+                        "successor-side-proven": 1,
+                        "root-predecessor-proven": 1,
+                    },
+                )
+
+    def test_root_without_predecessor_evidence_refuses(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"root successor LINKNO 300 cannot determine the root upstream endpoint: "
+            r"no predecessor endpoint coincides",
+        ):
+            self.build_compact(
+                [100, 300],
+                [300, -1],
+                [
+                    [(0.0003, 0.0), (0.0005, 0.0)],
+                    [(0.0, 0.0), (0.0008, 0.0)],
+                ],
+                [10.0, 20.0],
+            )
+
+    def test_conflicting_root_evidence_refuses(self) -> None:
+        with self.subTest(evidence="two exact coincidences from one predecessor"):
+            with self.assertRaisesRegex(
+                ValueError, r"conflicting root endpoint indexes \[0, 1\]"
+            ):
+                self.build_compact(
+                    [100, 300],
+                    [300, -1],
+                    [
+                        [(0.0, 0.0), (0.0015, 0.0)],
+                        [(0.0, 0.0), (0.0015, 0.0)],
+                    ],
+                    [10.0, 20.0],
+                )
+        with self.subTest(evidence="single pairing against exact coincidence"):
+            with self.assertRaisesRegex(
+                ValueError, r"conflicting root endpoint indexes \[0, 1\]"
+            ):
+                self.build_compact(
+                    [100, 200, 300, 400],
+                    [300, 300, -1, 300],
+                    [
+                        [(0.0015, 0.0), (0.01, 0.0)],
+                        [(0.0, 0.0), (0.01, 0.0)],
+                        [(0.0, 0.0), (0.0015, 0.0)],
+                        [(0.0024, 0.0), (0.0001, 0.0)],
+                    ],
+                    [10.0, 20.0, 40.0, 30.0],
+                )
+        with self.subTest(evidence="conflict without a both-matched predecessor"):
+            with self.assertRaisesRegex(
+                ValueError, r"root LINKNO 300 has conflicting predecessor matches"
+            ):
+                self.build_compact(
+                    [100, 200, 300],
+                    [300, 300, -1],
+                    [
+                        [(0.0015, 0.0), (0.01, 0.0)],
+                        [(0.0, 0.0), (0.01, 0.0)],
+                        [(0.0, 0.0), (0.0015, 0.0)],
+                    ],
+                    [10.0, 20.0, 40.0],
+                )
+
+    def test_exact_coincidence_selects_the_outlet_of_a_near_degenerate_reach(
+        self,
+    ) -> None:
+        topology = self.build_compact(
+            [100, 200, 300],
+            [200, 300, -1],
+            [
+                [(0.0015, 0.0), (0.0018, 0.0)],
+                [(0.01, 0.0), (0.0015, 0.0)],
+                [(0.02, 0.0), (0.01, 0.0)],
+            ],
+            [10.0, 20.0, 30.0],
+        )
+        np.testing.assert_allclose(topology.outlet_lons, [0.0015, 0.01, 0.02])
+        self.assertEqual(
+            self.resolution_counts(topology),
+            {
+                "endpoint-proven": 1,
+                "exact-coincidence-proven": 1,
+                "root-predecessor-proven": 1,
+            },
+        )
+        self.assertEqual(
+            topology.diagnostics.reach_side_near_degenerate_resolved_reach_native_linknos,
+            (100,),
+        )
+
+    def test_exact_coincidence_identifies_the_root_upstream_end(self) -> None:
+        topology = self.build_compact(
+            [100, 300],
+            [300, -1],
+            [
+                [(0.0015, 0.0), (0.0018, 0.0)],
+                [(0.02, 0.0), (0.0015, 0.0)],
+            ],
+            [10.0, 20.0],
+        )
+        np.testing.assert_allclose(topology.outlet_lons, [0.0015, 0.02])
+        self.assertEqual(
+            self.resolution_counts(topology),
+            {"exact-coincidence-proven": 1, "root-predecessor-proven": 1},
+        )
+        self.assertEqual(
+            topology.diagnostics.predecessor_orientation_proven_root_count, 1
+        )
+
+    def test_near_degenerate_reach_without_exact_coincidence_refuses(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"native LINKNO 100 and downstream LINKNO 200 remains reach-side ambiguous: "
+            r".*exactly coincident current endpoints \[\] do not single one out",
+        ):
+            self.build_compact(
+                [100, 200, 300],
+                [200, 300, -1],
+                [
+                    [(0.0014, 0.0), (0.0017, 0.0)],
+                    [(0.01, 0.0), (0.0015, 0.0)],
+                    [(0.02, 0.0), (0.01, 0.0)],
+                ],
+                [10.0, 20.0, 30.0],
+            )
+
+    def test_reach_touching_only_the_successor_outlet_refuses(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"native LINKNO 100 and downstream LINKNO 200 is contradictory: "
+            r".*neither coincides with successor upstream endpoint 1",
+        ):
+            self.build_compact(
+                [100, 200, 300],
+                [200, 300, -1],
+                [
+                    [(0.0099, 0.0), (0.0101, 0.0)],
+                    [(0.01, 0.0), (0.0015, 0.0)],
+                    [(0.02, 0.0), (0.01, 0.0)],
+                ],
+                [10.0, 20.0, 30.0],
+            )
+
+    def test_successor_side_orients_a_hairpin_reach_beyond_any_distance_band(
+        self,
+    ) -> None:
+        for polygon_native_ids in ([100, 200, 300], [200, 300]):
+            with self.subTest(polygon_native_ids=polygon_native_ids):
+                topology = self.build_compact(
+                    [100, 200, 300],
+                    [200, 300, -1],
+                    [
+                        [(0.0015, 0.0), (0.0105, 0.0)],
+                        [(0.01, 0.0), (0.0015, 0.0)],
+                        [(0.02, 0.0), (0.01, 0.0)],
+                    ],
+                    [10.0, 20.0, 30.0],
+                    polygon_native_ids=polygon_native_ids,
+                )
+                expected = [0.0015, 0.01, 0.02][3 - len(polygon_native_ids) :]
+                np.testing.assert_allclose(topology.outlet_lons, expected)
+                self.assertEqual(
+                    self.resolution_counts(topology)["successor-side-proven"], 1
+                )
+
+    def test_reversed_vertex_order_resolves_from_evidence(self) -> None:
+        forward = self.build_compact(
+            [100, 200, 300],
+            [200, 300, -1],
+            [
+                [(0.0015, 0.0), (0.0018, 0.0)],
+                [(0.01, 0.0), (0.0015, 0.0)],
+                [(0.02, 0.0), (0.01, 0.0)],
+            ],
+            [10.0, 20.0, 30.0],
+        )
+        reversed_order = self.build_compact(
+            [100, 200, 300],
+            [200, 300, -1],
+            [
+                [(0.0018, 0.0), (0.0015, 0.0)],
+                [(0.0015, 0.0), (0.01, 0.0)],
+                [(0.01, 0.0), (0.02, 0.0)],
+            ],
+            [10.0, 20.0, 30.0],
+        )
+        np.testing.assert_array_equal(forward.outlet_lons, reversed_order.outlet_lons)
+        self.assertEqual(
+            self.resolution_counts(forward), self.resolution_counts(reversed_order)
+        )
+
+    def test_degenerate_successor_uses_exact_coincidence(self) -> None:
+        topology = self.build_compact(
+            [12345, 67890],
+            [67890, -1],
+            [
+                [(0.0, 0.0), (0.0003, 0.0)],
+                [(0.0, 0.0), (0.0, 0.0)],
+            ],
+            [10.0, 20.0],
+            degenerate=[False, True],
+        )
+        np.testing.assert_allclose(topology.outlet_lons, [0.0, 0.0])
+        self.assertEqual(
+            self.resolution_counts(topology),
+            {"degenerate": 1, "exact-coincidence-proven": 1},
+        )
+
+    def test_degenerate_successor_without_exact_coincidence_refuses(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"native LINKNO 12345 and downstream LINKNO 67890 remains reach-side ambiguous",
+        ):
+            self.build_compact(
+                [12345, 67890],
+                [67890, -1],
+                [
+                    [(0.0001, 0.0), (0.0004, 0.0)],
+                    [(0.0, 0.0), (0.0, 0.0)],
+                ],
+                [10.0, 20.0],
+                degenerate=[False, True],
+            )
+
+    def test_area_guards_precede_endpoint_selection(self) -> None:
+        with self.subTest(guard="tied"):
+            with self.assertRaisesRegex(
+                ValueError, r"DSContArea evidence is tied at 10.0 km2"
+            ):
+                self.build_compact(
+                    [12345, 67890],
+                    [67890, -1],
+                    [
+                        [(0.0, 0.0), (0.0003, 0.0)],
+                        [(0.0, 0.0), (0.0, 0.0)],
+                    ],
+                    [10.0, 10.0],
+                    degenerate=[False, True],
+                )
+        with self.subTest(guard="decrease"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"upstream DSContArea 30.0 km2 exceeds downstream DSContArea 20.0 km2",
+            ):
+                self.build_compact(
+                    [12345, 67890],
+                    [67890, -1],
+                    [
+                        [(0.0, 0.0), (0.0003, 0.0)],
+                        [(0.0, 0.0), (0.0, 0.0)],
+                    ],
+                    [30.0, 20.0],
+                    degenerate=[False, True],
+                )
+
+    def test_reach_resolutions_cover_every_reach(self) -> None:
+        topology = self.build_compact(
+            [100, 200, 300, 400],
+            [200, 300, -1, -1],
+            [
+                [(0.0015, 0.0), (0.0018, 0.0)],
+                [(0.01, 0.0), (0.0015, 0.0)],
+                [(0.02, 0.0), (0.01, 0.0)],
+                [(5.0, 5.0), (5.1, 5.0)],
+            ],
+            [10.0, 20.0, 30.0, 1.0],
+        )
+        resolutions = topology.reach_resolutions
+        assert resolutions is not None
+        np.testing.assert_array_equal(resolutions.native_ids, [100, 200, 300, 400])
+        np.testing.assert_array_equal(
+            resolutions.downstream_endpoint_index, [0, 0, 0, 1]
+        )
+        self.assertEqual(
+            self.resolution_counts(topology),
+            {
+                "endpoint-proven": 1,
+                "exact-coincidence-proven": 1,
+                "root-predecessor-proven": 1,
+                "root-isolated-trusted": 1,
+            },
+        )
+        self.assertEqual(
+            topology.diagnostics.trusted_orientation_isolated_root_native_linknos,
+            (400,),
+        )
+
+
+class OrientCliTests(unittest.TestCase):
+    basin_id = "7020000010"
+
+    def orient_args(
+        self, basins_path: Path, streamnet_path: Path, report: Path
+    ) -> list[str]:
+        return [
+            "orient",
+            "--basins", str(basins_path),
+            "--streamnet", str(streamnet_path),
+            "--report", str(report),
+            "--processing-basin-id", self.basin_id,
+        ]
+
+    def test_orient_reports_resolution_classes_and_digest(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = canonical_frames()
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            report_path = root / "reports" / "orient.json"
+            with redirect_stdout(io.StringIO()) as stdout:
+                status = main(self.orient_args(basins_path, streamnet_path, report_path))
+            report = json.loads(report_path.read_text())
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(stdout.getvalue()), report)
+            self.assertEqual(report["outcome"], "resolved")
+            self.assertIsNone(report["refusal"])
+            self.assertEqual(report["header_number"], 71)
+            self.assertEqual(report["unit_count"], 2)
+            self.assertEqual(report["rows"], {"basins": 2, "streamnet": 2})
+            self.assertEqual(
+                {
+                    name: count
+                    for name, count in report["resolution_counts"].items()
+                    if count
+                },
+                {"endpoint-proven": 1, "root-predecessor-proven": 1},
+            )
+            self.assertEqual(
+                report["proven_downstream_endpoint_index_counts"], {"0": 0, "1": 1}
+            )
+            self.assertRegex(report["orientation_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                report["streamnet_diagnostics"]["endpoint_coincidence_proven_link_count"],
+                1,
+            )
+            self.assertEqual(report["streamnet_clamp"]["altered_vertex_count"], 0)
+
+    def test_orient_digest_matches_the_build_topology(self) -> None:
+        basins, streamnet, _, _ = canonical_frames()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            report = build_adapter.orient_topology(
+                basins_path, streamnet_path, processing_basin_id=self.basin_id
+            )
+        native_ids = np.asarray([100, 200], dtype="int64")
+        topology = build_adapter._build_compact_topology(
+            native_ids,
+            native_ids,
+            np.asarray([200, -1], dtype="int64"),
+            np.asarray(
+                [[(0.0, 0.0), (0.01, 0.0)], [(0.01, 0.0), (0.02, 0.0)]],
+                dtype="float64",
+            ),
+            np.asarray([False, False]),
+            np.asarray([1.0, 2.0], dtype="float64"),
+            71,
+            0.001,
+        )
+        self.assertEqual(
+            report["orientation_digest"], build_adapter._orientation_digest(topology)
+        )
+
+    def test_orient_dissolves_repeated_stream_ids_like_build(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = canonical_frames()
+            duplicated = pd.concat([basins, basins.iloc[[1]]], ignore_index=True)
+            basins_path, streamnet_path = write_pair(
+                root, gpd.GeoDataFrame(duplicated, crs=basins.crs), streamnet
+            )
+            report_path = root / "orient.json"
+            with redirect_stdout(io.StringIO()):
+                status = main(self.orient_args(basins_path, streamnet_path, report_path))
+            report = json.loads(report_path.read_text())
+            self.assertEqual(status, 0)
+            self.assertEqual(report["outcome"], "resolved")
+            self.assertEqual(report["rows"], {"basins": 3, "streamnet": 2})
+            self.assertEqual(report["unit_count"], 2)
+            self.assertEqual(
+                report["basins_identity_dissolve"],
+                {
+                    "dissolved_unit_count": 1,
+                    "dissolved_part_count": 2,
+                    "dissolved_stream_ids": [100],
+                    "geometry_checked": False,
+                },
+            )
+
+    def test_orient_reports_orientation_refusal_with_linkno_pair(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins, streamnet, _, _ = canonical_frames()
+            streamnet.loc[streamnet["LINKNO"] == 100, "geometry"] = LineString(
+                [(0.5, 0.5), (0.6, 0.5)]
+            )
+            basins_path, streamnet_path = write_pair(root, basins, streamnet)
+            report_path = root / "orient.json"
+            with redirect_stdout(io.StringIO()):
+                status = main(self.orient_args(basins_path, streamnet_path, report_path))
+            report = json.loads(report_path.read_text())
+            self.assertEqual(status, 1)
+            self.assertEqual(
+                report["refusal"],
+                {
+                    "message": (
+                        "orientation proof for native LINKNO 100 and downstream "
+                        "LINKNO 200 is non-coincident"
+                    ),
+                    "native_linkno": 100,
+                    "downstream_linkno": 200,
+                },
+            )
+
+    def test_refusal_record_extracts_root_linkno(self) -> None:
+        self.assertEqual(
+            build_adapter._refusal_record(
+                "orientation proof for root LINKNO 300 has conflicting predecessor matches"
+            ),
+            {
+                "message": (
+                    "orientation proof for root LINKNO 300 has conflicting predecessor matches"
+                ),
+                "native_linkno": 300,
+                "downstream_linkno": None,
+            },
+        )
+
+
 class StreamnetModelTests(unittest.TestCase):
     def test_compact_topology_matches_streamnet_model_rules(self) -> None:
         point = (-120.729444444445, 42.8208888888891)
@@ -4921,6 +5429,52 @@ class BuildCliTests(unittest.TestCase):
             "--fabric-version", self.fabric_version,
         ]
 
+    def test_build_cli_uses_explicit_created_at_for_reproducibility(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, *build_cli_frames())
+            output = root / "output"
+            report = root / "report.json"
+            arguments = self.build_args(
+                basins_path, streamnet_path, output, report
+            ) + ["--created-at", "2026-07-21T14:34:56+02:00"]
+
+            with patch(
+                "build_adapter._utc_now",
+                side_effect=AssertionError("explicit --created-at must bypass the clock"),
+            ):
+                self.assertEqual(main(arguments), 0)
+
+            self.assertEqual(
+                json.loads((output / "manifest.json").read_text())["created_at"],
+                "2026-07-21T12:34:56+00:00",
+            )
+            self.assertEqual(
+                json.loads(report.read_text())["build_identity"]["created_at"],
+                "2026-07-21T12:34:56+00:00",
+            )
+
+    def test_build_cli_rejects_naive_and_invalid_created_at(self) -> None:
+        for value in (
+            "2026-07-21T12:34:56",
+            "2026-07-21",
+            "not-a-timestamp",
+            "2026-07-21T12:34:56+25:00",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as raised:
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        build_adapter.build_arg_parser().parse_args(
+                            self.build_args(
+                                Path("basins.gpkg"),
+                                Path("streamnet.gpkg"),
+                                Path("output"),
+                                Path("report.json"),
+                            )
+                            + ["--created-at", value]
+                        )
+                self.assertEqual(raised.exception.code, 2)
+
     def three_reach_near_degenerate_frames(
         self,
     ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float, float]:
@@ -5389,7 +5943,7 @@ class BuildCliTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(report.exists())
 
-    def test_build_cli_rejects_backwards_near_degenerate_reach(self) -> None:
+    def test_build_cli_orients_reversed_near_degenerate_reach_from_evidence(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             basins, streamnet, _, _ = self.three_reach_near_degenerate_frames()
@@ -5433,28 +5987,35 @@ class BuildCliTests(unittest.TestCase):
             )
             reversed_output = root / "reversed-output"
             reversed_report = root / "reversed-report.json"
-            with self.assertRaises(ValueError) as raised:
+            self.assertEqual(
                 main(
                     self.build_args(
                         *reversed_paths, reversed_output, reversed_report
                     )
-                )
-            self.assertEqual(
-                str(raised.exception),
-                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
-                "contradicts source vertex order: downstream-nondecreasing DSContArea "
-                "0.4923628827649266 km2 -> 0.4923678063937605 km2 identifies "
-                "successor endpoint 0 as upstream, but source endpoint 1 matches "
-                "successor downstream endpoint 1",
+                ),
+                0,
             )
-            self.assertFalse(reversed_output.exists())
-            self.assertFalse(reversed_report.exists())
-            self.assertTrue(clean_output.exists())
-            self.assertTrue(clean_report.exists())
+            reversed_catchments = pq.read_table(reversed_output / "catchments.parquet")
+            reversed_outlets = dict(
+                zip(
+                    reversed_catchments["id"].to_pylist(),
+                    zip(
+                        reversed_catchments["outlet_lon"].to_pylist(),
+                        reversed_catchments["outlet_lat"].to_pylist(),
+                        strict=True,
+                    ),
+                    strict=True,
+                )
+            )
+            self.assertEqual(reversed_outlets, clean_outlets)
+            self.assertEqual(
+                json.loads(reversed_report.read_text())["diagnostics"]["streamnet"][
+                    "reach_side_near_degenerate_resolved_reach_native_linknos"
+                ],
+                [100],
+            )
 
-    def test_build_cli_rejects_reach_side_ambiguity_beyond_widened_bound(
-        self,
-    ) -> None:
+    def test_build_cli_orients_reach_beyond_distance_band_from_successor_side(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             basins, streamnet, _, _ = self.three_reach_near_degenerate_frames()
@@ -5470,18 +6031,27 @@ class BuildCliTests(unittest.TestCase):
             basins_path, streamnet_path = write_pair(root, basins, streamnet)
             output = root / "output"
             report = root / "report.json"
-            with self.assertRaises(ValueError) as raised:
-                main(self.build_args(basins_path, streamnet_path, output, report))
+
             self.assertEqual(
-                (str(raised.exception), output.exists(), report.exists()),
-                (
-                    "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
-                    "is reach-side ambiguous: both current endpoints coincide within "
-                    "tolerance but endpoint separation 0.0030999000000000443 exceeds "
-                    "near-degenerate limit 0.003",
-                    False,
-                    False,
-                ),
+                main(self.build_args(basins_path, streamnet_path, output, report)), 0
+            )
+            catchments = pq.read_table(output / "catchments.parquet")
+            outlets = dict(
+                zip(
+                    catchments["id"].to_pylist(),
+                    zip(
+                        catchments["outlet_lon"].to_pylist(),
+                        catchments["outlet_lat"].to_pylist(),
+                        strict=True,
+                    ),
+                    strict=True,
+                )
+            )
+            self.assertEqual(outlets[710000100], (1.0021, 0.0))
+            self.assertEqual(
+                json.loads(report.read_text())["diagnostics"]["streamnet"]
+                ["reach_side_near_degenerate_resolved_reach_native_linknos"],
+                [100],
             )
 
     def test_build_cli_rejects_near_degenerate_reach_with_unoriented_root(
@@ -5525,10 +6095,9 @@ class BuildCliTests(unittest.TestCase):
                 main(self.build_args(basins_path, streamnet_path, output, report))
             self.assertEqual(
                 str(raised.exception),
-                "orientation proof for native LINKNO 100 and downstream LINKNO 200 "
-                "cannot use source vertex order: downstream-nondecreasing DSContArea "
-                "1.2309072049932537 km2 -> 2.4618144099865074 km2 cannot determine "
-                "the upstream endpoint of root successor LINKNO 200",
+                "orientation proof for native LINKNO 100 and root successor LINKNO 200 "
+                "cannot determine the root upstream endpoint: predecessor evidence "
+                "names conflicting root endpoint indexes [0, 1]",
             )
             self.assertFalse(output.exists())
             self.assertFalse(report.exists())
@@ -5567,17 +6136,11 @@ class BuildCliTests(unittest.TestCase):
                     main(self.build_args(basins_path, streamnet_path, output, report))
             self.assertEqual(
                 (
-                    getattr(
-                        build_adapter,
-                        "NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER",
-                        None,
-                    ),
                     str(raised.exception),
                     output.exists(),
                     report.exists(),
                 ),
                 (
-                    3.0,
                     "orientation proof for root LINKNO 200 is reach-side ambiguous: "
                     "predecessors (100,) match both root endpoints but endpoint separation "
                     "0.0021 exceeds near-degenerate limit 0.002",

@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -23,7 +24,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Callable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 import geopandas as gpd
@@ -66,7 +67,6 @@ COORDINATE_DOMAIN_TOLERANCE_DEGREES = TDX_SOURCE_CELL_ARCSECONDS / 3600.0
 DSCONTAREA_UNIT_DECISIVENESS_MIN_RATIO = 1_000.0
 DSCONTAREA_FABRIC_DIVERGENCE_SANITY_CEILING = 1.0
 DEFAULT_ENDPOINT_TOLERANCE = 0.001
-NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER = 3.0
 SNAP_BBOX_EPSILON = 1e-4
 COMPILE_BATCH_SIZE = 4_096
 COMPILE_MERGE_FAN_IN = 32
@@ -3158,6 +3158,8 @@ class _CompactTopology:
     upstream_offsets: np.ndarray
     upstream_global_ids: np.ndarray
     diagnostics: StreamnetDiagnostics
+    # Absent when the topology was derived from a StreamnetModel.
+    reach_resolutions: _ReachResolutions | None = None
 
     @property
     def nbytes(self) -> int:
@@ -3299,32 +3301,10 @@ def _write_raw_layer_spool(
                         _topology_integer(value.as_py(), "streamnet", "DSLINKNO")
                         for value in batch.column(batch.schema.get_field_index("DSLINKNO"))
                     ]
-                    raw_values = [
+                    converted = _dscontarea_values(
                         value.as_py()
                         for value in batch.column(batch.schema.get_field_index("DSContArea"))
-                    ]
-                    converted: list[float] = []
-                    for original in raw_values:
-                        if original is None:
-                            original = float("nan")
-                        if isinstance(original, bool):
-                            raise ValueError(
-                                "streamnet.DSContArea must contain finite positive "
-                                f"values; got {original!r}"
-                            )
-                        try:
-                            value = float(original)
-                        except (TypeError, ValueError) as exc:
-                            raise ValueError(
-                                "streamnet.DSContArea must contain finite positive "
-                                f"values; got {original!r}"
-                            ) from exc
-                        if not math.isfinite(value) or value <= 0.0:
-                            raise ValueError(
-                                "streamnet.DSContArea must contain finite positive "
-                                f"values; got {original!r}"
-                            )
-                        converted.append(value)
+                    )
                     table = pa.Table.from_arrays(
                         [
                             pa.array(native, type=pa.int64()),
@@ -3345,6 +3325,60 @@ def _write_raw_layer_spool(
     if recorder is not None:
         recorder.scratch_event(f"{layer_name}-raw-closed")
     return crs, row_count
+
+
+def _dscontarea_values(raw_values: Iterable[object]) -> list[float]:
+    """Parse one batch of streamnet DSContArea cells as finite positive floats."""
+    converted: list[float] = []
+    for original in raw_values:
+        if original is None:
+            original = float("nan")
+        if isinstance(original, bool):
+            raise ValueError(
+                "streamnet.DSContArea must contain finite positive "
+                f"values; got {original!r}"
+            )
+        try:
+            value = float(original)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "streamnet.DSContArea must contain finite positive "
+                f"values; got {original!r}"
+            ) from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "streamnet.DSContArea must contain finite positive "
+                f"values; got {original!r}"
+            )
+        converted.append(value)
+    return converted
+
+
+def _stream_batch_endpoints(
+    native: np.ndarray, series: gpd.GeoSeries
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract (start_lon, start_lat, end_lon, end_lat) and degeneracy per reach."""
+    endpoints = np.empty((len(series), 4), dtype="float64")
+    degenerate = np.zeros(len(series), dtype=bool)
+    for row, (native_id, geometry) in enumerate(zip(native, series, strict=True)):
+        coordinates = list(geometry.coords)
+        if len(coordinates) < 2:
+            raise ValueError(
+                f"streamnet geometry for native LINKNO {native_id} must have at least two coordinates"
+            )
+        endpoints[row] = (
+            float(coordinates[0][0]),
+            float(coordinates[0][1]),
+            float(coordinates[-1][0]),
+            float(coordinates[-1][1]),
+        )
+        degenerate[row] = _is_tdx_degenerate_reach(geometry)
+        if endpoints[row, 0] == endpoints[row, 2] and endpoints[row, 1] == endpoints[row, 3] and not degenerate[row]:
+            raise ValueError(
+                "streamnet geometry for native LINKNO "
+                f"{native_id} has unsupported degenerate geometry"
+            )
+    return endpoints, degenerate
 
 
 def _geometry_series_from_wkb(values: pa.Array, crs: object) -> gpd.GeoSeries:
@@ -3593,26 +3627,7 @@ def _normalize_stream_spool(
             altered_ids.update(changed)
             geometry_count += len(series)
             coordinate_count += sum(len(get_coordinates(geometry)) for geometry in series)
-            endpoints = np.empty((len(series), 4), dtype="float64")
-            degenerate = np.zeros(len(series), dtype=bool)
-            for row, (native_id, geometry) in enumerate(zip(native, series, strict=True)):
-                coordinates = list(geometry.coords)
-                if len(coordinates) < 2:
-                    raise ValueError(
-                        f"streamnet geometry for native LINKNO {native_id} must have at least two coordinates"
-                    )
-                endpoints[row] = (
-                    float(coordinates[0][0]),
-                    float(coordinates[0][1]),
-                    float(coordinates[-1][0]),
-                    float(coordinates[-1][1]),
-                )
-                degenerate[row] = _is_tdx_degenerate_reach(geometry)
-                if endpoints[row, 0] == endpoints[row, 2] and endpoints[row, 1] == endpoints[row, 3] and not degenerate[row]:
-                    raise ValueError(
-                        "streamnet geometry for native LINKNO "
-                        f"{native_id} has unsupported degenerate geometry"
-                    )
+            endpoints, degenerate = _stream_batch_endpoints(native, series)
             bounds = series.bounds.to_numpy(dtype="float64")
             hilbert = _hilbert_for_series(series)
             writer.write_table(
@@ -3831,6 +3846,90 @@ def _infer_dscontarea_from_columns(
     return diagnostics, up_area_km2.astype("float64", copy=False)
 
 
+class ReachResolution(Enum):
+    """How one reach's downstream endpoint was established."""
+
+    DEGENERATE = "degenerate"
+    ENDPOINT_PROVEN = "endpoint-proven"
+    SUCCESSOR_SIDE_PROVEN = "successor-side-proven"
+    EXACT_COINCIDENCE_PROVEN = "exact-coincidence-proven"
+    ROOT_PREDECESSOR_PROVEN = "root-predecessor-proven"
+    ROOT_SOURCE_ORDER_TRUSTED = "root-source-order-trusted"
+    ROOT_ISOLATED_TRUSTED = "root-isolated-trusted"
+
+
+_REACH_RESOLUTION_CODES = tuple(ReachResolution)
+
+
+@dataclass(frozen=True)
+class _ReachResolutions:
+    """Per-reach orientation outcome for every streamnet reach, sorted by LINKNO.
+
+    `downstream_endpoint_index` is 0 or 1; `resolution` indexes
+    `_REACH_RESOLUTION_CODES`.
+    """
+
+    native_ids: np.ndarray
+    downstream_endpoint_index: np.ndarray
+    resolution: np.ndarray
+
+    def counts(self) -> dict[str, int]:
+        totals = np.bincount(self.resolution, minlength=len(_REACH_RESOLUTION_CODES))
+        return {
+            member.value: int(totals[code])
+            for code, member in enumerate(_REACH_RESOLUTION_CODES)
+        }
+
+
+def _select_reach_side_endpoint(
+    matches: Sequence[tuple[int, int, float]],
+    *,
+    successor_upstream_index: int,
+    current_id: int,
+    successor_id: int,
+) -> tuple[int, ReachResolution]:
+    """Pick the downstream endpoint of a both-endpoint-matched reach.
+
+    `matches` are the admitted (current index, successor index, separation)
+    pairings. Only pairings on the successor's established upstream endpoint
+    count. One candidate is the outlet. Two candidates are told apart by exact
+    coincidence, which is a shared raster cell in the TauDEM-derived network;
+    neither or both exact refuses. No candidate refuses.
+    """
+    candidates = sorted(
+        {
+            current_index
+            for current_index, successor_index, _ in matches
+            if successor_index == successor_upstream_index
+        }
+    )
+    if len(candidates) == 1:
+        return candidates[0], ReachResolution.SUCCESSOR_SIDE_PROVEN
+    if not candidates:
+        raise ValueError(
+            "orientation proof for native LINKNO "
+            f"{current_id} and downstream LINKNO {successor_id} is contradictory: "
+            "both current endpoints coincide within tolerance but neither "
+            f"coincides with successor upstream endpoint {successor_upstream_index}"
+        )
+    exact = sorted(
+        {
+            current_index
+            for current_index, successor_index, separation in matches
+            if successor_index == successor_upstream_index and separation == 0.0
+        }
+    )
+    if len(exact) == 1:
+        return exact[0], ReachResolution.EXACT_COINCIDENCE_PROVEN
+    raise ValueError(
+        "orientation proof for native LINKNO "
+        f"{current_id} and downstream LINKNO {successor_id} remains reach-side "
+        "ambiguous: both current endpoints coincide within tolerance with "
+        f"successor upstream endpoint {successor_upstream_index} and exactly "
+        f"coincident current endpoints {exact} do not single one out"
+    )
+
+
 def _build_compact_topology(
     basin_native_ids: np.ndarray,
     stream_native_ids: np.ndarray,
@@ -3841,10 +3940,25 @@ def _build_compact_topology(
     header_number: int,
     endpoint_tolerance: float,
 ) -> _CompactTopology:
+    """Orient every reach and contract the polygon-bearing unit graph.
+
+    compact_topology : (BasinIdentities, StreamnetReaches, HeaderNumber, Tolerance)
+                       -> _CompactTopology                 (partial: refuses)
+
+    where StreamnetReaches = (LINKNO, DSLINKNO, endpoints, degeneracy, DSContArea)
+    sorted by LINKNO. Each reach's outlet is
+    orient(reach) = the endpoint singled out by coincidence evidence: a unique
+    admitted pairing with the successor, else the unique candidate on the
+    successor's established upstream endpoint, else the candidate exactly
+    coincident with that endpoint; root upstream endpoints come from predecessor
+    evidence collected first. The function refuses whenever that evidence is
+    absent, tied, or conflicting, except for the two inherited root conventions
+    recorded as `ReachResolution.ROOT_SOURCE_ORDER_TRUSTED` and
+    `ReachResolution.ROOT_ISOLATED_TRUSTED`. Units, global IDs, contracted edges,
+    outlets, and upstream adjacency are then pure functions of the orientation
+    and the polygon join.
+    """
     tolerance = _positive_finite_tolerance(endpoint_tolerance)
-    non_root_reach_side_ambiguity_limit = (
-        NON_ROOT_REACH_SIDE_AMBIGUITY_TOLERANCE_MULTIPLIER * tolerance
-    )
     polygon_positions = np.searchsorted(stream_native_ids, basin_native_ids)
     if (
         np.any(polygon_positions == len(stream_native_ids))
@@ -3881,16 +3995,15 @@ def _build_compact_topology(
     )
 
     downstream_endpoints = np.full((len(stream_native_ids), 2), np.nan)
+    chosen_index = np.zeros(len(stream_native_ids), dtype="int8")
+    resolution = np.zeros(len(stream_native_ids), dtype="int8")
     successor_match = np.full(len(stream_native_ids), -1, dtype="int8")
     successor_conflict = np.zeros(len(stream_native_ids), dtype=bool)
     indeterminate = np.zeros(len(stream_native_ids), dtype=bool)
     short_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     near_resolved = np.zeros(len(stream_native_ids), dtype=bool)
     endpoint_proven = 0
-    connected_matches: list[list[tuple[int, int]] | None] = [
-        None
-    ] * len(stream_native_ids)
-    connected_current_indexes: list[list[int] | None] = [
+    connected_matches: list[list[tuple[int, int, float]] | None] = [
         None
     ] * len(stream_native_ids)
     for row in np.flatnonzero(downstream_rows >= 0):
@@ -3898,11 +4011,14 @@ def _build_compact_topology(
         current_candidates = (0,) if degenerate[row] else (0, 1)
         successor_candidates = (0,) if degenerate[successor] else (0, 1)
         matches = [
-            (current_index, successor_index)
+            (current_index, successor_index, separation)
             for current_index in current_candidates
             for successor_index in successor_candidates
-            if math.dist(
-                endpoints[row, current_index], endpoints[successor, successor_index]
+            if (
+                separation := math.dist(
+                    endpoints[row, current_index],
+                    endpoints[successor, successor_index],
+                )
             )
             <= tolerance
         ]
@@ -3912,19 +4028,37 @@ def _build_compact_topology(
                 f"{int(stream_native_ids[row])} and downstream LINKNO "
                 f"{int(stream_native_ids[successor])} is non-coincident"
             )
-        current_indexes = sorted({current for current, _ in matches})
-        if len(current_indexes) > 1:
-            separation = math.dist(endpoints[row, 0], endpoints[row, 1])
-            if separation > non_root_reach_side_ambiguity_limit:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{int(stream_native_ids[row])} and downstream LINKNO "
-                    f"{int(stream_native_ids[successor])} is reach-side ambiguous: "
-                    "both current endpoints coincide within tolerance but endpoint "
-                    f"separation {separation} exceeds near-degenerate limit {non_root_reach_side_ambiguity_limit}"
-                )
         connected_matches[row] = matches
-        connected_current_indexes[row] = current_indexes
+
+    # Root upstream endpoints from predecessor evidence: a predecessor with
+    # exactly one admitted pairing names the root endpoint it drains into, and
+    # so does any predecessor endpoint that coincides exactly with a root
+    # endpoint. Conflicting evidence is recorded and refused where consulted.
+    root_upstream_undetermined = np.int8(-1)
+    root_upstream_conflicting = np.int8(2)
+    root_upstream_endpoints = np.full(
+        len(stream_native_ids), root_upstream_undetermined, dtype="int8"
+    )
+    for root_value in np.flatnonzero((downstream_rows < 0) & ~degenerate):
+        root = int(root_value)
+        evidence: set[int] = set()
+        for predecessor in predecessor_rows[
+            predecessor_offsets[root] : predecessor_offsets[root + 1]
+        ]:
+            matches = connected_matches[int(predecessor)]
+            if matches is None:
+                continue
+            if len(matches) == 1:
+                evidence.add(matches[0][1])
+            evidence.update(
+                successor_index
+                for _, successor_index, separation in matches
+                if separation == 0.0
+            )
+        if len(evidence) == 1:
+            root_upstream_endpoints[root] = evidence.pop()
+        elif len(evidence) > 1:
+            root_upstream_endpoints[root] = root_upstream_conflicting
 
     for row_value in topology_order[::-1]:
         row = int(row_value)
@@ -3932,20 +4066,27 @@ def _build_compact_topology(
         if successor < 0:
             continue
         matches = connected_matches[row]
-        current_indexes = connected_current_indexes[row]
-        if matches is None or current_indexes is None:
+        if matches is None:
             raise RuntimeError(
                 "internal compact-topology match state is missing for native LINKNO "
                 f"{int(stream_native_ids[row])} and downstream LINKNO "
                 f"{int(stream_native_ids[successor])}"
             )
+        current_indexes = sorted({current for current, _, _ in matches})
+        current_id = int(stream_native_ids[row])
+        successor_id = int(stream_native_ids[successor])
         if len(current_indexes) == 1:
             current_index = current_indexes[0]
-            if not degenerate[row]:
+            if degenerate[row]:
+                resolution[row] = _REACH_RESOLUTION_CODES.index(
+                    ReachResolution.DEGENERATE
+                )
+            else:
                 endpoint_proven += 1
+                resolution[row] = _REACH_RESOLUTION_CODES.index(
+                    ReachResolution.ENDPOINT_PROVEN
+                )
         else:
-            current_id = int(stream_native_ids[row])
-            successor_id = int(stream_native_ids[successor])
             current_area = float(up_area_km2[row])
             successor_area = float(up_area_km2[successor])
             if current_area == successor_area:
@@ -3964,75 +4105,47 @@ def _build_compact_topology(
                     f"{successor_area!r} km2"
                 )
             if degenerate[successor]:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 does not "
-                    "distinguish the successor endpoint side"
-                )
-            if downstream_rows[successor] < 0:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 cannot determine "
-                    f"the upstream endpoint of root successor LINKNO {successor_id}"
-                )
-            if np.isnan(downstream_endpoints[successor]).any():
-                raise RuntimeError(
-                    "internal compact-topology orientation is missing for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id}"
-                )
-            successor_downstream_index = next(
-                (
-                    index
-                    for index in (0, 1)
-                    if np.array_equal(
-                        endpoints[successor, index],
-                        downstream_endpoints[successor],
+                # A collapsed successor is one coordinate, stored at index 0.
+                successor_upstream_index = 0
+            elif downstream_rows[successor] < 0:
+                root_upstream_index = int(root_upstream_endpoints[successor])
+                if root_upstream_index == root_upstream_undetermined:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and root successor LINKNO {successor_id} "
+                        "cannot determine the root upstream endpoint: no "
+                        "predecessor endpoint coincides with exactly one root "
+                        "endpoint or exactly on a root endpoint"
                     )
-                ),
-                -1,
+                if root_upstream_index == root_upstream_conflicting:
+                    raise ValueError(
+                        "orientation proof for native LINKNO "
+                        f"{current_id} and root successor LINKNO {successor_id} cannot "
+                        "determine the root upstream endpoint: predecessor "
+                        "evidence names conflicting root endpoint indexes [0, 1]"
+                    )
+                successor_upstream_index = root_upstream_index
+            else:
+                if np.isnan(downstream_endpoints[successor]).any():
+                    raise RuntimeError(
+                        "internal compact-topology orientation is missing for native LINKNO "
+                        f"{current_id} and downstream LINKNO {successor_id}"
+                    )
+                successor_upstream_index = 1 - int(chosen_index[successor])
+            current_index, reach_resolution = _select_reach_side_endpoint(
+                matches,
+                successor_upstream_index=successor_upstream_index,
+                current_id=current_id,
+                successor_id=successor_id,
             )
-            if successor_downstream_index < 0:
-                raise RuntimeError(
-                    "internal compact-topology orientation is invalid for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id}"
-                )
-            successor_upstream_index = 1 - successor_downstream_index
-            source_successor_indexes = sorted(
-                {
-                    successor_index
-                    for matched_current, successor_index in matches
-                    if matched_current == 1
-                }
-            )
-            if source_successor_indexes == [successor_downstream_index]:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} contradicts "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 identifies "
-                    f"successor endpoint {successor_upstream_index} as upstream, but "
-                    "source endpoint 1 matches successor downstream endpoint "
-                    f"{successor_downstream_index}"
-                )
-            if source_successor_indexes != [successor_upstream_index]:
-                raise ValueError(
-                    "orientation proof for native LINKNO "
-                    f"{current_id} and downstream LINKNO {successor_id} cannot use "
-                    "source vertex order: downstream-nondecreasing DSContArea "
-                    f"{current_area!r} km2 -> {successor_area!r} km2 does not "
-                    "distinguish the successor endpoint side"
-                )
-            current_index = 1
+            resolution[row] = _REACH_RESOLUTION_CODES.index(reach_resolution)
             near_resolved[row] = True
+        chosen_index[row] = current_index
         downstream_endpoints[row] = endpoints[row, current_index]
         successor_indexes = sorted(
             {
                 successor_index
-                for matched_current, successor_index in matches
+                for matched_current, successor_index, _ in matches
                 if matched_current == current_index
             }
         )
@@ -4055,16 +4168,32 @@ def _build_compact_topology(
     trusted_roots: list[int] = []
     for row in np.flatnonzero(downstream_rows < 0):
         native_id = int(stream_native_ids[row])
+        root_upstream_index = int(root_upstream_endpoints[row])
         if degenerate[row]:
-            downstream_endpoints[row] = endpoints[row, 0]
-        elif successor_conflict[row]:
+            chosen_index[row] = 0
+            resolution[row] = _REACH_RESOLUTION_CODES.index(
+                ReachResolution.DEGENERATE
+            )
+        elif successor_conflict[row] or root_upstream_index == root_upstream_conflicting:
             raise ValueError(
                 f"orientation proof for root LINKNO {native_id} has conflicting predecessor matches"
             )
-        elif successor_match[row] >= 0:
-            downstream_endpoints[row] = endpoints[row, 1 - successor_match[row]]
+        elif root_upstream_index != root_upstream_undetermined:
+            chosen_index[row] = 1 - root_upstream_index
             predecessor_proven_roots += 1
+            resolution[row] = _REACH_RESOLUTION_CODES.index(
+                ReachResolution.ROOT_PREDECESSOR_PROVEN
+            )
+        elif successor_match[row] >= 0:
+            chosen_index[row] = 1 - successor_match[row]
+            predecessor_proven_roots += 1
+            resolution[row] = _REACH_RESOLUTION_CODES.index(
+                ReachResolution.ROOT_PREDECESSOR_PROVEN
+            )
         elif indeterminate[row]:
+            # Inherited convention: predecessors coincide within tolerance with
+            # both ends of a near-degenerate root and none exactly; the final
+            # source vertex is taken as the outlet after DSContArea guards.
             separation = math.dist(endpoints[row, 0], endpoints[row, 1])
             if separation > 2.0 * tolerance:
                 predecessor_ids = tuple(
@@ -4106,11 +4235,26 @@ def _build_compact_topology(
                         f"{predecessor_id} DSContArea {predecessor_area!r} km2 "
                         f"exceeds root DSContArea {root_area!r} km2"
                     )
-            downstream_endpoints[row] = endpoints[row, 1]
+            chosen_index[row] = 1
             near_resolved[row] = True
+            resolution[row] = _REACH_RESOLUTION_CODES.index(
+                ReachResolution.ROOT_SOURCE_ORDER_TRUSTED
+            )
         else:
-            downstream_endpoints[row] = endpoints[row, 1]
+            # Inherited convention: an isolated root has no coincidence
+            # evidence; the final source vertex is taken as the outlet.
+            chosen_index[row] = 1
             trusted_roots.append(native_id)
+            resolution[row] = _REACH_RESOLUTION_CODES.index(
+                ReachResolution.ROOT_ISOLATED_TRUSTED
+            )
+        downstream_endpoints[row] = endpoints[row, int(chosen_index[row])]
+
+    reach_resolutions = _ReachResolutions(
+        native_ids=stream_native_ids,
+        downstream_endpoint_index=chosen_index,
+        resolution=resolution,
+    )
 
     next_polygon = np.full(len(stream_native_ids), -1, dtype="int64")
     distance_to_polygon_or_root = np.zeros(len(stream_native_ids), dtype="int64")
@@ -4227,6 +4371,7 @@ def _build_compact_topology(
         upstream_offsets=upstream_offsets,
         upstream_global_ids=sorted_upstream,
         diagnostics=diagnostics,
+        reach_resolutions=reach_resolutions,
     )
 
 
@@ -4285,51 +4430,8 @@ def _ingest_source_spools(
         stream_native_input, downstream_input = _spool_numpy(
             stream_raw, ("native_id", "downstream_native_id")
         )
-        basin_native_input = basin_native_input.astype("int64", copy=False)
-        stream_native_input = stream_native_input.astype("int64", copy=False)
-        downstream_input = downstream_input.astype("int64", copy=False)
-        if np.any(basin_native_input < 0):
-            raise ValueError(
-                "basins.streamID must be non-negative; got "
-                f"{int(basin_native_input[np.flatnonzero(basin_native_input < 0)[0]])}"
-            )
-        if np.any(stream_native_input < 0):
-            raise ValueError(
-                "streamnet.LINKNO must be non-negative; got "
-                f"{int(stream_native_input[np.flatnonzero(stream_native_input < 0)[0]])}"
-            )
-        if np.any(downstream_input < TDX_LINKNO_SENTINEL):
-            raise ValueError(
-                "streamnet.DSLINKNO must be non-negative or -1; got "
-                f"{int(downstream_input[np.flatnonzero(downstream_input < TDX_LINKNO_SENTINEL)[0]])}"
-            )
-        basin_sorted = _sorted_unique_ids(basin_native_input, "basins")
-        stream_order = np.argsort(stream_native_input, kind="stable")
-        stream_sorted = stream_native_input[stream_order]
-        downstream_sorted = downstream_input[stream_order]
-        duplicates = np.flatnonzero(stream_sorted[1:] == stream_sorted[:-1])
-        if len(duplicates):
-            duplicate = int(stream_sorted[int(duplicates[0])])
-            targets = downstream_sorted[stream_sorted == duplicate]
-            if len(np.unique(targets)) > 1:
-                raise ValueError(
-                    f"bifurcation: duplicate LINKNO {duplicate} has multiple DSLINKNO targets"
-                )
-            raise ValueError(f"duplicate LINKNO {duplicate} in streamnet")
-        missing_positions = np.searchsorted(stream_sorted, basin_sorted)
-        missing = (missing_positions == len(stream_sorted)) | (
-            stream_sorted[np.minimum(missing_positions, len(stream_sorted) - 1)]
-            != basin_sorted
-        )
-        if np.any(missing):
-            raise ValueError(
-                "basins.streamID does not join to streamnet.LINKNO: "
-                f"{int(basin_sorted[np.flatnonzero(missing)[0]])}"
-            )
-        _compact_downstream_rows(stream_sorted, downstream_sorted)
-        _topological_order(
-            stream_sorted,
-            _compact_downstream_rows(stream_sorted, downstream_sorted),
+        _validated_native_identities(
+            basin_native_input, stream_native_input, downstream_input
         )
     with recorder.phase("basins_clamp"):
         (
@@ -4446,6 +4548,190 @@ def _ingest_source_spools(
         endpoints=endpoints,
         degenerate=degenerate,
         up_area_km2=up_area_km2,
+    )
+
+
+def _validated_native_identities(
+    basin_native_input: np.ndarray,
+    stream_native_input: np.ndarray,
+    downstream_input: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Check unit and reach identities and return them sorted by native ID.
+
+    Refuses negative identities, duplicate `basins.streamID`, duplicate
+    `streamnet.LINKNO`, units without a reach, dangling `DSLINKNO`, self-links,
+    and cycles. Returns (sorted basin IDs, sorted reach IDs, DSLINKNO in reach
+    order).
+    """
+    basin_native_input = basin_native_input.astype("int64", copy=False)
+    stream_native_input = stream_native_input.astype("int64", copy=False)
+    downstream_input = downstream_input.astype("int64", copy=False)
+    if np.any(basin_native_input < 0):
+        raise ValueError(
+            "basins.streamID must be non-negative; got "
+            f"{int(basin_native_input[np.flatnonzero(basin_native_input < 0)[0]])}"
+        )
+    if np.any(stream_native_input < 0):
+        raise ValueError(
+            "streamnet.LINKNO must be non-negative; got "
+            f"{int(stream_native_input[np.flatnonzero(stream_native_input < 0)[0]])}"
+        )
+    if np.any(downstream_input < TDX_LINKNO_SENTINEL):
+        raise ValueError(
+            "streamnet.DSLINKNO must be non-negative or -1; got "
+            f"{int(downstream_input[np.flatnonzero(downstream_input < TDX_LINKNO_SENTINEL)[0]])}"
+        )
+    basin_sorted = _sorted_unique_ids(basin_native_input, "basins")
+    stream_order = np.argsort(stream_native_input, kind="stable")
+    stream_sorted = stream_native_input[stream_order]
+    downstream_sorted = downstream_input[stream_order]
+    duplicates = np.flatnonzero(stream_sorted[1:] == stream_sorted[:-1])
+    if len(duplicates):
+        duplicate = int(stream_sorted[int(duplicates[0])])
+        targets = downstream_sorted[stream_sorted == duplicate]
+        if len(np.unique(targets)) > 1:
+            raise ValueError(
+                f"bifurcation: duplicate LINKNO {duplicate} has multiple DSLINKNO targets"
+            )
+        raise ValueError(f"duplicate LINKNO {duplicate} in streamnet")
+    missing_positions = np.searchsorted(stream_sorted, basin_sorted)
+    missing = (missing_positions == len(stream_sorted)) | (
+        stream_sorted[np.minimum(missing_positions, len(stream_sorted) - 1)]
+        != basin_sorted
+    )
+    if np.any(missing):
+        raise ValueError(
+            "basins.streamID does not join to streamnet.LINKNO: "
+            f"{int(basin_sorted[np.flatnonzero(missing)[0]])}"
+        )
+    _compact_downstream_rows(stream_sorted, downstream_sorted)
+    _topological_order(
+        stream_sorted,
+        _compact_downstream_rows(stream_sorted, downstream_sorted),
+    )
+    return basin_sorted, stream_sorted, downstream_sorted
+
+
+@dataclass(frozen=True)
+class _StreamnetTopologyColumns:
+    """The streamnet columns that orientation consumes, in source row order."""
+
+    native_ids: np.ndarray
+    downstream_native_ids: np.ndarray
+    dscontarea_raw: np.ndarray
+    endpoints: np.ndarray
+    degenerate: np.ndarray
+    clamp: LayerClampDiagnostics
+
+
+def _read_basin_identities(basins_path: Path) -> np.ndarray:
+    """Read `basins.streamID` without geometry, in source row order."""
+    layer, info = _single_layer_metadata(basins_path, "basins")
+    if "streamID" not in set(str(name) for name in info["fields"]):
+        raise ValueError("basins is missing required columns: ['streamID']")
+    try:
+        frame = pyogrio.read_dataframe(
+            basins_path, layer=layer, columns=["streamID"], read_geometry=False
+        )
+    except Exception as exc:
+        raise ValueError(f"failed to read basins layer from {basins_path}: {exc}") from exc
+    if len(frame) == 0:
+        raise ValueError("basins must be a non-empty GeoDataFrame")
+    return np.asarray(
+        [_topology_integer(value, "basins", "streamID") for value in frame["streamID"]],
+        dtype="int64",
+    )
+
+
+def _read_streamnet_topology_columns(streamnet_path: Path) -> _StreamnetTopologyColumns:
+    """Read LINKNO, DSLINKNO, DSContArea, and clamped reach endpoints only.
+
+    Reads the streamnet layer in batches through the same column parsing,
+    geometry validation, coordinate-domain clamp, and endpoint extraction the
+    build path uses, without spooling geometry to scratch.
+    """
+    fields = ("LINKNO", "DSLINKNO", "DSContArea")
+    layer, info = _single_layer_metadata(streamnet_path, "streamnet")
+    available = set(str(name) for name in info["fields"])
+    missing = sorted(set(fields) - available)
+    if missing:
+        raise ValueError(f"streamnet is missing required columns: {missing}")
+    crs = info.get("crs")
+    if crs is None:
+        raise ValueError("streamnet must declare a CRS")
+    native_batches: list[np.ndarray] = []
+    downstream_batches: list[np.ndarray] = []
+    area_batches: list[np.ndarray] = []
+    endpoint_batches: list[np.ndarray] = []
+    degenerate_batches: list[np.ndarray] = []
+    altered = 0
+    altered_ids: set[int] = set()
+    try:
+        with pyogrio.open_arrow(
+            streamnet_path,
+            layer=layer,
+            columns=list(fields),
+            batch_size=COMPILE_BATCH_SIZE,
+            use_pyarrow=True,
+        ) as (metadata, reader):
+            geometry_name = str(metadata.get("geometry_name") or "wkb_geometry")
+            for batch in reader:
+                names = batch.schema.names
+                native = np.asarray(
+                    [
+                        _topology_integer(value.as_py(), "streamnet", "LINKNO")
+                        for value in batch.column(names.index("LINKNO"))
+                    ],
+                    dtype="int64",
+                )
+                downstream = np.asarray(
+                    [
+                        _topology_integer(value.as_py(), "streamnet", "DSLINKNO")
+                        for value in batch.column(names.index("DSLINKNO"))
+                    ],
+                    dtype="int64",
+                )
+                areas = np.asarray(
+                    _dscontarea_values(
+                        value.as_py() for value in batch.column(names.index("DSContArea"))
+                    ),
+                    dtype="float64",
+                )
+                series = _geometry_series_from_wkb(
+                    _raw_wkb_values(batch, geometry_name, "streamnet"), crs
+                )
+                _validate_layer_geometry(
+                    gpd.GeoDataFrame({"native_id": native}, geometry=series, crs=CRS),
+                    "streamnet",
+                    {"LineString"},
+                    allow_tdx_degenerate_reaches=True,
+                )
+                normalized, count, changed = _clamp_coordinate_batch(
+                    series, native, "streamnet", "LINKNO"
+                )
+                altered += count
+                altered_ids.update(changed)
+                endpoints, degenerate = _stream_batch_endpoints(
+                    native, gpd.GeoSeries(normalized, crs=CRS)
+                )
+                native_batches.append(native)
+                downstream_batches.append(downstream)
+                area_batches.append(areas)
+                endpoint_batches.append(endpoints)
+                degenerate_batches.append(degenerate)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"failed to read streamnet layer from {streamnet_path}: {exc}") from exc
+    if not native_batches:
+        raise ValueError("streamnet must be a non-empty GeoDataFrame")
+    return _StreamnetTopologyColumns(
+        native_ids=np.concatenate(native_batches),
+        downstream_native_ids=np.concatenate(downstream_batches),
+        dscontarea_raw=np.concatenate(area_batches),
+        endpoints=np.concatenate(endpoint_batches).reshape(-1, 2, 2),
+        degenerate=np.concatenate(degenerate_batches),
+        clamp=LayerClampDiagnostics(altered, tuple(sorted(altered_ids))),
     )
 
 
@@ -5317,6 +5603,150 @@ def _warn_nonzero_build_diagnostics(diagnostics: CoreBuildDiagnostics) -> None:
                 count,
                 getattr(streamnet, native_ids_field),
             )
+
+
+class OrientationOutcome(Enum):
+    """Whether a read-only orientation preflight resolved every reach or refused."""
+
+    RESOLVED = "resolved"
+    REFUSED = "refused"
+
+
+_REFUSAL_LINKNO_PAIR = re.compile(
+    r"native LINKNO (\d+) and (?:downstream|root successor) LINKNO (\d+)"
+)
+_REFUSAL_ROOT_LINKNO = re.compile(r"root LINKNO (\d+)")
+
+
+def _refusal_record(message: str) -> dict[str, object]:
+    pair = _REFUSAL_LINKNO_PAIR.search(message)
+    if pair is not None:
+        return {
+            "message": message,
+            "native_linkno": int(pair.group(1)),
+            "downstream_linkno": int(pair.group(2)),
+        }
+    root = _REFUSAL_ROOT_LINKNO.search(message)
+    if root is not None:
+        return {
+            "message": message,
+            "native_linkno": int(root.group(1)),
+            "downstream_linkno": None,
+        }
+    return {"message": message, "native_linkno": None, "downstream_linkno": None}
+
+
+def _orientation_digest(topology: _CompactTopology) -> str:
+    """SHA-256 over every unit's LINKNO, downstream LINKNO, and outlet coordinate."""
+    digest = hashlib.sha256()
+    for values, dtype in (
+        (topology.native_ids, "int64"),
+        (topology.downstream_native_ids, "int64"),
+        (topology.outlet_lons, "float64"),
+        (topology.outlet_lats, "float64"),
+    ):
+        digest.update(np.ascontiguousarray(values, dtype=dtype).tobytes())
+    return digest.hexdigest()
+
+
+def orient_topology(
+    basins_path: Path,
+    streamnet_path: Path,
+    *,
+    processing_basin_id: str,
+    endpoint_tolerance: float = DEFAULT_ENDPOINT_TOLERANCE,
+) -> dict[str, object]:
+    """Resolve reach orientation for one basin without compiling.
+
+    orient : (BasinIdentities, StreamnetTopologyColumns, HeaderNumber, Tolerance)
+             -> OrientationReport                 (total: resolved or refused)
+
+    Reads only `basins.streamID` and the streamnet topology columns, treats
+    repeated streamIDs as one dissolved unit the way `build` does (without the
+    geometry overlap check), runs the same identity checks and compact
+    topology step as `build`, and reports
+    per-class resolution counts, the proven-outlet endpoint index histogram,
+    the orientation digest, and on refusal the exact message with its LINKNO
+    pair. Orientation compares DSContArea only by order, so raw DSContArea is
+    used without unit inference.
+    """
+    header_number = load_header_crosswalk()[processing_basin_id]
+    tolerance = _positive_finite_tolerance(endpoint_tolerance)
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "processing_basin_id": processing_basin_id,
+        "header_number": header_number,
+        "endpoint_tolerance": tolerance,
+        "adapter_version": ADAPTER_VERSION,
+        "source": {
+            "basins": str(basins_path.expanduser().resolve(strict=False)),
+            "streamnet": str(streamnet_path.expanduser().resolve(strict=False)),
+        },
+    }
+    try:
+        basin_native_input = _read_basin_identities(basins_path)
+        columns = _read_streamnet_topology_columns(streamnet_path)
+        report["rows"] = {
+            "basins": int(len(basin_native_input)),
+            "streamnet": int(len(columns.native_ids)),
+        }
+        report["streamnet_clamp"] = asdict(columns.clamp)
+        # `build` dissolves rows sharing one streamID into one unit; the
+        # preflight reads no geometry, so it takes the distinct identities as
+        # the polygon-bearing set and reports the dissolve it assumes. The
+        # interior-overlap check of the dissolve is left to `build`.
+        unique_identities, part_counts = np.unique(basin_native_input, return_counts=True)
+        duplicated = part_counts > 1
+        report["basins_identity_dissolve"] = {
+            "dissolved_unit_count": int(np.count_nonzero(duplicated)),
+            "dissolved_part_count": int(part_counts[duplicated].sum()),
+            "dissolved_stream_ids": [int(value) for value in unique_identities[duplicated]],
+            "geometry_checked": False,
+        }
+        basin_native, stream_native, downstream_native = _validated_native_identities(
+            unique_identities, columns.native_ids, columns.downstream_native_ids
+        )
+        order = np.argsort(columns.native_ids, kind="stable")
+        topology = _build_compact_topology(
+            basin_native,
+            stream_native,
+            downstream_native,
+            columns.endpoints[order],
+            columns.degenerate[order],
+            columns.dscontarea_raw[order],
+            header_number,
+            tolerance,
+        )
+    except ValueError as error:
+        report["outcome"] = OrientationOutcome.REFUSED.value
+        report["refusal"] = _refusal_record(str(error))
+        return report
+    resolutions = topology.reach_resolutions
+    if resolutions is None:
+        raise RuntimeError("compact topology did not record reach resolutions")
+    proven = resolutions.resolution == _REACH_RESOLUTION_CODES.index(
+        ReachResolution.ENDPOINT_PROVEN
+    )
+    proven_index_counts = np.bincount(
+        resolutions.downstream_endpoint_index[proven], minlength=2
+    )
+    report["outcome"] = OrientationOutcome.RESOLVED.value
+    report["refusal"] = None
+    report["unit_count"] = int(len(topology.native_ids))
+    report["resolution_counts"] = resolutions.counts()
+    report["proven_downstream_endpoint_index_counts"] = {
+        "0": int(proven_index_counts[0]),
+        "1": int(proven_index_counts[1]),
+    }
+    report["orientation_digest"] = _orientation_digest(topology)
+    report["streamnet_diagnostics"] = asdict(topology.diagnostics)
+    return report
+
+
+def _write_json_report(report: dict[str, object], report_path: Path) -> None:
+    report_path = report_path.expanduser()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def build_dataset(
@@ -6274,6 +6704,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--processing-basin-id", required=True)
     build_parser.add_argument("--fabric-version", required=True)
     build_parser.add_argument(
+        "--created-at",
+        type=_parse_created_at,
+        help=(
+            "timezone-aware ISO 8601 manifest timestamp; defaults to the current "
+            "UTC time"
+        ),
+    )
+    build_parser.add_argument(
         "--endpoint-tolerance",
         type=float,
         default=DEFAULT_ENDPOINT_TOLERANCE,
@@ -6292,6 +6730,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     assemble_parser.add_argument("--partial-input", type=Path)
     assemble_parser.add_argument("--partial-roster", type=Path)
     assemble_parser.add_argument("--out", required=True, type=Path)
+    orient_parser = subparsers.add_parser("orient")
+    orient_parser.add_argument("--basins", required=True, type=Path)
+    orient_parser.add_argument("--streamnet", required=True, type=Path)
+    orient_parser.add_argument("--report", required=True, type=Path)
+    orient_parser.add_argument("--processing-basin-id", required=True)
+    orient_parser.add_argument(
+        "--endpoint-tolerance",
+        type=float,
+        default=DEFAULT_ENDPOINT_TOLERANCE,
+    )
     adjudicate_parser = subparsers.add_parser("adjudicate")
     adjudicate_parser.add_argument(
         "--acquired-evidence-root", required=True, type=Path
@@ -6312,6 +6760,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     duplicate_parser.add_argument("--streamnet", required=True, type=Path)
     duplicate_parser.add_argument("--stream-id", type=int)
     return parser
+
+
+def _parse_created_at(value: str) -> datetime:
+    """Parse one timezone-aware ISO 8601 build timestamp."""
+    try:
+        created_at = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "--created-at must be a valid timezone-aware ISO 8601 timestamp"
+        ) from error
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise argparse.ArgumentTypeError(
+            "--created-at must be a valid timezone-aware ISO 8601 timestamp"
+        )
+    return created_at
 
 
 def _utc_now() -> datetime:
@@ -6354,7 +6817,7 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch the selected adapter command."""
     arguments = build_arg_parser().parse_args(argv)
     if arguments.command == "build":
-        created_at = _utc_now()
+        created_at = arguments.created_at if arguments.created_at is not None else _utc_now()
         build_dataset(
             arguments.basins,
             arguments.streamnet,
@@ -6382,6 +6845,16 @@ def main(argv: list[str] | None = None) -> int:
             partial_input_root=arguments.partial_input,
             partial_basin_roster=partial_basin_roster,
         )
+    elif arguments.command == "orient":
+        report = orient_topology(
+            arguments.basins,
+            arguments.streamnet,
+            processing_basin_id=arguments.processing_basin_id,
+            endpoint_tolerance=arguments.endpoint_tolerance,
+        )
+        _write_json_report(report, arguments.report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["outcome"] == OrientationOutcome.RESOLVED.value else 1
     elif arguments.command == "adjudicate":
         result = adjudicate_basins(
             arguments.acquired_evidence_root,
