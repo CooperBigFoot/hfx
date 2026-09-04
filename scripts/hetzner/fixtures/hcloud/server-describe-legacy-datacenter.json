@@ -1,0 +1,169 @@
+{
+  "id": 1,
+  "name": "pourpoint-web-1",
+  "status": "running",
+  "created": "2026-07-24T11:30:20Z",
+  "public_net": {
+    "ipv4": {
+      "id": 1,
+      "ip": "192.0.2.10",
+      "blocked": false,
+      "dns_ptr": "redacted.example"
+    },
+    "ipv6": {
+      "id": 2,
+      "ip": "2001:db8::/64",
+      "blocked": false,
+      "dns_ptr": []
+    },
+    "floating_ips": [],
+    "firewalls": [
+      {
+        "id": 1,
+        "status": "applied"
+      }
+    ]
+  },
+  "private_net": [],
+  "server_type": {
+    "id": 115,
+    "name": "cx33",
+    "description": "CX 33",
+    "category": "cost_optimized",
+    "cores": 4,
+    "memory": 8,
+    "disk": 80,
+    "storage_type": "local",
+    "cpu_type": "shared",
+    "architecture": "x86",
+    "included_traffic": 0,
+    "prices": [
+      {
+        "location": "fsn1",
+        "price_hourly": {
+          "net": "0.0136000000",
+          "gross": "0.0147016000000000"
+        },
+        "price_monthly": {
+          "net": "8.4900000000",
+          "gross": "9.1776900000000000"
+        },
+        "included_traffic": 21990232555520,
+        "price_per_tb_traffic": {
+          "net": "1.0000000000",
+          "gross": "1.0810000000000000"
+        }
+      },
+      {
+        "location": "hel1",
+        "price_hourly": {
+          "net": "0.0136000000",
+          "gross": "0.0147016000000000"
+        },
+        "price_monthly": {
+          "net": "8.4900000000",
+          "gross": "9.1776900000000000"
+        },
+        "included_traffic": 21990232555520,
+        "price_per_tb_traffic": {
+          "net": "1.0000000000",
+          "gross": "1.0810000000000000"
+        }
+      },
+      {
+        "location": "nbg1",
+        "price_hourly": {
+          "net": "0.0136000000",
+          "gross": "0.0147016000000000"
+        },
+        "price_monthly": {
+          "net": "8.4900000000",
+          "gross": "9.1776900000000000"
+        },
+        "included_traffic": 21990232555520,
+        "price_per_tb_traffic": {
+          "net": "1.0000000000",
+          "gross": "1.0810000000000000"
+        }
+      }
+    ],
+    "deprecated": false,
+    "deprecation": null,
+    "locations": [
+      {
+        "id": 1,
+        "name": "fsn1",
+        "recommended": false,
+        "available": false,
+        "deprecation": null
+      },
+      {
+        "id": 2,
+        "name": "nbg1",
+        "recommended": false,
+        "available": false,
+        "deprecation": null
+      },
+      {
+        "id": 3,
+        "name": "hel1",
+        "recommended": false,
+        "available": false,
+        "deprecation": null
+      }
+    ]
+  },
+  "included_traffic": 21990232555520,
+  "outgoing_traffic": 35960000,
+  "ingoing_traffic": 28960000,
+  "backup_window": null,
+  "rescue_enabled": false,
+  "iso": null,
+  "locked": false,
+  "image": {
+    "id": 310554929,
+    "status": "available",
+    "type": "system",
+    "name": "debian-13",
+    "description": "Debian 13",
+    "image_size": null,
+    "disk_size": 5,
+    "created": "2025-08-18T06:15:25Z",
+    "created_from": null,
+    "bound_to": null,
+    "os_flavor": "debian",
+    "os_version": "13",
+    "architecture": "x86",
+    "rapid_deploy": true,
+    "protection": {
+      "delete": false
+    },
+    "deprecated": null,
+    "deleted": null,
+    "labels": {}
+  },
+  "protection": {
+    "delete": false,
+    "rebuild": false
+  },
+  "labels": {},
+  "volumes": [],
+  "primary_disk_size": 80,
+  "placement_group": null,
+  "load_balancers": [],
+  "datacenter": {
+    "id": 2,
+    "name": "fsn1-dc14",
+    "description": "Falkenstein 1 virtual DC 14",
+    "location": {
+      "id": 1,
+      "name": "fsn1",
+      "description": "Falkenstein DC Park 1",
+      "country": "DE",
+      "city": "Falkenstein",
+      "latitude": 50.47612,
+      "longitude": 12.370071,
+      "network_zone": "eu-central"
+    }
+  }
+}
