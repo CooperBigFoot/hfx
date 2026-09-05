@@ -16,7 +16,7 @@ die() { printf 'test-campaign-dry-run: error: %s\n' "$1" >&2; exit 1; }
 pass() { passed=$((passed + 1)); printf 'ok %d - %s\n' "$passed" "$1"; }
 
 [[ -x "$repo_root/target/release/hfx" ]] || die 'build the release hfx binary first: cargo build --release -p hfx-cli'
-bash "$SCRIPT_DIR/campaign-dry-run.sh" --work "$tmp/work" --record "$tmp/record/campaign-dry-run-result.json" --keep >"$tmp/dry-run.out" 2>&1 ||
+bash "$SCRIPT_DIR/campaign-dry-run.sh" --work "$tmp/work" --record "$tmp/record/campaign-dry-run-result.json" --keep --lifecycles 2 >"$tmp/dry-run.out" 2>&1 ||
     { tail -n 60 "$tmp/dry-run.out" >&2; die 'campaign dry run failed'; }
 grep -q 'dry run passed' "$tmp/dry-run.out" || die 'dry run did not report a pass'
 jq -e '.result == "passed" and .lifecycle_result.strict_validation == "passed" and .lifecycle_result.zero_footprint == true' \
@@ -24,6 +24,21 @@ jq -e '.result == "passed" and .lifecycle_result.strict_validation == "passed" a
 [[ $(jq -r '.ground_truth_ref' "$tmp/record/campaign-dry-run-result.json") == $(git -C "$repo_root" rev-parse HEAD) ]] || die 'dry-run record ref is not HEAD'
 "$SCRIPT_DIR/verify-compile-runbook.sh" --evidence-root "$tmp/record" --check dry-run-passed >/dev/null || die 'verifier does not accept the dry-run record'
 pass 'the whole composed driver runs locally to a passing lifecycle result with zero footprint, and the verifier accepts its record'
+
+# The second lifecycle ran in the same evidence root: the first campaign directory was superseded in place,
+# and the VM-built reference control lives under each campaign directory, so the second run's fence 2
+# found no previous reference (a shared off-vm/control-builds/planetary/<control> would have refused it).
+control_id=$(jq -r '.control_basin' "$repo_root/scripts/hetzner/rehearsal-campaign-contract.json")
+grep -q 'lifecycle 2 passed' "$tmp/dry-run.out" || die 'the second lifecycle did not pass'
+[[ $(find "$tmp/work/evidence" -mindepth 1 -maxdepth 1 -type d -name 'campaign-rehearsal-superseded-*' | wc -l | tr -d ' ') == 1 ]] ||
+    die 'the first lifecycle was not superseded in place'
+superseded=$(find "$tmp/work/evidence" -mindepth 1 -maxdepth 1 -type d -name 'campaign-rehearsal-superseded-*')
+for dir in "$superseded" "$tmp/work/evidence/campaign-rehearsal"; do
+    [[ -f "$dir/control-reference/$control_id/manifest.json" ]] || die "no VM-built reference control under $dir"
+    jq -e '.result == "passed"' "$dir/lifecycle-result.json" >/dev/null || die "lifecycle under $dir did not pass"
+done
+[[ ! -e "$tmp/work/evidence/off-vm/control-builds" ]] || die 'a reference control was written into the shared off-vm inputs'
+pass 'a second lifecycle in the same evidence root passes with its own reference control after the first was superseded'
 
 # The converge fence's swap post-condition read the swap table the shims built: SwapTotal must equal
 # the contract's root plus volume swap bytes under the shim's page model (whole 4 KiB pages, one page

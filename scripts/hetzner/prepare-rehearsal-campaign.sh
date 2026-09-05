@@ -10,7 +10,10 @@
 # on the VM by runbook section 10 (contract control_reference
 # vm-planetary-build), never here, so no workstation float result becomes a
 # byte reference. It provisions nothing, never names the production baseline
-# prefix, and never creates the approval record.
+# prefix, and never creates the approval record. With --re-resolve it only
+# regenerates the resolved contract from the tracked record, carrying over the
+# values derived at preparation, for an evidence root whose resolved contract
+# predates fields added to the tracked record since.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -28,12 +31,16 @@ readonly HFX_S3_REGION=fsn1
 usage() {
     cat <<'USAGE'
 Usage: prepare-rehearsal-campaign.sh --evidence-root <absolute-path> --s3-env-file <absolute-path> [--skip-upload]
+       prepare-rehearsal-campaign.sh --evidence-root <absolute-path> --re-resolve
 
 Options:
   --evidence-root <path>  rehearsal evidence root; must already hold provisioner-transfer-approval.txt
   --s3-env-file <path>    opaque file holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (never printed)
   --skip-upload           build everything but do not upload the baseline (dry run; the resolved
                           contract is still written so the driver's preflight can be rehearsed)
+  --re-resolve            regenerate rehearsal-campaign-contract.resolved.json from the tracked
+                          record, keeping the values derived at preparation and checking them
+                          against the corpus and baseline on disk; builds and uploads nothing
   -h, --help              print usage and exit 0
 USAGE
 }
@@ -41,6 +48,7 @@ USAGE
 evidence_root=
 s3_env_file=
 skip_upload=0
+re_resolve=0
 while (($#)); do
     case $1 in
         -h | --help)
@@ -59,6 +67,10 @@ while (($#)); do
             skip_upload=1
             shift
             ;;
+        --re-resolve)
+            re_resolve=1
+            shift
+            ;;
         *) hfx_die "unknown argument: $1" ;;
     esac
 done
@@ -67,8 +79,12 @@ done
 approval=$evidence_root/provisioner-transfer-approval.txt
 [[ -f "$approval" && ! -L "$approval" && -s "$approval" ]] ||
     hfx_die 'the rehearsal evidence root must already hold provisioner-transfer-approval.txt; this tool never creates it'
-[[ -n "$s3_env_file" && "$s3_env_file" == /* ]] || hfx_die '--s3-env-file must be an absolute path'
-[[ -f "$s3_env_file" && ! -L "$s3_env_file" && -s "$s3_env_file" ]] || hfx_die '--s3-env-file must be a nonempty regular file'
+if ((re_resolve == 0)); then
+    [[ -n "$s3_env_file" && "$s3_env_file" == /* ]] || hfx_die '--s3-env-file must be an absolute path'
+    [[ -f "$s3_env_file" && ! -L "$s3_env_file" && -s "$s3_env_file" ]] || hfx_die '--s3-env-file must be a nonempty regular file'
+else
+    [[ -z "$s3_env_file" && "$skip_upload" == 0 ]] || hfx_die '--re-resolve takes no --s3-env-file or --skip-upload; it builds and uploads nothing'
+fi
 for command in jq uv git shasum aws python3; do hfx_require_command "$command"; done
 
 contract=$repo_root/$HFX_REHEARSAL_CONTRACT_REL
@@ -89,6 +105,50 @@ while IFS= read -r selected_id; do selected_ids+=("$selected_id"); done < <(jq -
 
 corpus_dir=$evidence_root/off-vm/acquired-source
 baseline_dir=$evidence_root/off-vm/baseline
+resolved=$evidence_root/rehearsal-campaign-contract.resolved.json
+
+measure_corpus_bytes() { find "$corpus_dir" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s+0}'; }
+measure_corpus_files() { find "$corpus_dir" -type f -name '*.gpkg' | wc -l | tr -d ' '; }
+measure_baseline_bytes() { find "$baseline_dir/dataset" -type f -exec stat -f '%z' {} + | awk '{s+=$1} END {print s+0}'; }
+measure_baseline_objects() { find "$baseline_dir/dataset" -type f | wc -l | tr -d ' '; }
+
+# write_resolved_contract : (corpus_bytes, baseline_bytes, baseline_objects) -> resolved contract file
+write_resolved_contract() {
+    jq --argjson corpus_bytes "$1" --argjson baseline_bytes "$2" --argjson baseline_objects "$3" '
+        .source_corpus.total_bytes = $corpus_bytes
+        | .baseline.exported_bytes = $baseline_bytes
+        | .baseline.object_count = $baseline_objects
+        | del(.derived_at_preparation)
+        | .resolved_from = "scripts/hetzner/rehearsal-campaign-contract.json"
+    ' "$contract" > "$resolved"
+    jq -e '[paths(. == "DERIVED")] == []' "$resolved" >/dev/null || hfx_die 'a DERIVED value remains unresolved'
+}
+
+if ((re_resolve == 1)); then
+    [[ -f "$resolved" && ! -L "$resolved" ]] || hfx_die "no resolved contract to re-resolve at $resolved; prepare the root first"
+    jq -e --arg campaign "$campaign" '.campaign == $campaign and .resolved_from == "scripts/hetzner/rehearsal-campaign-contract.json"' "$resolved" >/dev/null ||
+        hfx_die "$resolved was not resolved from the tracked rehearsal contract for campaign $campaign"
+    carried=()
+    while IFS= read -r derived_path; do
+        value=$(jq -r --arg path "$derived_path" 'getpath($path | split(".")) | if type == "number" then tostring else empty end' "$resolved")
+        [[ -n "$value" ]] || hfx_die "$resolved carries no derived value at $derived_path; prepare a fresh root instead"
+        carried+=("$value")
+    done < <(jq -r '.derived_at_preparation[]' "$contract")
+    ((${#carried[@]} == 3)) || hfx_die 'the tracked contract must derive exactly source_corpus.total_bytes, baseline.exported_bytes, and baseline.object_count'
+    [[ -d "$corpus_dir" && -d "$baseline_dir/dataset" ]] || hfx_die 'the evidence root lacks the corpus or the baseline dataset; prepare a fresh root instead'
+    [[ "$(measure_corpus_bytes)" == "${carried[0]}" && "$(measure_corpus_files)" == "$(jq -r '.source_corpus.file_count' "$contract")" ]] ||
+        hfx_die 'the corpus on disk disagrees with the recorded derived values; prepare a fresh root instead'
+    [[ "$(measure_baseline_bytes)" == "${carried[1]}" && "$(measure_baseline_objects)" == "${carried[2]}" ]] ||
+        hfx_die 'the baseline on disk disagrees with the recorded derived values; prepare a fresh root instead'
+    superseded="$resolved.superseded-$(date -u +%Y%m%dT%H%M%SZ)"
+    [[ ! -e "$superseded" ]] || hfx_die "refusing to overwrite $superseded"
+    mv -- "$resolved" "$superseded"
+    write_resolved_contract "${carried[0]}" "${carried[1]}" "${carried[2]}"
+    hfx_log "re-resolved contract: $resolved (previous copy kept at $superseded)"
+    hfx_log "run the driver with HFX_CAMPAIGN_CONTRACT=$resolved HFX_CAMPAIGN_EVIDENCE=$evidence_root"
+    exit 0
+fi
+
 [[ ! -e "$corpus_dir" && ! -e "$evidence_root/off-vm/control-builds" && ! -e "$baseline_dir" ]] ||
     hfx_die 'the rehearsal evidence root already holds off-vm inputs; use a fresh root'
 mkdir -p -- "$corpus_dir" "$baseline_dir"
@@ -103,8 +163,8 @@ for id in "${selected_ids[@]}"; do synth_args+=(--basin "$id"); done
 adapter_run "$repo_root/adapters/tdx-hydro/synthesize_rehearsal_corpus.py" --out "$corpus_dir" --manifest "$manifest_name" "${synth_args[@]}"
 mv -- "$corpus_dir/$manifest_name" "$evidence_root/$manifest_name"
 (cd "$corpus_dir" && shasum -a 256 -c "$evidence_root/$manifest_name") >/dev/null
-corpus_bytes=$(find "$corpus_dir" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s}')
-corpus_files=$(find "$corpus_dir" -type f -name '*.gpkg' | wc -l | tr -d ' ')
+corpus_bytes=$(measure_corpus_bytes)
+corpus_files=$(measure_corpus_files)
 [[ "$corpus_files" == "$(jq -r '.source_corpus.file_count' "$contract")" ]] || hfx_die 'synthesized corpus file count differs from the contract'
 
 hfx_log 'compiling the roster basins and assembling the tiny baseline'
@@ -123,8 +183,8 @@ jq -e --arg region "$(jq -r '.baseline.region' "$contract")" --argjson units "$(
     '.region == $region and .unit_count == $units and .format_version == "0.3.0" and .fabric_version == $fabric and .fabric_name == "tdx_hydro"' \
     "$baseline_dir/dataset/manifest.json" >/dev/null || hfx_die 'assembled baseline manifest disagrees with the rehearsal contract'
 jq -n --argjson roster "$(jq -c '.baseline.basin_ids | sort | unique' "$contract")" '{schema_version: 1, status: "succeeded", input_basin_ids: $roster}' > "$baseline_dir/evidence-assembly.json"
-baseline_bytes=$(find "$baseline_dir/dataset" -type f -exec stat -f '%z' {} + | awk '{s+=$1} END {print s}')
-baseline_objects=$(find "$baseline_dir/dataset" -type f | wc -l | tr -d ' ')
+baseline_bytes=$(measure_baseline_bytes)
+baseline_objects=$(measure_baseline_objects)
 
 if ((skip_upload == 0)); then
     hfx_log "uploading the tiny baseline to $baseline_prefix"
@@ -146,14 +206,7 @@ else
 fi
 
 hfx_log 'writing the resolved rehearsal contract'
-jq --argjson corpus_bytes "$corpus_bytes" --argjson baseline_bytes "$baseline_bytes" --argjson baseline_objects "$baseline_objects" '
-    .source_corpus.total_bytes = $corpus_bytes
-    | .baseline.exported_bytes = $baseline_bytes
-    | .baseline.object_count = $baseline_objects
-    | del(.derived_at_preparation)
-    | .resolved_from = "scripts/hetzner/rehearsal-campaign-contract.json"
-' "$contract" > "$evidence_root/rehearsal-campaign-contract.resolved.json"
-jq -e '[paths(. == "DERIVED")] == []' "$evidence_root/rehearsal-campaign-contract.resolved.json" >/dev/null || hfx_die 'a DERIVED value remains unresolved'
+write_resolved_contract "$corpus_bytes" "$baseline_bytes" "$baseline_objects"
 
 hfx_log "corpus: $corpus_files files, $corpus_bytes bytes; baseline: $baseline_objects objects, $baseline_bytes bytes"
 hfx_log "resolved contract: $evidence_root/rehearsal-campaign-contract.resolved.json"
