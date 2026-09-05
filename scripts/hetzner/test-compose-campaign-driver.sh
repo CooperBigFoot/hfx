@@ -104,6 +104,44 @@ sed '/^campaign_gate pre-compile /,/^```$/d' "$runbook" >"$tmp/dropped-runbook.m
 expect_failure --runbook "$tmp/dropped-runbook.md" --mode full --out "$tmp/bad"
 assert_contains "$stderr" 'expected 25 fences'
 pass 'argument errors and a moved, renamed, or dropped fence refuse before composing'
+perl -0pe 's/if \[ "\$control_reference" = preserved-off-vm \]; then\n  test "\$\(jq -r .\.orientation_digest. "\$control_root\/corrected\/\$control_id-orient\.json"\)" = "\$\(jq -r .\.corrected_orientation_digest. "\$adjudication"\)"\nfi\n/test "\$(jq -r \x27.orientation_digest\x27 "\$control_root\/corrected\/\$control_id-orient.json")" = "\$(jq -r \x27.corrected_orientation_digest\x27 "\$adjudication")"\n/' "$runbook" >"$tmp/unguarded-runbook.md"
+grep -q '^test "$(jq -r '"'"'.orientation_digest'"'"'' "$tmp/unguarded-runbook.md" || die 'unguarded mutation did not apply'
+expect_failure --runbook "$tmp/unguarded-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived and outside the preserved-off-vm guard'
+# Hardening: a comment or printf mentioning the flag is not the derive step, a trailing comment
+# or the literal mode name earns no exemption, and a read in the else branch of the guard refuses.
+mutate_fence13() {
+    # name, then the text to insert before the mkdir line of fence 13 (or an old/new pair with --replace)
+    python3 - "$runbook" "$tmp/$1.md" "$2" "${3-}" <<'PY'
+import sys
+runbook, out, first, second = sys.argv[1:5]
+text = open(runbook).read()
+anchor = 'mkdir -p "$control_root/corrected" "$control_root/planetary"\n'
+if second:
+    assert text.count(first) == 1, first
+    text = text.replace(first, second)
+else:
+    assert text.count(anchor) == 1
+    text = text.replace(anchor, first + "\n" + anchor)
+open(out, "w").write(text)
+PY
+    printf '%s\n' "$tmp/$1.md"
+}
+mutated=$(mutate_fence13 f13-comment-derive '# compare_unit_outlets.py --derive-expected "$adjudication" is documented here
+jq -r .unit_count "$adjudication" >/dev/null')
+expect_failure --runbook "$mutated" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived'
+mutated=$(mutate_fence13 f13-printf-flag "printf '%s\\n' 'compare_unit_outlets.py --derive-expected \"\$adjudication\"'
+jq -r .unit_count \"\$adjudication\" >/dev/null")
+expect_failure --runbook "$mutated" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived'
+mutated=$(mutate_fence13 f13-trailing-comment 'jq -r .unit_count "$adjudication" >/dev/null # preserved-off-vm')
+expect_failure --runbook "$mutated" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived'
+mutated=$(mutate_fence13 f13-else-read 'else test ! -e "$adjudication"; fi' 'else jq -r .unit_count "$adjudication" >/dev/null; fi')
+expect_failure --runbook "$mutated" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'reads the adjudication record before it is derived'
+pass 'the composer refuses a control-build fence that reads the adjudication record before deriving it'
 
 # The exit-trap wrapper must reach campaign_cleanup with the original failing status even though
 # errexit is in force inside an EXIT trap. Extract the wrapper from the driver and drive it with stubs.

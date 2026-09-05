@@ -105,7 +105,83 @@ def extract_fences(text: str) -> list[str]:
         if actual != first_line:
             raise ComposeError(f"fence {number} ({label}) starts with {actual!r}, expected {first_line!r}")
         check_remote_arguments(number, label, fences[number - 1])
+    check_adjudication_reads(fences[12])
     return fences
+
+
+def strip_comment(line: str) -> str:
+    """Return the line without a trailing comment, leaving quoted text untouched."""
+    quote = None
+    for index, character in enumerate(line):
+        if quote:
+            if character == quote:
+                quote = None
+        elif character in ("'", '"'):
+            quote = character
+        elif character == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index].rstrip()
+    return line
+
+
+def joined_lines(fence: str) -> list[tuple[int, str]]:
+    """Join backslash-continued lines, keeping the number of the first line of each."""
+    result: list[tuple[int, str]] = []
+    pending = ""
+    pending_number = 0
+    for index, raw in enumerate(fence.split("\n"), start=1):
+        line = strip_comment(raw)
+        if not pending:
+            pending_number = index
+        if line.rstrip().endswith("\\"):
+            pending += line.rstrip()[:-1] + " "
+            continue
+        result.append((pending_number, (pending + line).strip()))
+        pending = ""
+    return result
+
+
+def check_adjudication_reads(fence: str) -> None:
+    """Refuse a control-build fence that reads the adjudication record before deriving it unguarded.
+
+    Under `vm-planetary-build` the record exists only after the
+    `compare_unit_outlets.py --derive-expected "$adjudication"` invocation;
+    rehearsal run 3 ended on an unguarded read before that point. Comments are
+    stripped before matching, a line that merely mentions the flag or the mode
+    name is not the derive step and earns no exemption, and the guard flips on
+    `else`. An assignment and an existence test are the only tolerated
+    unguarded mentions.
+    """
+    guarded = False
+    for number, line in joined_lines(fence):
+        if line.startswith('"$python" ') and "/compare_unit_outlets.py " in line and '--derive-expected "$adjudication"' in line:
+            return
+        for segment in [part.strip() for part in line.split(";")]:
+            if not segment:
+                continue
+            if segment.startswith("if ") and '"$control_reference" = preserved-off-vm' in segment:
+                guarded = True
+                continue
+            if segment in ("then", "do"):
+                continue
+            if segment == "else" or segment.startswith("else "):
+                guarded = not guarded
+                segment = segment[len("else"):].strip()
+                if not segment:
+                    continue
+            if segment == "fi":
+                guarded = False
+                continue
+            if segment.endswith(" fi"):
+                segment = segment[: -len(" fi")].strip()
+                closes = True
+            else:
+                closes = False
+            if '"$adjudication"' in segment and not segment.startswith("adjudication=") \
+                    and not segment.startswith(("test ! -e ", "test -e ", "[ ! -e ", "[ -e ")) and not guarded:
+                raise ComposeError(f"fence 13 (control-builds) line {number} reads the adjudication record before it is derived and outside the preserved-off-vm guard")
+            if closes:
+                guarded = False
+    raise ComposeError("fence 13 (control-builds) never derives the adjudication record")
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'

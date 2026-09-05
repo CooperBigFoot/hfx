@@ -293,6 +293,20 @@ else
     passed=$((passed + 1))
     printf 'ok %d - rehearsal result # SKIP runner fix commit is not an ancestor of this checkout\n' "$passed"
 fi
+mkdir "$tmp/dry-evidence"
+expect_failure --evidence-root "$tmp/dry-evidence" --check dry-run-passed
+assert_contains "$stderr" 'campaign dry-run result is missing'
+jq -n --arg ref "$head_ref" '{schema_version: 1, kind: "campaign-dry-run", ground_truth_ref: $ref, finished_at: "2026-09-05T00:00:00Z", result: "passed",
+    lifecycle_result: {result: "passed", strict_validation: "passed", zero_footprint: true}}' >"$tmp/dry-evidence/campaign-dry-run-result.json"
+expect_pass --evidence-root "$tmp/dry-evidence" --check dry-run-passed
+assert_contains "$stdout" 'PASS dry-run-passed'
+jq '.ground_truth_ref = "0000000000000000000000000000000000000000"' "$tmp/dry-evidence/campaign-dry-run-result.json" >"$tmp/dry-old.json" && mv "$tmp/dry-old.json" "$tmp/dry-evidence/campaign-dry-run-result.json"
+expect_failure --evidence-root "$tmp/dry-evidence" --check dry-run-passed
+assert_contains "$stderr" 'recorded at another ref than HEAD'
+jq --arg ref "$head_ref" '.ground_truth_ref = $ref | .lifecycle_result.strict_validation = "incomplete"' "$tmp/dry-evidence/campaign-dry-run-result.json" >"$tmp/dry-bad.json" && mv "$tmp/dry-bad.json" "$tmp/dry-evidence/campaign-dry-run-result.json"
+expect_failure --evidence-root "$tmp/dry-evidence" --check dry-run-passed
+assert_contains "$stderr" 'campaign dry-run result is not a passing record'
+pass 'the dry-run precondition requires a passing record at HEAD'
 mutated=$(mutate short-authority 's/"authority_ref": "69747055bcb1876d9d1fad48c60f5cae6a24ea60"/"authority_ref": "6974705"/')
 expect_failure --runbook "$mutated" --check authority-is-current
 assert_contains "$stderr" 'authority ref is not a full commit hash'
