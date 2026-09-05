@@ -16,7 +16,7 @@ die() { printf 'test-campaign-dry-run: error: %s\n' "$1" >&2; exit 1; }
 pass() { passed=$((passed + 1)); printf 'ok %d - %s\n' "$passed" "$1"; }
 
 [[ -x "$repo_root/target/release/hfx" ]] || die 'build the release hfx binary first: cargo build --release -p hfx-cli'
-bash "$SCRIPT_DIR/campaign-dry-run.sh" --work "$tmp/work" --record "$tmp/record/campaign-dry-run-result.json" >"$tmp/dry-run.out" 2>&1 ||
+bash "$SCRIPT_DIR/campaign-dry-run.sh" --work "$tmp/work" --record "$tmp/record/campaign-dry-run-result.json" --keep >"$tmp/dry-run.out" 2>&1 ||
     { tail -n 60 "$tmp/dry-run.out" >&2; die 'campaign dry run failed'; }
 grep -q 'dry run passed' "$tmp/dry-run.out" || die 'dry run did not report a pass'
 jq -e '.result == "passed" and .lifecycle_result.strict_validation == "passed" and .lifecycle_result.zero_footprint == true' \
