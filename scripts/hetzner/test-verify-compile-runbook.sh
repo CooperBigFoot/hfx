@@ -234,7 +234,16 @@ expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'cumulative estimated rehearsal spend has reached the rehearsal ceiling'
 mutated=$(mutate rehearsal-run-incomplete 's/"cause": "ssh-remote-argument-flattening", //')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
-assert_contains "$stderr" 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'
+assert_contains "$stderr" 'a rehearsal run is neither a failure with its cause nor a pass'
+mutated=$(mutate rehearsal-pass-unpinned 's/"ground_truth_ref": "a8d4ef29b9fd95d465cbff27eefc239a5717c283", "result": "passed"/"result": "passed"/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'a rehearsal run is neither a failure with its cause nor a pass'
+mutated=$(mutate rehearsal-pass-with-cause 's/"result": "passed", "strict_validation": "passed"/"cause": "none", "result": "passed", "strict_validation": "passed"/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'a rehearsal run is neither a failure with its cause nor a pass'
+mutated=$(mutate rehearsal-pass-differences 's/"outlet_differences": 0\}/"outlet_differences": 3}/')
+expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
+assert_contains "$stderr" 'a rehearsal run is neither a failure with its cause nor a pass'
 mutated=$(mutate rehearsal-rerun-rule-removed 's/"reruns": "[^"]*",/"reruns": "never",/')
 expect_failure --runbook "$mutated" --check rehearsal-record-is-pinned
 assert_contains "$stderr" 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'

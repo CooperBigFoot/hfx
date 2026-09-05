@@ -1,0 +1,6 @@
+{"pricing":{"currency":"EUR","vat_rate":"8.100000",
+ "primary_ips":[{"type":"ipv4","prices":[{"location":"fsn1","price_hourly":{"net":"0.0008000000","gross":"0.0008648000"}}]}],
+ "volume":{"price_per_gb_month":{"net":"0.0572000000","gross":"0.0618332000"}},
+ "server_types":[
+  {"name":"cx23","prices":[{"location":"fsn1","price_hourly":{"net":"0.0088000000","gross":"0.0095128000"},"included_traffic":21990232555520,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]},
+  {"name":"ccx33","prices":[{"location":"fsn1","price_hourly":{"net":"0.2219000000","gross":"0.2398739000"},"included_traffic":32985348833280,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]}]}}

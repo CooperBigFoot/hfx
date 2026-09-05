@@ -7,7 +7,9 @@
 # onto a scratch VM root and run `bash -s` scripts with the same argument
 # joining the real ssh performs; hcloud answers from a state file seeded with
 # the recorded fixtures; aws reads and writes a directory standing in for the
-# bucket; curl answers the price preflight from a fixture; provision.sh and
+# bucket; curl answers the price preflight from a fixture; fallocate, mkswap,
+# swapon, free, and /proc/meminfo keep a swap table so the converge fence's swap
+# post-condition reads what the fence created; provision.sh and
 # bootstrap.sh are replaced by stubs that lay out the VM root; launch.sh,
 # teardown.sh, tmux, the campaign runner, the adapter, and hfx run unchanged.
 # The dry run exercises the committed HEAD: it clones the repository, so
@@ -24,12 +26,15 @@ repo_root=$(cd -P -- "$SCRIPT_DIR/../.." && pwd)
 
 usage() {
     cat <<'USAGE'
-Usage: campaign-dry-run.sh [--work <absolute-dir>] [--record <absolute-json-path>] [--keep]
+Usage: campaign-dry-run.sh [--work <absolute-dir>] [--record <absolute-json-path>] [--keep] [--lifecycles <n>]
 
 Options:
   --work <dir>     scratch directory (default: a fresh mktemp directory)
   --record <path>  write the dry-run result record there when the run passes
   --keep           keep the scratch directory on success (it is always kept on failure)
+  --lifecycles <n> run the composed driver n times in the same evidence root (default 1); each
+                   later lifecycle gets a fresh shimmed VM and a cleared extension scratch prefix,
+                   as a rerun after a failed rehearsal does, and every lifecycle must pass
   -h, --help       print usage and exit 0
 
 Exit status: 0 when the composed driver ran every fence to lifecycle-result.json
@@ -40,14 +45,16 @@ USAGE
 work=
 record=
 keep=0
+lifecycles=1
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
-        --work | --record)
+        --work | --record | --lifecycles)
             (($# >= 2)) || hfx_die "option $1 requires a value"
             case $1 in
                 --work) work=$2 ;;
                 --record) record=$2 ;;
+                --lifecycles) lifecycles=$2 ;;
             esac
             shift 2
             ;;
@@ -57,6 +64,7 @@ while (($#)); do
 done
 [[ -z "$work" || "$work" == /* ]] || hfx_die '--work must be an absolute path'
 [[ -z "$record" || "$record" == /* ]] || hfx_die '--record must be an absolute path'
+[[ "$lifecycles" =~ ^[1-9][0-9]*$ ]] || hfx_die '--lifecycles must be a positive integer'
 for command in git jq uv tmux rsync ogrinfo gdal-config sha256sum python3; do hfx_require_command "$command"; done
 hfx_binary=$repo_root/target/release/hfx
 [[ -x "$hfx_binary" ]] || hfx_die "release hfx binary is missing at $hfx_binary; run cargo build --release -p hfx-cli"
@@ -78,6 +86,10 @@ export DRY_VM_BIN=$work/vm-bin
 export DRY_WS_BIN=$work/bin
 export DRY_BARE=$work/bare.git
 export DRY_LOG=$work/dry-run.log
+export DRY_FIXTURES=$repo_root/scripts/hetzner/fixtures
+# Fault injection for the dry-run test: a nonzero status makes the mkswap shim fail with it.
+export DRY_MKSWAP_STATUS=${DRY_MKSWAP_STATUS:-0}
+[[ "$DRY_MKSWAP_STATUS" =~ ^[0-9]+$ ]] || hfx_die 'DRY_MKSWAP_STATUS must be a non-negative integer'
 mkdir -p "$DRY_VMROOT" "$DRY_BUCKET" "$DRY_VM_BIN" "$DRY_WS_BIN" "$work/evidence"
 hfx_log "scratch: $work"
 
@@ -106,11 +118,24 @@ venv_python=$(cd "$work/workstation" && uv run --frozen --project adapters/tdx-h
 [[ -x "$venv_python" ]] || hfx_die 'adapter environment python is not executable'
 
 # ---------------------------------------------------------------- VM root and VM-side shims
-mkdir -p "$DRY_VMROOT/mnt/hfx/work/downloads" "$DRY_VMROOT/mnt/hfx/logs" "$DRY_VMROOT/root/.ssh" "$DRY_VMROOT/root/.cargo/bin" \
-    "$DRY_VMROOT/opt" "$DRY_VMROOT/etc" "$DRY_VMROOT/proc"
-# The whole environment directory is linked so Python finds pyvenv.cfg beside the invoked path.
-ln -s "$(cd -P -- "$(dirname -- "$venv_python")/.." && pwd)" "$DRY_VMROOT/opt/hfx-geo"
-printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\n' >"$DRY_VMROOT/proc/meminfo"
+write_meminfo() {
+    # SwapTotal follows the swap table the swapon shim maintains, so the fence 8 post-condition reads real state.
+    local swap_kib=0 kib
+    if [[ -f "$DRY_VMROOT/swap-table.txt" ]]; then
+        while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$DRY_VMROOT/swap-table.txt"
+    fi
+    printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\nSwapTotal:      %8d kB\nSwapFree:       %8d kB\n' "$swap_kib" "$swap_kib" >"$DRY_VMROOT/proc/meminfo"
+}
+# A freshly provisioned VM: empty work and log trees, the adapter environment, no swap, no checkout.
+lay_out_vm_root() {
+    mkdir -p "$DRY_VMROOT/mnt/hfx/work/downloads" "$DRY_VMROOT/mnt/hfx/logs" "$DRY_VMROOT/root/.ssh" "$DRY_VMROOT/root/.cargo/bin" \
+        "$DRY_VMROOT/opt" "$DRY_VMROOT/etc" "$DRY_VMROOT/proc"
+    # The whole environment directory is linked so Python finds pyvenv.cfg beside the invoked path.
+    ln -s "$(cd -P -- "$(dirname -- "$venv_python")/.." && pwd)" "$DRY_VMROOT/opt/hfx-geo"
+    ln -s "$DRY_VM_BIN/cargo" "$DRY_VMROOT/root/.cargo/bin/cargo"
+    write_meminfo
+}
+lay_out_vm_root
 
 write_shim() {
     local path=$1
@@ -124,7 +149,7 @@ s#/mnt/hfx#$DRY_VMROOT/mnt/hfx#g
 s#/root/#$DRY_VMROOT/root/#g
 s#/opt/hfx-geo#$DRY_VMROOT/opt/hfx-geo#g
 s#/etc/pourpoint-hfx\.env#$DRY_VMROOT/etc/pourpoint-hfx.env#g
-s#/swapfile#$DRY_VMROOT/swapfile#g
+s#\([[:space:]]\)/swapfile#\1$DRY_VMROOT/swapfile#g
 s#/proc/meminfo#$DRY_VMROOT/proc/meminfo#g
 EOF
 
@@ -178,22 +203,65 @@ while (($#)); do
 done
 exec /usr/bin/install "${args[@]}"
 SHIM
-for noop in fallocate mkswap; do
-    write_shim "$DRY_VM_BIN/$noop" <<'SHIM'
+# Swap: fallocate creates a sparse file of the requested size, mkswap stamps a signature sidecar
+# whose size follows the kernel's model (whole 4 KiB pages, one page for the header), swapon
+# requires the signature and appends the file to the swap table that meminfo and free report.
+write_shim "$DRY_VM_BIN/fallocate" <<'SHIM'
 #!/usr/bin/env bash
-exit 0
+set -Eeuo pipefail
+[[ ${1-} == -l && ${2-} =~ ^[0-9]+$ && -n ${3-} ]] || { printf 'dry-run fallocate: unsupported: %s\n' "$*" >&2; exit 1; }
+: >"$3"
+dd if=/dev/null of="$3" bs=1 seek="$2" count=0 2>/dev/null
 SHIM
-done
+write_shim "$DRY_VM_BIN/mkswap" <<'SHIM'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${DRY_MKSWAP_STATUS:-0}" != 0 ]]; then printf 'dry-run mkswap: injected failure on %s\n' "${1-}" >&2; exit "$DRY_MKSWAP_STATUS"; fi
+path=${1-}
+[[ -f "$path" ]] || { printf 'mkswap: cannot open %s: No such file or directory\n' "$path" >&2; exit 1; }
+pages=$(( $(/usr/bin/stat -f %z -- "$path") / 4096 ))
+((pages >= 10)) || { printf 'mkswap: error: swap area needs to be at least 40 KiB\n' >&2; exit 1; }
+printf '%s\n' "$(( (pages - 1) * 4 ))" >"$path.dry-run-swap-kib"
+printf 'Setting up swapspace version 1, size = %s KiB (dry run)\n' "$(( (pages - 1) * 4 ))"
+SHIM
 write_shim "$DRY_VM_BIN/swapon" <<'SHIM'
 #!/usr/bin/env bash
-if [[ ${1-} == --show ]]; then
-    printf 'NAME TYPE SIZE USED PRIO\n/swapfile file 8000000000 0 -2\n/mnt/hfx/swap/swapfile file 2000000000 0 -3\n'
+set -Eeuo pipefail
+table=$DRY_VMROOT/swap-table.txt
+if [[ ${1-} == --show* ]]; then
+    columns=; headings=1; unit=1024
+    while (($#)); do
+        case $1 in
+            --show) ;;
+            --show=*) columns=${1#--show=} ;;
+            --noheadings) headings=0 ;;
+            --bytes) unit=1024 ;;
+            *) printf 'dry-run swapon: unsupported: %s\n' "$*" >&2; exit 1 ;;
+        esac
+        shift
+    done
+    [[ -f "$table" ]] || exit 0
+    if [[ "$columns" == NAME ]]; then
+        cut -d ' ' -f1 -- "$table"
+    else
+        ((headings == 0)) || printf 'NAME TYPE SIZE USED PRIO\n'
+        priority=-2
+        while read -r path kib; do printf '%s file %s 0 %s\n' "$path" "$((kib * unit))" "$priority"; priority=$((priority - 1)); done <"$table"
+    fi
+    exit 0
 fi
-exit 0
+path=${1-}
+[[ -f "$path.dry-run-swap-kib" ]] || { printf 'swapon: %s: read swap header failed\n' "$path" >&2; exit 255; }
+printf '%s %s\n' "$path" "$(cat "$path.dry-run-swap-kib")" >>"$table"
+swap_kib=0
+while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$table"
+printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\nSwapTotal:      %8d kB\nSwapFree:       %8d kB\n' "$swap_kib" "$swap_kib" >"$DRY_VMROOT/proc/meminfo"
 SHIM
 write_shim "$DRY_VM_BIN/free" <<'SHIM'
 #!/usr/bin/env bash
-printf '               total        used        free\nMem:      4000000000   400000000  3600000000\nSwap:    10000000000           0 10000000000\n'
+swap_kib=0
+if [[ -f "$DRY_VMROOT/swap-table.txt" ]]; then while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$DRY_VMROOT/swap-table.txt"; fi
+printf '               total        used        free\nMem:      4000000000   400000000  3600000000\nSwap:    %11d           0 %11d\n' "$((swap_kib * 1024))" "$((swap_kib * 1024))"
 SHIM
 write_shim "$DRY_VM_BIN/dmesg" <<'SHIM'
 #!/usr/bin/env bash
@@ -204,7 +272,6 @@ write_shim "$DRY_VM_BIN/cargo" <<'SHIM'
 # The release binary is placed by the bootstrap stub; the converge rebuild is a no-op here.
 printf '    Finished `release` profile [optimized] target(s) (dry run)\n'
 SHIM
-ln -s "$DRY_VM_BIN/cargo" "$DRY_VMROOT/root/.cargo/bin/cargo"
 write_shim "$DRY_VM_BIN/tmux" <<'SHIM'
 #!/usr/bin/env bash
 exec /opt/homebrew/bin/tmux -L "$DRY_TMUX_SOCKET" "$@"
@@ -275,24 +342,16 @@ write_shim "$DRY_WS_BIN/security" <<'SHIM'
 #!/usr/bin/env bash
 printf 'DRY-RUN-HCLOUD-TOKEN\n'
 SHIM
-cat >"$work/pricing.json" <<'JSON'
-{"pricing":{"currency":"EUR","vat_rate":"8.100000",
- "primary_ips":[{"type":"ipv4","prices":[{"location":"fsn1","price_hourly":{"net":"0.0008000000","gross":"0.0008648000"}}]}],
- "volume":{"price_per_gb_month":{"net":"0.0572000000","gross":"0.0618332000"}},
- "server_types":[
-  {"name":"cx23","prices":[{"location":"fsn1","price_hourly":{"net":"0.0088000000","gross":"0.0095128000"},"included_traffic":21990232555520,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]},
-  {"name":"ccx33","prices":[{"location":"fsn1","price_hourly":{"net":"0.2219000000","gross":"0.2398739000"},"included_traffic":32985348833280,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]}]}}
-JSON
 write_shim "$DRY_WS_BIN/curl" <<'SHIM'
 #!/usr/bin/env bash
 cat >/dev/null
-cat -- "$DRY_WORK/pricing.json"
+cat -- "$DRY_FIXTURES/pricing-fsn1.json"
 SHIM
 cp -- "$DRY_VM_BIN/aws" "$DRY_WS_BIN/aws"
 
 # hcloud: a state file seeded with the recorded fixtures; describe, list, detach, delete, and create.
-fixtures=$repo_root/scripts/hetzner/fixtures/hcloud
-jq -n --slurpfile web "$fixtures/server-describe-pourpoint-web-1.json" '{servers: [$web[0]], volumes: [], next_id: 900000}' >"$DRY_HCLOUD_STATE"
+fixtures=$repo_root/scripts/hetzner/fixtures
+jq -n --slurpfile web "$fixtures/hcloud/server-describe-pourpoint-web-1.json" '{servers: [$web[0]], volumes: [], next_id: 900000}' >"$DRY_HCLOUD_STATE"
 write_shim "$DRY_WS_BIN/hcloud" <<'SHIM'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -315,8 +374,8 @@ case "$1 $2" in
     'volume list') jq '.volumes' "$state" ;;
     'server describe') select_server "$3" >/dev/null 2>&1 || { printf 'hcloud: server not found: %s\n' "$3" >&2; exit 1; }; select_server "$3" ;;
     'volume describe') select_volume "$3" >/dev/null 2>&1 || { printf 'hcloud: volume not found: %s\n' "$3" >&2; exit 1; }; select_volume "$3" ;;
-    'server-type describe') cat -- "$fixtures/server-type-describe-ccx33.json" ;;
-    'location describe') cat -- "$fixtures/location-describe-fsn1.json" ;;
+    'server-type describe') cat -- "$fixtures/hcloud/server-type-describe-ccx33.json" ;;
+    'location describe') cat -- "$fixtures/hcloud/location-describe-fsn1.json" ;;
     'volume detach')
         jq --arg key "$3" '(.volumes[] | select((.id | tostring) == $key) | .server) = null
             | (.servers[] | select(.volumes != null) | .volumes) |= map(select((. | tostring) != $key))' "$state" >"$state.tmp" && mv "$state.tmp" "$state" ;;
@@ -325,7 +384,6 @@ case "$1 $2" in
     *) printf 'dry-run hcloud: unsupported: %s\n' "$*" >&2; exit 1 ;;
 esac
 SHIM
-export DRY_FIXTURES=$fixtures
 
 # ssh: joins the remote command into one string, re-splits it through bash -c, remaps the VM paths in
 # the command and in the script on stdin, and runs it in the scratch VM with the VM-side shims first.
@@ -458,32 +516,65 @@ jq '.requires_passing_dry_run = false' "$work/evidence/rehearsal-campaign-contra
 hfx_log 'composing the full driver'
 (cd "$work/workstation" && python3 scripts/hetzner/compose-campaign-driver.py --mode full --out "$work/evidence/composed") >/dev/null
 [[ "$(grep -c ': IDENTICAL$' "$work/evidence/composed/fence-diff-proof.txt")" == 25 ]] || hfx_die 'composed driver proof is not 25 identical fences'
-hfx_log 'running the composed driver end to end (every fence, shimmed cloud and VM)'
-driver_status=0
-(
-    cd "$work/workstation"
-    export PATH="$DRY_WS_BIN:$PATH"
-    export HFX_CAMPAIGN_EVIDENCE=$work/evidence
-    export HFX_CAMPAIGN_CONTRACT=$work/evidence/dry-run-contract.json
-    export POLL_SECONDS=${DRY_POLL_SECONDS:-3}
-    printf '%s\n' "$work/s3.env" | bash "$work/evidence/composed/campaign-driver.sh"
-) >"$DRY_LOG" 2>&1 || driver_status=$?
-
 evidence=$work/evidence/campaign-rehearsal
-if ((driver_status != 0)); then
-    printf '%s\n' '--- last driver lines ---' >&2
-    tail -n 40 "$DRY_LOG" >&2
-    hfx_die "composed driver exited $driver_status; log at $DRY_LOG"
-fi
-[[ -f "$evidence/lifecycle-result.json" ]] || hfx_die 'lifecycle-result.json was not written'
-jq -e '.result == "passed" and .strict_validation == "passed" and .zero_footprint == true' "$evidence/lifecycle-result.json" >/dev/null ||
-    hfx_die "lifecycle result is not a pass: $(jq -c . "$evidence/lifecycle-result.json")"
-grep -qF 'has zero Hetzner footprint' "$evidence/teardown.log" || hfx_die 'teardown log lacks the zero-footprint line'
-[[ "$(jq '.servers | map(select(.name != "pourpoint-web-1")) | length' "$DRY_HCLOUD_STATE")" == 0 ]] || hfx_die 'a campaign server remains in the hcloud state'
-[[ "$(jq '.volumes | length' "$DRY_HCLOUD_STATE")" == 0 ]] || hfx_die 'a campaign volume remains in the hcloud state'
-for milestone in 01-preflight-passed 02-provisioned 03-corpus-verified-on-vm 04-control-gates-passed 05-compiles-done 06-assembly-done 07-preserved 08-validation-classified 09-torn-down; do
-    [[ -f "$evidence/milestones/$milestone" ]] || hfx_die "milestone $milestone was not reached"
+extension_key=$(jq -r '.extension_scratch_prefix' "$work/evidence/dry-run-contract.json")
+baseline_top=${baseline_key#"$extension_key"}; baseline_top=${baseline_top%%/*}
+[[ -n "$baseline_top" && "$baseline_key" == "$extension_key"* ]] || hfx_die 'the rehearsal baseline prefix is not under the extension scratch prefix'
+
+# require_passing_lifecycle : () -> () | Refusal; the checks every lifecycle must satisfy.
+require_passing_lifecycle() {
+    local milestone
+    [[ -f "$evidence/lifecycle-result.json" ]] || hfx_die 'lifecycle-result.json was not written'
+    jq -e '.result == "passed" and .strict_validation == "passed" and .zero_footprint == true' "$evidence/lifecycle-result.json" >/dev/null ||
+        hfx_die "lifecycle result is not a pass: $(jq -c . "$evidence/lifecycle-result.json")"
+    grep -qF 'has zero Hetzner footprint' "$evidence/teardown.log" || hfx_die 'teardown log lacks the zero-footprint line'
+    [[ "$(jq '.servers | map(select(.name != "pourpoint-web-1")) | length' "$DRY_HCLOUD_STATE")" == 0 ]] || hfx_die 'a campaign server remains in the hcloud state'
+    [[ "$(jq '.volumes | length' "$DRY_HCLOUD_STATE")" == 0 ]] || hfx_die 'a campaign volume remains in the hcloud state'
+    for milestone in 01-preflight-passed 02-provisioned 03-corpus-verified-on-vm 04-control-gates-passed 05-compiles-done 06-assembly-done 07-preserved 08-validation-classified 09-torn-down; do
+        [[ -f "$evidence/milestones/$milestone" ]] || hfx_die "milestone $milestone was not reached"
+    done
+    [[ ! -e "$evidence/gate-transport-failures.log" ]] ||
+        hfx_die "gate transport failures were recorded although the price shim never fails: $(tr '\n' ' ' <"$evidence/gate-transport-failures.log")"
+    [[ -s "$evidence/observed-swap-total-bytes.txt" ]] || hfx_die 'the converge fence did not preserve observed-swap-total-bytes.txt'
+    [[ -d "$evidence/control-reference" ]] || hfx_die 'the VM-built reference control was not preserved under the campaign evidence directory'
+    [[ ! -e "$work/evidence/off-vm/control-builds" ]] || hfx_die 'the reference control was written into the shared off-vm inputs'
+}
+
+for lifecycle in $(seq 1 "$lifecycles"); do
+    if ((lifecycle > 1)); then
+        # A rerun after a failed rehearsal provisions a fresh VM and the maintainer clears the extension
+        # scratch prefix by hand; the baseline prefix under it is read-only and stays.
+        hfx_log "lifecycle $lifecycle: fresh shimmed VM; clearing the extension scratch prefix except the baseline"
+        rm -rf -- "$DRY_VMROOT"
+        lay_out_vm_root
+        for entry in "$DRY_BUCKET/${extension_key%/}"/*; do
+            [[ -e "$entry" ]] || continue
+            [[ "$(basename -- "$entry")" == "$baseline_top" ]] || rm -rf -- "$entry"
+        done
+        DRY_LOG=$work/dry-run-lifecycle-$lifecycle.log
+    fi
+    hfx_log "lifecycle $lifecycle of $lifecycles: running the composed driver end to end (every fence, shimmed cloud and VM)"
+    driver_status=0
+    (
+        cd "$work/workstation"
+        export PATH="$DRY_WS_BIN:$PATH"
+        export HFX_CAMPAIGN_EVIDENCE=$work/evidence
+        export HFX_CAMPAIGN_CONTRACT=$work/evidence/dry-run-contract.json
+        export POLL_SECONDS=${DRY_POLL_SECONDS:-3}
+        printf '%s\n' "$work/s3.env" | bash "$work/evidence/composed/campaign-driver.sh"
+    ) >"$DRY_LOG" 2>&1 || driver_status=$?
+    if ((driver_status != 0)); then
+        printf '%s\n' '--- last driver lines ---' >&2
+        tail -n 40 "$DRY_LOG" >&2
+        hfx_die "lifecycle $lifecycle: composed driver exited $driver_status; log at $DRY_LOG"
+    fi
+    require_passing_lifecycle
+    hfx_log "lifecycle $lifecycle passed: $(jq -c '{campaign, strict_validation, result}' "$evidence/lifecycle-result.json")"
 done
+if ((lifecycles > 1)); then
+    [[ "$(find "$work/evidence" -mindepth 1 -maxdepth 1 -type d -name 'campaign-rehearsal-superseded-*' | wc -l | tr -d ' ')" == "$((lifecycles - 1))" ]] ||
+        hfx_die 'each earlier lifecycle must have been superseded in place'
+fi
 hfx_log "dry run passed: $(jq -c '{campaign, strict_validation, result}' "$evidence/lifecycle-result.json")"
 hfx_log "control gates: $(jq -c '.control_gates' "$evidence/lifecycle-result.json")"
 hfx_log "compiled basins: $(tr '\n' ' ' <"$evidence/compiled-absent-basins.txt")"

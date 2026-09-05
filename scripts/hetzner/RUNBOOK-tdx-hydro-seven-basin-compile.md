@@ -27,7 +27,8 @@ version_policy is NONE: NO version bump, NO tag.
       "runs": [
         {"date": "2026-09-04", "provisioning_request": "2026-09-04T20:51:00Z", "zero_footprint": "2026-09-04T21:04:28Z", "server_id": 164601847, "volume_id": 106794141, "cause": "ssh-remote-argument-flattening", "workload_dispatched": false, "estimated_cost_eur": 0.01},
         {"date": "2026-09-04", "provisioning_request": "2026-09-04T21:44:40Z", "zero_footprint": "2026-09-04T22:00:48Z", "server_id": 164608352, "volume_id": 106794390, "cause": "launch-log-flush-race", "workload_dispatched": true, "estimated_cost_eur": 0.01},
-        {"date": "2026-09-04", "provisioning_request": "2026-09-04T22:23:13Z", "zero_footprint": "2026-09-04T22:40:06Z", "server_id": 164611503, "volume_id": 106794635, "cause": "orient-digest-gate-read-underived-record", "workload_dispatched": true, "estimated_cost_eur": 0.01}
+        {"date": "2026-09-04", "provisioning_request": "2026-09-04T22:23:13Z", "zero_footprint": "2026-09-04T22:40:06Z", "server_id": 164611503, "volume_id": 106794635, "cause": "orient-digest-gate-read-underived-record", "workload_dispatched": true, "estimated_cost_eur": 0.01},
+        {"date": "2026-09-05", "provisioning_request": "2026-09-05T16:14:27Z", "provisioning_request_epoch": 1788624867, "zero_footprint": "2026-09-05T16:39:13Z", "server_id": 164691973, "volume_id": 106798609, "server_type": "cx23", "volume_size_gb": 10, "ground_truth_ref": "a8d4ef29b9fd95d465cbff27eefc239a5717c283", "result": "passed", "strict_validation": "passed", "control_gates": {"corrected_versus_reference": "identical", "planetary_versus_reference": "created-at-only", "adjudicated": "accepted", "outlet_differences": 0}, "workload_dispatched": true, "estimated_cost_eur": 0.01}
       ]
     },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"}
@@ -136,7 +137,7 @@ The second lifecycle ran from the provisioning request at 12:51:01Z (server `164
 
 ### Rehearsal and third lifecycle authorized on 2026-09-04
 
-After the second lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 a rehearsal lifecycle and, conditional on it, exactly one further production lifecycle. The rehearsal runs the same fences on a synthetic corpus under the limits pinned in `lifecycle_ledger.rehearsal_authority`: one `cx23` in `fsn1`, one 10 GB volume, strictly under 6 hours, strictly under EUR 1.00 per run, and exact-resource teardown; its parameters are the tracked `scripts/hetzner/rehearsal-campaign-contract.json`. Later on 2026-09-04 the maintainer made the rehearsal repeatable: after each merged, reviewed fix a rehearsal may run again under the same limits as long as the cumulative estimated rehearsal spend recorded in `rehearsal_authority.runs` stays below `cumulative_ceiling_eur`; the verifier refuses a rehearsal once the estimates reach that ceiling. The production lifecycle keeps the limits above and is recorded in `lifecycle_ledger.current_authority`; its `precondition` names the passing rehearsal record that the production preflight requires. Both authorities are the maintainer decision recorded in the pull request named by their `record` fields, together with the vision on `main`. The 2026-09-04 authorization covers one lifecycle only. A rehearsal that fails is recorded in `rehearsal_authority.runs` with its cause and estimated cost; the next rehearsal waits for a merged, reviewed fix and for the cumulative estimate to remain below the ceiling.
+After the second lifecycle was consumed, Nicolas Lazaro authorized on 2026-09-04 a rehearsal lifecycle and, conditional on it, exactly one further production lifecycle. The rehearsal runs the same fences on a synthetic corpus under the limits pinned in `lifecycle_ledger.rehearsal_authority`: one `cx23` in `fsn1`, one 10 GB volume, strictly under 6 hours, strictly under EUR 1.00 per run, and exact-resource teardown; its parameters are the tracked `scripts/hetzner/rehearsal-campaign-contract.json`. Later on 2026-09-04 the maintainer made the rehearsal repeatable: after each merged, reviewed fix a rehearsal may run again under the same limits as long as the cumulative estimated rehearsal spend recorded in `rehearsal_authority.runs` stays below `cumulative_ceiling_eur`; the verifier refuses a rehearsal once the estimates reach that ceiling. The production lifecycle keeps the limits above and is recorded in `lifecycle_ledger.current_authority`; its `precondition` names the passing rehearsal record that the production preflight requires. Both authorities are the maintainer decision recorded in the pull request named by their `record` fields, together with the vision on `main`. The 2026-09-04 authorization covers one lifecycle only. A rehearsal that fails is recorded in `rehearsal_authority.runs` with its cause and estimated cost; the next rehearsal waits for a merged, reviewed fix and for the cumulative estimate to remain below the ceiling. A rehearsal that passes is recorded there with `result` `passed`, its `ground_truth_ref`, its strict validation outcome, and its control gate verdicts; rehearsal run 4 passed on 2026-09-05 at revision `a8d4ef29b9fd95d465cbff27eefc239a5717c283` (provisioning request 16:14:27Z, zero footprint 16:39:13Z, server `164691973`, volume `106798609`, about EUR 0.01, cumulative about EUR 0.04 of the EUR 1.00 ceiling), which satisfies the production `precondition` once its `lifecycle-result.json` sits under the rehearsal evidence root named by `HFX_REHEARSAL_EVIDENCE`.
 
 ### Rehearsal run 1 consumed on 2026-09-04
 
@@ -187,12 +188,24 @@ IFS=$'\n\t'
 
 test -n "${HFX_CAMPAIGN_EVIDENCE:-}"
 case "$HFX_CAMPAIGN_EVIDENCE" in /*) ;; *) exit 1 ;; esac
-test -d "$HFX_CAMPAIGN_EVIDENCE" && test ! -L "$HFX_CAMPAIGN_EVIDENCE"
+test -d "$HFX_CAMPAIGN_EVIDENCE"
+test ! -L "$HFX_CAMPAIGN_EVIDENCE"
 RUNBOOK=scripts/hetzner/RUNBOOK-tdx-hydro-seven-basin-compile.md
 if test -n "${HFX_CAMPAIGN_CONTRACT:-}"; then
   case "$HFX_CAMPAIGN_CONTRACT" in /*) ;; *) exit 1 ;; esac
-  test -f "$HFX_CAMPAIGN_CONTRACT" && test ! -L "$HFX_CAMPAIGN_CONTRACT"
+  test -f "$HFX_CAMPAIGN_CONTRACT"
+  test ! -L "$HFX_CAMPAIGN_CONTRACT"
   CAMPAIGN_CONTRACT_JSON=$(cat -- "$HFX_CAMPAIGN_CONTRACT")
+  CONTRACT_RESOLVED_FROM=$(jq -r '.resolved_from // empty' <<<"$CAMPAIGN_CONTRACT_JSON")
+  if test -n "$CONTRACT_RESOLVED_FROM"; then
+    case "$CONTRACT_RESOLVED_FROM" in scripts/hetzner/*-contract.json) ;; *) exit 1 ;; esac
+    test -f "$CONTRACT_RESOLVED_FROM"
+    missing_contract_fields=$(jq -r --slurpfile tracked "$CONTRACT_RESOLVED_FROM" '[paths] as $present | [$tracked[0] | paths | select(.[0] != "derived_at_preparation")] - $present | map(map(tostring) | join(".")) | join(" ")' <<<"$CAMPAIGN_CONTRACT_JSON")
+    if test -n "$missing_contract_fields"; then
+      printf 'hfx: refusing: resolved contract %s lacks %s, present in the tracked %s; an older prepare-rehearsal-campaign.sh wrote it, so rerun that tool with --re-resolve\n' "$HFX_CAMPAIGN_CONTRACT" "$missing_contract_fields" "$CONTRACT_RESOLVED_FROM" >&2
+      exit 1
+    fi
+  fi
 else
   CAMPAIGN_CONTRACT_JSON=$(sed -n '/^<!-- BEGIN COMPILE CAMPAIGN CONTRACT$/,/^END COMPILE CAMPAIGN CONTRACT -->$/p' "$RUNBOOK" | sed '1d;$d')
 fi
@@ -203,7 +216,8 @@ CAMPAIGN=$(contract_value '.campaign')
 [[ "$CAMPAIGN" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]
 SERVER_NAME=$(contract_value '.server_name')
 VOLUME_NAME=$(contract_value '.volume_name')
-test "$SERVER_NAME" = "hfx-build-$CAMPAIGN" && test "$VOLUME_NAME" = "hfx-build-$CAMPAIGN-data"
+test "$SERVER_NAME" = "hfx-build-$CAMPAIGN"
+test "$VOLUME_NAME" = "hfx-build-$CAMPAIGN-data"
 SERVER_TYPE=$(contract_value '.server_type')
 LOCATION=$(contract_value '.location')
 VOLUME_SIZE_GB=$(contract_value '.volume_size_gb')
@@ -211,7 +225,8 @@ CONTROL_ID=$(contract_value '.control_basin')
 CONTROL_UNIT_COUNT=$(contract_value '.control_unit_count')
 ABSENT_IDS=()
 while IFS= read -r absent_id; do ABSENT_IDS+=("$absent_id"); done < <(contract_value '.absent_basins[]')
-test "${#ABSENT_IDS[@]}" -eq "$(contract_value '.absent_basins | length')" && test "${#ABSENT_IDS[@]}" -ge 1
+test "${#ABSENT_IDS[@]}" -eq "$(contract_value '.absent_basins | length')"
+test "${#ABSENT_IDS[@]}" -ge 1
 FABRIC_VERSION=$(contract_value '.fabric_version')
 CONTROL_FABRIC_VERSION=$(contract_value '.control_fabric_version')
 WORKSPACE_ROOT=/mnt/hfx/work
@@ -233,13 +248,18 @@ CORPUS_FILE_COUNT=$(contract_value '.source_corpus.file_count')
 CORPUS_TOTAL_BYTES=$(contract_value '.source_corpus.total_bytes')
 CORPUS_DIR="$HFX_CAMPAIGN_EVIDENCE/off-vm/acquired-source"
 CORPUS_MANIFEST="$HFX_CAMPAIGN_EVIDENCE/$(contract_value '.source_corpus.manifest')"
-PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
 CONTROL_ADJUDICATION_SOURCE=$(contract_value '.control_adjudication_record')
 CONTROL_REFERENCE=$(contract_value '.control_reference')
 test "$CONTROL_REFERENCE" = preserved-off-vm || test "$CONTROL_REFERENCE" = vm-planetary-build
 LOCAL_EVIDENCE_DIR="$HFX_CAMPAIGN_EVIDENCE/$CAMPAIGN"
+if test "$CONTROL_REFERENCE" = preserved-off-vm; then
+  PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
+else
+  PRESERVED_CONTROL="$LOCAL_EVIDENCE_DIR/control-reference/$CONTROL_ID"
+fi
 if test -e "$LOCAL_EVIDENCE_DIR" && test "${HFX_CAMPAIGN_RESUME:-0}" != 1; then
-  test -d "$LOCAL_EVIDENCE_DIR" && test ! -L "$LOCAL_EVIDENCE_DIR"
+  test -d "$LOCAL_EVIDENCE_DIR"
+  test ! -L "$LOCAL_EVIDENCE_DIR"
   mv -- "$LOCAL_EVIDENCE_DIR" "$LOCAL_EVIDENCE_DIR-superseded-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 if test "${HFX_CAMPAIGN_RESUME:-0}" = 1; then test -f "$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt"; fi
@@ -250,7 +270,10 @@ rsync --version | sed -n 1p | grep -E '^rsync +version 3\.[1-9]'
 
 printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be displayed):' >&2
 IFS= read -r S3_ENV_FILE
-test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
+test -n "$S3_ENV_FILE"
+test -f "$S3_ENV_FILE"
+test ! -L "$S3_ENV_FILE"
+test -s "$S3_ENV_FILE"
 ```
 
 `remote_tokens` quotes every argument a fence sends to the VM with `printf '%q'`. `ssh` joins its remote command arguments into one string that the remote login shell splits again, so an unquoted argument holding a space arrives as several positional parameters; on 2026-09-04 at 21:03:54Z the rehearsal's converge fence sent five sizing values as one space-joined argument, the VM saw five parameters, the remote `read` filled one variable, and the numeric guard ended the lifecycle before any output. Every `bash -s --` fence therefore builds a `remote_args` array, sends exactly `"$(remote_tokens "${remote_args[@]}")"`, and the remote script assigns and validates each positional it expects before doing anything else; section 20's composer refuses any other form.
@@ -285,7 +308,8 @@ fi
 ./scripts/hetzner/verify-campaign-inputs.sh --s3-env-file "$S3_ENV_FILE" --check credential-file-authenticates
 ./scripts/hetzner/verify-campaign-inputs.sh --check hcloud-context-resolves
 
-test -f "$CORPUS_MANIFEST" && test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPUS_FILE_COUNT"
+test -f "$CORPUS_MANIFEST"
+test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPUS_FILE_COUNT"
 (cd "$CORPUS_DIR" && shasum -a 256 -c "$CORPUS_MANIFEST") | tee "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt"
 test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt")" -eq "$CORPUS_FILE_COUNT"
 test "$(find "$CORPUS_DIR" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s}')" -eq "$CORPUS_TOTAL_BYTES"
@@ -296,7 +320,8 @@ if test "$CONTROL_REFERENCE" = preserved-off-vm; then
   test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
 else
   test ! -e "$PRESERVED_CONTROL"
-  test "$(contract_value '.control_digests')" = DERIVED-ON-VM && test "$CONTROL_ADJUDICATION_SOURCE" = DERIVED-ON-VM
+  test "$(contract_value '.control_digests')" = DERIVED-ON-VM
+  test "$CONTROL_ADJUDICATION_SOURCE" = DERIVED-ON-VM
 fi
 
 contract_value '.baseline.basin_ids | sort | unique' | jq -c . > "$LOCAL_EVIDENCE_DIR/baseline-roster.json"
@@ -314,6 +339,8 @@ Every lifecycle also requires `dry-run-passed`: `scripts/hetzner/campaign-dry-ru
 The contract's `control_reference` says where the reference control comes from. `preserved-off-vm` (production) verifies the preserved planetary control and the tracked adjudication record here; `vm-planetary-build` (rehearsal) has no reference yet, requires the digests and record fields to read `DERIVED-ON-VM`, and lets section 10 build the reference and derive the record on the VM, so the byte-for-byte planetary gate never depends on float identity between the workstation and the server. The control adjudication record is the tracked file `scripts/hetzner/seven-basin-control-adjudication.json` for the production campaign and the record derived on the VM for the rehearsal. It pins the corrected control's orientation digest, the exact set of units whose outlet is allowed to differ from the planetary control, the maximum shift, and the decision. Section 10 consumes the copy made above. The verifier refuses a production record that is missing, untracked, malformed, internally inconsistent, or still carrying a placeholder.
 
 The baseline roster is the contract's `baseline.basin_ids`, the 55 basins the frozen artifact was assembled from, pinned inline so no untracked mirror is needed. Its sorted comma-joined SHA-256 prefix must equal the partial-region suffix `4dbff0d6ec31` recorded in `CAMPAIGN-tdx-hydro-planetary.md`, every roster and absent basin must exist in the authoritative inventory, and no absent basin may sit in the roster; the verifier's `baseline-is-pinned` check additionally requires the production roster's complement in the inventory to be exactly the seven absent basins. Section 12 rechecks the roster against the pulled baseline on the VM.
+
+A resolved rehearsal contract carries `resolved_from`, the tracked record it was resolved from. The shell compares the two before it reads any field: a resolved contract written by an older `prepare-rehearsal-campaign.sh` lacks fields added to the tracked record since (rehearsal run 4's setup lacked `requires_passing_dry_run`, and the section 5 read of that field ended the driver with an opaque jq error), so the shell refuses up front, names the resolved contract and the missing fields, and points at `prepare-rehearsal-campaign.sh --re-resolve`, which regenerates the resolved contract from the tracked record while keeping the derived values. Under `preserved-off-vm` the preserved control is a shared input of the evidence root (`off-vm/control-builds/planetary/<control>`); under `vm-planetary-build` it is written per campaign under the evidence directory this shell creates, so a rerun never meets the previous run's reference.
 
 ## 5. Current-price preflight and gates
 
@@ -346,13 +373,14 @@ Install this gate after provisioning and run it before every workload dispatch a
 campaign_gate() {
   test "$#" -eq 2
   local phase=$1 remaining_hours=$2 origin now elapsed record gate_attempt gate_status
+  GATE_SEQUENCE=$((${GATE_SEQUENCE:-0} + 1))
   [[ "$phase" =~ ^[a-z0-9-]+$ ]]
   [[ "$remaining_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]
   origin=$(<"$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt")
   [[ "$origin" =~ ^[0-9]+$ ]]
   now=$(date +%s)
   elapsed=$(awk -v now="$now" -v origin="$origin" 'BEGIN { printf "%.10f\n", (now - origin) / 3600 }')
-  record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ).json"
+  record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04d' "$GATE_SEQUENCE").json"
   if ! awk -v elapsed="$elapsed" -v remaining="$remaining_hours" -v ceiling="$ELAPSED_CEILING_HOURS" \
       'BEGIN { exit !(elapsed + remaining < ceiling) }'; then
     : > "$LOCAL_EVIDENCE_DIR/hard-ceiling-reached"
@@ -370,7 +398,8 @@ campaign_gate() {
     if test "$gate_status" -eq 0 || test "$gate_status" -eq 3; then break; fi
     printf 'phase=%s\nattempt=%s\ntransport_status=%s\n' "$phase" "$gate_attempt" "$gate_status" >> "$LOCAL_EVIDENCE_DIR/gate-transport-failures.log"
     sleep 30
-    record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ).json"
+    GATE_SEQUENCE=$((GATE_SEQUENCE + 1))
+    record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04d' "$GATE_SEQUENCE").json"
   done
   if test "$gate_status" -ne 0; then
     : > "$LOCAL_EVIDENCE_DIR/hard-ceiling-reached"
@@ -382,6 +411,8 @@ campaign_gate() {
 ```
 
 Hetzner exposes no invoice total through the API. The conservative actual spend in each gate record is an upper bound computed from current rates and billed hours, the same approach the earlier lifecycles recorded. A refusal stops dispatch and enters preservation and teardown.
+
+Each record name carries the UTC second and a per-shell sequence number (`gate-<phase>-<UTC second>-<NNNN>.json`), because the helper refuses to overwrite an existing record and the section 11 monitor pair runs a gate twice within one second when nothing slow sits between the calls; the 2026-09-05 dry run counted that refusal as a transport failure.
 
 ## 6. Read-only quota, exact-name, and ref preflight
 
@@ -600,11 +631,26 @@ root_avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
 root_swap_bytes=$((root_avail - root_disk_reserve_bytes))
 if test "$root_swap_bytes" -gt "$root_swap_bytes_max"; then root_swap_bytes=$root_swap_bytes_max; fi
 test "$root_swap_bytes" -gt 0
-fallocate -l "$root_swap_bytes" /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+fallocate -l "$root_swap_bytes" /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
 mkdir -p /mnt/hfx/swap
-fallocate -l "$volume_swap_bytes" /mnt/hfx/swap/swapfile && chmod 600 /mnt/hfx/swap/swapfile && mkswap /mnt/hfx/swap/swapfile && swapon /mnt/hfx/swap/swapfile
+fallocate -l "$volume_swap_bytes" /mnt/hfx/swap/swapfile
+chmod 600 /mnt/hfx/swap/swapfile
+mkswap /mnt/hfx/swap/swapfile
+swapon /mnt/hfx/swap/swapfile
 swapon --show --bytes
 free -b
+swapon --show=NAME --noheadings | grep -q -x -F -- /swapfile
+swapon --show=NAME --noheadings | grep -q -x -F -- /mnt/hfx/swap/swapfile
+expected_swap_bytes=$((root_swap_bytes + volume_swap_bytes))
+swap_total_kib=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+[[ "$swap_total_kib" =~ ^[0-9]+$ ]]
+swap_total_bytes=$((swap_total_kib * 1024))
+printf 'swap_total_bytes=%s expected_swap_bytes=%s\n' "$swap_total_bytes" "$expected_swap_bytes"
+test "$swap_total_bytes" -ge $((expected_swap_bytes - 2097152))
+printf '%s\n' "$swap_total_bytes" > /root/observed-swap-total-bytes.txt
 df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ' > /root/observed-available-disk-bytes.txt
 test "$(cat /root/observed-available-disk-bytes.txt)" -ge "$required_available_disk_bytes"
 awk -v required="$required_memory_bytes" '/MemAvailable:/ {exit !($2 * 1024 >= required)}' /proc/meminfo
@@ -612,9 +658,12 @@ mkdir -p /mnt/hfx/work/sha256 /mnt/hfx/work/control-builds/preserved "$HOME/.ssh
 REMOTE
 scp -o BatchMode=yes "root@$SERVER_IP:/root/hfx-planetary-provenance.txt" "$LOCAL_EVIDENCE_DIR/planetary-provenance.txt"
 scp -o BatchMode=yes "root@$SERVER_IP:/root/observed-available-disk-bytes.txt" "$LOCAL_EVIDENCE_DIR/observed-available-disk-bytes.txt"
+scp -o BatchMode=yes "root@$SERVER_IP:/root/observed-swap-total-bytes.txt" "$LOCAL_EVIDENCE_DIR/observed-swap-total-bytes.txt"
 ```
 
 The remote `rsync --version` line reads the banner through `sed -n 1p` for the same reason as the workstation line in section 4: the remote rsync 3.2.7 wrote its banner in several writes, `head -n 1` closed the pipe, and the resulting SIGPIPE exit 141 under the remote `pipefail` ended the first converge of the second 2026-09-04 lifecycle at 12:59:17Z. The converge also creates `/mnt/hfx/work/control-builds/preserved`, the parent directory the section 10 transfer needs; on 2026-09-04 at 16:00:31Z the transfer ran before any command had created it, remote rsync failed with `mkdir ... No such file or directory`, and that lifecycle ended there.
+
+Each swap step is its own statement. Under `set -e` only the last member of an `a && b && c` list can end the script, so the earlier `fallocate ... && mkswap ... && swapon ...` chain would have skipped `swapon` after a failed `mkswap` and carried on without swap; on the `ccx33` the 55-basin strict validation would then have been OOM-killed hours later. The post-condition requires both swap files in `swapon --show`, and `SwapTotal` from `/proc/meminfo` within 2 MiB of the contract's root plus volume swap bytes (each swap file gives up one page to its header and rounds down to a page); the observed total is preserved as `observed-swap-total-bytes.txt`. The same rule applies to every check in this runbook: a `test a && test b` line at the top level continues after a failed `test a`, so each check stands on its own line.
 
 Swap and capacity sizing come from the contract's `workload_sizing`. For production: the 55-basin strict validation needed about 265 GB resident and finished only on 287 GB of swap. A `ccx33` has 32 GB of memory and a 240 GB local disk, so the root swap file takes up to 200 GB after a 20 GB root reserve and the volume swap file 150 GB, about 350 GB in total. The volume then holds the corpus (84.1 GB), the baseline (114.1 GB), the extended artifact (about 130 GB), per-basin outputs (about 25 GB), control builds (about 9 GB), and 150 GB of swap, about 510 GB of 600 GB; the roughly 74 GB that remain cannot hold a second copy of the extended artifact, which is why section 14 streams the S3 read-back when the volume lacks room. Section 13 states the expected validation outcome.
 
@@ -699,7 +748,7 @@ Reacquisition from NGA is a fallback for an integrity failure or a stalled trans
 
 ## 10. Two control builds and the adjudicated comparison
 
-Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests. When the contract's `control_reference` is `vm-planetary-build`, the fence instead builds the reference on the VM with the planetary adapter worktree that section 8 converged, records its digests as `expected-control-sha256.json`, copies the reference tree off the VM as the campaign's preserved control, and writes the digests into the evidence copy of the contract; the planetary rebuild in the next fence then compares two builds of the same adapter on the same machine, so no workstation float result is ever the byte reference:
+Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests. When the contract's `control_reference` is `vm-planetary-build`, the fence instead builds the reference on the VM with the planetary adapter worktree that section 8 converged, records its digests as `expected-control-sha256.json`, copies the reference tree off the VM as the campaign's preserved control under the per-campaign evidence directory (`control-reference/<control>`, so a rerun in the same evidence root starts from a fresh reference instead of refusing on the previous one), and writes the digests into the evidence copy of the contract; the planetary rebuild in the next fence then compares two builds of the same adapter on the same machine, so no workstation float result is ever the byte reference:
 
 ```bash
 ssh -o BatchMode=yes "root@$SERVER_IP" mkdir -p "$CONTROL_ROOT/preserved"
@@ -1107,7 +1156,8 @@ artifact_bytes=$(find "$campaign_dir/assembly/dataset" -type f -exec stat -c '%s
 available_bytes=$(df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ')
 if test "$available_bytes" -ge $((artifact_bytes + 10000000000)); then
   printf 'readback_mode=on-disk artifact_bytes=%s available_bytes=%s\n' "$artifact_bytes" "$available_bytes"
-  rm -rf /mnt/hfx/work/s3-readback && mkdir -p /mnt/hfx/work/s3-readback
+  rm -rf /mnt/hfx/work/s3-readback
+  mkdir -p /mnt/hfx/work/s3-readback
   aws s3 cp "$prefix/extension-hfx-v0-3-0/dataset/" /mnt/hfx/work/s3-readback/dataset/ --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
   (cd /mnt/hfx/work/s3-readback && sed 's#^\([0-9a-f]\{64\}\)  assembly/dataset/#\1  dataset/#' /mnt/hfx/work/sha256/campaign-assembly-dataset-sha256.txt | sha256sum -c) > /mnt/hfx/work/sha256/extension-s3-readback-verification.txt
   ! grep -v ': OK$' /mnt/hfx/work/sha256/extension-s3-readback-verification.txt
@@ -1251,6 +1301,7 @@ bash scripts/hetzner/test-price-preflight.sh
 bash scripts/hetzner/test-compare-dataset-trees.sh
 bash scripts/hetzner/test-compose-campaign-driver.sh
 bash scripts/hetzner/test-launch.sh
+bash scripts/hetzner/test-prepare-rehearsal-campaign.sh
 bash scripts/hetzner/test-campaign-dry-run.sh
 bash scripts/hetzner/test-tdx-hydro-campaign.sh
 uv run --frozen --project adapters/tdx-hydro python adapters/tdx-hydro/test_compare_unit_outlets.py
@@ -1275,4 +1326,4 @@ diff -q "$HFX_CAMPAIGN_EVIDENCE/composed/fence-diff-proof.txt" <(python3 scripts
 printf '%s\n' "$S3_ENV_FILE_PATH" | caffeinate -i -s bash "$HFX_CAMPAIGN_EVIDENCE/composed/campaign-driver.sh"
 ```
 
-Before any lifecycle, `scripts/hetzner/campaign-dry-run.sh` executes the entire composed driver on the workstation at zero cloud cost: it clones the committed `HEAD`, prepares the rehearsal inputs from the synthetic corpus, and runs every fence of sections 4 to 16 under the rehearsal contract with the cloud and the VM replaced by shims. `ssh`, `scp`, and `rsync` remap the VM paths onto a scratch VM root and run each `bash -s` script through the same argument joining the real `ssh` performs; `hcloud` answers from a state file seeded with the recorded fixtures and honours detach and delete; `aws` reads and writes a directory standing in for the bucket; `curl` answers the price preflight from a fixture; `provision.sh` and `bootstrap.sh` are stubs that lay out the VM root; `launch.sh`, `teardown.sh`, `tmux`, the campaign runner, both adapter revisions, and `hfx` run unchanged. The run passes only when `lifecycle-result.json` records `passed` and the shimmed teardown proves zero footprint, and `--record` writes `campaign-dry-run-result.json`, which the section 4 `dry-run-passed` check requires for the ref about to run. Rehearsal runs 1 to 3 each ended on a defect this dry run would have surfaced at zero cost. The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The composer also refuses any `bash -s --` line whose arguments are not exactly `"$(remote_tokens "${remote_args[@]}")"` preceded by a `remote_args=(...)` assignment, and its test suite runs every such fence's argument construction through a fake `ssh` that joins and re-splits the command string the way the real one does, proving on the workstation that each remote script receives every positional it validates. Other remote invocations (`mkdir -p`, `tail -n 1`, the `du`, `sha256sum -c`, and `rm -f` command strings of section 9, the `tmux kill-session` loop of the trap, and every `rsync` remote path) carry only constant paths, validated identifiers, or names matched by a fixed pattern, so they contain no character the remote shell could split. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.
+Before any lifecycle, `scripts/hetzner/campaign-dry-run.sh` executes the entire composed driver on the workstation at zero cloud cost: it clones the committed `HEAD`, prepares the rehearsal inputs from the synthetic corpus, and runs every fence of sections 4 to 16 under the rehearsal contract with the cloud and the VM replaced by shims. `ssh`, `scp`, and `rsync` remap the VM paths onto a scratch VM root and run each `bash -s` script through the same argument joining the real `ssh` performs; `hcloud` answers from a state file seeded with the recorded fixtures and honours detach and delete; `aws` reads and writes a directory standing in for the bucket; `curl` answers the price preflight from a fixture; `provision.sh` and `bootstrap.sh` are stubs that lay out the VM root; `launch.sh`, `teardown.sh`, `tmux`, the campaign runner, both adapter revisions, and `hfx` run unchanged. The run passes only when `lifecycle-result.json` records `passed` and the shimmed teardown proves zero footprint; `--lifecycles 2` runs the driver a second time in the same evidence root against a fresh shimmed VM and a cleared extension scratch prefix, as a rerun after a failed rehearsal does, and `--record` writes `campaign-dry-run-result.json`, which the section 4 `dry-run-passed` check requires for the ref about to run. Rehearsal runs 1 to 3 each ended on a defect this dry run would have surfaced at zero cost; run 4 passed. The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The composer also refuses any `bash -s --` line whose arguments are not exactly `"$(remote_tokens "${remote_args[@]}")"` preceded by a `remote_args=(...)` assignment, and its test suite runs every such fence's argument construction through a fake `ssh` that joins and re-splits the command string the way the real one does, proving on the workstation that each remote script receives every positional it validates. Other remote invocations (`mkdir -p`, `tail -n 1`, the `du`, `sha256sum -c`, and `rm -f` command strings of section 9, the `tmux kill-session` loop of the trap, and every `rsync` remote path) carry only constant paths, validated identifiers, or names matched by a fixed pattern, so they contain no character the remote shell could split. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.

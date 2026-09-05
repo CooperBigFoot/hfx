@@ -314,4 +314,68 @@ grep -q '^2000000000$' "$tmp/fake-ssh/arrived-08-1.txt" || die 'fence 8 required
 grep -q '^/mnt/hfx/work/control builds$' "$tmp/fake-ssh/arrived-22-1.txt" || die 'a path with a space did not survive the remote split'
 pass 'every bash -s fence delivers each argument intact through a joined and re-split ssh command, including fence 8 sizing'
 
+
+# Two gates within the same UTC second must write two records: fence 15 runs `campaign_gate compile-monitor`
+# and wait_workload runs it again at once, and the 2026-09-05 dry run saw price-preflight refuse the second
+# record with `--out already exists`, counted as a transport failure. Run the real helper behind the fakes.
+mkdir -p "$tmp/gate/scripts/hetzner" "$tmp/gate/bin" "$tmp/gate/evidence"
+cp -- "$SCRIPT_DIR/price-preflight.sh" "$SCRIPT_DIR/common.sh" "$tmp/gate/scripts/hetzner/"
+cat >"$tmp/gate/bin/security" <<'FAKE'
+#!/usr/bin/env bash
+printf 'TEST-HCLOUD-TOKEN\n'
+FAKE
+cat >"$tmp/gate/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+cat >/dev/null
+cat -- "$HFX_TEST_PRICE_FIXTURE"
+FAKE
+chmod +x "$tmp/gate/bin/security" "$tmp/gate/bin/curl"
+printf '%s\n' "$(( $(date +%s) - 60 ))" >"$tmp/gate/evidence/provisioning-request-epoch.txt"
+cat >"$tmp/gate-harness.sh" <<HARNESS
+set -Eeuo pipefail
+IFS=\$'\n\t'
+cd "$tmp/gate"
+export PATH="$tmp/gate/bin:\$PATH"
+export HFX_TEST_PRICE_FIXTURE=$SCRIPT_DIR/fixtures/pricing-fsn1.json
+LOCAL_EVIDENCE_DIR=$tmp/gate/evidence
+SERVER_TYPE=cx23; LOCATION=fsn1; VOLUME_SIZE_GB=10
+ELAPSED_CEILING_HOURS=72; BILLABLE_OUTBOUND_BYTES=0; BUDGET_CEILING_EUR=40.00
+# Pin the clock so both gates fall in the same second whatever the machine does between them.
+date() { case "\$1 \${2-}" in '-u +%Y%m%dT%H%M%SZ') printf '20260905T170000Z\n' ;; *) command date "\$@" ;; esac; }
+sleep() { printf 'slept %s\n' "\$1" >>"$tmp/gate/sleeps.txt"; }
+source "$tmp/full/fence-proof/driver-04.sh"
+campaign_gate compile-monitor 20
+campaign_gate compile-monitor 20
+HARNESS
+bash "$tmp/gate-harness.sh" >"$stdout" 2>"$stderr" || die "two gates in one second did not both pass ($(cat "$stderr"))"
+[[ $(ls "$tmp/gate/evidence" | grep -c '^gate-compile-monitor-20260905T170000Z-000[12]\.json$') == 2 ]] ||
+    die "two gates in one second did not write two records: $(ls "$tmp/gate/evidence" | tr '\n' ' ')"
+[[ $(grep -c '^record=' "$tmp/gate/evidence/gates.log") == 2 ]] || die 'gates.log does not carry both records'
+[[ ! -e "$tmp/gate/evidence/gate-transport-failures.log" ]] || die 'a same-second gate was counted as a transport failure'
+[[ ! -e "$tmp/gate/sleeps.txt" ]] || die 'a same-second gate slept for a retry'
+jq -e '.projected_gross_total_eur | type == "number" or type == "string"' "$tmp/gate/evidence/gate-compile-monitor-20260905T170000Z-0002.json" >/dev/null ||
+    die 'the second gate record is not a price preflight record'
+pass 'two campaign gates within one second write two distinct records and record no transport failure'
+
+# Every top-level `a && b` list in a fence would continue after a failed non-final member under errexit
+# (the swap chain of fence 8 skipped swapon after a failed mkswap). Only conditions, `&& break`,
+# `&& status=1`, the per-basin count, `[[ ... ]]`, and `(cd ... && ...)` subshells whose status is
+# the list's own may keep the form; everything else is one statement per line.
+and_lists() {
+    local number
+    for number in $(seq -w 1 25); do
+        awk -v fence="$number" '/ && / { line = $0; sub(/^[[:space:]]+/, "", line); if (line ~ /^#/) next; print fence ":" line }' \
+            "$tmp/full/fence-proof/driver-$number.sh"
+    done
+}
+and_list_count=0
+while IFS=: read -r number line; do
+    and_list_count=$((and_list_count + 1))
+    case $line in
+        'if '*|'while '*|'until '*|'elif '*|*' && break'|*' && '*'=1'|'test "$(for id in '*'&& printf '*|'[['*|'(cd '*|'"cd '*'&& sha256sum -c '*) continue ;;
+    esac
+    die "fence $number carries a top-level && list that fails open under errexit: $line"
+done < <(and_lists)
+[[ "$and_list_count" -ge 20 ]] || die "the && audit saw only $and_list_count lines; the fence proof was not scanned"
+pass 'no fence carries a top-level && list whose non-final member could fail without stopping the driver'
 printf '1..%d\n' "$passed"
