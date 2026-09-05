@@ -187,11 +187,13 @@ IFS=$'\n\t'
 
 test -n "${HFX_CAMPAIGN_EVIDENCE:-}"
 case "$HFX_CAMPAIGN_EVIDENCE" in /*) ;; *) exit 1 ;; esac
-test -d "$HFX_CAMPAIGN_EVIDENCE" && test ! -L "$HFX_CAMPAIGN_EVIDENCE"
+test -d "$HFX_CAMPAIGN_EVIDENCE"
+test ! -L "$HFX_CAMPAIGN_EVIDENCE"
 RUNBOOK=scripts/hetzner/RUNBOOK-tdx-hydro-seven-basin-compile.md
 if test -n "${HFX_CAMPAIGN_CONTRACT:-}"; then
   case "$HFX_CAMPAIGN_CONTRACT" in /*) ;; *) exit 1 ;; esac
-  test -f "$HFX_CAMPAIGN_CONTRACT" && test ! -L "$HFX_CAMPAIGN_CONTRACT"
+  test -f "$HFX_CAMPAIGN_CONTRACT"
+  test ! -L "$HFX_CAMPAIGN_CONTRACT"
   CAMPAIGN_CONTRACT_JSON=$(cat -- "$HFX_CAMPAIGN_CONTRACT")
 else
   CAMPAIGN_CONTRACT_JSON=$(sed -n '/^<!-- BEGIN COMPILE CAMPAIGN CONTRACT$/,/^END COMPILE CAMPAIGN CONTRACT -->$/p' "$RUNBOOK" | sed '1d;$d')
@@ -203,7 +205,8 @@ CAMPAIGN=$(contract_value '.campaign')
 [[ "$CAMPAIGN" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]
 SERVER_NAME=$(contract_value '.server_name')
 VOLUME_NAME=$(contract_value '.volume_name')
-test "$SERVER_NAME" = "hfx-build-$CAMPAIGN" && test "$VOLUME_NAME" = "hfx-build-$CAMPAIGN-data"
+test "$SERVER_NAME" = "hfx-build-$CAMPAIGN"
+test "$VOLUME_NAME" = "hfx-build-$CAMPAIGN-data"
 SERVER_TYPE=$(contract_value '.server_type')
 LOCATION=$(contract_value '.location')
 VOLUME_SIZE_GB=$(contract_value '.volume_size_gb')
@@ -211,7 +214,8 @@ CONTROL_ID=$(contract_value '.control_basin')
 CONTROL_UNIT_COUNT=$(contract_value '.control_unit_count')
 ABSENT_IDS=()
 while IFS= read -r absent_id; do ABSENT_IDS+=("$absent_id"); done < <(contract_value '.absent_basins[]')
-test "${#ABSENT_IDS[@]}" -eq "$(contract_value '.absent_basins | length')" && test "${#ABSENT_IDS[@]}" -ge 1
+test "${#ABSENT_IDS[@]}" -eq "$(contract_value '.absent_basins | length')"
+test "${#ABSENT_IDS[@]}" -ge 1
 FABRIC_VERSION=$(contract_value '.fabric_version')
 CONTROL_FABRIC_VERSION=$(contract_value '.control_fabric_version')
 WORKSPACE_ROOT=/mnt/hfx/work
@@ -239,7 +243,8 @@ CONTROL_REFERENCE=$(contract_value '.control_reference')
 test "$CONTROL_REFERENCE" = preserved-off-vm || test "$CONTROL_REFERENCE" = vm-planetary-build
 LOCAL_EVIDENCE_DIR="$HFX_CAMPAIGN_EVIDENCE/$CAMPAIGN"
 if test -e "$LOCAL_EVIDENCE_DIR" && test "${HFX_CAMPAIGN_RESUME:-0}" != 1; then
-  test -d "$LOCAL_EVIDENCE_DIR" && test ! -L "$LOCAL_EVIDENCE_DIR"
+  test -d "$LOCAL_EVIDENCE_DIR"
+  test ! -L "$LOCAL_EVIDENCE_DIR"
   mv -- "$LOCAL_EVIDENCE_DIR" "$LOCAL_EVIDENCE_DIR-superseded-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 if test "${HFX_CAMPAIGN_RESUME:-0}" = 1; then test -f "$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt"; fi
@@ -250,7 +255,10 @@ rsync --version | sed -n 1p | grep -E '^rsync +version 3\.[1-9]'
 
 printf '%s\n' 'Enter the secrets environment FILE PATH (contents must never be displayed):' >&2
 IFS= read -r S3_ENV_FILE
-test -n "$S3_ENV_FILE" && test -f "$S3_ENV_FILE" && test ! -L "$S3_ENV_FILE" && test -s "$S3_ENV_FILE"
+test -n "$S3_ENV_FILE"
+test -f "$S3_ENV_FILE"
+test ! -L "$S3_ENV_FILE"
+test -s "$S3_ENV_FILE"
 ```
 
 `remote_tokens` quotes every argument a fence sends to the VM with `printf '%q'`. `ssh` joins its remote command arguments into one string that the remote login shell splits again, so an unquoted argument holding a space arrives as several positional parameters; on 2026-09-04 at 21:03:54Z the rehearsal's converge fence sent five sizing values as one space-joined argument, the VM saw five parameters, the remote `read` filled one variable, and the numeric guard ended the lifecycle before any output. Every `bash -s --` fence therefore builds a `remote_args` array, sends exactly `"$(remote_tokens "${remote_args[@]}")"`, and the remote script assigns and validates each positional it expects before doing anything else; section 20's composer refuses any other form.
@@ -285,7 +293,8 @@ fi
 ./scripts/hetzner/verify-campaign-inputs.sh --s3-env-file "$S3_ENV_FILE" --check credential-file-authenticates
 ./scripts/hetzner/verify-campaign-inputs.sh --check hcloud-context-resolves
 
-test -f "$CORPUS_MANIFEST" && test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPUS_FILE_COUNT"
+test -f "$CORPUS_MANIFEST"
+test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPUS_FILE_COUNT"
 (cd "$CORPUS_DIR" && shasum -a 256 -c "$CORPUS_MANIFEST") | tee "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt"
 test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt")" -eq "$CORPUS_FILE_COUNT"
 test "$(find "$CORPUS_DIR" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s}')" -eq "$CORPUS_TOTAL_BYTES"
@@ -296,7 +305,8 @@ if test "$CONTROL_REFERENCE" = preserved-off-vm; then
   test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
 else
   test ! -e "$PRESERVED_CONTROL"
-  test "$(contract_value '.control_digests')" = DERIVED-ON-VM && test "$CONTROL_ADJUDICATION_SOURCE" = DERIVED-ON-VM
+  test "$(contract_value '.control_digests')" = DERIVED-ON-VM
+  test "$CONTROL_ADJUDICATION_SOURCE" = DERIVED-ON-VM
 fi
 
 contract_value '.baseline.basin_ids | sort | unique' | jq -c . > "$LOCAL_EVIDENCE_DIR/baseline-roster.json"
@@ -346,13 +356,14 @@ Install this gate after provisioning and run it before every workload dispatch a
 campaign_gate() {
   test "$#" -eq 2
   local phase=$1 remaining_hours=$2 origin now elapsed record gate_attempt gate_status
+  GATE_SEQUENCE=$((${GATE_SEQUENCE:-0} + 1))
   [[ "$phase" =~ ^[a-z0-9-]+$ ]]
   [[ "$remaining_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]
   origin=$(<"$LOCAL_EVIDENCE_DIR/provisioning-request-epoch.txt")
   [[ "$origin" =~ ^[0-9]+$ ]]
   now=$(date +%s)
   elapsed=$(awk -v now="$now" -v origin="$origin" 'BEGIN { printf "%.10f\n", (now - origin) / 3600 }')
-  record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ).json"
+  record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04d' "$GATE_SEQUENCE").json"
   if ! awk -v elapsed="$elapsed" -v remaining="$remaining_hours" -v ceiling="$ELAPSED_CEILING_HOURS" \
       'BEGIN { exit !(elapsed + remaining < ceiling) }'; then
     : > "$LOCAL_EVIDENCE_DIR/hard-ceiling-reached"
@@ -370,7 +381,8 @@ campaign_gate() {
     if test "$gate_status" -eq 0 || test "$gate_status" -eq 3; then break; fi
     printf 'phase=%s\nattempt=%s\ntransport_status=%s\n' "$phase" "$gate_attempt" "$gate_status" >> "$LOCAL_EVIDENCE_DIR/gate-transport-failures.log"
     sleep 30
-    record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ).json"
+    GATE_SEQUENCE=$((GATE_SEQUENCE + 1))
+    record="$LOCAL_EVIDENCE_DIR/gate-$phase-$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04d' "$GATE_SEQUENCE").json"
   done
   if test "$gate_status" -ne 0; then
     : > "$LOCAL_EVIDENCE_DIR/hard-ceiling-reached"
@@ -382,6 +394,8 @@ campaign_gate() {
 ```
 
 Hetzner exposes no invoice total through the API. The conservative actual spend in each gate record is an upper bound computed from current rates and billed hours, the same approach the earlier lifecycles recorded. A refusal stops dispatch and enters preservation and teardown.
+
+Each record name carries the UTC second and a per-shell sequence number (`gate-<phase>-<UTC second>-<NNNN>.json`), because the helper refuses to overwrite an existing record and the section 11 monitor pair runs a gate twice within one second when nothing slow sits between the calls; the 2026-09-05 dry run counted that refusal as a transport failure.
 
 ## 6. Read-only quota, exact-name, and ref preflight
 
@@ -600,11 +614,26 @@ root_avail=$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')
 root_swap_bytes=$((root_avail - root_disk_reserve_bytes))
 if test "$root_swap_bytes" -gt "$root_swap_bytes_max"; then root_swap_bytes=$root_swap_bytes_max; fi
 test "$root_swap_bytes" -gt 0
-fallocate -l "$root_swap_bytes" /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+fallocate -l "$root_swap_bytes" /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
 mkdir -p /mnt/hfx/swap
-fallocate -l "$volume_swap_bytes" /mnt/hfx/swap/swapfile && chmod 600 /mnt/hfx/swap/swapfile && mkswap /mnt/hfx/swap/swapfile && swapon /mnt/hfx/swap/swapfile
+fallocate -l "$volume_swap_bytes" /mnt/hfx/swap/swapfile
+chmod 600 /mnt/hfx/swap/swapfile
+mkswap /mnt/hfx/swap/swapfile
+swapon /mnt/hfx/swap/swapfile
 swapon --show --bytes
 free -b
+swapon --show=NAME --noheadings | grep -q -x -F -- /swapfile
+swapon --show=NAME --noheadings | grep -q -x -F -- /mnt/hfx/swap/swapfile
+expected_swap_bytes=$((root_swap_bytes + volume_swap_bytes))
+swap_total_kib=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+[[ "$swap_total_kib" =~ ^[0-9]+$ ]]
+swap_total_bytes=$((swap_total_kib * 1024))
+printf 'swap_total_bytes=%s expected_swap_bytes=%s\n' "$swap_total_bytes" "$expected_swap_bytes"
+test "$swap_total_bytes" -ge $((expected_swap_bytes - 2097152))
+printf '%s\n' "$swap_total_bytes" > /root/observed-swap-total-bytes.txt
 df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ' > /root/observed-available-disk-bytes.txt
 test "$(cat /root/observed-available-disk-bytes.txt)" -ge "$required_available_disk_bytes"
 awk -v required="$required_memory_bytes" '/MemAvailable:/ {exit !($2 * 1024 >= required)}' /proc/meminfo
@@ -612,9 +641,12 @@ mkdir -p /mnt/hfx/work/sha256 /mnt/hfx/work/control-builds/preserved "$HOME/.ssh
 REMOTE
 scp -o BatchMode=yes "root@$SERVER_IP:/root/hfx-planetary-provenance.txt" "$LOCAL_EVIDENCE_DIR/planetary-provenance.txt"
 scp -o BatchMode=yes "root@$SERVER_IP:/root/observed-available-disk-bytes.txt" "$LOCAL_EVIDENCE_DIR/observed-available-disk-bytes.txt"
+scp -o BatchMode=yes "root@$SERVER_IP:/root/observed-swap-total-bytes.txt" "$LOCAL_EVIDENCE_DIR/observed-swap-total-bytes.txt"
 ```
 
 The remote `rsync --version` line reads the banner through `sed -n 1p` for the same reason as the workstation line in section 4: the remote rsync 3.2.7 wrote its banner in several writes, `head -n 1` closed the pipe, and the resulting SIGPIPE exit 141 under the remote `pipefail` ended the first converge of the second 2026-09-04 lifecycle at 12:59:17Z. The converge also creates `/mnt/hfx/work/control-builds/preserved`, the parent directory the section 10 transfer needs; on 2026-09-04 at 16:00:31Z the transfer ran before any command had created it, remote rsync failed with `mkdir ... No such file or directory`, and that lifecycle ended there.
+
+Each swap step is its own statement. Under `set -e` only the last member of an `a && b && c` list can end the script, so the earlier `fallocate ... && mkswap ... && swapon ...` chain would have skipped `swapon` after a failed `mkswap` and carried on without swap; on the `ccx33` the 55-basin strict validation would then have been OOM-killed hours later. The post-condition requires both swap files in `swapon --show`, and `SwapTotal` from `/proc/meminfo` within 2 MiB of the contract's root plus volume swap bytes (each swap file gives up one page to its header and rounds down to a page); the observed total is preserved as `observed-swap-total-bytes.txt`. The same rule applies to every check in this runbook: a `test a && test b` line at the top level continues after a failed `test a`, so each check stands on its own line.
 
 Swap and capacity sizing come from the contract's `workload_sizing`. For production: the 55-basin strict validation needed about 265 GB resident and finished only on 287 GB of swap. A `ccx33` has 32 GB of memory and a 240 GB local disk, so the root swap file takes up to 200 GB after a 20 GB root reserve and the volume swap file 150 GB, about 350 GB in total. The volume then holds the corpus (84.1 GB), the baseline (114.1 GB), the extended artifact (about 130 GB), per-basin outputs (about 25 GB), control builds (about 9 GB), and 150 GB of swap, about 510 GB of 600 GB; the roughly 74 GB that remain cannot hold a second copy of the extended artifact, which is why section 14 streams the S3 read-back when the volume lacks room. Section 13 states the expected validation outcome.
 
@@ -1107,7 +1139,8 @@ artifact_bytes=$(find "$campaign_dir/assembly/dataset" -type f -exec stat -c '%s
 available_bytes=$(df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ')
 if test "$available_bytes" -ge $((artifact_bytes + 10000000000)); then
   printf 'readback_mode=on-disk artifact_bytes=%s available_bytes=%s\n' "$artifact_bytes" "$available_bytes"
-  rm -rf /mnt/hfx/work/s3-readback && mkdir -p /mnt/hfx/work/s3-readback
+  rm -rf /mnt/hfx/work/s3-readback
+  mkdir -p /mnt/hfx/work/s3-readback
   aws s3 cp "$prefix/extension-hfx-v0-3-0/dataset/" /mnt/hfx/work/s3-readback/dataset/ --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
   (cd /mnt/hfx/work/s3-readback && sed 's#^\([0-9a-f]\{64\}\)  assembly/dataset/#\1  dataset/#' /mnt/hfx/work/sha256/campaign-assembly-dataset-sha256.txt | sha256sum -c) > /mnt/hfx/work/sha256/extension-s3-readback-verification.txt
   ! grep -v ': OK$' /mnt/hfx/work/sha256/extension-s3-readback-verification.txt

@@ -329,7 +329,11 @@ set -Eeuo pipefail
 set +x
 findmnt -rn -M /mnt/hfx -o SOURCE,OPTIONS | grep -E ' rw,|,rw,'
 stat -c 'credential %U:%G %a' /etc/pourpoint-hfx.env
-cd /root/hfx && git fetch origin main && git checkout --detach "$1" && test "$(git rev-parse HEAD)" = "$1" && test -z "$(git status --porcelain)"
+cd /root/hfx
+git fetch origin main
+git checkout --detach "$1"
+test "$(git rev-parse HEAD)" = "$1"
+test -z "$(git status --porcelain)"
 printf 'hfx HEAD %s\n' "$(git -C /root/hfx rev-parse HEAD)"
 test -x /root/hfx/target/release/hfx
 printf 'swap: %s\n' "$(swapon --show --noheadings | tr '\n' ';')"
@@ -381,7 +385,7 @@ milestone 01-preflight-passed "sections 4-6 passed; ground_truth_ref=$GROUND_TRU
 
     if first <= 8:
         add(fence_block(8, fences[7]))
-        add('oplog "converged; observed-available-disk-bytes=$(cat "$LOCAL_EVIDENCE_DIR/observed-available-disk-bytes.txt")"\n')
+        add('oplog "converged; observed-available-disk-bytes=$(cat "$LOCAL_EVIDENCE_DIR/observed-available-disk-bytes.txt"); observed-swap-total-bytes=$(cat "$LOCAL_EVIDENCE_DIR/observed-swap-total-bytes.txt")"\n')
     if first <= 9:
         add(fence_block(9, fences[8]))
         add(r'''POLL_SECONDS=20 wait_workload tdx-init init-monitor "$(gate_reserve pre-acquire)" "$(decision_point 0)"

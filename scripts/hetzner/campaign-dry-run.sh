@@ -7,7 +7,9 @@
 # onto a scratch VM root and run `bash -s` scripts with the same argument
 # joining the real ssh performs; hcloud answers from a state file seeded with
 # the recorded fixtures; aws reads and writes a directory standing in for the
-# bucket; curl answers the price preflight from a fixture; provision.sh and
+# bucket; curl answers the price preflight from a fixture; fallocate, mkswap,
+# swapon, free, and /proc/meminfo keep a swap table so the converge fence's swap
+# post-condition reads what the fence created; provision.sh and
 # bootstrap.sh are replaced by stubs that lay out the VM root; launch.sh,
 # teardown.sh, tmux, the campaign runner, the adapter, and hfx run unchanged.
 # The dry run exercises the committed HEAD: it clones the repository, so
@@ -78,6 +80,10 @@ export DRY_VM_BIN=$work/vm-bin
 export DRY_WS_BIN=$work/bin
 export DRY_BARE=$work/bare.git
 export DRY_LOG=$work/dry-run.log
+export DRY_FIXTURES=$repo_root/scripts/hetzner/fixtures
+# Fault injection for the dry-run test: a nonzero status makes the mkswap shim fail with it.
+export DRY_MKSWAP_STATUS=${DRY_MKSWAP_STATUS:-0}
+[[ "$DRY_MKSWAP_STATUS" =~ ^[0-9]+$ ]] || hfx_die 'DRY_MKSWAP_STATUS must be a non-negative integer'
 mkdir -p "$DRY_VMROOT" "$DRY_BUCKET" "$DRY_VM_BIN" "$DRY_WS_BIN" "$work/evidence"
 hfx_log "scratch: $work"
 
@@ -110,7 +116,15 @@ mkdir -p "$DRY_VMROOT/mnt/hfx/work/downloads" "$DRY_VMROOT/mnt/hfx/logs" "$DRY_V
     "$DRY_VMROOT/opt" "$DRY_VMROOT/etc" "$DRY_VMROOT/proc"
 # The whole environment directory is linked so Python finds pyvenv.cfg beside the invoked path.
 ln -s "$(cd -P -- "$(dirname -- "$venv_python")/.." && pwd)" "$DRY_VMROOT/opt/hfx-geo"
-printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\n' >"$DRY_VMROOT/proc/meminfo"
+write_meminfo() {
+    # SwapTotal follows the swap table the swapon shim maintains, so the fence 8 post-condition reads real state.
+    local swap_kib=0 kib
+    if [[ -f "$DRY_VMROOT/swap-table.txt" ]]; then
+        while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$DRY_VMROOT/swap-table.txt"
+    fi
+    printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\nSwapTotal:      %8d kB\nSwapFree:       %8d kB\n' "$swap_kib" "$swap_kib" >"$DRY_VMROOT/proc/meminfo"
+}
+write_meminfo
 
 write_shim() {
     local path=$1
@@ -124,7 +138,7 @@ s#/mnt/hfx#$DRY_VMROOT/mnt/hfx#g
 s#/root/#$DRY_VMROOT/root/#g
 s#/opt/hfx-geo#$DRY_VMROOT/opt/hfx-geo#g
 s#/etc/pourpoint-hfx\.env#$DRY_VMROOT/etc/pourpoint-hfx.env#g
-s#/swapfile#$DRY_VMROOT/swapfile#g
+s#\([[:space:]]\)/swapfile#\1$DRY_VMROOT/swapfile#g
 s#/proc/meminfo#$DRY_VMROOT/proc/meminfo#g
 EOF
 
@@ -178,22 +192,65 @@ while (($#)); do
 done
 exec /usr/bin/install "${args[@]}"
 SHIM
-for noop in fallocate mkswap; do
-    write_shim "$DRY_VM_BIN/$noop" <<'SHIM'
+# Swap: fallocate creates a sparse file of the requested size, mkswap stamps a signature sidecar
+# whose size follows the kernel's model (whole 4 KiB pages, one page for the header), swapon
+# requires the signature and appends the file to the swap table that meminfo and free report.
+write_shim "$DRY_VM_BIN/fallocate" <<'SHIM'
 #!/usr/bin/env bash
-exit 0
+set -Eeuo pipefail
+[[ ${1-} == -l && ${2-} =~ ^[0-9]+$ && -n ${3-} ]] || { printf 'dry-run fallocate: unsupported: %s\n' "$*" >&2; exit 1; }
+: >"$3"
+dd if=/dev/null of="$3" bs=1 seek="$2" count=0 2>/dev/null
 SHIM
-done
+write_shim "$DRY_VM_BIN/mkswap" <<'SHIM'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${DRY_MKSWAP_STATUS:-0}" != 0 ]]; then printf 'dry-run mkswap: injected failure on %s\n' "${1-}" >&2; exit "$DRY_MKSWAP_STATUS"; fi
+path=${1-}
+[[ -f "$path" ]] || { printf 'mkswap: cannot open %s: No such file or directory\n' "$path" >&2; exit 1; }
+pages=$(( $(/usr/bin/stat -f %z -- "$path") / 4096 ))
+((pages >= 10)) || { printf 'mkswap: error: swap area needs to be at least 40 KiB\n' >&2; exit 1; }
+printf '%s\n' "$(( (pages - 1) * 4 ))" >"$path.dry-run-swap-kib"
+printf 'Setting up swapspace version 1, size = %s KiB (dry run)\n' "$(( (pages - 1) * 4 ))"
+SHIM
 write_shim "$DRY_VM_BIN/swapon" <<'SHIM'
 #!/usr/bin/env bash
-if [[ ${1-} == --show ]]; then
-    printf 'NAME TYPE SIZE USED PRIO\n/swapfile file 8000000000 0 -2\n/mnt/hfx/swap/swapfile file 2000000000 0 -3\n'
+set -Eeuo pipefail
+table=$DRY_VMROOT/swap-table.txt
+if [[ ${1-} == --show* ]]; then
+    columns=; headings=1; unit=1024
+    while (($#)); do
+        case $1 in
+            --show) ;;
+            --show=*) columns=${1#--show=} ;;
+            --noheadings) headings=0 ;;
+            --bytes) unit=1024 ;;
+            *) printf 'dry-run swapon: unsupported: %s\n' "$*" >&2; exit 1 ;;
+        esac
+        shift
+    done
+    [[ -f "$table" ]] || exit 0
+    if [[ "$columns" == NAME ]]; then
+        cut -d ' ' -f1 -- "$table"
+    else
+        ((headings == 0)) || printf 'NAME TYPE SIZE USED PRIO\n'
+        priority=-2
+        while read -r path kib; do printf '%s file %s 0 %s\n' "$path" "$((kib * unit))" "$priority"; priority=$((priority - 1)); done <"$table"
+    fi
+    exit 0
 fi
-exit 0
+path=${1-}
+[[ -f "$path.dry-run-swap-kib" ]] || { printf 'swapon: %s: read swap header failed\n' "$path" >&2; exit 255; }
+printf '%s %s\n' "$path" "$(cat "$path.dry-run-swap-kib")" >>"$table"
+swap_kib=0
+while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$table"
+printf 'MemTotal:        4000000 kB\nMemFree:         3500000 kB\nMemAvailable:    3600000 kB\nSwapTotal:      %8d kB\nSwapFree:       %8d kB\n' "$swap_kib" "$swap_kib" >"$DRY_VMROOT/proc/meminfo"
 SHIM
 write_shim "$DRY_VM_BIN/free" <<'SHIM'
 #!/usr/bin/env bash
-printf '               total        used        free\nMem:      4000000000   400000000  3600000000\nSwap:    10000000000           0 10000000000\n'
+swap_kib=0
+if [[ -f "$DRY_VMROOT/swap-table.txt" ]]; then while read -r _ kib; do swap_kib=$((swap_kib + kib)); done <"$DRY_VMROOT/swap-table.txt"; fi
+printf '               total        used        free\nMem:      4000000000   400000000  3600000000\nSwap:    %11d           0 %11d\n' "$((swap_kib * 1024))" "$((swap_kib * 1024))"
 SHIM
 write_shim "$DRY_VM_BIN/dmesg" <<'SHIM'
 #!/usr/bin/env bash
@@ -275,24 +332,16 @@ write_shim "$DRY_WS_BIN/security" <<'SHIM'
 #!/usr/bin/env bash
 printf 'DRY-RUN-HCLOUD-TOKEN\n'
 SHIM
-cat >"$work/pricing.json" <<'JSON'
-{"pricing":{"currency":"EUR","vat_rate":"8.100000",
- "primary_ips":[{"type":"ipv4","prices":[{"location":"fsn1","price_hourly":{"net":"0.0008000000","gross":"0.0008648000"}}]}],
- "volume":{"price_per_gb_month":{"net":"0.0572000000","gross":"0.0618332000"}},
- "server_types":[
-  {"name":"cx23","prices":[{"location":"fsn1","price_hourly":{"net":"0.0088000000","gross":"0.0095128000"},"included_traffic":21990232555520,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]},
-  {"name":"ccx33","prices":[{"location":"fsn1","price_hourly":{"net":"0.2219000000","gross":"0.2398739000"},"included_traffic":32985348833280,"price_per_tb_traffic":{"net":"1.0000000000","gross":"1.0810000000"}}]}]}}
-JSON
 write_shim "$DRY_WS_BIN/curl" <<'SHIM'
 #!/usr/bin/env bash
 cat >/dev/null
-cat -- "$DRY_WORK/pricing.json"
+cat -- "$DRY_FIXTURES/pricing-fsn1.json"
 SHIM
 cp -- "$DRY_VM_BIN/aws" "$DRY_WS_BIN/aws"
 
 # hcloud: a state file seeded with the recorded fixtures; describe, list, detach, delete, and create.
-fixtures=$repo_root/scripts/hetzner/fixtures/hcloud
-jq -n --slurpfile web "$fixtures/server-describe-pourpoint-web-1.json" '{servers: [$web[0]], volumes: [], next_id: 900000}' >"$DRY_HCLOUD_STATE"
+fixtures=$repo_root/scripts/hetzner/fixtures
+jq -n --slurpfile web "$fixtures/hcloud/server-describe-pourpoint-web-1.json" '{servers: [$web[0]], volumes: [], next_id: 900000}' >"$DRY_HCLOUD_STATE"
 write_shim "$DRY_WS_BIN/hcloud" <<'SHIM'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -315,8 +364,8 @@ case "$1 $2" in
     'volume list') jq '.volumes' "$state" ;;
     'server describe') select_server "$3" >/dev/null 2>&1 || { printf 'hcloud: server not found: %s\n' "$3" >&2; exit 1; }; select_server "$3" ;;
     'volume describe') select_volume "$3" >/dev/null 2>&1 || { printf 'hcloud: volume not found: %s\n' "$3" >&2; exit 1; }; select_volume "$3" ;;
-    'server-type describe') cat -- "$fixtures/server-type-describe-ccx33.json" ;;
-    'location describe') cat -- "$fixtures/location-describe-fsn1.json" ;;
+    'server-type describe') cat -- "$fixtures/hcloud/server-type-describe-ccx33.json" ;;
+    'location describe') cat -- "$fixtures/hcloud/location-describe-fsn1.json" ;;
     'volume detach')
         jq --arg key "$3" '(.volumes[] | select((.id | tostring) == $key) | .server) = null
             | (.servers[] | select(.volumes != null) | .volumes) |= map(select((. | tostring) != $key))' "$state" >"$state.tmp" && mv "$state.tmp" "$state" ;;
@@ -325,7 +374,6 @@ case "$1 $2" in
     *) printf 'dry-run hcloud: unsupported: %s\n' "$*" >&2; exit 1 ;;
 esac
 SHIM
-export DRY_FIXTURES=$fixtures
 
 # ssh: joins the remote command into one string, re-splits it through bash -c, remaps the VM paths in
 # the command and in the script on stdin, and runs it in the scratch VM with the VM-side shims first.
@@ -484,6 +532,9 @@ grep -qF 'has zero Hetzner footprint' "$evidence/teardown.log" || hfx_die 'teard
 for milestone in 01-preflight-passed 02-provisioned 03-corpus-verified-on-vm 04-control-gates-passed 05-compiles-done 06-assembly-done 07-preserved 08-validation-classified 09-torn-down; do
     [[ -f "$evidence/milestones/$milestone" ]] || hfx_die "milestone $milestone was not reached"
 done
+[[ ! -e "$evidence/gate-transport-failures.log" ]] ||
+    hfx_die "gate transport failures were recorded although the price shim never fails: $(tr '\n' ' ' <"$evidence/gate-transport-failures.log")"
+[[ -s "$evidence/observed-swap-total-bytes.txt" ]] || hfx_die 'the converge fence did not preserve observed-swap-total-bytes.txt'
 hfx_log "dry run passed: $(jq -c '{campaign, strict_validation, result}' "$evidence/lifecycle-result.json")"
 hfx_log "control gates: $(jq -c '.control_gates' "$evidence/lifecycle-result.json")"
 hfx_log "compiled basins: $(tr '\n' ' ' <"$evidence/compiled-absent-basins.txt")"
