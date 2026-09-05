@@ -322,9 +322,16 @@ case $check in
             and (.reruns | type == "string" and test("merged, reviewed fix"))
             and (.runs | type == "array" and all(.[];
                 (.date | type == "string") and (.provisioning_request | type == "string") and (.zero_footprint | type == "string")
-                and (.server_id | type == "number") and (.volume_id | type == "number") and (.cause | type == "string" and length > 0)
+                and (.server_id | type == "number") and (.volume_id | type == "number")
                 and (.workload_dispatched | type == "boolean") and (.estimated_cost_eur | type == "number" and . >= 0)))' <<<"$contract" >/dev/null 2>&1 ||
             fail 'rehearsal authority lacks a cumulative ceiling, the rerun rule, or a complete run ledger'
+        # Each run is either a failure with its cause or a pass with its ground truth ref and outcomes, never both.
+        jq -e '.lifecycle_ledger.rehearsal_authority.runs | all(.[];
+                (has("cause") and (.cause | type == "string" and length > 0) and (has("result") | not))
+                or ((has("cause") | not) and .result == "passed" and .strict_validation == "passed" and .workload_dispatched == true
+                    and (.ground_truth_ref | type == "string" and test("^[0-9a-f]{40}$"))
+                    and (.control_gates | type == "object" and .corrected_versus_reference == "identical" and .adjudicated == "accepted" and .outlet_differences == 0)))' <<<"$contract" >/dev/null 2>&1 ||
+            fail 'a rehearsal run is neither a failure with its cause nor a pass with its ground truth ref, strict validation, and control gate verdicts'
         jq -e '.lifecycle_ledger.rehearsal_authority | ([.runs[].estimated_cost_eur] | add // 0) < .cumulative_ceiling_eur' <<<"$contract" >/dev/null 2>&1 ||
             fail 'cumulative estimated rehearsal spend has reached the rehearsal ceiling; a new rehearsal needs new maintainer authority'
         jq -e '.lifecycle_ledger.rehearsal_authority.record | type == "string" and length > 0 and . != "RECORD-URL"' <<<"$contract" >/dev/null 2>&1 ||
