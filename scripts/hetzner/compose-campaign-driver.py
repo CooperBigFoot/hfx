@@ -9,7 +9,10 @@ workload finishes, the decision-point checks, the validation classification of
 section 13, and an exit-trap wrapper that turns errexit off before it calls the
 runbook's `campaign_cleanup`. The fence proof beside the driver lets a reviewer
 diff every embedded fence against the runbook; the composer itself refuses when
-a fence's first line is not the one this composer was written for.
+a fence's first line is not the one this composer was written for, when a
+remote script's arguments are not the quoted remote_args array, when a control
+fence reads the adjudication record before deriving it, or when a fence prints
+an accumulated awk sum through awk's default number format.
 
 Runs on the standard library only, so the workstation needs no Python project.
 """
@@ -105,6 +108,7 @@ def extract_fences(text: str) -> list[str]:
         if actual != first_line:
             raise ComposeError(f"fence {number} ({label}) starts with {actual!r}, expected {first_line!r}")
         check_remote_arguments(number, label, fences[number - 1])
+        check_integer_byte_sums(number, label, fences[number - 1])
     check_adjudication_reads(fences[12])
     return fences
 
@@ -182,6 +186,27 @@ def check_adjudication_reads(fence: str) -> None:
             if closes:
                 guarded = False
     raise ComposeError("fence 13 (control-builds) never derives the adjudication record")
+
+
+AWK_ACCUMULATED_PRINT = re.compile(r"\bawk\b[^']*'[^']*\+=[^']*\bprint\s+[^'\s]")
+
+
+def check_integer_byte_sums(number: int, label: str, fence: str) -> None:
+    """Refuse an awk program that accumulates a sum and prints it with bare `print`.
+
+    awk holds every number as a double and prints an accumulated value through
+    its output format; the mawk of Debian 12 writes any integer at or above
+    2^31 as `1.14063e+11`, which `test -eq` rejects. The 2026-09-05 production
+    lifecycle died on that form at the baseline byte check after the baseline
+    was fully pulled. Byte totals are summed in shell integer arithmetic; an
+    awk program may keep a sum only when it prints it through `printf` with an
+    explicit format.
+    """
+    for line_number, line in joined_lines(fence):
+        if AWK_ACCUMULATED_PRINT.search(line):
+            raise ComposeError(
+                f"fence {number} ({label}) line {line_number} prints an awk sum through awk's default number format: {line!r}"
+            )
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'
