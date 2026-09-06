@@ -38,7 +38,12 @@ for dir in "$superseded" "$tmp/work/evidence/campaign-rehearsal"; do
     jq -e '.result == "passed"' "$dir/lifecycle-result.json" >/dev/null || die "lifecycle under $dir did not pass"
 done
 [[ ! -e "$tmp/work/evidence/off-vm/control-builds" ]] || die 'a reference control was written into the shared off-vm inputs'
-pass 'a second lifecycle in the same evidence root passes with its own reference control after the first was superseded'
+object_count=$(jq -r '.baseline.object_count' "$tmp/work/evidence/dry-run-contract.json")
+[[ "$object_count" =~ ^[1-9][0-9]*$ ]] || die 'the resolved dry-run contract carries no baseline object count'
+grep -qx "baseline_objects_kept=0 baseline_objects_pulled=$object_count" "$superseded/baseline-pull.log" || die 'the first lifecycle did not pull every baseline object'
+grep -qx "baseline_objects_kept=$object_count baseline_objects_pulled=0" "$tmp/work/evidence/campaign-rehearsal/baseline-pull.log" ||
+    die 'the second lifecycle re-copied the baseline that the volume already held'
+pass 'a second lifecycle in the same evidence root passes with its own reference control after the first was superseded, and its baseline pull copies nothing'
 
 # The converge fence's swap post-condition read the swap table the shims built: SwapTotal must equal
 # the contract's root plus volume swap bytes under the shim's page model (whole 4 KiB pages, one page

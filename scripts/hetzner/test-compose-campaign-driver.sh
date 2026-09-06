@@ -393,7 +393,7 @@ grep -c -F -- "$byte_sum" "$runbook" | grep -q -x 3 || die 'the runbook does not
 SUM="$byte_sum" OLD="$old_sum" perl -pe 'BEGIN { $s = $ENV{SUM}; $o = $ENV{OLD} } s/\Q$s\E/$o/ if index($_, q{$baseline_exported_bytes}) >= 0' "$runbook" >"$tmp/awk-sum-runbook.md"
 grep -q -F -- "$old_sum" "$tmp/awk-sum-runbook.md" || die 'mutation did not apply'
 expect_failure --runbook "$tmp/awk-sum-runbook.md" --mode full --out "$tmp/bad"
-assert_contains "$stderr" "fence 18 (baseline-pull) line 17 prints an awk sum through awk's default number format"
+grep -E -- "fence 18 \(baseline-pull\) line [0-9]+ prints an awk sum through awk's default number format" "$stderr" >/dev/null || die 'the composer did not name the fence 18 awk sum'
 mkdir -p "$tmp/no-awk"
 printf '#!/usr/bin/env bash\nprintf "byte check invoked awk\\n" >&2\nexit 99\n' >"$tmp/no-awk/awk"
 chmod +x "$tmp/no-awk/awk"

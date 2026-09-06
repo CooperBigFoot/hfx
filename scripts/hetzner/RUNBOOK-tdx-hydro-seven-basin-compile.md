@@ -154,7 +154,7 @@ Rehearsal run 3 ran from the provisioning request at 22:23:13Z (server `16461150
 
 ### Third lifecycle in progress since 2026-09-05
 
-The production lifecycle under the current authority was requested on 2026-09-05 at 21:18:04Z (provisioning request epoch `1788643084`, server `164714525`, volume `106799807`). Provisioning, bootstrap, convergence, initialization, the corpus transfer, the adopting acquisition, both control builds with their gates, and the per-basin compiles all passed: the compiles of all seven absent basins succeeded at 04:00:11Z on 2026-09-06. The section 12 baseline pull then aborted at 04:07:27Z with the baseline fully pulled (6 objects, 114063230627 bytes): the remote byte check summed the object sizes with `awk '{s+=$1} END {print s}'`, the Debian 12 `mawk` printed that sum as `1.14063e+11`, and `test -eq` rejected it with `integer expression expected`. The rehearsal and the dry run carry tiny data, so no sum there ever reached 2^31. The lifecycle is held for a resume at the `baseline` stage: the server and the volume remain provisioned, and the conservative cost so far is about EUR 2.04 at 6.7 hours of the 72-hour ceiling. Every byte total is now summed in shell integer arithmetic (sections 4, 12, and 14, and the rehearsal preparation), and the composer refuses a fence that prints an accumulated awk sum through awk's default number format. This entry is in progress and records no result; the resume, its outcome, the zero-footprint proof, and the final cost are recorded when the lifecycle ends.
+The production lifecycle under the current authority was requested on 2026-09-05 at 21:18:04Z (provisioning request epoch `1788643084`, server `164714525`, volume `106799807`). Provisioning, bootstrap, convergence, initialization, the corpus transfer, the adopting acquisition, both control builds with their gates, and the per-basin compiles all passed: the compiles of all seven absent basins succeeded at 04:00:11Z on 2026-09-06. The section 12 baseline pull then aborted at 04:07:27Z with the baseline fully pulled (6 objects, 114063230627 bytes): the remote byte check summed the object sizes with `awk '{s+=$1} END {print s}'`, the Debian 12 `mawk` printed that sum as `1.14063e+11`, and `test -eq` rejected it with `integer expression expected`. The rehearsal and the dry run carry tiny data, so no sum there ever reached 2^31. The lifecycle is held for a resume at the `baseline` stage: the server and the volume remain provisioned, and the conservative cost so far is about EUR 2.04 at 6.7 hours of the 72-hour ceiling. The section 12 pull now skips every object whose local size matches the listing, so the resume re-downloads nothing. Every byte total is now summed in shell integer arithmetic (sections 4, 12, and 14, and the rehearsal preparation), and the composer refuses a fence that prints an accumulated awk sum through awk's default number format. This entry is in progress and records no result; the resume, its outcome, the zero-footprint proof, and the final cost are recorded when the lifecycle ends.
 
 ## 2. Fixed ceilings and retention
 
@@ -994,7 +994,7 @@ If `compiled-absent-basins.txt` is empty or `compile_exit_zero` is `0`, no exten
 
 ## 12. Baseline pull, roster verification, and extension assembly
 
-Section 12 runs only when `compile_exit_zero` is `1` and `compiled-absent-basins.txt` is nonempty; the composed driver of section 20 wraps sections 12 and 13 in that condition. Pull the frozen artifact from the baseline prefix onto the volume. The prefix is read from S3 only; nothing under it is written, overwritten, or deleted. Verify the pulled manifest against the contract before it is used. Every byte total in this runbook is summed in shell integer arithmetic (a `while read -r size` loop that refuses any size that is not a decimal integer and adds each one with `$((total + size))`), because awk prints an accumulated sum through its default number format: on 2026-09-06 the Debian 12 `mawk` wrote the 114063230627-byte baseline as `1.14063e+11` and `test -eq` rejected it after the baseline had been fully pulled.
+Section 12 runs only when `compile_exit_zero` is `1` and `compiled-absent-basins.txt` is nonempty; the composed driver of section 20 wraps sections 12 and 13 in that condition. Pull the frozen artifact from the baseline prefix onto the volume. The prefix is read from S3 only; nothing under it is written, overwritten, or deleted. The pull is idempotent: each listed object is copied only when the local file is absent or its size differs from the listing, so a resume at this stage on a volume that already holds the baseline copies nothing, and the listing count, the byte total, the manifest fields, and the SHA-256 manifest are checked with the same strictness either way. Verify the pulled manifest against the contract before it is used. Every byte total in this runbook is summed in shell integer arithmetic (a `while read -r size` loop that refuses any size that is not a decimal integer and adds each one with `$((total + size))`), because awk prints an accumulated sum through its default number format: on 2026-09-06 the Debian 12 `mawk` wrote the 114063230627-byte baseline as `1.14063e+11` and `test -eq` rejected it after the baseline had been fully pulled.
 
 ```bash
 campaign_gate pre-baseline "$(contract_value '.gate_reserve_hours["pre-baseline"]')"
@@ -1010,7 +1010,23 @@ set -a; source /etc/pourpoint-hfx.env; set +a
 mkdir -p "$baseline_root"
 aws s3 ls "$prefix/dataset/" --recursive --endpoint-url "$endpoint" --region fsn1 > "$baseline_root/remote-listing.txt"
 test "$(grep -c . "$baseline_root/remote-listing.txt")" -eq "$baseline_object_count"
-aws s3 cp "$prefix/dataset/" "$baseline_root/dataset/" --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
+prefix_key=${prefix#s3://*/}
+[[ "$prefix_key" != "$prefix" && -n "$prefix_key" && "$prefix_key" != */ ]]
+kept=0
+pulled=0
+while read -r _ _ size key <&3; do
+  [[ "$size" =~ ^[0-9]+$ && "$key" == "$prefix_key/dataset/"?* ]]
+  relative=${key#"$prefix_key/dataset/"}
+  [[ "$relative" != *../* && "$relative" != ../* && "$relative" != */ ]]
+  if test -f "$baseline_root/dataset/$relative" && test "$(stat -c '%s' "$baseline_root/dataset/$relative")" -eq "$size"; then
+    kept=$((kept + 1))
+  else
+    aws s3 cp "$prefix/dataset/$relative" "$baseline_root/dataset/$relative" --endpoint-url "$endpoint" --region fsn1 --only-show-errors </dev/null
+    pulled=$((pulled + 1))
+  fi
+done 3<"$baseline_root/remote-listing.txt"
+printf 'baseline_objects_kept=%s baseline_objects_pulled=%s\n' "$kept" "$pulled"
+test "$((kept + pulled))" -eq "$baseline_object_count"
 aws s3 cp "$prefix/evidence/state/assembly.json" "$baseline_root/evidence-assembly.json" --endpoint-url "$endpoint" --region fsn1 --only-show-errors || true
 jq -e --arg region "$baseline_region" --argjson units "$baseline_unit_count" --arg fabric "$fabric_version" '.region == $region and .unit_count == $units and .format_version == "0.3.0" and .fabric_version == $fabric and .fabric_name == "tdx_hydro"' "$baseline_root/dataset/manifest.json"
 test "$(find "$baseline_root/dataset" -type f -exec stat -c '%s' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; })" -eq "$baseline_exported_bytes"

@@ -545,8 +545,16 @@ for lifecycle in $(seq 1 "$lifecycles"); do
         # A rerun after a failed rehearsal provisions a fresh VM and the maintainer clears the extension
         # scratch prefix by hand; the baseline prefix under it is read-only and stays.
         hfx_log "lifecycle $lifecycle: fresh shimmed VM; clearing the extension scratch prefix except the baseline"
+        # The pulled baseline is carried onto the fresh VM root, as a resume at the baseline stage finds it on the
+        # volume: the idempotent pull of fence 18 must keep every object and copy none.
+        carried_baseline=$work/carried-baseline
+        rm -rf -- "$carried_baseline"
+        mv -- "$DRY_VMROOT/mnt/hfx/work/baseline" "$carried_baseline"
         rm -rf -- "$DRY_VMROOT"
         lay_out_vm_root
+        mkdir -p -- "$DRY_VMROOT/mnt/hfx/work"
+        mv -- "$carried_baseline" "$DRY_VMROOT/mnt/hfx/work/baseline"
+        baseline_manifest_before=$(/usr/bin/stat -f '%m %i' -- "$DRY_VMROOT/mnt/hfx/work/baseline/dataset/manifest.json")
         for entry in "$DRY_BUCKET/${extension_key%/}"/*; do
             [[ -e "$entry" ]] || continue
             [[ "$(basename -- "$entry")" == "$baseline_top" ]] || rm -rf -- "$entry"
@@ -569,6 +577,16 @@ for lifecycle in $(seq 1 "$lifecycles"); do
         hfx_die "lifecycle $lifecycle: composed driver exited $driver_status; log at $DRY_LOG"
     fi
     require_passing_lifecycle
+    baseline_object_count=$(jq -r '.baseline.object_count' "$work/evidence/dry-run-contract.json")
+    if ((lifecycle > 1)); then
+        grep -qx "baseline_objects_kept=$baseline_object_count baseline_objects_pulled=0" "$evidence/baseline-pull.log" ||
+            hfx_die "lifecycle $lifecycle: the baseline pull did not keep every already-pulled object: $(grep 'baseline_objects_' "$evidence/baseline-pull.log")"
+        [[ "$(/usr/bin/stat -f '%m %i' -- "$DRY_VMROOT/mnt/hfx/work/baseline/dataset/manifest.json")" == "$baseline_manifest_before" ]] ||
+            hfx_die "lifecycle $lifecycle: the baseline pull re-copied an object that was already on the volume"
+    else
+        grep -qx "baseline_objects_kept=0 baseline_objects_pulled=$baseline_object_count" "$evidence/baseline-pull.log" ||
+            hfx_die "lifecycle $lifecycle: the baseline pull did not pull every object onto the empty volume: $(grep 'baseline_objects_' "$evidence/baseline-pull.log")"
+    fi
     hfx_log "lifecycle $lifecycle passed: $(jq -c '{campaign, strict_validation, result}' "$evidence/lifecycle-result.json")"
 done
 if ((lifecycles > 1)); then
