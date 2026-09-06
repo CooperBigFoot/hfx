@@ -536,8 +536,25 @@ require_passing_lifecycle() {
     [[ ! -e "$evidence/gate-transport-failures.log" ]] ||
         hfx_die "gate transport failures were recorded although the price shim never fails: $(tr '\n' ' ' <"$evidence/gate-transport-failures.log")"
     [[ -s "$evidence/observed-swap-total-bytes.txt" ]] || hfx_die 'the converge fence did not preserve observed-swap-total-bytes.txt'
-    [[ -d "$evidence/control-reference" ]] || hfx_die 'the VM-built reference control was not preserved under the campaign evidence directory'
+    local control_id corpus_files
+    control_id=$(jq -r '.control_basin' "$work/evidence/dry-run-contract.json")
+    [[ -f "$DRY_BUCKET/${extension_key%/}/control-reference/$control_id/manifest.json" ]] ||
+        hfx_die 'the VM-built reference control was not preserved to the control-reference prefix in the bucket'
     [[ ! -e "$work/evidence/off-vm/control-builds" ]] || hfx_die 'the reference control was written into the shared off-vm inputs'
+    # The maintainer's 2026-09-06 directive: no dataset byte reaches the workstation; records only.
+    for forbidden in control-reference off-vm/campaign/basin-outputs off-vm/control-builds off-vm/extension salvage/control-builds salvage/campaign/basin-outputs salvage/extension; do
+        [[ ! -e "$evidence/$forbidden" ]] || hfx_die "dataset bytes were written to the workstation under $forbidden"
+    done
+    [[ -f "$evidence/workstation-free-space.txt" ]] || hfx_die 'the records-only free-space check did not record'
+    for bucket_root in control-builds basin-outputs source-corpus; do
+        [[ -s "$evidence/verify-$bucket_root.txt" ]] || hfx_die "no read-back verification for $bucket_root"
+        ! grep -v ': OK$' "$evidence/verify-$bucket_root.txt" >/dev/null || hfx_die "a $bucket_root object failed its read-back"
+    done
+    corpus_files=$(jq -r '.source_corpus.file_count' "$work/evidence/dry-run-contract.json")
+    [[ "$(find "$DRY_BUCKET/${extension_key%/}/source-corpus" -type f -name '*.gpkg' | wc -l | tr -d ' ')" == "$corpus_files" ]] ||
+        hfx_die 'the source corpus was not preserved to the bucket'
+    [[ "$(grep -c ': OK$' "$evidence/verify-source-corpus.txt")" == "$corpus_files" ]] || hfx_die 'the source corpus read-back did not verify every GeoPackage'
+    [[ -s "$evidence/verify-extension.txt" ]] || hfx_die 'no read-back verification for the extended artifact'
 }
 
 for lifecycle in $(seq 1 "$lifecycles"); do

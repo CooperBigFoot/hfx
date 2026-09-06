@@ -173,10 +173,12 @@ case $check in
         require_field '.absent_basins' "$HFX_EXPECTED_ABSENT_BASINS" 'seven-basin scope is not exact'
         require_field '.control_basin' "\"$HFX_EXPECTED_CONTROL_BASIN\"" 'control basin is not pinned'
         require_field '.control_builds' "[\"corrected-adapter\",\"planetary-revision-$HFX_EXPECTED_PLANETARY_REF-with-recorded-ARG_MAX-hotpatch\"]" 'both control builds are not pinned'
-        require_field '.source_corpus' '{"file_count":16,"total_bytes":84101885952,"manifest":"attempt21-source-remote-sha256.txt"}' 'preserved source corpus is not pinned'
+        require_field '.source_corpus' '{"file_count":16,"total_bytes":84101885952,"manifest":"attempt21-source-remote-sha256.txt","prefix":"s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/source-corpus"}' 'preserved source corpus is not pinned'
+        jq -e '.corpus_source == "workstation-rsync" or .corpus_source == "bucket"' <<<"$contract" >/dev/null 2>&1 ||
+            fail 'corpus_source must be workstation-rsync or bucket'
         require_field '.control_unit_count' "$HFX_EXPECTED_CONTROL_UNIT_COUNT" 'control unit count is not pinned'
         require_field '[.fabric_version, .control_fabric_version]' '["NGA-TDX-Hydro-20230126","0.3.0"]' 'fabric versions are not pinned'
-        require_field '.permitted_acts' '["transfer-preserved-source-corpus","reacquire-selected-source-on-integrity-failure","compile-both-control-builds","compare-control-outputs","compile-selected-basins","pull-baseline-read-only","assemble-extension","attempt-strict-validation","preserve-all-produced-output-off-vm","read-only-audit","exact-resource-teardown"]' 'permitted acts are incomplete or overbroad'
+        require_field '.permitted_acts' '["transfer-preserved-source-corpus","reacquire-selected-source-on-integrity-failure","compile-both-control-builds","compare-control-outputs","compile-selected-basins","pull-baseline-read-only","assemble-extension","attempt-strict-validation","preserve-all-produced-output-off-vm","copy-source-corpus-to-bucket","read-only-audit","exact-resource-teardown"]' 'permitted acts are incomplete or overbroad'
         require_field '.sole_destructive_act' '"exact-resource-teardown"' 'destructive scope is not exact teardown only'
         require_phrase 'Only the named campaign server and volume may be mutated.'
         require_phrase '`pourpoint-web-1` is outside scope and must remain untouched.'
@@ -378,6 +380,8 @@ case $check in
             and (.control_builds == $production.control_builds)
             and ([.fabric_version, .control_fabric_version] == [$production.fabric_version, $production.control_fabric_version])
             and (.permitted_acts == $production.permitted_acts)
+            and (.corpus_source == "workstation-rsync" or .corpus_source == "bucket")
+            and (.source_corpus.prefix | type == "string" and startswith("s3://pourpoint-hfx/scratch/tdx-hydro-" + $campaign + "/") and endswith("/") == false)
             and (.sole_destructive_act == "exact-resource-teardown")
             and (.retention_policy == $production.retention_policy)
             and (.derived_at_preparation | type == "array" and length > 0)

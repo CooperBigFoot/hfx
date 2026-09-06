@@ -32,7 +32,7 @@ version_policy is NONE: NO version bump, NO tag.
       ]
     },
     "current_authority": {"maintainer": "Nicolas Lazaro", "date": "2026-09-04", "lifecycles": 1, "record": "https://github.com/CooperBigFoot/hfx/pull/234", "precondition": "a lifecycle-result.json with result passed under the rehearsal evidence root for campaign-rehearsal", "limits": "one ccx33 in fsn1, one 600 GB volume, under 72 hours from the provisioning request, under EUR 40.00 projected and actual, exact-resource teardown"},
-    "in_progress": {"date": "2026-09-05", "provisioning_request": "2026-09-05T21:18:04Z", "provisioning_request_epoch": 1788643084, "server_id": 164714525, "volume_id": 106799807, "workload_dispatched": true, "compiles_succeeded": "2026-09-06T04:00:11Z", "aborted": "2026-09-06T04:07:27Z", "cause": "awk-default-format-printed-baseline-byte-sum-as-exponent", "baseline_pulled": true, "held_for_resume_at": "baseline", "estimated_cost_eur_so_far": 2.04, "elapsed_hours_so_far": 6.7, "result": null}
+    "in_progress": {"date": "2026-09-05", "provisioning_request": "2026-09-05T21:18:04Z", "provisioning_request_epoch": 1788643084, "server_id": 164714525, "volume_id": 106799807, "workload_dispatched": true, "compiles_succeeded": "2026-09-06T04:00:11Z", "aborted": "2026-09-06T04:07:27Z", "cause": "awk-default-format-printed-baseline-byte-sum-as-exponent", "baseline_pulled": true, "held_for_resume_at": "baseline", "estimated_cost_eur_so_far": 2.04, "elapsed_hours_so_far": 6.7, "preservation_target": "bucket-only", "workstation_dataset_copies_to_delete_after_bucket_verification": [{"path": "off-vm/campaign/basin-outputs", "approximate_bytes": 29000000000, "origin": "section 11 fence, complete"}, {"path": "salvage/control-builds", "approximate_bytes": 8000000000, "origin": "trap salvage, complete"}, {"path": "salvage/campaign/basin-outputs", "approximate_bytes": 20000000000, "origin": "trap salvage, partial; stopped by the operator"}], "result": null}
   },
   "requires_passing_rehearsal": true,
   "requires_passing_dry_run": true,
@@ -55,7 +55,8 @@ version_policy is NONE: NO version bump, NO tag.
   "control_unit_count": 331263,
   "fabric_version": "NGA-TDX-Hydro-20230126",
   "control_fabric_version": "0.3.0",
-  "source_corpus": {"file_count": 16, "total_bytes": 84101885952, "manifest": "attempt21-source-remote-sha256.txt"},
+  "corpus_source": "workstation-rsync",
+  "source_corpus": {"file_count": 16, "total_bytes": 84101885952, "manifest": "attempt21-source-remote-sha256.txt", "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/source-corpus"},
   "control_builds": ["corrected-adapter", "planetary-revision-43a98aff8c15a1a196f47b10217ad2f5553b6611-with-recorded-ARG_MAX-hotpatch"],
   "control_hotpatch": {
     "commit": "bde61149d3fefc5e3f30435bf7ed3d0bb32a519c",
@@ -105,7 +106,7 @@ version_policy is NONE: NO version bump, NO tag.
     "required_available_disk_bytes": 420000000000,
     "required_memory_bytes": 30000000000
   },
-  "permitted_acts": ["transfer-preserved-source-corpus", "reacquire-selected-source-on-integrity-failure", "compile-both-control-builds", "compare-control-outputs", "compile-selected-basins", "pull-baseline-read-only", "assemble-extension", "attempt-strict-validation", "preserve-all-produced-output-off-vm", "read-only-audit", "exact-resource-teardown"],
+  "permitted_acts": ["transfer-preserved-source-corpus", "reacquire-selected-source-on-integrity-failure", "compile-both-control-builds", "compare-control-outputs", "compile-selected-basins", "pull-baseline-read-only", "assemble-extension", "attempt-strict-validation", "preserve-all-produced-output-off-vm", "copy-source-corpus-to-bucket", "read-only-audit", "exact-resource-teardown"],
   "sole_destructive_act": "exact-resource-teardown"
 }
 END COMPILE CAMPAIGN CONTRACT -->
@@ -120,7 +121,7 @@ Only the named campaign server and volume may be mutated. Those are server `hfx-
 
 Mandatory exact-resource teardown of the named server and volume is the sole permitted destructive operation. This campaign deletes no source data, no output, no evidence, no S3 object, and no other server or volume. The baseline prefix is read-only; nothing under it is modified or deleted. No produced output may remain unique to the VM or volume.
 
-The permitted acts are the transfer of the preserved source corpus, reacquisition of a selected product only when its integrity check fails, both control builds and their comparisons, the per-basin compiles, a read-only pull of the baseline, one extension assembly, one strict validation attempt, off-VM preservation, read-only audits, and exact-resource teardown. Adjudication, defect-report transmission, publication under `hfx/`, and adapter changes are outside this runbook.
+The permitted acts are the transfer of the preserved source corpus, reacquisition of a selected product only when its integrity check fails, both control builds and their comparisons, the per-basin compiles, a read-only pull of the baseline, one extension assembly, one strict validation attempt, off-VM preservation to the bucket, one copy of the source corpus to the bucket, read-only audits, and exact-resource teardown. Adjudication, defect-report transmission, publication under `hfx/`, and adapter changes are outside this runbook.
 
 ### Lifecycle consumed on 2026-09-04
 
@@ -156,6 +157,10 @@ Rehearsal run 3 ran from the provisioning request at 22:23:13Z (server `16461150
 
 The production lifecycle under the current authority was requested on 2026-09-05 at 21:18:04Z (provisioning request epoch `1788643084`, server `164714525`, volume `106799807`). Provisioning, bootstrap, convergence, initialization, the corpus transfer, the adopting acquisition, both control builds with their gates, and the per-basin compiles all passed: the compiles of all seven absent basins succeeded at 04:00:11Z on 2026-09-06. The section 12 baseline pull then aborted at 04:07:27Z with the baseline fully pulled (6 objects, 114063230627 bytes): the remote byte check summed the object sizes with `awk '{s+=$1} END {print s}'`, the Debian 12 `mawk` printed that sum as `1.14063e+11`, and `test -eq` rejected it with `integer expression expected`. The rehearsal and the dry run carry tiny data, so no sum there ever reached 2^31. The lifecycle is held for a resume at the `baseline` stage: the server and the volume remain provisioned, and the conservative cost so far is about EUR 2.04 at 6.7 hours of the 72-hour ceiling. The section 12 pull now skips every object whose local size matches the listing, so the resume re-downloads nothing. Every byte total is now summed in shell integer arithmetic (sections 4, 12, and 14, and the rehearsal preparation), and the composer refuses a fence that prints an accumulated awk sum through awk's default number format. This entry is in progress and records no result; the resume, its outcome, the zero-footprint proof, and the final cost are recorded when the lifecycle ends.
 
+### Maintainer directive of 2026-09-06: work solely in the cloud
+
+On 2026-09-06 Nicolas Lazaro directed: "Work solely in the cloud. Never locally, that is the whole point of hetzner." From that directive on, no dataset byte is written to the workstation. Every per-basin output, both control builds, the VM-built reference control of a rehearsal, the extended artifact, and the source corpus are preserved to the campaign prefix in the bucket with VM-side SHA-256 manifests and a streamed read-back digest check, and only small records reach the workstation evidence root: logs, JSON records, SHA-256 manifests and read-back verifications, campaign state, reports, and the lifecycle result. The trap's salvage preserves dataset trees to a `salvage/` prefix under the campaign prefix the same way. The composer refuses any fence that copies anything else from the VM to the workstation, and section 6 checks workstation free space sized only for records. Before the directive, this lifecycle had already written three dataset copies to the workstation under `seven-basin-extension/`: the section 11 fence copied the seven basin outputs to `off-vm/campaign/basin-outputs` (about 29 GB, complete), and the trap's salvage copied both control builds to `salvage/control-builds` (about 8.0 GB, complete) and started a second copy of the basin outputs to `salvage/campaign/basin-outputs` (about 20 GB, partial, stopped by the operator); `off-vm/control-builds` does not exist. The maintainer deletes those three copies by hand after the bucket copies are digest-verified, and no automated step deletes them. The contract's `corpus_source` is `workstation-rsync` for this lifecycle because the corpus is already on the VM; the preservation stage copies it to `source_corpus.prefix`, and future runs set `corpus_source` to `bucket` and pull it from there with the same SHA-256 checks.
+
 ## 2. Fixed ceilings and retention
 
 These limits exist before any provisioning step and cannot be raised while the campaign is running:
@@ -170,7 +175,7 @@ These limits exist before any provisioning step and cannot be raised while the c
 | Price source | `https://api.hetzner.cloud/v1/pricing`, queried immediately before provisioning and before every gate |
 | Decision points | 24, 48, and 66 hours after the provisioning request |
 
-The retention policy is `retain-all-produced-output-off-vm-before-exact-resource-teardown`. Every per-basin output, both control outputs, the extended artifact, campaign state, reports, logs, and refusal diagnostics are retained until a digest-matching off-VM copy exists. Failure does not relax retention. Capacity pressure never permits deletion.
+The retention policy is `retain-all-produced-output-off-vm-before-exact-resource-teardown`. Every per-basin output, both control outputs, the extended artifact, campaign state, reports, logs, and refusal diagnostics are retained until a digest-matching copy exists in the bucket, proven by a streamed read-back of every object. The workstation holds records only, never dataset bytes. Failure does not relax retention. Capacity pressure never permits deletion.
 
 Equality with a ceiling refuses the act. At either ceiling, or whenever the next bounded act cannot be proved to finish below both ceilings, stop dispatch, preserve completed work, then perform exact-resource teardown. Teardown targets the two exact names above and is mandatory on success, failure, refusal, interruption, and timeout. `--keep-volume` is forbidden.
 
@@ -184,7 +189,7 @@ The S3 environment file is a separate opaque input. Keep tracing disabled before
 
 ## 4. Operator shell, inputs, and local verification
 
-Run every operator-side command from the repository root in one shell:
+Run every operator-side command from the repository root in one shell. The contract's `corpus_source` says where the source corpus comes from: `workstation-rsync` transfers `off-vm/acquired-source` from the workstation and verifies it locally first; `bucket` pulls it on the VM from `source_corpus.prefix` and verifies it there, and the workstation holds only the manifest. The operator shell never writes dataset bytes to the workstation.
 
 ```bash
 set -Eeuo pipefail
@@ -253,6 +258,10 @@ CORPUS_FILE_COUNT=$(contract_value '.source_corpus.file_count')
 CORPUS_TOTAL_BYTES=$(contract_value '.source_corpus.total_bytes')
 CORPUS_DIR="$HFX_CAMPAIGN_EVIDENCE/off-vm/acquired-source"
 CORPUS_MANIFEST="$HFX_CAMPAIGN_EVIDENCE/$(contract_value '.source_corpus.manifest')"
+CORPUS_SOURCE=$(contract_value '.corpus_source')
+test "$CORPUS_SOURCE" = workstation-rsync || test "$CORPUS_SOURCE" = bucket
+CORPUS_PREFIX=$(contract_value '.source_corpus.prefix')
+[[ "$CORPUS_PREFIX" == s3://pourpoint-hfx/scratch/* && "$CORPUS_PREFIX" != */ ]]
 CONTROL_ADJUDICATION_SOURCE=$(contract_value '.control_adjudication_record')
 CONTROL_REFERENCE=$(contract_value '.control_reference')
 test "$CONTROL_REFERENCE" = preserved-off-vm || test "$CONTROL_REFERENCE" = vm-planetary-build
@@ -260,7 +269,7 @@ LOCAL_EVIDENCE_DIR="$HFX_CAMPAIGN_EVIDENCE/$CAMPAIGN"
 if test "$CONTROL_REFERENCE" = preserved-off-vm; then
   PRESERVED_CONTROL="$HFX_CAMPAIGN_EVIDENCE/off-vm/control-builds/planetary/$CONTROL_ID"
 else
-  PRESERVED_CONTROL="$LOCAL_EVIDENCE_DIR/control-reference/$CONTROL_ID"
+  PRESERVED_CONTROL="$EXTENSION_PREFIX/control-reference/$CONTROL_ID"
 fi
 if test -e "$LOCAL_EVIDENCE_DIR" && test "${HFX_CAMPAIGN_RESUME:-0}" != 1; then
   test -d "$LOCAL_EVIDENCE_DIR"
@@ -315,9 +324,13 @@ fi
 
 test -f "$CORPUS_MANIFEST"
 test "$(grep -c . "$CORPUS_MANIFEST")" -eq "$CORPUS_FILE_COUNT"
-(cd "$CORPUS_DIR" && shasum -a 256 -c "$CORPUS_MANIFEST") | tee "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt"
-test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt")" -eq "$CORPUS_FILE_COUNT"
-test "$(find "$CORPUS_DIR" -type f -name '*.gpkg' -exec stat -f '%z' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; })" -eq "$CORPUS_TOTAL_BYTES"
+if test "$CORPUS_SOURCE" = workstation-rsync; then
+  (cd "$CORPUS_DIR" && shasum -a 256 -c "$CORPUS_MANIFEST") | tee "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt"
+  test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt")" -eq "$CORPUS_FILE_COUNT"
+  test "$(find "$CORPUS_DIR" -type f -name '*.gpkg' -exec stat -f '%z' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; })" -eq "$CORPUS_TOTAL_BYTES"
+else
+  printf 'corpus_source=bucket prefix=%s; the corpus is pulled from the bucket by section 9 and verified on the VM\n' "$CORPUS_PREFIX" | tee "$LOCAL_EVIDENCE_DIR/corpus-local-verification.txt"
+fi
 
 if test "$CONTROL_REFERENCE" = preserved-off-vm; then
   contract_value '.control_digests' > "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"
@@ -421,7 +434,7 @@ Each record name carries the UTC second and a per-shell sequence number (`gate-<
 
 ## 6. Read-only quota, exact-name, and ref preflight
 
-Confirm the checked ref, require the authority ref to be its ancestor, and list servers and volumes read-only. Refuse if either exact resource name already exists, because an existing resource has unknown ownership. The preflight never turns a listing into cleanup.
+Confirm the checked ref, require the authority ref to be its ancestor, and list servers and volumes read-only. Refuse if either exact resource name already exists, because an existing resource has unknown ownership. The preflight never turns a listing into cleanup. The workstation free-space check is sized for records only (2 GiB under the evidence root): the composer of section 20 has already refused any fence that would copy dataset bytes from the VM to the workstation, so no larger reserve is ever needed there.
 
 ```bash
 git fetch origin main
@@ -431,6 +444,10 @@ git merge-base --is-ancestor 0ffa2d048ce5d748c0ab4c71fbe6f5862478107d "$GROUND_T
 git cat-file -e "$GROUND_TRUTH_REF:scripts/hetzner/RUNBOOK-tdx-hydro-seven-basin-compile.md"
 git show "$GROUND_TRUTH_REF:scripts/hetzner/tdx-hydro-campaign.sh" | grep -F -- '--partial-fabric <dataset-root> --partial-fabric-roster <json-file> --exclude-control-basin <processing-basin-id>'
 printf '%s\n' "$GROUND_TRUTH_REF" > "$LOCAL_EVIDENCE_DIR/ground-truth-ref.txt"
+evidence_free_kib=$(df -Pk "$HFX_CAMPAIGN_EVIDENCE" | awk 'NR == 2 { print $4 }')
+[[ "$evidence_free_kib" =~ ^[0-9]+$ ]]
+test "$evidence_free_kib" -ge 2097152
+printf 'evidence_free_kib=%s records_only=true\n' "$evidence_free_kib" > "$LOCAL_EVIDENCE_DIR/workstation-free-space.txt"
 
 test "$(hcloud context active)" = pourpoint
 hcloud --context pourpoint server list -o json > "$LOCAL_EVIDENCE_DIR/preflight-servers.json"
@@ -451,7 +468,7 @@ The shape check is the last preflight before the trap and the provisioning reque
 
 ## 7. Fail-closed preservation and mandatory teardown trap
 
-Install this handler before provisioning. It disables tracing, stops the campaign workloads, copies the exact preservation roots when the server is addressable, records copy failures without masking teardown, invokes exact-name default teardown, and independently proves both exact names absent. It runs on success, failure, refusal, interruption, and both kill switches.
+Install this handler before provisioning. It disables tracing, stops the campaign workloads, and, when the server is addressable, salvages campaign state, reports, logs, and digest records to the workstation and every dataset tree (control builds, basin outputs, the assembled dataset) to the `salvage/` prefix under the campaign prefix with `preserve_root_to_bucket`; it records salvage failures without masking teardown, invokes exact-name default teardown, and independently proves both exact names absent. `preserve_root_to_bucket` is the one preservation primitive for dataset bytes: on the VM it writes a SHA-256 manifest of the root, lists the destination prefix once, uploads only objects whose listed size differs, reads every object back as a stream and records its digest verdict in `<name>-s3-readback-verification.txt`, skipping objects already recorded `OK` under the same digest, and fails unless every manifest line is recorded `OK`. It runs on success, failure, refusal, interruption, and both kill switches.
 
 ```bash
 cleanup_running=0
@@ -474,6 +491,53 @@ copy_remote_root() {
   rsync -a --partial --timeout=120 -e 'ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new' \
     "root@$SERVER_IP:$source" "$destination/"
 }
+preserve_root_to_bucket() {
+  local source_root=$1 destination_prefix=$2 manifest_name=$3
+  remote_args=("$source_root" "$destination_prefix" "$S3_ENDPOINT" "$manifest_name")
+  ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE'
+set -Eeuo pipefail
+set +x
+source_root=$1; prefix=$2; endpoint=$3; manifest_name=$4
+[[ "$source_root" == /* && "$prefix" == s3://* && "$prefix" != */ && "$endpoint" == https://* && "$manifest_name" =~ ^[a-z][a-z0-9-]*$ ]]
+test "$#" -eq 4
+set -a; source /etc/pourpoint-hfx.env; set +a
+manifest=/mnt/hfx/work/sha256/$manifest_name-sha256.txt
+verified=/mnt/hfx/work/sha256/$manifest_name-s3-readback-verification.txt
+listing=/mnt/hfx/work/sha256/$manifest_name-s3-listing.txt
+prefix_key=${prefix#s3://*/}
+[[ "$prefix_key" != "$prefix" && -n "$prefix_key" ]]
+mkdir -p /mnt/hfx/work/sha256
+if test -d "$source_root"; then
+  (cd "$source_root" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum | sed 's#^\([0-9a-f]\{64\}\)  \./#\1  #') > "$manifest"
+else
+  : > "$manifest"
+fi
+aws s3 ls "$prefix/" --recursive --endpoint-url "$endpoint" --region fsn1 > "$listing" || : > "$listing"
+touch "$verified"
+kept=0
+uploaded=0
+while IFS= read -r manifest_line <&3; do
+  digest=${manifest_line%%  *}; relative=${manifest_line#*  }
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && -n "$relative" && "$relative" != *../* && "$relative" != /* ]]
+  size=$(stat -c '%s' "$source_root/$relative")
+  listed=$(while read -r _ _ listed_size listed_key; do if test "$listed_key" = "$prefix_key/$relative"; then printf '%s\n' "$listed_size"; break; fi; done < "$listing")
+  if test "$listed" = "$size"; then
+    kept=$((kept + 1))
+  else
+    aws s3 cp "$source_root/$relative" "$prefix/$relative" --endpoint-url "$endpoint" --region fsn1 --only-show-errors </dev/null
+    uploaded=$((uploaded + 1))
+    grep -vF -- "  $relative: " "$verified" > "$verified.tmp" || true
+    mv -- "$verified.tmp" "$verified"
+  fi
+  if grep -qxF -- "$digest  $relative: OK" "$verified"; then continue; fi
+  observed=$(aws s3 cp "$prefix/$relative" - --endpoint-url "$endpoint" --region fsn1 | sha256sum | cut -c1-64)
+  if test "$observed" = "$digest"; then printf '%s  %s: OK\n' "$digest" "$relative" >> "$verified"; else printf '%s  %s: FAILED\n' "$digest" "$relative" >> "$verified"; fi
+done 3<"$manifest"
+printf '%s: objects=%s kept=%s uploaded=%s prefix=%s\n' "$manifest_name" "$(grep -c . "$manifest" || true)" "$kept" "$uploaded" "$prefix"
+test "$(grep -c . "$manifest" || true)" -eq "$(grep -c ': OK$' "$verified" || true)"
+! grep -v ': OK$' "$verified"
+REMOTE
+}
 salvage_evidence() {
   local salvage_status=0
   set +x
@@ -482,9 +546,9 @@ salvage_evidence() {
   copy_remote_root "$CAMPAIGN_DIR/state" "$LOCAL_EVIDENCE_DIR/salvage/campaign" || salvage_status=1
   copy_remote_root "$CAMPAIGN_DIR/reports" "$LOCAL_EVIDENCE_DIR/salvage/campaign" || salvage_status=1
   copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/salvage" || salvage_status=1
-  copy_remote_root "$CONTROL_ROOT" "$LOCAL_EVIDENCE_DIR/salvage" || salvage_status=1
-  copy_remote_root "$CAMPAIGN_DIR/basin-outputs" "$LOCAL_EVIDENCE_DIR/salvage/campaign" || salvage_status=1
-  copy_remote_root "$CAMPAIGN_DIR/assembly/dataset" "$LOCAL_EVIDENCE_DIR/salvage/extension" || salvage_status=1
+  preserve_root_to_bucket "$CONTROL_ROOT" "$EXTENSION_PREFIX/salvage/control-builds" salvage-control-builds >> "$LOCAL_EVIDENCE_DIR/salvage/bucket-preservation.log" 2>&1 || salvage_status=1
+  preserve_root_to_bucket "$CAMPAIGN_DIR/basin-outputs" "$EXTENSION_PREFIX/salvage/basin-outputs" salvage-basin-outputs >> "$LOCAL_EVIDENCE_DIR/salvage/bucket-preservation.log" 2>&1 || salvage_status=1
+  preserve_root_to_bucket "$CAMPAIGN_DIR/assembly/dataset" "$EXTENSION_PREFIX/salvage/extension/dataset" salvage-extension-dataset >> "$LOCAL_EVIDENCE_DIR/salvage/bucket-preservation.log" 2>&1 || salvage_status=1
   copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/salvage" || salvage_status=1
   printf 'salvage_status=%s\n' "$salvage_status" > "$LOCAL_EVIDENCE_DIR/salvage-status.txt"
   return "$salvage_status"
@@ -674,7 +738,7 @@ Swap and capacity sizing come from the contract's `workload_sizing`. For product
 
 ## 9. Corpus transfer and remote integrity
 
-Initialize the campaign with the eight selected basins so the runner owns the `downloads` directory, then transfer the corpus into it and prove integrity on the VM against the recorded manifest:
+Initialize the campaign with the eight selected basins so the runner owns the `downloads` directory, then transfer the corpus into it and prove integrity on the VM against the recorded manifest. Under `corpus_source` `bucket` the fence pulls each GeoPackage listed under `source_corpus.prefix` on the VM, skipping any file already present with the listed size, and the same `sha256sum -c` against the pinned manifest follows either path:
 
 ```bash
 campaign_gate pre-init "$(contract_value '.gate_reserve_hours["pre-init"]')"
@@ -702,10 +766,42 @@ Every gate's reserve is the contract's `gate_reserve_hours` entry for its phase,
 
 ```bash
 transfer_start=$(date +%s)
+transfer_stopped=0
+if test "$CORPUS_SOURCE" = bucket; then
+  remote_args=("$CAMPAIGN_DIR/downloads" "$CORPUS_PREFIX" "$S3_ENDPOINT" "$CORPUS_FILE_COUNT")
+  ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/corpus-transfer.log"
+set -Eeuo pipefail
+set +x
+downloads=$1; prefix=$2; endpoint=$3; file_count=$4
+[[ "$downloads" == /* && "$prefix" == s3://* && "$prefix" != */ && "$endpoint" == https://* && "$file_count" =~ ^[0-9]+$ ]]
+test "$#" -eq 4
+set -a; source /etc/pourpoint-hfx.env; set +a
+mkdir -p "$downloads" /mnt/hfx/work/sha256
+aws s3 ls "$prefix/" --recursive --endpoint-url "$endpoint" --region fsn1 > /mnt/hfx/work/sha256/source-corpus-remote-listing.txt
+test "$(grep -c -E '/[0-9]{10}-(basins|streamnet)\.gpkg$' /mnt/hfx/work/sha256/source-corpus-remote-listing.txt)" -eq "$file_count"
+prefix_key=${prefix#s3://*/}
+[[ "$prefix_key" != "$prefix" && -n "$prefix_key" ]]
+kept=0
+pulled=0
+while read -r _ _ size key <&3; do
+  [[ "$size" =~ ^[0-9]+$ && "$key" == "$prefix_key/"?* ]]
+  relative=${key#"$prefix_key/"}
+  [[ "$relative" =~ ^[0-9]{10}-(basins|streamnet)\.gpkg$ ]] || continue
+  if test -f "$downloads/$relative" && test "$(stat -c '%s' "$downloads/$relative")" -eq "$size"; then
+    kept=$((kept + 1))
+  else
+    aws s3 cp "$prefix/$relative" "$downloads/$relative" --endpoint-url "$endpoint" --region fsn1 --only-show-errors </dev/null
+    pulled=$((pulled + 1))
+  fi
+done 3</mnt/hfx/work/sha256/source-corpus-remote-listing.txt
+printf 'corpus_objects_kept=%s corpus_objects_pulled=%s\n' "$kept" "$pulled"
+test "$((kept + pulled))" -eq "$file_count"
+REMOTE
+  printf 'corpus_source=bucket\n' > "$LOCAL_EVIDENCE_DIR/corpus-transfer-projection.txt"
+else
 rsync -a --partial --info=progress2 -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
   "$CORPUS_DIR/" "root@$SERVER_IP:$CAMPAIGN_DIR/downloads/" > "$LOCAL_EVIDENCE_DIR/corpus-transfer.log" 2>&1 &
 transfer_pid=$!
-transfer_stopped=0
 transfer_slept=0
 while kill -0 "$transfer_pid" 2>/dev/null && test "$transfer_slept" -lt 1800; do sleep 30; transfer_slept=$((transfer_slept + 30)); done
 if kill -0 "$transfer_pid" 2>/dev/null; then
@@ -722,6 +818,7 @@ if kill -0 "$transfer_pid" 2>/dev/null; then
   fi
 fi
 wait "$transfer_pid" || test "$transfer_stopped" -eq 1
+fi
 printf 'transfer_stopped=%s\ntransfer_seconds=%s\n' "$transfer_stopped" "$(( $(date +%s) - transfer_start ))" >> "$LOCAL_EVIDENCE_DIR/corpus-transfer-projection.txt"
 scp -o BatchMode=yes "$CORPUS_MANIFEST" "root@$SERVER_IP:/mnt/hfx/work/sha256/source-expected-sha256.txt"
 ssh -o BatchMode=yes "root@$SERVER_IP" \
@@ -753,7 +850,7 @@ Reacquisition from NGA is a fallback for an integrity failure or a stalled trans
 
 ## 10. Two control builds and the adjudicated comparison
 
-Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests. When the contract's `control_reference` is `vm-planetary-build`, the fence instead builds the reference on the VM with the planetary adapter worktree that section 8 converged, records its digests as `expected-control-sha256.json`, copies the reference tree off the VM as the campaign's preserved control under the per-campaign evidence directory (`control-reference/<control>`, so a rerun in the same evidence root starts from a fresh reference instead of refusing on the previous one), and writes the digests into the evidence copy of the contract; the planetary rebuild in the next fence then compares two builds of the same adapter on the same machine, so no workstation float result is ever the byte reference:
+Transfer the preserved planetary control output to the VM. It is the byte-for-byte reference for the planetary rebuild and the per-unit reference for the corrected build. The fence creates the destination's parent first: on 2026-09-04 at 16:00:31Z this transfer was the first command to name `/mnt/hfx/work/control-builds`, no earlier fence had created it, remote rsync refused with `mkdir ... failed: No such file or directory` (exit 11), and the second authorized lifecycle ended with nothing compiled. Reverify the control there and place the control adjudication record beside the expected digests. When the contract's `control_reference` is `vm-planetary-build`, the fence instead builds the reference on the VM with the planetary adapter worktree that section 8 converged, records its digests as `expected-control-sha256.json`, preserves the reference tree to `control-reference/<control>/` under the campaign prefix with `preserve_root_to_bucket` as the campaign's preserved control under the per-campaign evidence directory (`control-reference/<control>`, so a rerun in the same evidence root starts from a fresh reference instead of refusing on the previous one), and writes the digests into the evidence copy of the contract; the planetary rebuild in the next fence then compares two builds of the same adapter on the same machine, so no workstation float result is ever the byte reference:
 
 ```bash
 ssh -o BatchMode=yes "root@$SERVER_IP" mkdir -p "$CONTROL_ROOT/preserved"
@@ -781,12 +878,11 @@ test ! -e "$control_root/preserved/$control_id"
 (cd "$control_root/preserved/$control_id" && find . -type f | sort | sed 's#^\./##' | while IFS= read -r file; do printf '%s %s\n' "$file" "$(sha256sum -- "$file" | cut -c1-64)"; done) \
   | jq -R -n '[inputs | split(" ") | {key: .[0], value: .[1]}] | from_entries' > /mnt/hfx/work/sha256/expected-control-sha256.json
 REMOTE
-  mkdir -p -- "$PRESERVED_CONTROL"
-  rsync -a -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
-    "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/" "$PRESERVED_CONTROL/"
+  preserve_root_to_bucket "$CONTROL_ROOT/preserved/$CONTROL_ID" "$PRESERVED_CONTROL" control-reference 2>&1 | tee "$LOCAL_EVIDENCE_DIR/control-reference-preservation.log"
   scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json" "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"
-  (cd "$PRESERVED_CONTROL" && jq -r 'to_entries[] | "\(.value)  ./\(.key)"' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" | shasum -a 256 -c) | tee "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
+  scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/control-reference-s3-readback-verification.txt" "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
   test "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt")" -eq "$(jq 'length' "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json")"
+  ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/preserved-control-verification.txt"
   jq --slurpfile digests "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json" '.control_digests = $digests[0]' "$LOCAL_EVIDENCE_DIR/campaign-contract.json" > "$LOCAL_EVIDENCE_DIR/campaign-contract.json.tmp"
   mv -- "$LOCAL_EVIDENCE_DIR/campaign-contract.json.tmp" "$LOCAL_EVIDENCE_DIR/campaign-contract.json"
 fi
@@ -970,17 +1066,17 @@ set -Eeuo pipefail
 campaign_dir=$1
 [[ "$campaign_dir" == /* ]]
 test "$#" -eq 1
-cd "$campaign_dir"
-find basin-outputs -type f -print0 | sort -z | xargs -0 -r sha256sum > /mnt/hfx/work/sha256/basin-outputs-sha256.txt
+mkdir -p "$campaign_dir/basin-outputs"
 REMOTE
+preserve_root_to_bucket "$CAMPAIGN_DIR/basin-outputs" "$EXTENSION_PREFIX/basin-outputs" basin-outputs 2>&1 | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-preservation.log"
 mkdir -p "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
-copy_remote_root "$CAMPAIGN_DIR/basin-outputs" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
 copy_remote_root "$CAMPAIGN_DIR/reports" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
 copy_remote_root "$CAMPAIGN_DIR/state" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
 copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
 copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
 if test -s "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt"; then
-  (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt") | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+  cp -- "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-s3-readback-verification.txt" "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
+  test "$(grep -c . "$LOCAL_EVIDENCE_DIR/off-vm/sha256/basin-outputs-sha256.txt")" -eq "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt")"
   ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
 else
   printf 'no basin output was produced; nothing to verify\n' | tee "$LOCAL_EVIDENCE_DIR/basin-outputs-verification.txt"
@@ -1104,13 +1200,14 @@ The extended artifact and the complete validation record are preserved whatever 
 
 ## 14. Preservation before teardown
 
-Preserve in this order, each root with a SHA-256 manifest computed on the VM and recomputed after transfer. A copy counts only when relative paths and digests match on both sides. The first pass runs while strict validation may still be writing the canonical log and `state/assembly.json`, so the fence repeats the digest, copy, and verification up to three times until every root verifies unchanged; a root with no files (no basin output at all) verifies as empty instead of aborting, because an empty outcome is a truthful outcome. The order follows value per byte so an interruption loses the least:
+Preserve in this order, each root with a SHA-256 manifest computed on the VM. Records (campaign `state`, `reports`, `/mnt/hfx/logs`, and the digest manifests) are copied to the workstation and recomputed there; dataset trees go to the campaign prefix in the bucket through `preserve_root_to_bucket` and count only when every object reads back with its manifest digest. The first pass runs while strict validation may still be writing the canonical log and `state/assembly.json`, so the fence repeats the digest, copy, and verification up to three times until every root verifies unchanged; a root with no files (no basin output at all) verifies as empty instead of aborting, because an empty outcome is a truthful outcome. The order follows value per byte so an interruption loses the least:
 
-1. campaign `state`, `reports`, and `/mnt/hfx/logs`
-2. both control builds, their reports, the orient report, and the four comparison records
-3. every per-basin output
-4. the extended artifact, first to the extension scratch prefix, then to the operator
-5. the VM-side digest manifests
+1. campaign `state`, `reports`, and `/mnt/hfx/logs` to the workstation
+2. both control builds, their reports, the orient report, and the four comparison records to `control-builds/`
+3. every per-basin output to `basin-outputs/`
+4. the source corpus to `source_corpus.prefix`, so future runs pull it from the bucket
+5. the extended artifact to `extension-hfx-v0-3-0/`
+6. the VM-side digest manifests and read-back verifications to the workstation
 
 ```bash
 campaign_gate pre-preservation "$(contract_value '.gate_reserve_hours["pre-preservation"]')"
@@ -1123,19 +1220,30 @@ campaign_dir=$1; control_root=$2
 [[ "$campaign_dir" == /* && "$control_root" == /* ]]
 test "$#" -eq 2
 cd "$campaign_dir"
-for root in state reports basin-outputs assembly/dataset; do
+test -d "$control_root"
+test -d downloads
+for root in state reports assembly/dataset; do
   test -d "$root" || continue
   find "$root" -type f -print0 | sort -z | xargs -0 -r sha256sum > "/mnt/hfx/work/sha256/campaign-$(printf '%s' "$root" | tr / -)-sha256.txt"
 done
 (cd /mnt/hfx && find logs -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/logs-sha256.txt
-(cd "$control_root" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /mnt/hfx/work/sha256/control-builds-sha256.txt
 REMOTE
-  for root in state reports basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done
+  copy_remote_root "$CAMPAIGN_DIR/state" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
+  copy_remote_root "$CAMPAIGN_DIR/reports" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"
   copy_remote_root /mnt/hfx/logs "$LOCAL_EVIDENCE_DIR/off-vm"
-  copy_remote_root "$CONTROL_ROOT" "$LOCAL_EVIDENCE_DIR/off-vm"
+  preserve_root_to_bucket "$CONTROL_ROOT" "$EXTENSION_PREFIX/control-builds" control-builds 2>&1 | tee -a "$LOCAL_EVIDENCE_DIR/control-builds-preservation.log"
+  preserve_root_to_bucket "$CAMPAIGN_DIR/basin-outputs" "$EXTENSION_PREFIX/basin-outputs" basin-outputs 2>&1 | tee -a "$LOCAL_EVIDENCE_DIR/basin-outputs-preservation.log"
+  preserve_root_to_bucket "$CAMPAIGN_DIR/downloads" "$EXTENSION_PREFIX/source-corpus" source-corpus 2>&1 | tee -a "$LOCAL_EVIDENCE_DIR/source-corpus-preservation.log"
   copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
   preservation_status=0
-  for manifest in campaign-state campaign-reports campaign-basin-outputs; do
+  for bucket_root in control-builds basin-outputs source-corpus; do
+    if test "$(grep -c . "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$bucket_root-sha256.txt" || true)" -eq "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$bucket_root-s3-readback-verification.txt" || true)" && ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$bucket_root-s3-readback-verification.txt" >/dev/null; then
+      cp -- "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$bucket_root-s3-readback-verification.txt" "$LOCAL_EVIDENCE_DIR/verify-$bucket_root.txt"
+    else
+      preservation_status=1
+    fi
+  done
+  for manifest in campaign-state campaign-reports; do
     if test -s "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$manifest-sha256.txt"; then
       (cd "$LOCAL_EVIDENCE_DIR/off-vm/campaign" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/$manifest-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt" || preservation_status=1
       grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-$manifest.txt" >/dev/null && preservation_status=1
@@ -1145,8 +1253,6 @@ REMOTE
   done
   (cd "$LOCAL_EVIDENCE_DIR/off-vm" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/logs-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-logs.txt" || preservation_status=1
   grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-logs.txt" >/dev/null && preservation_status=1
-  (cd "$LOCAL_EVIDENCE_DIR/off-vm/control-builds" && shasum -a 256 -c "$LOCAL_EVIDENCE_DIR/off-vm/sha256/control-builds-sha256.txt") > "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt" || preservation_status=1
-  grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-control-builds.txt" >/dev/null && preservation_status=1
   if test "$preservation_status" -eq 0; then break; fi
   printf 'preservation attempt %s found a root that changed between digest and copy; repeating\n' "$preservation_attempt" >> "$LOCAL_EVIDENCE_DIR/preservation-retries.log"
   sleep 30
@@ -1158,20 +1264,18 @@ Copy the extended artifact, when it exists, to a new prefix under the campaign's
 
 ```bash
 if ssh -o BatchMode=yes "root@$SERVER_IP" test -d "$CAMPAIGN_DIR/assembly/dataset"; then
-  remote_args=("$CAMPAIGN_DIR" "$EXTENSION_PREFIX" "$S3_ENDPOINT" "$CONTROL_ROOT")
+  remote_args=("$CAMPAIGN_DIR" "$EXTENSION_PREFIX" "$S3_ENDPOINT")
   ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'REMOTE' 2>&1 | tee "$LOCAL_EVIDENCE_DIR/extension-s3-preservation.log"
 set -Eeuo pipefail
 set +x
-campaign_dir=$1; prefix=$2; endpoint=$3; control_root=$4
-[[ "$campaign_dir" == /* && "$prefix" == s3://* && "$endpoint" == https://* && "$control_root" == /* ]]
-test "$#" -eq 4
+campaign_dir=$1; prefix=$2; endpoint=$3
+[[ "$campaign_dir" == /* && "$prefix" == s3://* && "$endpoint" == https://* ]]
+test "$#" -eq 3
 set -a; source /etc/pourpoint-hfx.env; set +a
 test -z "$(aws s3 ls "$prefix/extension-hfx-v0-3-0/" --endpoint-url "$endpoint" --region fsn1)"
 aws s3 cp "$campaign_dir/assembly/dataset/" "$prefix/extension-hfx-v0-3-0/dataset/" --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
 aws s3 cp /mnt/hfx/work/sha256/campaign-assembly-dataset-sha256.txt "$prefix/extension-hfx-v0-3-0/dataset-sha256.txt" --endpoint-url "$endpoint" --region fsn1 --only-show-errors
 aws s3 cp "$campaign_dir/state/assembly.json" "$prefix/extension-hfx-v0-3-0/evidence/state/assembly.json" --endpoint-url "$endpoint" --region fsn1 --only-show-errors
-aws s3 cp "$control_root/" "$prefix/control-builds/" --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
-aws s3 cp "$campaign_dir/basin-outputs/" "$prefix/basin-outputs/" --recursive --endpoint-url "$endpoint" --region fsn1 --only-show-errors
 aws s3 ls "$prefix/" --recursive --endpoint-url "$endpoint" --region fsn1 > /mnt/hfx/work/sha256/extension-remote-listing.txt
 artifact_bytes=$(find "$campaign_dir/assembly/dataset" -type f -exec stat -c '%s' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; })
 available_bytes=$(df -B1 --output=avail /mnt/hfx | tail -n 1 | tr -d ' ')
@@ -1194,9 +1298,9 @@ else
   ! grep -v ': OK$' /mnt/hfx/work/sha256/extension-s3-readback-verification.txt
 fi
 REMOTE
-  copy_remote_root "$CAMPAIGN_DIR/assembly/dataset" "$LOCAL_EVIDENCE_DIR/off-vm/extension"
   copy_remote_root /mnt/hfx/work/sha256 "$LOCAL_EVIDENCE_DIR/off-vm"
-  (cd "$LOCAL_EVIDENCE_DIR/off-vm/extension" && sed 's#^\([0-9a-f]\{64\}\)  assembly/dataset/#\1  dataset/#' "$LOCAL_EVIDENCE_DIR/off-vm/sha256/campaign-assembly-dataset-sha256.txt" | shasum -a 256 -c) | tee "$LOCAL_EVIDENCE_DIR/verify-extension.txt"
+  cp -- "$LOCAL_EVIDENCE_DIR/off-vm/sha256/extension-s3-readback-verification.txt" "$LOCAL_EVIDENCE_DIR/verify-extension.txt"
+  test "$(grep -c . "$LOCAL_EVIDENCE_DIR/off-vm/sha256/campaign-assembly-dataset-sha256.txt")" -eq "$(grep -c ': OK$' "$LOCAL_EVIDENCE_DIR/verify-extension.txt")"
   ! grep -v ': OK$' "$LOCAL_EVIDENCE_DIR/verify-extension.txt"
 fi
 : > "$LOCAL_EVIDENCE_DIR/preservation-complete"
@@ -1347,4 +1451,4 @@ diff -q "$HFX_CAMPAIGN_EVIDENCE/composed/fence-diff-proof.txt" <(python3 scripts
 printf '%s\n' "$S3_ENV_FILE_PATH" | caffeinate -i -s bash "$HFX_CAMPAIGN_EVIDENCE/composed/campaign-driver.sh"
 ```
 
-Before any lifecycle, `scripts/hetzner/campaign-dry-run.sh` executes the entire composed driver on the workstation at zero cloud cost: it clones the committed `HEAD`, prepares the rehearsal inputs from the synthetic corpus, and runs every fence of sections 4 to 16 under the rehearsal contract with the cloud and the VM replaced by shims. `ssh`, `scp`, and `rsync` remap the VM paths onto a scratch VM root and run each `bash -s` script through the same argument joining the real `ssh` performs; `hcloud` answers from a state file seeded with the recorded fixtures and honours detach and delete; `aws` reads and writes a directory standing in for the bucket; `curl` answers the price preflight from a fixture; `provision.sh` and `bootstrap.sh` are stubs that lay out the VM root; `launch.sh`, `teardown.sh`, `tmux`, the campaign runner, both adapter revisions, and `hfx` run unchanged. The run passes only when `lifecycle-result.json` records `passed` and the shimmed teardown proves zero footprint; `--lifecycles 2` runs the driver a second time in the same evidence root against a fresh shimmed VM and a cleared extension scratch prefix, as a rerun after a failed rehearsal does, and `--record` writes `campaign-dry-run-result.json`, which the section 4 `dry-run-passed` check requires for the ref about to run. Rehearsal runs 1 to 3 each ended on a defect this dry run would have surfaced at zero cost; run 4 passed. The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The composer also refuses any `bash -s --` line whose arguments are not exactly `"$(remote_tokens "${remote_args[@]}")"` preceded by a `remote_args=(...)` assignment, and its test suite runs every such fence's argument construction through a fake `ssh` that joins and re-splits the command string the way the real one does, proving on the workstation that each remote script receives every positional it validates. The composer also refuses any fence whose awk program accumulates a sum and prints it with bare `print`, and its test suite runs the fence 18 baseline byte check against ten 20 GB sizes with no `awk` on the path. Other remote invocations (`mkdir -p`, `tail -n 1`, the `du`, `sha256sum -c`, and `rm -f` command strings of section 9, the `tmux kill-session` loop of the trap, and every `rsync` remote path) carry only constant paths, validated identifiers, or names matched by a fixed pattern, so they contain no character the remote shell could split. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.
+Before any lifecycle, `scripts/hetzner/campaign-dry-run.sh` executes the entire composed driver on the workstation at zero cloud cost: it clones the committed `HEAD`, prepares the rehearsal inputs from the synthetic corpus, and runs every fence of sections 4 to 16 under the rehearsal contract with the cloud and the VM replaced by shims. `ssh`, `scp`, and `rsync` remap the VM paths onto a scratch VM root and run each `bash -s` script through the same argument joining the real `ssh` performs; `hcloud` answers from a state file seeded with the recorded fixtures and honours detach and delete; `aws` reads and writes a directory standing in for the bucket; `curl` answers the price preflight from a fixture; `provision.sh` and `bootstrap.sh` are stubs that lay out the VM root; `launch.sh`, `teardown.sh`, `tmux`, the campaign runner, both adapter revisions, and `hfx` run unchanged. The run passes only when `lifecycle-result.json` records `passed` and the shimmed teardown proves zero footprint; `--lifecycles 2` runs the driver a second time in the same evidence root against a fresh shimmed VM and a cleared extension scratch prefix, as a rerun after a failed rehearsal does, and `--record` writes `campaign-dry-run-result.json`, which the section 4 `dry-run-passed` check requires for the ref about to run. Rehearsal runs 1 to 3 each ended on a defect this dry run would have surfaced at zero cost; run 4 passed. The rehearsal's reference control is built on the VM (contract `control_reference` `vm-planetary-build`, section 10), never on the workstation, because `area_km2` and `up_area_km2` come from libm trigonometry and a last-ulp difference between macOS arm64 and Debian x86 would fail the byte-for-byte planetary gate on a non-defect. The composer also refuses any `bash -s --` line whose arguments are not exactly `"$(remote_tokens "${remote_args[@]}")"` preceded by a `remote_args=(...)` assignment, and its test suite runs every such fence's argument construction through a fake `ssh` that joins and re-splits the command string the way the real one does, proving on the workstation that each remote script receives every positional it validates. The composer also refuses a driver in which any `rsync` or `scp` from the VM, or any `copy_remote_root` call, targets the workstation with anything but the small-record roots (`state`, `reports`, `/mnt/hfx/logs`, `/mnt/hfx/work/sha256`) or single `.json`, `.txt`, or `.log` files, so no fence can write dataset bytes to the workstation. The composer also refuses any fence whose awk program accumulates a sum and prints it with bare `print`, and its test suite runs the fence 18 baseline byte check against ten 20 GB sizes with no `awk` on the path. Other remote invocations (`mkdir -p`, `tail -n 1`, the `du`, `sha256sum -c`, and `rm -f` command strings of section 9, the `tmux kill-session` loop of the trap, and every `rsync` remote path) carry only constant paths, validated identifiers, or names matched by a fixed pattern, so they contain no character the remote shell could split. The rehearsal succeeds only when section 16 writes `lifecycle-result.json` with `result` `passed`, which requires strict validation of the tiny extended artifact to pass and teardown to prove zero footprint. The production preflight in section 4 refuses without that record.

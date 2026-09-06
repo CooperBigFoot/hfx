@@ -11,8 +11,10 @@ runbook's `campaign_cleanup`. The fence proof beside the driver lets a reviewer
 diff every embedded fence against the runbook; the composer itself refuses when
 a fence's first line is not the one this composer was written for, when a
 remote script's arguments are not the quoted remote_args array, when a control
-fence reads the adjudication record before deriving it, or when a fence prints
-an accumulated awk sum through awk's default number format.
+fence reads the adjudication record before deriving it, when a fence prints
+an accumulated awk sum through awk's default number format, or when the
+composed driver would copy anything but small records from the VM to the
+workstation (the maintainer's 2026-09-06 directive: work solely in the cloud).
 
 Runs on the standard library only, so the workstation needs no Python project.
 """
@@ -207,6 +209,89 @@ def check_integer_byte_sums(number: int, label: str, fence: str) -> None:
             raise ComposeError(
                 f"fence {number} ({label}) line {line_number} prints an awk sum through awk's default number format: {line!r}"
             )
+
+
+SMALL_RECORD_ROOTS = ('"$CAMPAIGN_DIR/state"', '"$CAMPAIGN_DIR/reports"', "/mnt/hfx/logs", "/mnt/hfx/work/sha256")
+RECORD_FILE_SUFFIXES = (".json", ".txt", ".log", ".md")
+REMOTE_SOURCE = 'root@$SERVER_IP:'
+COMMAND_SEPARATORS = ("|", "||", "&&", "&", ";")
+REDIRECTION = re.compile(r"^[0-9]*>>?")
+
+
+def is_record_path(word: str) -> bool:
+    """A workstation path the driver may write: a record file, or a null or pipe sink."""
+    path = word.strip('"')
+    return path.endswith(RECORD_FILE_SUFFIXES) or path in ("/dev/null", "&1", "&2") or path.startswith("&")
+
+
+def command_operands(words: list[str], start: int) -> list[str]:
+    """The operands of the command that starts at words[start], up to the next separator or redirection."""
+    operands = []
+    for word in words[start:]:
+        if word in COMMAND_SEPARATORS or REDIRECTION.match(word) or word.startswith("<"):
+            break
+        operands.append(word)
+    return operands
+
+
+def check_workstation_copies(driver: str) -> None:
+    """Refuse a driver that copies anything but small records from the VM to the workstation.
+
+    Dataset bytes (basin outputs, control builds, the reference control, the
+    extended artifact, salvage trees) are preserved to the bucket by
+    `preserve_root_to_bucket`; the workstation receives state, reports, logs,
+    digest manifests, and single record files only. The check is token based:
+    wherever a `copy_remote_root`, `rsync`, `scp`, or `aws s3 cp` token occurs
+    on a workstation line (after `do`, `time`, `&&`, a pipe, anywhere), its
+    operands are inspected, and every redirection or `tee` target on a
+    workstation line that runs `ssh` must be a record file. Lines inside a
+    `<<'REMOTE'` heredoc run on the VM and are exempt; the `copy_remote_root`
+    definition is the one place a variable source is allowed.
+    """
+    in_definition = False
+    in_heredoc = False
+    for number, line in joined_lines(driver):
+        if in_heredoc:
+            if line == "REMOTE":
+                in_heredoc = False
+            continue
+        if line.startswith("copy_remote_root() {"):
+            in_definition = True
+            continue
+        if in_definition:
+            if line == "}":
+                in_definition = False
+            continue
+        words = line.replace(";", " ; ").split()
+        if "<<'REMOTE'" in words:
+            in_heredoc = True
+        for index, word in enumerate(words):
+            if word == "copy_remote_root":
+                if index + 1 >= len(words) or words[index + 1] not in SMALL_RECORD_ROOTS:
+                    raise ComposeError(f"driver line {number} copies a non-record root from the VM to the workstation: {line!r}")
+            elif word in ("rsync", "scp"):
+                operands = command_operands(words, index + 1)
+                for position, operand in enumerate(operands):
+                    if REMOTE_SOURCE not in operand:
+                        continue
+                    downloads = any(REMOTE_SOURCE not in later and not later.startswith("-") for later in operands[position + 1:])
+                    if downloads and not is_record_path(operand.split(REMOTE_SOURCE, 1)[1]):
+                        raise ComposeError(f"driver line {number} copies dataset bytes from the VM to the workstation: {line!r}")
+            elif word == "aws" and words[index + 1:index + 3] == ["s3", "cp"]:
+                operands = [operand for operand in command_operands(words, index + 3) if not operand.startswith("-") and operand != "-"]
+                if operands and not operands[-1].startswith(('"s3://', "s3://")) and not is_record_path(operands[-1]):
+                    raise ComposeError(f"driver line {number} copies bucket objects onto the workstation: {line!r}")
+        if "ssh" in words:
+            for index, word in enumerate(words):
+                target = None
+                if REDIRECTION.match(word):
+                    rest = REDIRECTION.sub("", word, count=1)
+                    target = rest if rest else (words[index + 1] if index + 1 < len(words) else "")
+                elif word == "tee":
+                    following = [operand for operand in command_operands(words, index + 1) if not operand.startswith("-")]
+                    target = following[0] if following else ""
+                if target is not None and not is_record_path(target):
+                    raise ComposeError(f"driver line {number} redirects VM output into a non-record workstation path: {line!r}")
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'
@@ -572,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fences = extract_fences(runbook.read_text(encoding="utf-8"))
         driver = compose(fences, arguments.mode, arguments.resume_at)
+        check_workstation_copies(driver)
     except (OSError, ComposeError) as error:
         print(f"compose-campaign-driver: refused: {error}", file=sys.stderr)
         return 1

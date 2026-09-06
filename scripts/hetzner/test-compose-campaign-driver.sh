@@ -225,9 +225,11 @@ IFS=\$'\n\t'
 LOCAL_EVIDENCE_DIR=$tmp/f17
 CAMPAIGN_DIR=/mnt/hfx/work/tdx-hydro-x
 SERVER_IP=127.0.0.1
+EXTENSION_PREFIX=s3://pourpoint-hfx/scratch/tdx-hydro-x
 ABSENT_IDS=(1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010)
 ssh() { cat >/dev/null; return 0; }
 copy_remote_root() { return 0; }
+preserve_root_to_bucket() { printf '%s: objects=0 kept=0 uploaded=0 prefix=%s\n' "\$3" "\$2"; }
 source "$tmp/full/fence-proof/driver-17.sh"
 HARNESS
 bash "$tmp/f17-harness.sh" >"$stdout" 2>"$stderr" || die "fence 17 aborted on an empty basin-outputs manifest ($(cat "$stderr"))"
@@ -291,6 +293,8 @@ run_fence_arguments() {
             printf 'CAMPAIGN=campaign-rehearsal\nCAMPAIGN_DIR="/mnt/hfx/work/tdx-hydro-campaign-rehearsal"\nCONTROL_ROOT="/mnt/hfx/work/control builds"\nBASELINE_ROOT="/mnt/hfx/work/base line"\n'
             printf 'CONTROL_ID=7020000010\nCONTROL_FABRIC_VERSION="0.3.0 (rehearsal)"\nCONTROL_REFERENCE=vm-planetary-build\nFABRIC_VERSION="NGA-TDX-Hydro-20230126 rehearsal"\n'
             printf 'BASELINE_PREFIX="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal/base line"\nEXTENSION_PREFIX="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal"\nS3_ENDPOINT=https://fsn1.your-objectstorage.com\n'
+            printf 'CORPUS_SOURCE=bucket\nCORPUS_PREFIX="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal/source corpus"\nCORPUS_FILE_COUNT=8\n'
+            printf 'source_root="/mnt/hfx/work/control builds/preserved/7020000010"\ndestination_prefix="s3://pourpoint-hfx/scratch/tdx-hydro-campaign-rehearsal/control reference"\nmanifest_name=control-reference\n'
             sed -n "${assignment_line}p" "$fence"
             printf 'printf '"'"'%%s\\n'"'"' "${remote_args[@]}" > %s\n' "$tmp/fake-ssh/expected-$number-$site.txt"
             printf 'ssh -o BatchMode=yes "root@$SERVER_IP" bash -s -- "$(remote_tokens "${remote_args[@]}")" <<'"'"'REMOTE'"'"'\n'
@@ -307,7 +311,9 @@ run_fence_arguments() {
             die "fence $number site $site: arrived count differs from the remote positional count check"
     done
 }
-for number in 08 12 13 17 18 21 22 23; do run_fence_arguments "$number"; done
+for number in 06 08 10 12 13 17 18 21 22 23; do run_fence_arguments "$number"; done
+[[ $(wc -l <"$tmp/fake-ssh/arrived-06-1.txt" | tr -d ' ') == 4 ]] || die 'preserve_root_to_bucket did not deliver four positionals'
+[[ $(wc -l <"$tmp/fake-ssh/arrived-10-1.txt" | tr -d ' ') == 4 ]] || die 'the bucket corpus pull did not deliver four positionals'
 [[ $(wc -l <"$tmp/fake-ssh/arrived-08-1.txt" | tr -d ' ') == 6 ]] || die 'fence 8 did not deliver six positionals'
 grep -q '^10000000000$' "$tmp/fake-ssh/arrived-08-1.txt" || die 'fence 8 root disk reserve did not arrive intact'
 grep -q '^2000000000$' "$tmp/fake-ssh/arrived-08-1.txt" || die 'fence 8 required memory did not arrive intact'
@@ -378,6 +384,50 @@ while IFS=: read -r number line; do
 done < <(and_lists)
 [[ "$and_list_count" -ge 20 ]] || die "the && audit saw only $and_list_count lines; the fence proof was not scanned"
 pass 'no fence carries a top-level && list whose non-final member could fail without stopping the driver'
+
+# The maintainer's 2026-09-06 directive: no dataset byte is written to the workstation. The composer refuses
+# a driver in which copy_remote_root names a dataset root or an rsync/scp from the VM names anything but a
+# single record file; uploads to the VM and the copy_remote_root definition itself stay allowed.
+for forbidden in '"$LOCAL_EVIDENCE_DIR/off-vm/campaign/basin-outputs' '"$LOCAL_EVIDENCE_DIR/off-vm/extension' '"$LOCAL_EVIDENCE_DIR/control-reference/' 'copy_remote_root "$CONTROL_ROOT"' 'copy_remote_root "$CAMPAIGN_DIR/basin-outputs"' 'copy_remote_root "$CAMPAIGN_DIR/assembly/dataset"' '"$LOCAL_EVIDENCE_DIR/salvage/extension"'; do
+    ! grep -qF -- "$forbidden" "$tmp/full/campaign-driver.sh" || die "the composed driver still names the workstation dataset path $forbidden"
+done
+grep -qF -- 'preserve_root_to_bucket "$CAMPAIGN_DIR/basin-outputs" "$EXTENSION_PREFIX/basin-outputs" basin-outputs' "$tmp/full/campaign-driver.sh" || die 'basin outputs are not preserved to the bucket'
+grep -qF -- 'preserve_root_to_bucket "$CONTROL_ROOT" "$EXTENSION_PREFIX/control-builds" control-builds' "$tmp/full/campaign-driver.sh" || die 'control builds are not preserved to the bucket'
+grep -qF -- 'preserve_root_to_bucket "$CAMPAIGN_DIR/downloads" "$EXTENSION_PREFIX/source-corpus" source-corpus' "$tmp/full/campaign-driver.sh" || die 'the source corpus is not preserved to the bucket'
+grep -qF -- 'preserve_root_to_bucket "$CONTROL_ROOT/preserved/$CONTROL_ID" "$PRESERVED_CONTROL" control-reference' "$tmp/full/campaign-driver.sh" || die 'the VM-built reference control is not preserved to the bucket'
+grep -qF -- '"$EXTENSION_PREFIX/salvage/extension/dataset" salvage-extension-dataset' "$tmp/full/campaign-driver.sh" || die 'salvage does not preserve the assembled dataset to the bucket'
+perl -0pe 's/(copy_remote_root "\$CAMPAIGN_DIR\/reports" "\$LOCAL_EVIDENCE_DIR\/off-vm\/campaign"\ncopy_remote_root "\$CAMPAIGN_DIR\/state")/copy_remote_root "\$CAMPAIGN_DIR\/basin-outputs" "\$LOCAL_EVIDENCE_DIR\/off-vm\/campaign"\n$1/' "$runbook" >"$tmp/dataset-root-runbook.md"
+grep -q 'copy_remote_root "$CAMPAIGN_DIR/basin-outputs" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"' "$tmp/dataset-root-runbook.md" || die 'mutation did not apply'
+expect_failure --runbook "$tmp/dataset-root-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'copies a non-record root from the VM to the workstation'
+perl -0pe 's/(  scp -o BatchMode=yes "root@\$SERVER_IP:\/mnt\/hfx\/work\/sha256\/expected-control-sha256\.json" "\$LOCAL_EVIDENCE_DIR\/expected-control-sha256\.json"\n)/$1  rsync -a -e ssh "root\@\$SERVER_IP:\$CONTROL_ROOT\/preserved\/\$CONTROL_ID\/" "\$LOCAL_EVIDENCE_DIR\/control-reference\/"\n/' "$runbook" >"$tmp/dataset-rsync-runbook.md"
+grep -q 'rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/"' "$tmp/dataset-rsync-runbook.md" || die 'mutation did not apply'
+expect_failure --runbook "$tmp/dataset-rsync-runbook.md" --mode full --out "$tmp/bad"
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+# The check is token based: a copy hidden behind `do`, `&&`, or `time`, an ssh redirected into a dataset
+# path, and an `aws s3 cp` onto the workstation are all refused; VM-side heredoc lines stay exempt.
+anchor='  scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json" "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"'
+grep -qF -- "$anchor" "$runbook" || die 'fence 12 anchor line is missing'
+inject_after_anchor() {  # $1 = name, $2 = the line to inject after the fence 12 anchor
+    ANCHOR="$anchor" INJECT="$2" perl -pe 'BEGIN { $a = $ENV{ANCHOR}; $i = $ENV{INJECT} } if (index($_, $a) == 0) { $_ .= "$i\n" }' "$runbook" >"$tmp/$1-runbook.md"
+    grep -qF -- "$2" "$tmp/$1-runbook.md" || die "mutation $1 did not apply"
+    expect_failure --runbook "$tmp/$1-runbook.md" --mode full --out "$tmp/bad"
+}
+inject_after_anchor do-rsync '  for tree in preserved; do rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/$tree/" "$LOCAL_EVIDENCE_DIR/trees/"; done'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor and-rsync '  test -d "$LOCAL_EVIDENCE_DIR" && rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/preserved/" "$LOCAL_EVIDENCE_DIR/trees/"'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor time-scp '  time scp -r -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/preserved" "$LOCAL_EVIDENCE_DIR/trees"'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor ssh-redirect '  ssh -o BatchMode=yes "root@$SERVER_IP" tar -C "$CONTROL_ROOT" -cf - preserved > "$LOCAL_EVIDENCE_DIR/preserved.tar"'
+assert_contains "$stderr" 'redirects VM output into a non-record workstation path'
+inject_after_anchor ssh-tee '  ssh -o BatchMode=yes "root@$SERVER_IP" cat "$CONTROL_ROOT/preserved/$CONTROL_ID/graph.parquet" | tee "$LOCAL_EVIDENCE_DIR/graph.parquet" >/dev/null'
+assert_contains "$stderr" 'redirects VM output into a non-record workstation path'
+inject_after_anchor aws-download '  aws s3 cp "$PRESERVED_CONTROL/" "$LOCAL_EVIDENCE_DIR/control-reference/" --recursive --endpoint-url "$S3_ENDPOINT" --region fsn1'
+assert_contains "$stderr" 'copies bucket objects onto the workstation'
+inject_after_anchor do-copy-root '  for root in basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done'
+assert_contains "$stderr" 'copies a non-record root from the VM to the workstation'
+pass 'the composed driver preserves every dataset tree to the bucket, and the composer refuses a copy of dataset bytes from the VM to the workstation behind do, &&, time, an ssh redirection or tee, or aws s3 cp'
 
 # Byte totals are summed in shell integer arithmetic. awk prints an accumulated sum through its default
 # number format, and the Debian 12 mawk wrote the 114063230627-byte baseline as 1.14063e+11, which ended the
