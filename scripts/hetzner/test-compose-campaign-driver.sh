@@ -404,7 +404,30 @@ perl -0pe 's/(  scp -o BatchMode=yes "root@\$SERVER_IP:\/mnt\/hfx\/work\/sha256\
 grep -q 'rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/preserved/$CONTROL_ID/"' "$tmp/dataset-rsync-runbook.md" || die 'mutation did not apply'
 expect_failure --runbook "$tmp/dataset-rsync-runbook.md" --mode full --out "$tmp/bad"
 assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
-pass 'the composed driver preserves every dataset tree to the bucket, and the composer refuses a copy of dataset bytes from the VM to the workstation'
+# The check is token based: a copy hidden behind `do`, `&&`, or `time`, an ssh redirected into a dataset
+# path, and an `aws s3 cp` onto the workstation are all refused; VM-side heredoc lines stay exempt.
+anchor='  scp -o BatchMode=yes "root@$SERVER_IP:/mnt/hfx/work/sha256/expected-control-sha256.json" "$LOCAL_EVIDENCE_DIR/expected-control-sha256.json"'
+grep -qF -- "$anchor" "$runbook" || die 'fence 12 anchor line is missing'
+inject_after_anchor() {  # $1 = name, $2 = the line to inject after the fence 12 anchor
+    ANCHOR="$anchor" INJECT="$2" perl -pe 'BEGIN { $a = $ENV{ANCHOR}; $i = $ENV{INJECT} } if (index($_, $a) == 0) { $_ .= "$i\n" }' "$runbook" >"$tmp/$1-runbook.md"
+    grep -qF -- "$2" "$tmp/$1-runbook.md" || die "mutation $1 did not apply"
+    expect_failure --runbook "$tmp/$1-runbook.md" --mode full --out "$tmp/bad"
+}
+inject_after_anchor do-rsync '  for tree in preserved; do rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/$tree/" "$LOCAL_EVIDENCE_DIR/trees/"; done'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor and-rsync '  test -d "$LOCAL_EVIDENCE_DIR" && rsync -a -e ssh "root@$SERVER_IP:$CONTROL_ROOT/preserved/" "$LOCAL_EVIDENCE_DIR/trees/"'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor time-scp '  time scp -r -o BatchMode=yes "root@$SERVER_IP:$CONTROL_ROOT/preserved" "$LOCAL_EVIDENCE_DIR/trees"'
+assert_contains "$stderr" 'copies dataset bytes from the VM to the workstation'
+inject_after_anchor ssh-redirect '  ssh -o BatchMode=yes "root@$SERVER_IP" tar -C "$CONTROL_ROOT" -cf - preserved > "$LOCAL_EVIDENCE_DIR/preserved.tar"'
+assert_contains "$stderr" 'redirects VM output into a non-record workstation path'
+inject_after_anchor ssh-tee '  ssh -o BatchMode=yes "root@$SERVER_IP" cat "$CONTROL_ROOT/preserved/$CONTROL_ID/graph.parquet" | tee "$LOCAL_EVIDENCE_DIR/graph.parquet" >/dev/null'
+assert_contains "$stderr" 'redirects VM output into a non-record workstation path'
+inject_after_anchor aws-download '  aws s3 cp "$PRESERVED_CONTROL/" "$LOCAL_EVIDENCE_DIR/control-reference/" --recursive --endpoint-url "$S3_ENDPOINT" --region fsn1'
+assert_contains "$stderr" 'copies bucket objects onto the workstation'
+inject_after_anchor do-copy-root '  for root in basin-outputs; do copy_remote_root "$CAMPAIGN_DIR/$root" "$LOCAL_EVIDENCE_DIR/off-vm/campaign"; done'
+assert_contains "$stderr" 'copies a non-record root from the VM to the workstation'
+pass 'the composed driver preserves every dataset tree to the bucket, and the composer refuses a copy of dataset bytes from the VM to the workstation behind do, &&, time, an ssh redirection or tee, or aws s3 cp'
 
 # Byte totals are summed in shell integer arithmetic. awk prints an accumulated sum through its default
 # number format, and the Debian 12 mawk wrote the 114063230627-byte baseline as 1.14063e+11, which ended the

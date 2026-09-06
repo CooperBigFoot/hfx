@@ -212,8 +212,26 @@ def check_integer_byte_sums(number: int, label: str, fence: str) -> None:
 
 
 SMALL_RECORD_ROOTS = ('"$CAMPAIGN_DIR/state"', '"$CAMPAIGN_DIR/reports"', "/mnt/hfx/logs", "/mnt/hfx/work/sha256")
-SMALL_RECORD_SUFFIXES = (".json", ".txt", ".log", '.json"', '.txt"', '.log"')
+RECORD_FILE_SUFFIXES = (".json", ".txt", ".log", ".md")
 REMOTE_SOURCE = 'root@$SERVER_IP:'
+COMMAND_SEPARATORS = ("|", "||", "&&", "&", ";")
+REDIRECTION = re.compile(r"^[0-9]*>>?")
+
+
+def is_record_path(word: str) -> bool:
+    """A workstation path the driver may write: a record file, or a null or pipe sink."""
+    path = word.strip('"')
+    return path.endswith(RECORD_FILE_SUFFIXES) or path in ("/dev/null", "&1", "&2") or path.startswith("&")
+
+
+def command_operands(words: list[str], start: int) -> list[str]:
+    """The operands of the command that starts at words[start], up to the next separator or redirection."""
+    operands = []
+    for word in words[start:]:
+        if word in COMMAND_SEPARATORS or REDIRECTION.match(word) or word.startswith("<"):
+            break
+        operands.append(word)
+    return operands
 
 
 def check_workstation_copies(driver: str) -> None:
@@ -222,14 +240,21 @@ def check_workstation_copies(driver: str) -> None:
     Dataset bytes (basin outputs, control builds, the reference control, the
     extended artifact, salvage trees) are preserved to the bucket by
     `preserve_root_to_bucket`; the workstation receives state, reports, logs,
-    digest manifests, and single record files only. Every `copy_remote_root`
-    call must name one of the small-record roots, and every `rsync` or `scp`
-    whose source is on the VM must name single `.json`, `.txt`, or `.log`
-    files; the `copy_remote_root` definition is the one place a variable
-    source is allowed.
+    digest manifests, and single record files only. The check is token based:
+    wherever a `copy_remote_root`, `rsync`, `scp`, or `aws s3 cp` token occurs
+    on a workstation line (after `do`, `time`, `&&`, a pipe, anywhere), its
+    operands are inspected, and every redirection or `tee` target on a
+    workstation line that runs `ssh` must be a record file. Lines inside a
+    `<<'REMOTE'` heredoc run on the VM and are exempt; the `copy_remote_root`
+    definition is the one place a variable source is allowed.
     """
     in_definition = False
+    in_heredoc = False
     for number, line in joined_lines(driver):
+        if in_heredoc:
+            if line == "REMOTE":
+                in_heredoc = False
+            continue
         if line.startswith("copy_remote_root() {"):
             in_definition = True
             continue
@@ -237,29 +262,36 @@ def check_workstation_copies(driver: str) -> None:
             if line == "}":
                 in_definition = False
             continue
-        for segment in [part.strip() for part in line.split(";")]:
-            words = segment.split()
-            if not words:
-                continue
+        words = line.replace(";", " ; ").split()
+        if "<<'REMOTE'" in words:
+            in_heredoc = True
+        for index, word in enumerate(words):
+            if word == "copy_remote_root":
+                if index + 1 >= len(words) or words[index + 1] not in SMALL_RECORD_ROOTS:
+                    raise ComposeError(f"driver line {number} copies a non-record root from the VM to the workstation: {line!r}")
+            elif word in ("rsync", "scp"):
+                operands = command_operands(words, index + 1)
+                for position, operand in enumerate(operands):
+                    if REMOTE_SOURCE not in operand:
+                        continue
+                    downloads = any(REMOTE_SOURCE not in later and not later.startswith("-") for later in operands[position + 1:])
+                    if downloads and not is_record_path(operand.split(REMOTE_SOURCE, 1)[1]):
+                        raise ComposeError(f"driver line {number} copies dataset bytes from the VM to the workstation: {line!r}")
+            elif word == "aws" and words[index + 1:index + 3] == ["s3", "cp"]:
+                operands = [operand for operand in command_operands(words, index + 3) if not operand.startswith("-") and operand != "-"]
+                if operands and not operands[-1].startswith(('"s3://', "s3://")) and not is_record_path(operands[-1]):
+                    raise ComposeError(f"driver line {number} copies bucket objects onto the workstation: {line!r}")
+        if "ssh" in words:
             for index, word in enumerate(words):
-                if word == "copy_remote_root" and index + 1 < len(words) and words[index + 1] not in SMALL_RECORD_ROOTS:
-                    raise ComposeError(f"driver line {number} copies a non-record root from the VM to the workstation: {segment!r}")
-            if words[0] not in ("rsync", "scp"):
-                continue
-            operands = []
-            for word in words[1:]:
-                if word in ("|", "&", "||", "&&") or word.startswith((">", "2>", "<")):
-                    break
-                operands.append(word)
-            for index, word in enumerate(operands):
-                if REMOTE_SOURCE not in word:
-                    continue
-                downloads = any(REMOTE_SOURCE not in later and not later.startswith("-") for later in operands[index + 1:])
-                if not downloads:
-                    continue
-                remote_path = word.split(REMOTE_SOURCE, 1)[1]
-                if not remote_path.endswith(SMALL_RECORD_SUFFIXES):
-                    raise ComposeError(f"driver line {number} copies dataset bytes from the VM to the workstation: {segment!r}")
+                target = None
+                if REDIRECTION.match(word):
+                    rest = REDIRECTION.sub("", word, count=1)
+                    target = rest if rest else (words[index + 1] if index + 1 < len(words) else "")
+                elif word == "tee":
+                    following = [operand for operand in command_operands(words, index + 1) if not operand.startswith("-")]
+                    target = following[0] if following else ""
+                if target is not None and not is_record_path(target):
+                    raise ComposeError(f"driver line {number} redirects VM output into a non-record workstation path: {line!r}")
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'
