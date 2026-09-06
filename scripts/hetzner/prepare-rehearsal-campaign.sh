@@ -107,9 +107,9 @@ corpus_dir=$evidence_root/off-vm/acquired-source
 baseline_dir=$evidence_root/off-vm/baseline
 resolved=$evidence_root/rehearsal-campaign-contract.resolved.json
 
-measure_corpus_bytes() { find "$corpus_dir" -type f -name '*.gpkg' -exec stat -f '%z' {} + | awk '{s+=$1} END {print s+0}'; }
+measure_corpus_bytes() { find "$corpus_dir" -type f -name '*.gpkg' -exec stat -f '%z' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; }; }
 measure_corpus_files() { find "$corpus_dir" -type f -name '*.gpkg' | wc -l | tr -d ' '; }
-measure_baseline_bytes() { find "$baseline_dir/dataset" -type f -exec stat -f '%z' {} + | awk '{s+=$1} END {print s+0}'; }
+measure_baseline_bytes() { find "$baseline_dir/dataset" -type f -exec stat -f '%z' {} + | { total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '%s\n' "$total"; }; }
 measure_baseline_objects() { find "$baseline_dir/dataset" -type f | wc -l | tr -d ' '; }
 
 # write_resolved_contract : (corpus_bytes, baseline_bytes, baseline_objects) -> resolved contract file

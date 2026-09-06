@@ -378,4 +378,50 @@ while IFS=: read -r number line; do
 done < <(and_lists)
 [[ "$and_list_count" -ge 20 ]] || die "the && audit saw only $and_list_count lines; the fence proof was not scanned"
 pass 'no fence carries a top-level && list whose non-final member could fail without stopping the driver'
+
+# Byte totals are summed in shell integer arithmetic. awk prints an accumulated sum through its default
+# number format, and the Debian 12 mawk wrote the 114063230627-byte baseline as 1.14063e+11, which ended the
+# 2026-09-05 production lifecycle at the fence 18 byte check after the baseline had been fully pulled. The
+# composer refuses that form, and the extracted check must total ten 20 GB sizes exactly with no awk on the path.
+byte_sum='{ total=0; while read -r size; do [[ "$size" =~ ^[0-9]+$ ]] || exit 1; total=$((total + size)); done; printf '"'"'%s\n'"'"' "$total"; }'
+old_sum="awk '{s+=\$1} END {print s}'"
+byte_check=$(grep -F -- '-eq "$baseline_exported_bytes"' "$tmp/expected/expected-18.sh")
+[[ $(printf '%s\n' "$byte_check" | wc -l | tr -d ' ') == 1 ]] || die 'fence 18 does not carry exactly one baseline byte check'
+[[ "$byte_check" == *"$byte_sum"* ]] || die 'the fence 18 baseline byte check does not sum in shell integer arithmetic'
+grep -c -F -- "$byte_sum" "$runbook" | grep -q -x 3 || die 'the runbook does not carry the shell integer sum at the corpus, baseline, and artifact checks'
+! grep -q -F -- "END {print s" "$tmp"/expected/expected-*.sh || die 'a fence still prints an awk sum through the default number format'
+SUM="$byte_sum" OLD="$old_sum" perl -pe 'BEGIN { $s = $ENV{SUM}; $o = $ENV{OLD} } s/\Q$s\E/$o/ if index($_, q{$baseline_exported_bytes}) >= 0' "$runbook" >"$tmp/awk-sum-runbook.md"
+grep -q -F -- "$old_sum" "$tmp/awk-sum-runbook.md" || die 'mutation did not apply'
+expect_failure --runbook "$tmp/awk-sum-runbook.md" --mode full --out "$tmp/bad"
+grep -E -- "fence 18 \(baseline-pull\) line [0-9]+ prints an awk sum through awk's default number format" "$stderr" >/dev/null || die 'the composer did not name the fence 18 awk sum'
+mkdir -p "$tmp/no-awk"
+printf '#!/usr/bin/env bash\nprintf "byte check invoked awk\\n" >&2\nexit 99\n' >"$tmp/no-awk/awk"
+chmod +x "$tmp/no-awk/awk"
+printf '20000000000\n%.0s' 1 2 3 4 5 6 7 8 9 10 >"$tmp/sizes.txt"
+write_byte_check() {  # $1 = output script, $2 = the check line; the find over the pulled dataset is replaced by the size list
+    local find_sizes='find "$baseline_root/dataset" -type f -exec stat -c '"'"'%s'"'"' {} +'
+    [[ "$2" == *"$find_sizes"* ]] || die 'the baseline byte check does not list the pulled sizes with find and stat'
+    printf 'set -Eeuo pipefail\nsizes=%q\n%s\n' "$tmp/sizes.txt" "${2/"$find_sizes"/cat \"\$sizes\"}" >"$1"
+}
+write_byte_check "$tmp/byte-check.sh" "$byte_check"
+PATH="$tmp/no-awk:$PATH" baseline_exported_bytes=200000000000 bash "$tmp/byte-check.sh" || die 'the shell integer sum did not total ten 20 GB sizes to 200000000000'
+! PATH="$tmp/no-awk:$PATH" baseline_exported_bytes=200000000001 bash "$tmp/byte-check.sh" 2>/dev/null || die 'the byte check accepted a total one byte off'
+printf '20000000000\nx\n' >"$tmp/bad-sizes.txt"
+! PATH="$tmp/no-awk:$PATH" baseline_exported_bytes=20000000000 bash -c 'sizes=$1; '"$(sed -n 3p "$tmp/byte-check.sh")" _ "$tmp/bad-sizes.txt" 2>/dev/null ||
+    die 'the byte check accepted a non-numeric size'
+write_byte_check "$tmp/awk-byte-check.sh" "${byte_check/"$byte_sum"/$old_sum}"
+grep -q -F -- "$old_sum" "$tmp/awk-byte-check.sh" || die 'the old awk form was not restored for the comparison'
+awk_status=0
+PATH="$tmp/no-awk:$PATH" baseline_exported_bytes=200000000000 bash "$tmp/awk-byte-check.sh" >"$tmp/awk-byte-check.out" 2>&1 || awk_status=$?
+[[ "$awk_status" -ne 0 ]] || die 'the old awk form passed without awk'
+grep -q 'byte check invoked awk' "$tmp/awk-byte-check.out" || die 'the old form did not depend on awk'
+# Where an awk prints 2^31 in exponent form (the Debian 12 mawk does), the old check fails on the exact total.
+if command -v mawk >/dev/null && [[ $(printf '2147483648\n' | mawk '{s+=$1} END {print s}') == *e+* ]]; then
+    mkdir -p "$tmp/mawk-as-awk"
+    ln -s "$(command -v mawk)" "$tmp/mawk-as-awk/awk"
+    ! PATH="$tmp/mawk-as-awk:$PATH" baseline_exported_bytes=200000000000 bash "$tmp/awk-byte-check.sh" 2>"$tmp/mawk.err" || die 'the old awk form passed under an exponent-printing mawk'
+    grep -q 'integer expression expected' "$tmp/mawk.err" || die 'the old awk form did not fail on the exponent form'
+    PATH="$tmp/mawk-as-awk:$PATH" baseline_exported_bytes=200000000000 bash "$tmp/byte-check.sh" || die 'the shell integer sum failed under an exponent-printing mawk'
+fi
+pass 'the baseline byte check totals ten 20 GB sizes exactly in shell arithmetic with no awk, and the composer refuses the awk default-format sum'
 printf '1..%d\n' "$passed"
