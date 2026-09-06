@@ -33,10 +33,16 @@ grep -q 'lifecycle 2 passed' "$tmp/dry-run.out" || die 'the second lifecycle did
 [[ $(find "$tmp/work/evidence" -mindepth 1 -maxdepth 1 -type d -name 'campaign-rehearsal-superseded-*' | wc -l | tr -d ' ') == 1 ]] ||
     die 'the first lifecycle was not superseded in place'
 superseded=$(find "$tmp/work/evidence" -mindepth 1 -maxdepth 1 -type d -name 'campaign-rehearsal-superseded-*')
+extension_key=$(jq -r '.extension_scratch_prefix' "$tmp/work/evidence/dry-run-contract.json")
 for dir in "$superseded" "$tmp/work/evidence/campaign-rehearsal"; do
-    [[ -f "$dir/control-reference/$control_id/manifest.json" ]] || die "no VM-built reference control under $dir"
+    [[ ! -e "$dir/control-reference" && ! -e "$dir/off-vm/campaign/basin-outputs" && ! -e "$dir/off-vm/control-builds" && ! -e "$dir/off-vm/extension" ]] ||
+        die "dataset bytes were written to the workstation under $dir"
+    [[ -s "$dir/verify-control-builds.txt" && -s "$dir/verify-basin-outputs.txt" && -s "$dir/verify-source-corpus.txt" && -s "$dir/verify-extension.txt" ]] ||
+        die "bucket read-back verifications are missing under $dir"
     jq -e '.result == "passed"' "$dir/lifecycle-result.json" >/dev/null || die "lifecycle under $dir did not pass"
 done
+[[ -f "$tmp/work/bucket/${extension_key%/}/control-reference/$control_id/manifest.json" ]] || die 'the VM-built reference control is not in the bucket'
+[[ -n "$(find "$tmp/work/bucket/${extension_key%/}/source-corpus" -type f -name '*.gpkg' 2>/dev/null)" ]] || die 'the source corpus is not in the bucket'
 [[ ! -e "$tmp/work/evidence/off-vm/control-builds" ]] || die 'a reference control was written into the shared off-vm inputs'
 object_count=$(jq -r '.baseline.object_count' "$tmp/work/evidence/dry-run-contract.json")
 [[ "$object_count" =~ ^[1-9][0-9]*$ ]] || die 'the resolved dry-run contract carries no baseline object count'

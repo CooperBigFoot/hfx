@@ -11,8 +11,10 @@ runbook's `campaign_cleanup`. The fence proof beside the driver lets a reviewer
 diff every embedded fence against the runbook; the composer itself refuses when
 a fence's first line is not the one this composer was written for, when a
 remote script's arguments are not the quoted remote_args array, when a control
-fence reads the adjudication record before deriving it, or when a fence prints
-an accumulated awk sum through awk's default number format.
+fence reads the adjudication record before deriving it, when a fence prints
+an accumulated awk sum through awk's default number format, or when the
+composed driver would copy anything but small records from the VM to the
+workstation (the maintainer's 2026-09-06 directive: work solely in the cloud).
 
 Runs on the standard library only, so the workstation needs no Python project.
 """
@@ -207,6 +209,57 @@ def check_integer_byte_sums(number: int, label: str, fence: str) -> None:
             raise ComposeError(
                 f"fence {number} ({label}) line {line_number} prints an awk sum through awk's default number format: {line!r}"
             )
+
+
+SMALL_RECORD_ROOTS = ('"$CAMPAIGN_DIR/state"', '"$CAMPAIGN_DIR/reports"', "/mnt/hfx/logs", "/mnt/hfx/work/sha256")
+SMALL_RECORD_SUFFIXES = (".json", ".txt", ".log", '.json"', '.txt"', '.log"')
+REMOTE_SOURCE = 'root@$SERVER_IP:'
+
+
+def check_workstation_copies(driver: str) -> None:
+    """Refuse a driver that copies anything but small records from the VM to the workstation.
+
+    Dataset bytes (basin outputs, control builds, the reference control, the
+    extended artifact, salvage trees) are preserved to the bucket by
+    `preserve_root_to_bucket`; the workstation receives state, reports, logs,
+    digest manifests, and single record files only. Every `copy_remote_root`
+    call must name one of the small-record roots, and every `rsync` or `scp`
+    whose source is on the VM must name single `.json`, `.txt`, or `.log`
+    files; the `copy_remote_root` definition is the one place a variable
+    source is allowed.
+    """
+    in_definition = False
+    for number, line in joined_lines(driver):
+        if line.startswith("copy_remote_root() {"):
+            in_definition = True
+            continue
+        if in_definition:
+            if line == "}":
+                in_definition = False
+            continue
+        for segment in [part.strip() for part in line.split(";")]:
+            words = segment.split()
+            if not words:
+                continue
+            for index, word in enumerate(words):
+                if word == "copy_remote_root" and index + 1 < len(words) and words[index + 1] not in SMALL_RECORD_ROOTS:
+                    raise ComposeError(f"driver line {number} copies a non-record root from the VM to the workstation: {segment!r}")
+            if words[0] not in ("rsync", "scp"):
+                continue
+            operands = []
+            for word in words[1:]:
+                if word in ("|", "&", "||", "&&") or word.startswith((">", "2>", "<")):
+                    break
+                operands.append(word)
+            for index, word in enumerate(operands):
+                if REMOTE_SOURCE not in word:
+                    continue
+                downloads = any(REMOTE_SOURCE not in later and not later.startswith("-") for later in operands[index + 1:])
+                if not downloads:
+                    continue
+                remote_path = word.split(REMOTE_SOURCE, 1)[1]
+                if not remote_path.endswith(SMALL_RECORD_SUFFIXES):
+                    raise ComposeError(f"driver line {number} copies dataset bytes from the VM to the workstation: {segment!r}")
 
 
 REMOTE_ARGUMENT_FORM = 'bash -s -- "$(remote_tokens "${remote_args[@]}")"'
@@ -572,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fences = extract_fences(runbook.read_text(encoding="utf-8"))
         driver = compose(fences, arguments.mode, arguments.resume_at)
+        check_workstation_copies(driver)
     except (OSError, ComposeError) as error:
         print(f"compose-campaign-driver: refused: {error}", file=sys.stderr)
         return 1

@@ -152,6 +152,9 @@ expect_failure --runbook "$mutated" --check scope-permits-compilation
 assert_contains "$stderr" 'runbook omits required operational text'
 pass 'scope drift in identity, lifecycles, basins, acts, or prose refuses'
 
+mutated=$(mutate laptop-corpus 's/"corpus_source": "workstation-rsync"/"corpus_source": "laptop"/')
+expect_failure --runbook "$mutated" --check scope-permits-compilation
+assert_contains "$stderr" 'corpus_source must be workstation-rsync or bucket'
 mutated=$(mutate bigger-server 's/"server_type": "ccx33"/"server_type": "ccx43"/')
 expect_failure --runbook "$mutated" --check ceilings-and-kill-switches
 assert_contains "$stderr" 'server type is absent or changed'
