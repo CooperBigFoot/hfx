@@ -156,7 +156,10 @@ All prefixes below are relative to
 The source digest list equals the preserved expected list for all 16 GeoPackages.
 The control prefix holds corrected, rebuilt planetary and preserved planetary
 trees plus their small comparison records. The receipt carries each object
-digest and the hashes of the manifests and readback records. No dataset was
+digest and the hashes of the manifests and readback records. Object paths are
+relative to each bucket prefix. The extension receipt records the original
+`assembly/dataset/` source-manifest prefix separately, keeping its SHA-list hash
+unchanged. No dataset was
 processed or downloaded during this retrospective audit.
 
 The retained bucket listing predates validation completion and shows an assembly

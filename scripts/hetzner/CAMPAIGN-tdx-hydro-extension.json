@@ -244,7 +244,8 @@
     "conservative_estimated_gross_eur": "11.3708598205",
     "cost_basis": "captured gross rates, 730 hours per month, 39 rounded billed hours; outbound estimate below included allowance",
     "invoiced_actual_gross_eur": null,
-    "extra_volume_swap_bytes": 55000000000
+    "extra_volume_swap_bytes": 55000000000,
+    "preserved_data_cleanup_authority": "none; historical workstation-copy records confer no deletion authority; separate explicit decision required"
   },
   "preservation": [
     {
@@ -562,30 +563,32 @@
       "readback_record_sha256": "d6089b1ad403f23af995050b86894da0c4e03ece6acec1e45dc9f89b77a920fa",
       "objects": [
         {
-          "path": "assembly/dataset/aux/snap_stems.parquet",
+          "path": "aux/snap_stems.parquet",
           "sha256": "9c3459148b528d54f7da4bf019bd761f557b6d139e23f592bef2136bd6ef9b3f"
         },
         {
-          "path": "assembly/dataset/catchments.parquet",
+          "path": "catchments.parquet",
           "sha256": "456a163cb627dd8128dd59f1cd820f7f156f44ebd7a2887e77041cc9259767bd"
         },
         {
-          "path": "assembly/dataset/CITATION.txt",
+          "path": "CITATION.txt",
           "sha256": "26cf72c81cb2841878979987a0e9345366738e6379ef6f016744d6903449e213"
         },
         {
-          "path": "assembly/dataset/graph.parquet",
+          "path": "graph.parquet",
           "sha256": "b21754976fb176a762bbd6e5bcdd1737dcad82551fdc21fac4bbb7bc8df038ed"
         },
         {
-          "path": "assembly/dataset/manifest.json",
+          "path": "manifest.json",
           "sha256": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85"
         },
         {
-          "path": "assembly/dataset/NOTICE",
+          "path": "NOTICE",
           "sha256": "d3d3e7a6c45aaf9e13fe471e8b427f7526addb60aa8fa9f47534890775cd4d93"
         }
-      ]
+      ],
+      "object_path_base": "bucket prefix",
+      "source_manifest_path_prefix": "assembly/dataset/"
     }
   ],
   "small_evidence_sha256": [
