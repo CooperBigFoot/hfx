@@ -245,7 +245,17 @@
     "cost_basis": "captured gross rates, 730 hours per month, 39 rounded billed hours; outbound estimate below included allowance",
     "invoiced_actual_gross_eur": null,
     "extra_volume_swap_bytes": 55000000000,
-    "preserved_data_cleanup_authority": "none; historical workstation-copy records confer no deletion authority; separate explicit decision required"
+    "preserved_data_cleanup_authority": "none; historical workstation-copy records confer no deletion authority; separate explicit decision required",
+    "execution_guard": {
+      "pull_request": "https://github.com/CooperBigFoot/hfx/pull/244",
+      "merge_revision": "682d4f6e475651fcb67ef033e41e5a4071533da9",
+      "read_only_checks": {
+        "authority-is-pinned": 0,
+        "scope-permits-compilation": 0,
+        "authority-is-current": 1
+      },
+      "driver_executed_during_audit": false
+    }
   },
   "preservation": [
     {

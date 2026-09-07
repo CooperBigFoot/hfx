@@ -190,14 +190,18 @@ The operator added 55 GB of volume swap while strict validation ran after the
 initial swap headroom became low. Preserve this sizing deviation independently
 of the successful result. No runbook Bash fence is changed by this record.
 
+[PR #244](https://github.com/CooperBigFoot/hfx/pull/244) landed the independently
+reviewed executable authority guard. Against this completed contract,
+`authority-is-pinned` and `scope-permits-compilation` pass;
+`authority-is-current` exits 1 because authority is consumed. The composed driver
+checks current authority before effects in every mode. No driver was executed
+during this evidence verification.
+
 Before this draft can land:
 
 1. Verify the small extension manifest and current baseline metadata through the
    existing opaque credential interface. Confirm the final small bucket state.
-2. Land an independently reviewed executable consumed-authority refusal. The
-   proposed ledger marks this production authority consumed, but the current
-   verifier ignores that status. Prose is not a launch guard.
-3. Review this retrospective evidence against the retained small records and
+2. Review this retrospective evidence against the retained small records and
    reconcile the accepted control and source-adjudication deviations explicitly.
 
 No further paid lifecycle is authorized. This record performs no artifact
