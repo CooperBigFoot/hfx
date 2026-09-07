@@ -16,6 +16,9 @@ an accumulated awk sum through awk's default number format, or when the
 composed driver would copy anything but small records from the VM to the
 workstation (the maintainer's 2026-09-06 directive: work solely in the cloud).
 
+Every generated execution mode checks current authority before operator inputs
+or side effects. Composition itself remains available for historical inspection.
+
 Runs on the standard library only, so the workstation needs no Python project.
 """
 
@@ -461,6 +464,8 @@ def compose(fences: list[str], mode: str, resume_at: str | None) -> str:
     add("# Composed by scripts/hetzner/compose-campaign-driver.py from RUNBOOK-tdx-hydro-seven-basin-compile.md.\n")
     add(f"# Mode: {mode}{' at ' + resume_at if resume_at else ''}. Every runbook fence is embedded verbatim between its markers.\n")
     add("# Invocation: printf '%s\\n' <s3-env-path> | caffeinate -i -s bash <this file>   (from the repository root)\n")
+    add("# Refuse unavailable authority before operator inputs, evidence mutation, watchdogs, or cloud commands.\n")
+    add("./scripts/hetzner/verify-compile-runbook.sh --check authority-is-current || exit $?\n")
     if mode == "resume":
         add("export HFX_CAMPAIGN_RESUME=1   # OPERATOR (resume): keep the evidence directory that holds the recorded epoch\n")
     add(fence_block(1, fences[0]))
