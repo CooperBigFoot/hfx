@@ -63,6 +63,68 @@ assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-assemble'
 assert_contains "$tmp/full/campaign-driver.sh" 'wait_workload tdx-compile compile-monitor'
 pass 'full mode embeds all 25 fences byte for byte, twice for preservation, with milestones, gates, and decision points'
 
+# Run the actual composed record fence with real jq and synthetic state records only.
+# The operator's final record failed with E2BIG because diagnostic JSON crossed argv.
+mkdir -p "$tmp/record evidence"
+python3 - "$tmp/record evidence" <<'PY'
+import json
+import os
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+ids = ["1020018110", "2020003440", "2020065840", "2020071190", "4020050470", "5020049720", "6020000010", "7020000010"]
+# Exceed this host's real exec argument limit without mocking jq or exec.
+size = max(1048576, 2 * os.sysconf("SC_ARG_MAX"))
+for index, basin in enumerate(ids):
+    directory = root / "off-vm/campaign/state/basins" / basin
+    directory.mkdir(parents=True)
+    diagnostic = {"path": f"reports/{basin}.json", "diagnostics": {"message": "x" * size}} if index == 0 else None
+    state = {"stages": {"acquire_basins": {"status": "succeeded"}, "acquire_streamnet": {"status": "succeeded"}, "compile": {"status": "succeeded", "failure_reason": None, "diagnostic_report": diagnostic}}}
+    (directory / "current.json").write_text(json.dumps(state))
+(root / "ground-truth-ref.txt").write_text("0123456789abcdef0123456789abcdef01234567\n")
+PY
+cat >"$tmp/record-harness.sh" <<'HARNESS'
+set -Eeuo pipefail
+IFS=$'\n\t'
+LOCAL_EVIDENCE_DIR=$1
+CAMPAIGN=record-test
+ABSENT_IDS=(1020018110 2020003440 2020065840 2020071190 4020050470 5020049720 6020000010)
+CONTROL_ID=7020000010
+VALIDATION_OUTCOME=not-attempted
+source "$2"
+HARNESS
+record_status=0
+bash "$tmp/record-harness.sh" "$tmp/record evidence" "$tmp/full/fence-proof/driver-24.sh" >"$stdout" 2>"$stderr" || record_status=$?
+[[ "$record_status" -eq 0 ]] || die "record fence failed with status $record_status ($(cat "$stderr"))"
+jq -e --slurpfile original "$tmp/record evidence/off-vm/campaign/state/basins/1020018110/current.json" '
+  .schema_version == 1 and .campaign == "record-test"
+  and (.basins | map(.processing_basin_id)) == ["1020018110","2020003440","2020065840","2020071190","4020050470","5020049720","6020000010","7020000010"]
+  and .basins[0].diagnostic_report == $original[0].stages.compile.diagnostic_report
+  and all(.basins[]; .compile == "succeeded" and .failure_reason == null)
+  and all(.basins[1:][]; .diagnostic_report == null)
+  and .control_builds.corrected_versus_preserved == "not-attempted"
+  and .extension == null and .strict_validation == "not-attempted"
+  and .final_fabric == "strict-validated baseline"
+' "$tmp/record evidence/campaign-record.json" >/dev/null || die 'record changed or truncated the basin diagnostics or missing-record defaults'
+pass 'the actual record fence preserves diagnostics larger than ARG_MAX without passing JSON through argv'
+
+# An early input failure must not be hidden by a later successful jq in the loop.
+for failure in missing malformed empty; do
+    rm -f "$tmp/record evidence/campaign-record.json"
+    if [[ "$failure" == missing ]]; then
+        rm "$tmp/record evidence/off-vm/campaign/state/basins/1020018110/current.json"
+    elif [[ "$failure" == malformed ]]; then
+        printf '{broken\n' >"$tmp/record evidence/off-vm/campaign/state/basins/1020018110/current.json"
+    else
+        : >"$tmp/record evidence/off-vm/campaign/state/basins/1020018110/current.json"
+    fi
+    record_status=0
+    bash "$tmp/record-harness.sh" "$tmp/record evidence" "$tmp/full/fence-proof/driver-24.sh" >"$stdout" 2>"$stderr" || record_status=$?
+    [[ "$record_status" -ne 0 && -s "$stderr" ]] || die "record fence accepted $failure basin state"
+    [[ ! -s "$tmp/record evidence/campaign-record.json" ]] || die "record fence emitted a partial campaign record after $failure basin state"
+done
+pass 'the actual record fence refuses missing, malformed, or empty early basin state before emitting a campaign record'
+
 compose --mode preflight --out "$tmp/preflight" || die "preflight composition failed: $(cat "$stderr")"
 bash -n "$tmp/preflight/campaign-driver.sh" || die 'preflight driver has a syntax error'
 for number in 01 02 03 04 05; do assert_contains "$tmp/preflight/campaign-driver.sh" "# >>> runbook fence $number "; done
