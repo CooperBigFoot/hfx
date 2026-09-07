@@ -1310,10 +1310,16 @@ The read-back scratch directory is the only VM path this campaign removes, and i
 
 ## 15. Campaign record
 
-Generate one record naming every selected basin and its disposition, both control builds with their comparison verdicts, the extension outcome, and the validation classification. The record is derived from state files:
+Generate one record naming every selected basin and its disposition, both control builds with their comparison verdicts, the extension outcome, and the validation classification. The record is derived from state files. Basin projections are written as a JSON stream to `basin-records.json` and loaded with `--slurpfile`, so diagnostic size does not consume the operating system's argument limit. Each projection must succeed and emit a record. An unreadable, empty, or malformed basin state stops record generation with a named diagnostic before a partial basin roster can be emitted.
 
 ```bash
 record_or_empty() { if test -f "$LOCAL_EVIDENCE_DIR/$1"; then printf '%s\n' "$LOCAL_EVIDENCE_DIR/$1"; else printf '%s\n' /dev/null; fi; }
+for id in "${ABSENT_IDS[@]}" "$CONTROL_ID"; do
+  jq -ce --arg id "$id" '{processing_basin_id:$id, acquire_basins:.stages.acquire_basins.status, acquire_streamnet:.stages.acquire_streamnet.status, compile:.stages.compile.status, failure_reason:.stages.compile.failure_reason, diagnostic_report:.stages.compile.diagnostic_report}' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json" || {
+    printf 'hfx: refusing campaign record: basin %s state is unreadable, empty, or malformed: %s\n' "$id" "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json" >&2
+    exit 1
+  }
+done > "$LOCAL_EVIDENCE_DIR/basin-records.json"
 jq -n \
   --arg campaign "$CAMPAIGN" \
   --arg ground_truth_ref "$(cat "$LOCAL_EVIDENCE_DIR/ground-truth-ref.txt")" \
@@ -1323,7 +1329,7 @@ jq -n \
   --slurpfile created_at_record "$(record_or_empty created-at-record.json)" \
   --slurpfile assembly "$(record_or_empty off-vm/campaign/state/assembly.json)" \
   --arg validation_outcome "$VALIDATION_OUTCOME" \
-  --argjson basins "$(for id in "${ABSENT_IDS[@]}" "$CONTROL_ID"; do jq -c --arg id "$id" '{processing_basin_id:$id, acquire_basins:.stages.acquire_basins.status, acquire_streamnet:.stages.acquire_streamnet.status, compile:.stages.compile.status, failure_reason:.stages.compile.failure_reason, diagnostic_report:.stages.compile.diagnostic_report}' "$LOCAL_EVIDENCE_DIR/off-vm/campaign/state/basins/$id/current.json"; done | jq -s '.')" '{
+  --slurpfile basins "$LOCAL_EVIDENCE_DIR/basin-records.json" '{
     schema_version: 1,
     campaign: $campaign,
     ground_truth_ref: $ground_truth_ref,
