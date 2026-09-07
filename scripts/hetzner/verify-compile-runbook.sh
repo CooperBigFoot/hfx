@@ -5,7 +5,8 @@
 # machine-readable contract the campaign operator relies on: exact scope,
 # fixed ceilings, the approval precondition, the pinned control hotpatch, the
 # pinned control digests, the pinned control adjudication record, the pinned
-# baseline, and a current authority ref.
+# baseline, and a pinned authority ref. Execution additionally requires an
+# explicitly available authority status; historical pin checks grant no execution.
 # Reading the runbook performs no cloud action. The approval record is only
 # tested for existence, regular-file-ness, and non-emptiness.
 
@@ -53,7 +54,8 @@ Checks:
   control-adjudication-is-pinned
                               adjudicated corrected-control difference record is tracked and complete
   baseline-is-pinned          baseline prefix, region, counts, and inline roster match the merged campaign record
-  authority-is-current        authority ref is an ancestor of HEAD and names the vision section
+  authority-is-pinned         historical authority ref is an ancestor of HEAD and names the vision section
+  authority-is-current        pinned authority has explicit available status for execution
   rehearsal-record-is-pinned  the rehearsal authority names the tracked rehearsal contract and both are consistent
   rehearsal-passed            a passing lifecycle-result.json for the rehearsal exists under --evidence-root
   dry-run-passed              campaign-dry-run-result.json under --evidence-root records a pass at HEAD
@@ -300,7 +302,7 @@ case $check in
             grep -F -q -- "$needle" "$planetary_record" || fail "planetary campaign record does not carry: $needle"
         done
         ;;
-    authority-is-current)
+    authority-is-pinned|authority-is-current)
         authority_ref=$(contract_field '.authority_ref' | tr -d '"')
         authority_document=$(contract_field '.authority_document' | tr -d '"')
         authority_section=$(contract_field '.authority_section' | tr -d '"')
@@ -314,6 +316,10 @@ case $check in
         git -C "$repo_root" show "$authority_ref:$authority_document" 2>/dev/null | grep -F -q -- 'single additional bounded lifecycle' ||
             fail 'authority document does not carry forward the single bounded lifecycle'
         require_phrase "$authority_ref"
+        if [[ "$check" == authority-is-current ]]; then
+            require_field '.lifecycle_ledger.current_authority.status' '"available"' \
+                'authority status must be available for execution; consumed, absent, or unknown authority requires a new reviewed maintainer decision'
+        fi
         ;;
     rehearsal-record-is-pinned)
         require_field '.lifecycle_ledger.rehearsal_authority | {maintainer, date, campaign, contract}' \

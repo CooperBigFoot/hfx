@@ -153,6 +153,72 @@ for stage in "${stages[@]}"; do assert_contains "$tmp/resume-$stage/campaign-dri
 assert_not_contains "$tmp/full/campaign-driver.sh" 'export HFX_CAMPAIGN_RESUME=1'
 pass 'resume modes skip the provisioning fence, re-arm the watchdog, re-prove identities, and start at the named stage'
 
+# Execute the actual generated prefix for every mode, then place a cloud sentinel at
+# its boundary with fence 1. No operator input or real cloud command may be reached.
+mkdir -p "$tmp/authority/scripts/hetzner" "$tmp/authority/bin"
+python3 - "$runbook" "$tmp/authority/consumed.md" <<'PY'
+import json
+import pathlib
+import sys
+text = pathlib.Path(sys.argv[1]).read_text()
+begin = text.index("\n", text.index("<!-- BEGIN COMPILE CAMPAIGN CONTRACT")) + 1
+end = text.index("END COMPILE CAMPAIGN CONTRACT -->", begin)
+contract = json.loads(text[begin:end])
+for status in ("consumed", "missing", "null", "unknown", "available"):
+    authority = contract["lifecycle_ledger"]["current_authority"]
+    if status == "missing":
+        del authority["status"]
+    else:
+        authority["status"] = None if status == "null" else status
+    out = pathlib.Path(sys.argv[2]).with_name(status + ".md")
+    out.write_text(text[:begin] + json.dumps(contract, indent=2) + "\n" + text[end:])
+PY
+# This wrapper only supplies the real verifier's supported --runbook argument.
+# The guard verdict and Git checks remain the tracked executable's responsibility.
+cat >"$tmp/authority/scripts/hetzner/verify-compile-runbook.sh" <<'GUARD'
+#!/usr/bin/env bash
+exec "$HFX_TEST_AUTHORITY_VERIFIER" --runbook "$HFX_TEST_AUTHORITY_RUNBOOK" "$@"
+GUARD
+cat >"$tmp/authority/bin/hcloud" <<'SENTINEL'
+#!/usr/bin/env bash
+printf '%s\n' "${0##*/}" >>"$HFX_TEST_AUTHORITY_CALLS"
+exit 99
+SENTINEL
+chmod +x "$tmp/authority/scripts/hetzner/verify-compile-runbook.sh" "$tmp/authority/bin/hcloud"
+for tool in ssh scp rsync security curl aws; do ln -s hcloud "$tmp/authority/bin/$tool"; done
+for mode in resume-preserve full preflight resume-converge resume-acquire resume-controls resume-compile resume-baseline; do
+    driver="$tmp/$mode/campaign-driver.sh"
+    awk '/^# >>> runbook fence 01 / { exit } { print }' "$driver" >"$tmp/authority/prefix.sh"
+    printf 'hcloud must-not-run\n' >>"$tmp/authority/prefix.sh"
+    for status in consumed missing null unknown; do
+        for script in "$tmp/authority/prefix.sh" "$driver"; do
+            authority_status=0
+            (
+                cd "$tmp/authority"
+                export PATH="$tmp/authority/bin:$PATH"
+                export HFX_TEST_AUTHORITY_VERIFIER="$SCRIPT_DIR/verify-compile-runbook.sh"
+                export HFX_TEST_AUTHORITY_RUNBOOK="$tmp/authority/$status.md"
+                export HFX_TEST_AUTHORITY_CALLS="$tmp/authority/calls.txt"
+                unset HFX_CAMPAIGN_EVIDENCE HFX_CAMPAIGN_CONTRACT HFX_CAMPAIGN_RESUME
+                bash "$script" </dev/null
+            ) >"$stdout" 2>"$stderr" || authority_status=$?
+            [[ ! -e "$tmp/authority/calls.txt" ]] || die "$mode executed a cloud/input command before refusing $status authority"
+            [[ "$authority_status" -eq 1 ]] || die "$mode authority refusal returned $authority_status instead of 1"
+            assert_contains "$stderr" 'authority status must be available'
+        done
+    done
+done
+# Positive fixture control: available status must reach the boundary sentinel.
+status=0
+(cd "$tmp/authority" && PATH="$tmp/authority/bin:$PATH" \
+    HFX_TEST_AUTHORITY_VERIFIER="$SCRIPT_DIR/verify-compile-runbook.sh" \
+    HFX_TEST_AUTHORITY_RUNBOOK="$tmp/authority/available.md" \
+    HFX_TEST_AUTHORITY_CALLS="$tmp/authority/calls.txt" \
+    bash "$tmp/authority/prefix.sh") >"$stdout" 2>"$stderr" || status=$?
+[[ "$status" -eq 99 ]] || die 'synthetic available authority did not reach the execution boundary'
+assert_contains "$tmp/authority/calls.txt" hcloud
+pass 'all composed modes refuse consumed, missing, null, or unknown authority before inputs or cloud commands through the real verifier'
+
 expect_failure --mode resume --out "$tmp/bad"
 assert_contains "$stderr" '--mode resume requires --resume-at'
 expect_failure --mode full --resume-at acquire --out "$tmp/bad"

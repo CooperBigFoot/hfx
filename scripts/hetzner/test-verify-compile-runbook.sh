@@ -27,6 +27,52 @@ expect_failure() {
     [[ -s "$stderr" ]] || die "no diagnostic for: $*"
 }
 
+# The real operational check must reject a consumed authority, even with valid Git provenance.
+python3 - "$runbook" "$tmp/consumed-runbook.md" <<'PY'
+import json
+import pathlib
+import sys
+text = pathlib.Path(sys.argv[1]).read_text()
+begin = text.index("\n", text.index("<!-- BEGIN COMPILE CAMPAIGN CONTRACT")) + 1
+end = text.index("END COMPILE CAMPAIGN CONTRACT -->", begin)
+contract = json.loads(text[begin:end])
+contract["lifecycle_ledger"]["current_authority"]["status"] = "consumed"
+pathlib.Path(sys.argv[2]).write_text(text[:begin] + json.dumps(contract, indent=2) + "\n" + text[end:])
+PY
+expect_failure --runbook "$tmp/consumed-runbook.md" --check authority-is-current
+assert_contains "$stderr" 'authority status must be available'
+pass 'consumed authority refuses through the real operational verifier despite valid Git provenance'
+
+# Historical pin verification stays available after consumption. Only fixtures
+# declare available status; the tracked record is never granted authority here.
+expect_pass --runbook "$tmp/consumed-runbook.md" --check authority-is-pinned
+for status in available null unknown missing; do
+    python3 - "$tmp/consumed-runbook.md" "$tmp/status-runbook.md" "$status" <<'PY'
+import json
+import pathlib
+import sys
+text = pathlib.Path(sys.argv[1]).read_text()
+begin = text.index("\n", text.index("<!-- BEGIN COMPILE CAMPAIGN CONTRACT")) + 1
+end = text.index("END COMPILE CAMPAIGN CONTRACT -->", begin)
+contract = json.loads(text[begin:end])
+authority = contract["lifecycle_ledger"]["current_authority"]
+status = sys.argv[3]
+if status == "missing":
+    del authority["status"]
+else:
+    authority["status"] = None if status == "null" else status
+pathlib.Path(sys.argv[2]).write_text(text[:begin] + json.dumps(contract, indent=2) + "\n" + text[end:])
+PY
+    if [[ "$status" == available ]]; then
+        expect_pass --runbook "$tmp/status-runbook.md" --check authority-is-current
+    else
+        expect_failure --runbook "$tmp/status-runbook.md" --check authority-is-current
+        assert_contains "$stderr" 'authority status must be available'
+    fi
+    expect_pass --runbook "$tmp/status-runbook.md" --check authority-is-pinned
+done
+pass 'historical pin checks remain readable while missing, null, and unknown authority status refuse execution'
+
 [[ -f "$runbook" ]] || die "runbook is missing: $runbook"
 git -C "$repo_root" ls-files --error-unmatch -- scripts/hetzner/RUNBOOK-tdx-hydro-seven-basin-compile.md >/dev/null 2>&1 ||
     die 'runbook must be tracked before the verifier can run against the checkout'
@@ -52,8 +98,8 @@ fi
 
 if git -C "$repo_root" cat-file -e '69747055bcb1876d9d1fad48c60f5cae6a24ea60^{commit}' 2>/dev/null &&
     git -C "$repo_root" merge-base --is-ancestor 69747055bcb1876d9d1fad48c60f5cae6a24ea60 HEAD 2>/dev/null; then
-    expect_pass --check authority-is-current
-    assert_contains "$stdout" 'PASS authority-is-current'
+    expect_pass --check authority-is-pinned
+    assert_contains "$stdout" 'PASS authority-is-pinned'
     pass 'authority ref is an ancestor of HEAD and names the vision section'
 else
     passed=$((passed + 1))
