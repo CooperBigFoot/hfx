@@ -1,0 +1,2 @@
+/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/test-venv/bin/python -m pytest /Users/nicolaslazaro/Desktop/work/hfx/.worktrees/pourpoint-effort108/crates/python/tests -m "not network" -q --basetemp=/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/test-output --junitxml=/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/pytest.xml
+PROJ_NETWORK=OFF; POURPOINT_TEST_REMOTE_URL unset
