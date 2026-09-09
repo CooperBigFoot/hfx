@@ -7,7 +7,7 @@ Storage I/O stays in this standalone composition root, outside the HFX library.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -267,8 +267,15 @@ def delivery_attempt(evidence, budget, operation):
         return operation()
 
 
+class JournalOperation(Enum):
+    """The entrypoint-selected journal transition, independent of argument values."""
+
+    DELIVERY_ATTEMPT = "delivery-attempt"
+    PART_RECONCILIATION = "part-reconciliation"
+
+
 @contextmanager
-def command_evidence(parser):
+def command_evidence(parser, operation=JournalOperation.DELIVERY_ATTEMPT):
     """Lock the explicit journal before parsing remaining invocation inputs."""
     if any(option in sys.argv[1:] for option in ("--help", "-h")):
         parser.parse_args()  # Informational help never starts an attempt.
@@ -280,7 +287,9 @@ def command_evidence(parser):
         # Without an identifiable journal, preserve normal argparse diagnostics.
         arguments = parser.parse_args()
         location.evidence_dir = arguments.evidence_dir
-    with private_evidence(location.evidence_dir) as evidence, evidence_attempt(evidence):
+    # Reconciliation preserves the exact interrupted journal, including on refusal.
+    with private_evidence(location.evidence_dir) as evidence, (
+            nullcontext() if operation is JournalOperation.PART_RECONCILIATION else evidence_attempt(evidence)):
         if arguments is None:
             arguments = parser.parse_args()
         require(arguments.evidence_dir == location.evidence_dir, "ambiguous evidence directory arguments")
@@ -497,6 +506,22 @@ class DatasetDelivery:
         return {"sha256": sha.hexdigest(), "bytes": count, "method": "full-ordered-range-stream-sha256",
                 "verified_at": stamp()}
 
+    def _listed_parts(self, key, upload_id):
+        observed, marker = [], None
+        while True:
+            request = {"Key": key, "UploadId": upload_id}
+            if marker is not None:
+                request["PartNumberMarker"] = marker
+            page = self.call("list_parts", **request)
+            observed.extend({"PartNumber": p["PartNumber"], "ETag": p["ETag"], "Size": p["Size"]}
+                            for p in page.get("Parts", []))
+            if not page.get("IsTruncated"):
+                break
+            next_marker = page.get("NextPartNumberMarker")
+            require(next_marker is not None and (marker is None or next_marker > marker), "invalid part pagination")
+            marker = next_marker
+        return observed
+
     def copy(self, obj):
         key, source_key = self.destination + obj.path, self.source.prefix + obj.path
         states = self.evidence.value["objects"]
@@ -514,19 +539,7 @@ class DatasetDelivery:
         require(state["status"] in {"copying", "copied", "verified"}, f"uncertain copy requires inspection: {obj.path}")
         if state["status"] == "copying":
             require(not state.get("pending_part"), f"uncertain part requires inspection: {obj.path}")
-            observed, marker = [], None
-            while True:
-                request = {"Key": key, "UploadId": state["upload_id"]}
-                if marker is not None:
-                    request["PartNumberMarker"] = marker
-                page = self.call("list_parts", **request)
-                observed.extend({"PartNumber": p["PartNumber"], "ETag": p["ETag"], "Size": p["Size"]}
-                                for p in page.get("Parts", []))
-                if not page.get("IsTruncated"):
-                    break
-                next_marker = page.get("NextPartNumberMarker")
-                require(next_marker is not None and (marker is None or next_marker > marker), "invalid part pagination")
-                marker = next_marker
+            observed = self._listed_parts(key, state["upload_id"])
             require(observed == state["parts"], f"multipart journal differs: {obj.path}")
             total = (obj.identity.bytes + self.part_bytes - 1) // self.part_bytes
             require(total <= 10000, "too many multipart parts")
@@ -565,6 +578,92 @@ class DatasetDelivery:
             state.update(status="copied", identity=asdict(identity))
             self.evidence.save()
         return state
+
+    def reconcile_part(self, path, conditional_evidence, *, authorization, exclusive_writer_confirmed,
+                       expected_journal_sha256, expected_part_etag):
+        """Observe one pending part in an owned upload without any provider mutation.
+
+        The operator must exclude all other writers, including replicated journals.
+        This observation cannot establish the original request outcome or content SHA.
+        """
+        require(exclusive_writer_confirmed, "explicit current exclusive-writer confirmation required")
+        require(self.protection is PublicationProtection.EXCLUSIVE_WRITER,
+                "part reconciliation requires exclusive-writer publication")
+        self._require_exclusive_probe(conditional_evidence, authorization)
+        original = read_small_file(self.evidence.path, 32 * 1024**2)
+        require(digest(original) == expected_journal_sha256, "reviewed journal SHA-256 differs")
+        require(json.loads(original) == self.evidence.value, "journal changed before reconciliation")
+        value = self.evidence.value
+        require(value["schema"] == "hfx-dataset-delivery-v1" and value["plan"] == self.plan,
+                "delivery plan changed")
+        require(value["status"] in {"refused", "checking", "partial-unverified"},
+                "reconciliation requires an interrupted unverified delivery")
+        protection = value["publication_protection"]
+        expected = {"mode": self.protection.value,
+                    "guarantee": "Operational exclusive-writer protection, not provider-enforced atomic destination no-overwrite.",
+                    "decision_sha256": authorization.decision_sha256,
+                    "failed_probe_sha256": authorization.failed_probe_sha256,
+                    "authorization_binding_sha256": authorization.authorization_binding_sha256,
+                    "scope": asdict(authorization.scope)}
+        require(all(protection.get(key) == item for key, item in expected.items()),
+                "publication protection or immutable authorization changed")
+        candidates = [obj for obj in self.source.objects if obj.path == path]
+        require(len(candidates) == 1, "reconciliation path must name one preserved object")
+        obj = candidates[0]
+        states = value["objects"]
+        require(path in states and all(
+            state["status"] in {"copied", "verified"} and not state.get("pending_part")
+            for name, state in states.items() if name != path),
+            "other uncertain object requires inspection")
+        state = states[path]
+        require(state["status"] == "copying" and isinstance(state.get("upload_id"), str)
+                and state["upload_id"], "reconciliation requires the journal-owned copying upload")
+        number = state.get("pending_part")
+        total = (obj.identity.bytes + self.part_bytes - 1) // self.part_bytes
+        require(type(number) is int and 1 <= number <= total <= 10000 and
+                number == len(state["parts"]) + 1, "pending part is not the exact next source range")
+        for index, part in enumerate(state["parts"], 1):
+            require(type(part["PartNumber"]) is int and part["PartNumber"] == index and
+                    type(part["Size"]) is int and part["Size"] == self.part_bytes and
+                    isinstance(part["ETag"], str) and part["ETag"], "invalid preceding journal part")
+        self._preflight()
+        reservation_verification = self._verify_reservation()
+        key = self.destination + path
+        require(self.head(key) is None, "pending destination already exists; completion is uncertain")
+        observed = self._listed_parts(key, state["upload_id"])
+        require(len(observed) == number and observed[:-1] == state["parts"],
+                "multipart preceding parts or additional part count differs")
+        part = observed[-1]
+        require(part["ETag"] == expected_part_etag, "reviewed pending part ETag differs")
+        expected_size = min(self.part_bytes, obj.identity.bytes - (number - 1) * self.part_bytes)
+        require(type(part["PartNumber"]) is int and part["PartNumber"] == number and
+                type(part["Size"]) is int and part["Size"] == expected_size and
+                isinstance(part["ETag"], str) and re.fullmatch(r'"[^"\s]+"', part["ETag"]),
+                "observed pending part number, size or ETag is invalid")
+        require(self._listed_parts(key, state["upload_id"]) == observed,
+                "multipart parts changed during reconciliation")
+        # Bracket ListParts with ownership/source checks. This cannot fence an external writer.
+        self._check_destination_ownership()
+        for source_obj in self.source.objects:
+            require(self.head(self.source.prefix + source_obj.path) == source_obj.identity,
+                    f"source changed during reconciliation: {source_obj.path}")
+        self._verify_reservation()
+        require(read_small_file(self.evidence.path, 32 * 1024**2) == original,
+                "journal changed during reconciliation")
+        self.budget.check()
+        value.setdefault("part_recoveries", []).append({
+            "path": path, "upload_id": state["upload_id"], "pending_part": number,
+            "observed_parts": observed, "observed_at": stamp(),
+            "original_journal": original.decode(), "original_journal_sha256": digest(original),
+            "original_request_success_observed": False,
+            "method": "owned-upload-list-parts-observation",
+            "exclusive_writer_confirmed": True,
+            "reservation_verification": reservation_verification,
+            "integrity_requirement": "completed object requires full ordered range SHA-256 verification"})
+        state["parts"] = observed
+        del state["pending_part"]
+        value["status"] = "partial-unverified"
+        self.evidence.save()  # Original intent and reconciliation commit in one atomic replacement.
 
     def deliver(self, conditional_evidence, *, authorization=None):
         return delivery_attempt(self.evidence, self.budget,
@@ -676,6 +775,17 @@ class DatasetDelivery:
                     "ownership reservation write identity differs")
             reservation.update(status="owned", identity=asdict(identity))
             self.evidence.save()
+        reservation["verification"] = self._verify_reservation()
+        self.evidence.save()
+
+    def _verify_reservation(self):
+        """Read the existing ownership reservation without acquiring or changing it."""
+        protection = self.evidence.value["publication_protection"]
+        destination_scope = {key: protection["scope"][key] for key in
+                             ("endpoint", "region", "bucket", "destination_prefix")}
+        key = "scratch/dataset-publication-ownership/" + digest(canonical(destination_scope)) + "/owner.json"
+        reservation = protection.get("reservation")
+        require(reservation is not None, "reconciliation requires an existing owned reservation")
         require(reservation["status"] == "owned" and reservation["key"] == key and
                 re.fullmatch(r"[a-f0-9]{32}", protection["operation_token"]),
                 "uncertain or foreign ownership reservation requires inspection")
@@ -683,9 +793,9 @@ class DatasetDelivery:
         require(reservation["sha256"] == digest(payload), "ownership reservation payload changed")
         identity = ObjectIdentity(**reservation["identity"])
         require(self.head(key) == identity, "ownership reservation identity changed")
-        reservation["verification"] = self.verify("owner.json", digest(payload), len(payload), identity,
-                                                  prefix=key.removesuffix("owner.json"))
-        self.evidence.save()
+        verification = self.verify("owner.json", digest(payload), len(payload), identity,
+                                   prefix=key.removesuffix("owner.json"))
+        return verification
 
     def _guard_exclusive_writer(self):
         if self.protection is PublicationProtection.EXCLUSIVE_WRITER:
@@ -830,8 +940,25 @@ class DatasetDelivery:
 
 
 def main():
+    return _main(JournalOperation.DELIVERY_ATTEMPT)
+
+
+def reconcile_part_main():
+    return _main(JournalOperation.PART_RECONCILIATION)
+
+
+def _main(operation):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "deliver"))
+    if operation is JournalOperation.PART_RECONCILIATION:
+        parser.description = "Observe one pending copy part in an owned upload; no provider writes or dataset acceptance."
+        parser.set_defaults(action="reconcile-part")
+        parser.add_argument("--object-path", help="exact preserved object with one pending part")
+        parser.add_argument("--expected-journal-sha256", help="reviewed raw interrupted delivery.json SHA-256")
+        parser.add_argument("--expected-part-etag", help="reviewed pending part ETag, including quotes")
+        parser.add_argument("--confirm-exclusive-writer", action="store_true",
+                            help="confirm all other writers, including replicated journals, are excluded now")
+    else:
+        parser.add_argument("action", choices=("plan", "deliver"))
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--destination-prefix", required=True)
     parser.add_argument("--readme", type=Path, required=True)
@@ -846,7 +973,7 @@ def main():
     parser.add_argument("--max-read-bytes", type=int, required=True)
     parser.add_argument("--request-timeout-seconds", type=int, default=30)
     try:
-        with command_evidence(parser) as (args, evidence):
+        with command_evidence(parser, operation) as (args, evidence):
             require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
             budget = TransferBudget(args.max_seconds, args.max_read_bytes)
             with bounded_invocation(budget):
@@ -881,7 +1008,14 @@ def main():
                             require(args.exclusive_writer_decision is None and
                                     args.exclusive_writer_authorization_binding is None,
                                     "operator authorization requires explicit exclusive-writer mode")
-                        delivery._deliver(json.loads(probe_bytes), authorization=authorization)
+                        if args.action == "reconcile-part":
+                            delivery.reconcile_part(args.object_path, json.loads(probe_bytes),
+                                                    authorization=authorization,
+                                                    exclusive_writer_confirmed=args.confirm_exclusive_writer,
+                                                    expected_journal_sha256=args.expected_journal_sha256,
+                                                    expected_part_etag=args.expected_part_etag)
+                        else:
+                            delivery._deliver(json.loads(probe_bytes), authorization=authorization)
                 finally:
                     storage.close()
                     anonymous.close()
