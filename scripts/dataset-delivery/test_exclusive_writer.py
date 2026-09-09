@@ -192,6 +192,17 @@ class ExclusiveWriterTests(unittest.TestCase):
             status = main()
         return status, stdout.getvalue(), stderr.getvalue()
 
+    def test_delivered_readme_authority_links_use_immutable_repository_urls(self):
+        import re
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / "hosting" /
+                  "tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774" / "README.md").read_text()
+        for label in ("decision", "authorization binding"):
+            match = re.search(r"\[" + re.escape(label) + r"\]\(([^)]+)\)", readme)
+            self.assertIsNotNone(match)
+            self.assertRegex(match.group(1),
+                             r"^https://github\.com/CooperBigFoot/hfx/blob/[0-9a-f]{40}/hosting/.+\.json$")
+
     def test_cli_invalid_input_rechecks_refuse_current_success(self):
         arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
         paths = {flag: Path(arguments[arguments.index(flag) + 1]) for flag in

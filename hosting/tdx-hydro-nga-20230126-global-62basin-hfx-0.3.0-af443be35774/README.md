@@ -142,8 +142,8 @@ accepted a multipart completion replacement despite `IfNoneMatch="*"`.
 The probe remains refused. No dataset payload was part of that test.
 Nicolas Lazaro then approved proceeding with operational single-writer exclusion
 for this exact source and destination. The original
-[decision](exclusive-writer-decision.json) and separate
-[authorization binding](exclusive-writer-authorization-binding.json) retain
+[decision](https://github.com/CooperBigFoot/hfx/blob/7fde62b2b3acf79715ddd6830eb7845b891fd7ba/hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-decision.json) and separate
+[authorization binding](https://github.com/CooperBigFoot/hfx/blob/7fde62b2b3acf79715ddd6830eb7845b891fd7ba/hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-authorization-binding.json) retain
 that scope and the raw failed-probe checksum.
 
 This is weaker than provider-enforced atomic destination no-overwrite.
