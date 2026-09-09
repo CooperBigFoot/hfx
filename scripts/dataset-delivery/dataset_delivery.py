@@ -267,6 +267,36 @@ def delivery_attempt(evidence, budget, operation):
         return operation()
 
 
+def command_action(parser, arguments):
+    """Locate the first positional action without validating any option values.
+
+    This CLI has only zero- and one-value options. Use argparse's registered
+    option metadata so aliases and unique long-option abbreviations consume the
+    same values. Unknown or ambiguous leading options cannot select recovery.
+    Full argparse validation still runs under the selected evidence policy.
+    """
+    options = parser._option_string_actions
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            return arguments[index + 1] if index + 1 < len(arguments) else None
+        if not token.startswith("-"):
+            return token
+        name, separator, _value = token.partition("=")
+        action = options.get(name)
+        if action is None and name.startswith("--") and parser.allow_abbrev:
+            matches = [option for option in options if option.startswith(name)]
+            if len(matches) == 1:
+                action = options[matches[0]]
+        if action is None or action.nargs not in (None, 0):
+            return None
+        if action.nargs == 0 and separator:
+            return None
+        index += 1 if separator or action.nargs == 0 else 2
+    return None
+
+
 @contextmanager
 def command_evidence(parser):
     """Lock the explicit journal before parsing remaining invocation inputs."""
@@ -281,10 +311,7 @@ def command_evidence(parser):
         arguments = parser.parse_args()
         location.evidence_dir = arguments.evidence_dir
     # Reconciliation preserves the exact interrupted journal, including on refusal.
-    reconciliation = "reconcile-part" in sys.argv[1:]
-    if reconciliation:
-        arguments = parser.parse_args()
-        reconciliation = arguments.action == "reconcile-part"
+    reconciliation = command_action(parser, sys.argv[1:]) == "reconcile-part"
     with private_evidence(location.evidence_dir) as evidence, (
             nullcontext() if reconciliation else evidence_attempt(evidence)):
         if arguments is None:

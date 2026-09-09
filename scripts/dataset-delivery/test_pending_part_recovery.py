@@ -48,6 +48,42 @@ class PendingPartRecoveryTests(ExclusiveWriterTests):
         for obj in self.source.objects:
             self.assertEqual(receipt["objects"][obj.path]["verification"]["sha256"], obj.sha256)
 
+    def test_deliver_option_value_cannot_select_recovery_or_preserve_acceptance(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        journal = Path(arguments[arguments.index("--evidence-dir") + 1]) / "delivery.json"
+        cases = ((["--max-seconds", "reconcile-part"], "first"),
+                 (["--max-sec=reconcile-part"], "first"),
+                 (["--max-sec", "reconcile-part"], "last"),
+                 (["--exclusive-writer", "reconcile-part"], "last"))
+        for invalid, position in cases:
+            with self.subTest(invalid=invalid, position=position):
+                self.assertEqual(self.invoke_cli(arguments)[0], 0)
+                self.storage.events.clear()
+                malformed = arguments + invalid
+                if position == "last":
+                    malformed.remove("deliver")
+                    malformed.append("deliver")
+                with self.assertRaises(SystemExit):
+                    self.invoke_cli(malformed)
+                self.assertFalse(self.storage.events)
+                self.assertEqual(json.loads(journal.read_bytes())["status"], "refused")
+
+    def test_recovery_action_after_options_and_abbreviations_preserves_refusal(self):
+        arguments, journal = self.interrupted_cli()
+        original = journal.read_bytes()
+        recovery = self.recovery_arguments(arguments, journal)
+        recovery.remove("reconcile-part")
+        recovery += ["reconcile-part", "--max-sec", "invalid"]
+        recovery[recovery.index("--profile")] = "--prof"
+        self.storage.events.clear()
+        with self.assertRaises(SystemExit):
+            self.invoke_cli(recovery)
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertFalse(self.storage.events)
+        recovery[-1] = "60"
+        self.assertEqual(self.invoke_cli(recovery)[0], 0)
+        self.assertFalse(self.writes())
+
     def recovery_arguments(self, arguments, journal, path="CITATION.txt", etag='"part-1"'):
         result = arguments.copy()
         result[1] = "reconcile-part"
