@@ -1,0 +1,52 @@
+{
+    "IsTruncated": false,
+    "Contents": [
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/CITATION.txt",
+            "LastModified": "2026-09-06T17:16:34.352000+00:00",
+            "ETag": "\"a39c326ed6ecc2a36c220a94dbbbf3d2\"",
+            "Size": 714,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/NOTICE",
+            "LastModified": "2026-09-06T17:16:34.371000+00:00",
+            "ETag": "\"48a71a944ed74ac13e6bdc9ad94976b2\"",
+            "Size": 1338,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/aux/snap_stems.parquet",
+            "LastModified": "2026-09-06T17:25:32.249000+00:00",
+            "ETag": "\"9900b9f695beaf8998e07d94b6c1c604-4033\"",
+            "Size": 33828897608,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/catchments.parquet",
+            "LastModified": "2026-09-06T17:28:26.709000+00:00",
+            "ETag": "\"52661a86b3411a838dd9ef7e9400ae54-6456\"",
+            "Size": 108307447136,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/graph.parquet",
+            "LastModified": "2026-09-06T17:16:47.134000+00:00",
+            "ETag": "\"fdb373b59af1c277070ca2b0b1f1a403-63\"",
+            "Size": 521408174,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/manifest.json",
+            "LastModified": "2026-09-06T17:16:34.374000+00:00",
+            "ETag": "\"4316ebbb2ea5154ba3d05102e9b7bfdd\"",
+            "Size": 827,
+            "StorageClass": "STANDARD"
+        }
+    ],
+    "Name": "pourpoint-hfx",
+    "Prefix": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/",
+    "MaxKeys": 100,
+    "EncodingType": "url",
+    "KeyCount": 6
+}

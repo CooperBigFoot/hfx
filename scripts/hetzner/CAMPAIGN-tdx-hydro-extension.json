@@ -1,0 +1,787 @@
+{
+  "record_kind": "retrospective campaign evidence",
+  "campaign": "seven-basin-extension",
+  "effort": "https://github.com/CooperBigFoot/hfx/issues/195",
+  "record_status": "verified retrospective evidence",
+  "provenance": {
+    "compile_revision": "c3e04bee941e95e19ebd88dca11b3d9cc7619b99",
+    "assembly_and_preservation_revision": "a1ebc116d326c9b4b192dcc942f2a42b40d9b2b2",
+    "adapter_and_crates_unchanged_between_revisions": true,
+    "planetary_control_revision": "43a98aff8c15a1a196f47b10217ad2f5553b6611",
+    "planetary_control_hotpatch_commit": "bde61149d3fefc5e3f30435bf7ed3d0bb32a519c"
+  },
+  "coverage": {
+    "baseline_processing_basin_ids": [
+      "1020000010",
+      "1020011530",
+      "1020021940",
+      "1020027430",
+      "1020034170",
+      "1020035180",
+      "1020040190",
+      "2020000010",
+      "2020018240",
+      "2020024230",
+      "2020033490",
+      "2020041390",
+      "2020057170",
+      "3020000010",
+      "3020003790",
+      "3020005240",
+      "3020008670",
+      "3020009320",
+      "3020024310",
+      "4020000010",
+      "4020006940",
+      "4020015090",
+      "4020024190",
+      "4020034510",
+      "4020050210",
+      "4020050220",
+      "4020050290",
+      "5020000010",
+      "5020015660",
+      "5020037270",
+      "5020054880",
+      "5020055870",
+      "5020082270",
+      "6020006540",
+      "6020008320",
+      "6020014330",
+      "6020017370",
+      "6020021870",
+      "6020029280",
+      "7020000010",
+      "7020014250",
+      "7020021430",
+      "7020024600",
+      "7020038340",
+      "7020046750",
+      "7020047840",
+      "7020065090",
+      "8020000010",
+      "8020008900",
+      "8020010700",
+      "8020020760",
+      "8020022890",
+      "8020032840",
+      "8020044560",
+      "9020000010"
+    ],
+    "added_processing_basin_ids": [
+      "1020018110",
+      "2020003440",
+      "2020065840",
+      "2020071190",
+      "4020050470",
+      "5020049720",
+      "6020000010"
+    ],
+    "derived_processing_basin_count": 62,
+    "baseline_unit_count": 12748154,
+    "added_unit_count": 3188274,
+    "derived_final_unit_count": 15936428,
+    "excluded_processing_basin_ids": [],
+    "observed_extension_manifest": {
+      "record": "evidence/tdx-hydro-extension/extension-manifest.json",
+      "sha256": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85",
+      "unit_count": 15936428,
+      "region_present": false,
+      "bbox": [
+        -180,
+        -90,
+        180,
+        90
+      ],
+      "format_version": "0.3.0",
+      "fabric_version": "NGA-TDX-Hydro-20230126"
+    },
+    "derivation": "baseline roster and count plus seven disjoint successful per-basin input manifests; control already belongs to baseline"
+  },
+  "per_basin": [
+    {
+      "processing_basin_id": "1020018110",
+      "unit_count": 515349,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "4b1441c2f6a317095e63a3db9b75473c51822572ec5725c1daea42fac40ff006",
+      "build_report_sha256": "2f3340fa5a95c09fde854280a3703b939ba6eb2c991f8b410f79c62ba583f296",
+      "state_sha256": "1f97d8c2055f900fa1a7e5468605bc0745bdc7f7739a827dbc4b9d30728f58df"
+    },
+    {
+      "processing_basin_id": "2020003440",
+      "unit_count": 336922,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "fb14cecde13a6e8d6fd741756c896df75cb144f9dd5577cb929d01ce61e35fc5",
+      "build_report_sha256": "6c7476d33798ffcfd78dfbd77767daa06f5e66c1981350dc1361b8c5f26a2d1b",
+      "state_sha256": "ce3911a58a138b80d8ea563dbcf602eb5b38600366f5cc62d3b2165550f6cb86"
+    },
+    {
+      "processing_basin_id": "2020065840",
+      "unit_count": 433202,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "7d128e60aa517a09d505fb641523c13e4c5a9dafce3c13dee5c67e710b00f679",
+      "build_report_sha256": "34ba30cb9186ccbd62202b2780ef7993d955918de6836dcfec6bcb276610a19f",
+      "state_sha256": "b3ab37af7996728c85f4338beb826c3817f592cfd05671a47c3d0c66a1777970"
+    },
+    {
+      "processing_basin_id": "2020071190",
+      "unit_count": 663991,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "2293296b5517f73b6a33fc0eb3fda498d29b2c93e463589b5c8a65b39b9357ed",
+      "build_report_sha256": "5d305dc85d2cb5b29f0ced8fbf7c9e2d80d8163c4ae89ef3bae3d75caa966628",
+      "state_sha256": "0849808b94411b57f99155c5fccabfccd6988d0730a354d26ba0c2e2e0bb58d7"
+    },
+    {
+      "processing_basin_id": "4020050470",
+      "unit_count": 78181,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "935fd1dbfebe49cc314c3a10828b0ad75c3841d76bc27fc85ad36a1c165f1151",
+      "build_report_sha256": "c8787859dc9531b0f6ed4d3da6eef9acf22c734786747c76cf531d52f27049a3",
+      "state_sha256": "de7b5f6e956a2245df64de515718fc0620bacefbed3d2bd966df2b4ec0064c47"
+    },
+    {
+      "processing_basin_id": "5020049720",
+      "unit_count": 933755,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "0cf822b7876df80855f36ef6a9a87ee45f6c95f2f258a912825159a2c901729d",
+      "build_report_sha256": "4efcb8398b40db2dd8b247e4388503d97127f92270dc47a794f56a93ec8edf40",
+      "state_sha256": "1611fad0309ba541a769d51464d581b572541589f48b27926754b2214eb3c9c7"
+    },
+    {
+      "processing_basin_id": "6020000010",
+      "unit_count": 226874,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": true,
+      "manifest_sha256": "41c54a7e06e933ffb97f39251069ed7decf81265f5453297f89fe473f324553b",
+      "build_report_sha256": "d09130ed1b611ac923e9f6b07f7413b9796f1ce56257538c00cdc98977159a12",
+      "state_sha256": "e256d6e68aa2fb142e2d17225246fb0b652be08c06c99339fa2f8146ec8262af"
+    },
+    {
+      "processing_basin_id": "7020000010",
+      "unit_count": 331263,
+      "compile_status": "succeeded",
+      "attempts": 1,
+      "added_to_baseline": false,
+      "manifest_sha256": "ae0f159dd3af2590d49425ad45cc2aa805747ef6f326df1ee2b0dd1002bc1ae8",
+      "build_report_sha256": "31ce230babcc93e2a19feb5ffa7fecf79dcf346024aab3cb9a2b217e2de600f2",
+      "state_sha256": "61fdaacafef2954984db5de9d19816da06b620aa6bb72a2e79ef0c9f6c16ed86"
+    }
+  ],
+  "validation": {
+    "result": "passed",
+    "assembly_state": "succeeded",
+    "launch_finished_at": "2026-09-07T11:17:46Z",
+    "launch_exit_code": 0,
+    "classified_at": "2026-09-07T11:19:41Z",
+    "command_template": [
+      "hfx",
+      "<assembled dataset>",
+      "--strict",
+      "--sample-pct",
+      "100",
+      "--format",
+      "text"
+    ],
+    "command_evidence": "target adapter validate_dataset and runner verify_assembly_dataset, plus retained assembly launch log",
+    "successful_validator_stdout_persisted": false,
+    "authoritative_final_state_record": "evidence/tdx-hydro-extension/final-assembly-state.json",
+    "authoritative_final_state_sha256": "91a7c0f829ee3ffcec82dd397da0e92d06b5e7f22530b41f5d4e61476b166e76",
+    "launch_log_record": "evidence/tdx-hydro-extension/assembly-launch.log",
+    "launch_log_sha256": "4d75c3d4ebc3f438b0281d7fe6ca25dcfba9a51e6de417d7a3a56e8ed8085cbe"
+  },
+  "control": {
+    "adjudicated_units_without_difference": 0,
+    "candidate_orientation_digest": "9571765ecaf73025a2c8489872998a08f0e7171c5bd6db3ef19c51ff11db8aec",
+    "catchment_attribute_differences": {
+      "area_km2": 0,
+      "bbox.xmax": 0,
+      "bbox.xmin": 0,
+      "bbox.ymax": 0,
+      "bbox.ymin": 0,
+      "level": 0,
+      "parent_id": 0,
+      "up_area_km2": 0
+    },
+    "catchment_geometry_differences": 0,
+    "downstream_differences": 0,
+    "graph_differences": {
+      "bbox_maxx": 0,
+      "bbox_maxy": 0,
+      "bbox_minx": 0,
+      "bbox_miny": 0,
+      "level": 0,
+      "upstream_ids": 0
+    },
+    "header_number": 71,
+    "manifest_equal_except_created_at": true,
+    "max_shift_deg": 0.17020920315745225,
+    "max_shift_deg_pinned": 0.17020920315745225,
+    "orient_report_digest": "9571765ecaf73025a2c8489872998a08f0e7171c5bd6db3ef19c51ff11db8aec",
+    "outlet_differences": 7192,
+    "outlet_differences_expected": 7192,
+    "outlet_differences_outside_adjudicated_set": 0,
+    "processing_basin_id": "7020000010",
+    "reference_orientation_digest": "40867ddecc42dae793aae62a1754d9e984aa68fce332815d588e54e635cf027d",
+    "refusals": [],
+    "schema_version": 1,
+    "snap_stem_differences_inside_adjudicated_set": 0,
+    "snap_stem_differences_outside_adjudicated_set": 0,
+    "unit_count": 331263,
+    "verdict": "accepted"
+  },
+  "lifecycle": {
+    "provisioning_request": "2026-09-05T21:18:04Z",
+    "provisioning_request_epoch": 1788643084,
+    "zero_footprint": "2026-09-07T11:39:49Z",
+    "server_id": 164714525,
+    "volume_id": 106799807,
+    "server_type": "ccx33",
+    "location": "fsn1",
+    "volume_size_gb": 600,
+    "elapsed_hours": 38.3625,
+    "driver_exit_code": 126,
+    "driver_failed_at": "2026-09-07T11:39:25Z",
+    "original_campaign_record_bytes": 0,
+    "original_lifecycle_result_present": false,
+    "authority_status": "consumed",
+    "gross_projected_eur": "20.9923565918",
+    "conservative_estimated_gross_eur": "11.3708598205",
+    "cost_basis": "captured gross rates, 730 hours per month, 39 rounded billed hours; outbound estimate below included allowance",
+    "invoiced_actual_gross_eur": null,
+    "extra_volume_swap_bytes": 55000000000,
+    "preserved_data_cleanup_authority": "none; historical workstation-copy records confer no deletion authority; separate explicit decision required",
+    "execution_guard": {
+      "pull_request": "https://github.com/CooperBigFoot/hfx/pull/244",
+      "merge_revision": "682d4f6e475651fcb67ef033e41e5a4071533da9",
+      "read_only_checks": {
+        "authority-is-pinned": 0,
+        "scope-permits-compilation": 0,
+        "authority-is-current": 1
+      },
+      "driver_executed_during_audit": false
+    },
+    "current_exact_resource_absence": {
+      "record": "evidence/tdx-hydro-extension/exact-resource-absence.json",
+      "sha256": "3af71c23d87bd87d199ce2ef59d86cf2baba7416425f00f90ff537bcef039e10",
+      "checked_at": "2026-09-09T11:11:19.179218+00:00",
+      "method": "hcloud CLI read-only exact-ID describe",
+      "server_id": 164714525,
+      "volume_id": 106799807,
+      "result": "both not found"
+    }
+  },
+  "preservation": [
+    {
+      "category": "source-corpus",
+      "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/source-corpus/",
+      "object_count": 16,
+      "listed_bytes": 84101885952,
+      "readback_ok_count": 16,
+      "manifest_record_sha256": "e2ac104c7b8c6791bf4a21303e7f44a84b973f49c69209dcb44f981ff4314c75",
+      "readback_record_sha256": "bbd524c5f4259d63c17746a1fc21eb0a437402a4dbc7b346259097ebcc9a5305",
+      "objects": [
+        {
+          "path": "1020018110-basins.gpkg",
+          "sha256": "4965c693b8891e0b3e4270241422567b6c1a7766099ab2324d55be08a6abec27"
+        },
+        {
+          "path": "1020018110-streamnet.gpkg",
+          "sha256": "b7bdd31f3c4ec06c57a557fea2c8f76fc42f9e4731881b7ed455f50a1918e1ac"
+        },
+        {
+          "path": "2020003440-basins.gpkg",
+          "sha256": "a4fd60ff2623631906cc356fb83310a4071bc9a8bd7f3749cada97d2dac7fcba"
+        },
+        {
+          "path": "2020003440-streamnet.gpkg",
+          "sha256": "fa2676491f525fb769eff381ad165031c76ca6a8a73ee219573b336059a2d47e"
+        },
+        {
+          "path": "2020065840-basins.gpkg",
+          "sha256": "35e85aa1fd463627b96e1aa3cd74a9e860d306370b5fd16dacc01fae9def8b5d"
+        },
+        {
+          "path": "2020065840-streamnet.gpkg",
+          "sha256": "471829fe3d26362699b2f9bc1b430d8c2ae73f533136933e133d5b20fa1b87e6"
+        },
+        {
+          "path": "2020071190-basins.gpkg",
+          "sha256": "c646fd9ab70a655f038bcaa0f898e972675ab731027c48bac1e70aca18b3bf4f"
+        },
+        {
+          "path": "2020071190-streamnet.gpkg",
+          "sha256": "9aaa47aeae3ab8a9b9e564c1d0b7cda20401cc1958a671ae75cec63ef50bdc6c"
+        },
+        {
+          "path": "4020050470-basins.gpkg",
+          "sha256": "65077c7ed655521496bb939d57523875599f377bcb9de5cac4793c5b2e46253a"
+        },
+        {
+          "path": "4020050470-streamnet.gpkg",
+          "sha256": "c70336659654dccba3cc9f3086495e171f9ca0f98c4fef4ae5dd4128180a500b"
+        },
+        {
+          "path": "5020049720-basins.gpkg",
+          "sha256": "9c1cf35d120312731de28f86212382e79bbc9b660035265e7c4e164624a04e8a"
+        },
+        {
+          "path": "5020049720-streamnet.gpkg",
+          "sha256": "dcd55720a98b1d2691d063c557ca95dff76dd4562342c6b94c8c89b08e11fff5"
+        },
+        {
+          "path": "6020000010-basins.gpkg",
+          "sha256": "530526ce8d0bbff74377e3c34f905812e9d3ed13b63c637b4328882ba61a38b7"
+        },
+        {
+          "path": "6020000010-streamnet.gpkg",
+          "sha256": "10b565b25090ecf3ca83c5887a1fb626da4a42d358984db64d63d68d21e39beb"
+        },
+        {
+          "path": "7020000010-basins.gpkg",
+          "sha256": "6d75b56428227824749a497b279a5d0891fd67d4c6a82df1b746f620add6da1a"
+        },
+        {
+          "path": "7020000010-streamnet.gpkg",
+          "sha256": "ae3e5c881cad7c4e3b85a594b4e59889e698f5262e18466a1748c13af6948ca9"
+        }
+      ]
+    },
+    {
+      "category": "basin-outputs",
+      "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/basin-outputs/",
+      "object_count": 32,
+      "listed_bytes": 31439612280,
+      "readback_ok_count": 32,
+      "manifest_record_sha256": "f97616b43e2d3b0f7eb3b1a4c195d8b8ec3fac07f21487f26b6f933e43cd2172",
+      "readback_record_sha256": "db5d310c66c02bf7d02292fb6625b6cafa7141e90153dc28940d4c343128df7a",
+      "objects": [
+        {
+          "path": "1020018110/aux/snap_stems.parquet",
+          "sha256": "5ca359e3777602de5f92784bda9c90a9bae96f51c9d2f134f7e3274b145ed42f"
+        },
+        {
+          "path": "1020018110/catchments.parquet",
+          "sha256": "e0a33474a772a8963789baf179784b89fcd53a9f1368e462fccfc46def98e7b4"
+        },
+        {
+          "path": "1020018110/graph.parquet",
+          "sha256": "afb8d729de869edb2cd1e6534bc761b028887d186dc93dd07b1ca5f219e5bc37"
+        },
+        {
+          "path": "1020018110/manifest.json",
+          "sha256": "4b1441c2f6a317095e63a3db9b75473c51822572ec5725c1daea42fac40ff006"
+        },
+        {
+          "path": "2020003440/aux/snap_stems.parquet",
+          "sha256": "904e40832ebfbbb8b3fa0f1f0534c52b62fec6349ca589868eaec5fea598ac8a"
+        },
+        {
+          "path": "2020003440/catchments.parquet",
+          "sha256": "060b37870acdf845cb16034cc1c68161a40c7547ff480ad431fdb2de60e15937"
+        },
+        {
+          "path": "2020003440/graph.parquet",
+          "sha256": "2e9f8fbcee42e4996a6cd9eef11137d4edd875b28f9af88e50ed7ac7a57f11b3"
+        },
+        {
+          "path": "2020003440/manifest.json",
+          "sha256": "fb14cecde13a6e8d6fd741756c896df75cb144f9dd5577cb929d01ce61e35fc5"
+        },
+        {
+          "path": "2020065840/aux/snap_stems.parquet",
+          "sha256": "a67861f08593c0cc9c66503b81397038dbd6a69834a0fd9a940d29c083e06cc6"
+        },
+        {
+          "path": "2020065840/catchments.parquet",
+          "sha256": "3fcb20992efb6a41f7d183f8fbc0c38eeee8808cde7ade7455054053b2863c01"
+        },
+        {
+          "path": "2020065840/graph.parquet",
+          "sha256": "3d9e951ee61e956d21851ef556cf8aabb9b4c8af5022ca9d83d8f2baf61237ea"
+        },
+        {
+          "path": "2020065840/manifest.json",
+          "sha256": "7d128e60aa517a09d505fb641523c13e4c5a9dafce3c13dee5c67e710b00f679"
+        },
+        {
+          "path": "2020071190/aux/snap_stems.parquet",
+          "sha256": "aeb5fb606f230ed516bca92338dad24aea0a2d6f745367d456781bcf53c0301a"
+        },
+        {
+          "path": "2020071190/catchments.parquet",
+          "sha256": "c1174e6c4deeffacc7a7775a52ab8c4c550c834210970c5610512b7c0f87e669"
+        },
+        {
+          "path": "2020071190/graph.parquet",
+          "sha256": "e7a8575a66cf180e4caaec40455324700018515b2b8ae5e561e82abad18d4880"
+        },
+        {
+          "path": "2020071190/manifest.json",
+          "sha256": "2293296b5517f73b6a33fc0eb3fda498d29b2c93e463589b5c8a65b39b9357ed"
+        },
+        {
+          "path": "4020050470/aux/snap_stems.parquet",
+          "sha256": "70e490cb79df6ed8d2a9a70b5d90a668a4977fa626318d1663d3b59cfced6391"
+        },
+        {
+          "path": "4020050470/catchments.parquet",
+          "sha256": "154f8e587ae3ca65f6c5214d84a13ec41b0c780b6ca96c804029539ae8c4643f"
+        },
+        {
+          "path": "4020050470/graph.parquet",
+          "sha256": "67a29f9c86e9284b4cbfd2c2c99a0f797145e48ff9a7fb27641c2bb740277383"
+        },
+        {
+          "path": "4020050470/manifest.json",
+          "sha256": "935fd1dbfebe49cc314c3a10828b0ad75c3841d76bc27fc85ad36a1c165f1151"
+        },
+        {
+          "path": "5020049720/aux/snap_stems.parquet",
+          "sha256": "5bcd1504c73da77a9908b05102f0ec53770f683c5e4b750945b22a09d5ea19c6"
+        },
+        {
+          "path": "5020049720/catchments.parquet",
+          "sha256": "b19f6e6869fadd2020856f1a04c411991827f12efb9b0e9a9b9bc3c1ff73e4a8"
+        },
+        {
+          "path": "5020049720/graph.parquet",
+          "sha256": "89eb079beedd321b41986b570d3cff5666dc627cd28a1d70dadd09f6868e0d45"
+        },
+        {
+          "path": "5020049720/manifest.json",
+          "sha256": "0cf822b7876df80855f36ef6a9a87ee45f6c95f2f258a912825159a2c901729d"
+        },
+        {
+          "path": "6020000010/aux/snap_stems.parquet",
+          "sha256": "8791cc6854ded295045f88b2161ae4124ed6f9f20bd9f19c80d04bb9e8e861b8"
+        },
+        {
+          "path": "6020000010/catchments.parquet",
+          "sha256": "167e4a6d442dd79765777a6a86e70e252f077e88d9aa309bf4802bcf931bd426"
+        },
+        {
+          "path": "6020000010/graph.parquet",
+          "sha256": "aba6ecfdf94c9bb18488faac2aac62366205a3bb9817d238b9dcec0438b9af02"
+        },
+        {
+          "path": "6020000010/manifest.json",
+          "sha256": "41c54a7e06e933ffb97f39251069ed7decf81265f5453297f89fe473f324553b"
+        },
+        {
+          "path": "7020000010/aux/snap_stems.parquet",
+          "sha256": "caf2eec3d1930f25d932b559ca943c7710a9a6cf18b4a9f84d3d94cbf379d9b2"
+        },
+        {
+          "path": "7020000010/catchments.parquet",
+          "sha256": "a0d0d2bdd1c193512f89b378490812a524dcc48394716aaa66b2875cc42f1bd7"
+        },
+        {
+          "path": "7020000010/graph.parquet",
+          "sha256": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5"
+        },
+        {
+          "path": "7020000010/manifest.json",
+          "sha256": "ae0f159dd3af2590d49425ad45cc2aa805747ef6f326df1ee2b0dd1002bc1ae8"
+        }
+      ]
+    },
+    {
+      "category": "control-builds",
+      "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/control-builds/",
+      "object_count": 20,
+      "listed_bytes": 8577720771,
+      "readback_ok_count": 20,
+      "manifest_record_sha256": "f869a6086f6c935a3ead56d81cf00e06247987c41b5273b0ab86bd56d91f35c3",
+      "readback_record_sha256": "ded9c4bd60e43759027c29cc43bdd368fc3c01b05d788e4e2282e7ba8b84aa4e",
+      "objects": [
+        {
+          "path": "compare-adjudicated-outlets.json",
+          "sha256": "512301afcfb1709a06afb8ad2abadca7df7bf057a7e1fda440bc54f1b04384a3"
+        },
+        {
+          "path": "compare-corrected.json",
+          "sha256": "5f736f632786bd529dc257f7346bb1e645cc15b83cb448af60440e815149cf20"
+        },
+        {
+          "path": "compare-corrected-planetary.json",
+          "sha256": "d5babf07129c468bccefba331a92682dd482061f2aca5b6d9d9feff576e27f3c"
+        },
+        {
+          "path": "compare-planetary.json",
+          "sha256": "634db90b43a5847cb375f0b34c55d6763ba434cd73dc9a0b749f0da11892ab11"
+        },
+        {
+          "path": "corrected/7020000010/aux/snap_stems.parquet",
+          "sha256": "caf2eec3d1930f25d932b559ca943c7710a9a6cf18b4a9f84d3d94cbf379d9b2"
+        },
+        {
+          "path": "corrected/7020000010-build-report.json",
+          "sha256": "cd01a4aa52436bb1ff702638adb4ec7f33b8e54094659f415b598261f2f04feb"
+        },
+        {
+          "path": "corrected/7020000010/catchments.parquet",
+          "sha256": "a0d0d2bdd1c193512f89b378490812a524dcc48394716aaa66b2875cc42f1bd7"
+        },
+        {
+          "path": "corrected/7020000010/graph.parquet",
+          "sha256": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5"
+        },
+        {
+          "path": "corrected/7020000010/manifest.json",
+          "sha256": "8ca5b2135d19c18a4b8fba6c93c63ffb7a784a2749867483ea6c0c49c46560c4"
+        },
+        {
+          "path": "corrected/7020000010-orient.json",
+          "sha256": "5adb8aaeea7ef2ac02d26e66f1aee406e29e974b95307f05d7843dbdfc80d349"
+        },
+        {
+          "path": "created-at-record.json",
+          "sha256": "22a27d1435f223c21605346356f2c628b0c95c0bd40107223c05248def9a769d"
+        },
+        {
+          "path": "planetary/7020000010/aux/snap_stems.parquet",
+          "sha256": "caf2eec3d1930f25d932b559ca943c7710a9a6cf18b4a9f84d3d94cbf379d9b2"
+        },
+        {
+          "path": "planetary/7020000010-build-report.json",
+          "sha256": "c4ec963f2072800cf9f884981cf3ba583a575358c918107cf7bc86f030fff621"
+        },
+        {
+          "path": "planetary/7020000010/catchments.parquet",
+          "sha256": "d2019ba08fd39c873eb0bac22946d25c91e785ef3345538447d30fc15ccf3be4"
+        },
+        {
+          "path": "planetary/7020000010/graph.parquet",
+          "sha256": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5"
+        },
+        {
+          "path": "planetary/7020000010/manifest.json",
+          "sha256": "055d32e044d0a414c92350cfaf02217a21369625c9ec2b470a0f0ae1815ccafc"
+        },
+        {
+          "path": "preserved/7020000010/aux/snap_stems.parquet",
+          "sha256": "caf2eec3d1930f25d932b559ca943c7710a9a6cf18b4a9f84d3d94cbf379d9b2"
+        },
+        {
+          "path": "preserved/7020000010/catchments.parquet",
+          "sha256": "d2019ba08fd39c873eb0bac22946d25c91e785ef3345538447d30fc15ccf3be4"
+        },
+        {
+          "path": "preserved/7020000010/graph.parquet",
+          "sha256": "fb64ce0fa941f244841ffc5eeed4f2057ea65262a0183a1ac1e81c67380e6cc5"
+        },
+        {
+          "path": "preserved/7020000010/manifest.json",
+          "sha256": "8ca5b2135d19c18a4b8fba6c93c63ffb7a784a2749867483ea6c0c49c46560c4"
+        }
+      ]
+    },
+    {
+      "category": "extension",
+      "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/",
+      "object_count": 6,
+      "listed_bytes": 142657755797,
+      "readback_ok_count": 6,
+      "manifest_record_sha256": "16f6d335ce681481c01fe17c1b9ff4e89f0717f97153e954d051562c7e2bb9fd",
+      "readback_record_sha256": "d6089b1ad403f23af995050b86894da0c4e03ece6acec1e45dc9f89b77a920fa",
+      "objects": [
+        {
+          "path": "aux/snap_stems.parquet",
+          "sha256": "9c3459148b528d54f7da4bf019bd761f557b6d139e23f592bef2136bd6ef9b3f"
+        },
+        {
+          "path": "catchments.parquet",
+          "sha256": "456a163cb627dd8128dd59f1cd820f7f156f44ebd7a2887e77041cc9259767bd"
+        },
+        {
+          "path": "CITATION.txt",
+          "sha256": "26cf72c81cb2841878979987a0e9345366738e6379ef6f016744d6903449e213"
+        },
+        {
+          "path": "graph.parquet",
+          "sha256": "b21754976fb176a762bbd6e5bcdd1737dcad82551fdc21fac4bbb7bc8df038ed"
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85"
+        },
+        {
+          "path": "NOTICE",
+          "sha256": "d3d3e7a6c45aaf9e13fe471e8b427f7526addb60aa8fa9f47534890775cd4d93"
+        }
+      ],
+      "object_path_base": "bucket prefix",
+      "source_manifest_path_prefix": "assembly/dataset/"
+    }
+  ],
+  "small_evidence_sha256": [
+    {
+      "path": "assembly-final.json",
+      "sha256": "91a7c0f829ee3ffcec82dd397da0e92d06b5e7f22530b41f5d4e61476b166e76"
+    },
+    {
+      "path": "validation-classification.txt",
+      "sha256": "8ae64ea9da36a0997e72b4df8c26593d02cb5e30c074b9f4de056ee068c2c741"
+    },
+    {
+      "path": "off-vm/logs/hfx-seven-basin-extension-tdx-assemble.log",
+      "sha256": "4d75c3d4ebc3f438b0281d7fe6ca25dcfba9a51e6de417d7a3a56e8ed8085cbe"
+    },
+    {
+      "path": "off-vm/sha256/campaign-state-sha256.txt",
+      "sha256": "4fd3cbf18fb0d7981af64e8e7263ba9ac3b75d7c5f82172d8403f007d0eb6eb0"
+    },
+    {
+      "path": "off-vm/sha256/campaign-reports-sha256.txt",
+      "sha256": "02ccaea0a1ba476f3b2e1f4bec85241b1cafe12a454aa81cc2cdddc2cbff82d8"
+    },
+    {
+      "path": "off-vm/sha256/logs-sha256.txt",
+      "sha256": "fcc1487157a9d19a39da34f84f62d1cf52be58b3793339faec7d85c51f0a18b1"
+    },
+    {
+      "path": "compare-corrected.json",
+      "sha256": "5f736f632786bd529dc257f7346bb1e645cc15b83cb448af60440e815149cf20"
+    },
+    {
+      "path": "compare-planetary.json",
+      "sha256": "634db90b43a5847cb375f0b34c55d6763ba434cd73dc9a0b749f0da11892ab11"
+    },
+    {
+      "path": "compare-adjudicated-outlets.json",
+      "sha256": "512301afcfb1709a06afb8ad2abadca7df7bf057a7e1fda440bc54f1b04384a3"
+    },
+    {
+      "path": "current-price-preflight.json",
+      "sha256": "2da2a69412a34ddd8cc8b8fa451f539cda60de605820ce953e8a2d40fceed8c6"
+    },
+    {
+      "path": "gate-pre-preservation-20260907T111941Z-0227.json",
+      "sha256": "c0ec863321751408274743be382953bb542659d490d20907bbf8fa070db8e007"
+    },
+    {
+      "path": "teardown.log",
+      "sha256": "619d5926a42a1bfc354eb3c3b9874097f4c4bbdfcb85d15601dcaaf334cfa068"
+    },
+    {
+      "path": "final-servers.json",
+      "sha256": "f5e2f656b7a7c7cd849d4cc0a86168973f162ab88f153b9b901001b969b0ffea"
+    },
+    {
+      "path": "final-volumes.json",
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    }
+  ],
+  "remaining_verification": [],
+  "local_records_rehashed": {
+    "campaign_state": 67,
+    "campaign_reports": 9,
+    "logs": 9,
+    "per_basin_manifests": 8
+  },
+  "baseline": {
+    "prefix": "s3://pourpoint-hfx/scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/",
+    "region": "tdx-hydro-partial-4dbff0d6ec31",
+    "exported_bytes": 114063230627,
+    "preservation_boundary": "read-only pull; original artifact retained separately",
+    "digest_evidence": "campaign VM baseline pull",
+    "objects": [
+      {
+        "path": "./aux/snap_stems.parquet",
+        "sha256": "bed2526e1f45ed8df334d493a644e027f1be31186e44b6c60a15c927c785350f"
+      },
+      {
+        "path": "./catchments.parquet",
+        "sha256": "4003fcc5432c09220435ab1ec96f1e475c783975cba8d3565021419014bcdbd8"
+      },
+      {
+        "path": "./CITATION.txt",
+        "sha256": "26cf72c81cb2841878979987a0e9345366738e6379ef6f016744d6903449e213"
+      },
+      {
+        "path": "./graph.parquet",
+        "sha256": "984f90d62ea999fa8117c0dc76c036d6cb424a22f6e0cef1edb24888c228c1a9"
+      },
+      {
+        "path": "./manifest.json",
+        "sha256": "8e8cdf67d5036d73dd584b16f5318a232796cc417c515e5fb4791d5de195d687"
+      },
+      {
+        "path": "./NOTICE",
+        "sha256": "d3d3e7a6c45aaf9e13fe471e8b427f7526addb60aa8fa9f47534890775cd4d93"
+      }
+    ]
+  },
+  "current_object_observation": {
+    "checked_at": "2026-09-09T11:10:27.498457+00:00",
+    "operations": "bounded range GET of three small JSON records and two prefix listings; no writes",
+    "scope_limit": "Current listings confirm names/sizes; full large-object current digests were not reread. Historical VM streamed readbacks remain full-byte evidence.",
+    "records": [
+      {
+        "path": "evidence/tdx-hydro-extension/extension-manifest.json",
+        "sha256": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/baseline-manifest.json",
+        "sha256": "8e8cdf67d5036d73dd584b16f5318a232796cc417c515e5fb4791d5de195d687"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/extension-listing.json",
+        "sha256": "fe900368e9456aba22a82bee105603e235602641fcb2a5b56ad85510476af752"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/baseline-listing.json",
+        "sha256": "3758cb06ac127a94f4a1aa433f8c308116925dc5cfb25e2b6fc478fd0dacfdff"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/bucket-assembly-state.json",
+        "sha256": "79ff2376b8ebdafd763adf3891077c5fa2b068e991275c959e0e24841351062d"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/verification-result.json",
+        "sha256": "ee6e4d4929fe758fad75f885e5db7660ecf26236b98eb742cc9f40ca3b69aa29"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/final-assembly-state.json",
+        "sha256": "91a7c0f829ee3ffcec82dd397da0e92d06b5e7f22530b41f5d4e61476b166e76"
+      },
+      {
+        "path": "evidence/tdx-hydro-extension/assembly-launch.log",
+        "sha256": "4d75c3d4ebc3f438b0281d7fe6ca25dcfba9a51e6de417d7a3a56e8ed8085cbe"
+      }
+    ],
+    "baseline_manifest_matches_preserved_digest": true,
+    "extension_manifest_matches_preserved_digest": true,
+    "extension_object_count": 6,
+    "extension_listed_bytes": 142657755797,
+    "baseline_object_count": 6,
+    "baseline_listed_bytes": 114063230627
+  },
+  "known_operational_limits": [
+    {
+      "kind": "stale non-dataset bucket state",
+      "bucket_record": "evidence/tdx-hydro-extension/bucket-assembly-state.json",
+      "bucket_state": "running",
+      "bucket_bytes": 1761,
+      "bucket_sha256": "79ff2376b8ebdafd763adf3891077c5fa2b068e991275c959e0e24841351062d",
+      "authoritative_final_record": "evidence/tdx-hydro-extension/final-assembly-state.json",
+      "final_state": "succeeded",
+      "final_bytes": 1763,
+      "final_sha256": "91a7c0f829ee3ffcec82dd397da0e92d06b5e7f22530b41f5d4e61476b166e76",
+      "disposition": "Superseded historical pre-validation snapshot. Final state and exit-zero launch log retained verbatim in Git; no bucket overwrite, rerun or unresolved validation claim."
+    }
+  ]
+}

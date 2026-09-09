@@ -1,0 +1,23 @@
+{
+  "checked_at": "2026-09-09T11:10:27.498457+00:00",
+  "endpoint": "https://fsn1.your-objectstorage.com",
+  "operations": "bounded range GET of three small JSON records and two prefix listings; no writes",
+  "manifest_sha256_matches": {
+    "extension-manifest.json": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85",
+    "baseline-manifest.json": "8e8cdf67d5036d73dd584b16f5318a232796cc417c515e5fb4791d5de195d687"
+  },
+  "listings": {
+    "extension": {
+      "objects": 6,
+      "bytes": 142657755797
+    },
+    "baseline": {
+      "objects": 6,
+      "bytes": 114063230627
+    }
+  },
+  "bucket_assembly_state": "running (historical pre-validation snapshot)",
+  "bucket_state_sha256": "79ff2376b8ebdafd763adf3891077c5fa2b068e991275c959e0e24841351062d",
+  "final_local_state": "succeeded; separately preserved and hashed campaign evidence",
+  "scope_limit": "Current listings confirm names/sizes; full large-object current digests were not reread. Historical VM streamed readbacks remain full-byte evidence."
+}

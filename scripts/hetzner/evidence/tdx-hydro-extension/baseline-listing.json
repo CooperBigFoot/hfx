@@ -1,0 +1,52 @@
+{
+    "IsTruncated": false,
+    "Contents": [
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/CITATION.txt",
+            "LastModified": "2026-08-07T04:57:22.841000+00:00",
+            "ETag": "\"a39c326ed6ecc2a36c220a94dbbbf3d2\"",
+            "Size": 714,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/NOTICE",
+            "LastModified": "2026-08-07T04:57:22.837000+00:00",
+            "ETag": "\"48a71a944ed74ac13e6bdc9ad94976b2\"",
+            "Size": 1338,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/aux/snap_stems.parquet",
+            "LastModified": "2026-08-07T05:03:07.378000+00:00",
+            "ETag": "\"67f33347b7dded7876149d371c3132d7-3218\"",
+            "Size": 26991983875,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/catchments.parquet",
+            "LastModified": "2026-08-07T05:05:39.253000+00:00",
+            "ETag": "\"3eabef3509f90817417c3cb0c3c9b1e6-5166\"",
+            "Size": 86655125778,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/graph.parquet",
+            "LastModified": "2026-08-07T04:57:27.725000+00:00",
+            "ETag": "\"860b476d3a25454c8eb917242d61b047-50\"",
+            "Size": 416117991,
+            "StorageClass": "STANDARD"
+        },
+        {
+            "Key": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/manifest.json",
+            "LastModified": "2026-08-07T04:57:22.818000+00:00",
+            "ETag": "\"5f8c5b76ac6715e4aa4b4794b11e4d18\"",
+            "Size": 931,
+            "StorageClass": "STANDARD"
+        }
+    ],
+    "Name": "pourpoint-hfx",
+    "Prefix": "scratch/tdx-hydro-tdx-m5-planetary/planetary-hfx-v0-3-0/dataset/",
+    "MaxKeys": 100,
+    "EncodingType": "url",
+    "KeyCount": 6
+}
