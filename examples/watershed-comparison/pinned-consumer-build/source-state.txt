@@ -1,9 +1,0 @@
-7a43834a870d0f5d46ed6d23926205ee58c8fb93
-52664f55283a29985ba34c0e6c1cfe710e6656e0
-worktree /Users/nicolaslazaro/Desktop/work/pourpoint
-HEAD 7a43834a870d0f5d46ed6d23926205ee58c8fb93
-branch refs/heads/main
-
-worktree /Users/nicolaslazaro/Desktop/work/hfx/.worktrees/pourpoint-effort108
-HEAD 7a43834a870d0f5d46ed6d23926205ee58c8fb93
-detached

@@ -1,9 +1,0 @@
-Command (in scripts/watershed-comparison):
-HFX_TEST_CONSUMER_IDENTITY=<local comparison-evidence>/consumer-identity.json HFX_TEST_LOCAL_FIXTURE=<pinned pourpoint checkout>/crates/core/tests/fixtures/parity/v021_synthetic_refined uv run --frozen --no-sync pytest -q --basetemp <local comparison-evidence>/comparison-acceptance-tests
-Result: exit 0; 35 passed in 1.88s; 40 upstream Cartopy/Matplotlib locs deprecation warnings.
-uv run --frozen --no-sync ruff check --fix .: exit 0 after one import-format correction.
-uv run --frozen --no-sync ruff format .: exit 0.
-Native wheel suite: see pytest.log and pytest.xml (48 passed, 1 skipped, 7 network deselected).
-Regression proof: typed skip_reason dictionary test failed through real overlay loading before correction; endpoint mismatch test failed through comparison preflight before receipt endpoint/region binding.
-Real supervised sleeping-child fault test proves wallclock gate terminates and reaps child; it is not native delineation proof.
-No remote dataset opened, no actual Basel/planetary delineation, no storage mutation.
