@@ -245,6 +245,59 @@ repetition. Inspect preserved records and provider state; do not edit the journa
 to manufacture success. Known completed parts can resume only when ListParts
 exactly equals the recorded parts. No unknown upload ID is adopted.
 
+### Explicit pending-part reconciliation
+
+After independent review of an interrupted copy, `reconcile-part` can record one
+observed pending part in the same journal-owned multipart upload. Ordinary
+`deliver` still refuses pending intent. This command supports only the explicitly
+approved `exclusive-writer` publication mode and requires all existing delivery
+arguments, including the original probe, decision and authorization binding.
+
+Stop all writers first, including any process with a replicated journal. Inspect
+the raw journal and read-only provider ListParts response. Pin the raw journal
+SHA-256 and the selected pending part ETag. Then replace action `deliver` with
+`reconcile-part` and add:
+
+```text
+--object-path catchments.parquet
+--expected-journal-sha256 <SHA-256-of-exact-reviewed-delivery.json-bytes>
+--expected-part-etag '"<exact-reviewed-part-ETag>"'
+--confirm-exclusive-writer
+```
+
+Use a small positive read budget sufficient for the source manifest and two
+ownership-reservation checks. No dataset payload is read by this command.
+The confirmation records the operator's current exclusion of all other writers;
+it does not establish a provider fence or observe another client's liveness.
+
+The command rechecks the exact plan, source inventory and HEAD identities,
+private access, immutable authorization, reservation bytes and identity, completed
+destination identities, and active upload ownership. Exactly one object may be
+copying. It must have one pending intent for the next source range. All preceding
+part numbers, sizes and ETags must match the journal exactly. Two complete
+ListParts observations must agree and contain exactly those preceding parts plus
+one pending part with the expected number, size and explicitly pinned ETag.
+Missing, extra, foreign, changed or ambiguous state refuses. An uncertain create,
+completion, reservation or README PUT remains outside this recovery path.
+
+All provider calls are read-only with one SDK attempt. The command does not
+copy, retry a write, create, complete, abort or delete anything. On success, one
+atomic fsynced journal replacement stores the exact original journal text and its
+SHA-256, original pending intent, observed parts, reservation verification,
+operator confirmation and observation time in `part_recoveries`. The selected
+part is recorded and its pending intent removed. The status is
+`partial-unverified`. A refusal leaves the journal bytes unchanged, with its
+reason reported on stderr. Retain that output separately for an audit.
+
+The evidence explicitly states that the original copy request's success was
+**not observed**. ListParts is an ownership/size/token observation. Its ETag is
+not SHA-256 evidence. The original interruption remains preserved. A later,
+separate `deliver` invocation rechecks all normal safeguards, resumes remaining
+parts, and must verify the full completed object SHA-256 before acceptance or
+manifest activation. The command does not authorize that subsequent invocation.
+External-writer races and the operational exclusive-writer guarantee remain
+unchanged.
+
 After a completed object has a recorded HEAD identity, the tool reads its entire
 payload as ordered 64 MiB HTTP ranges, through a 1 MiB buffer, into a sequential
 SHA-256 calculation. Every GET pins `IfMatch` and version where present. Each
