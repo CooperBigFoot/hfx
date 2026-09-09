@@ -1,0 +1,13 @@
+{
+  "schema": "hfx-exclusive-writer-authorization-binding-v1",
+  "decision_sha256": "66e1fe5af8f1cbcc1a1516b0178aecb32c3bebc204aff6b9dcb80549ca2b46e1",
+  "failed_probe_sha256": "100047cf7498bc52afc897ee54200a323c2cb2f91ef36411633e6cd51aa929be",
+  "scope": {
+    "endpoint": "https://fsn1.your-objectstorage.com",
+    "region": "fsn1",
+    "bucket": "pourpoint-hfx",
+    "destination_prefix": "hfx/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/",
+    "source_prefix": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/"
+  },
+  "recorded_at": "2026-09-09T12:54:21.519155+00:00"
+}
