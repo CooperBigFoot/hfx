@@ -114,19 +114,19 @@ class ProbeTests(unittest.TestCase):
         self.storage.ignore_condition = "put_object"
         with self.assertRaisesRegex(Refusal, "ignored destination condition"):
             self.probe.run()
-        self.assertEqual(self.evidence.value["status"], "unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
 
     def test_ignored_multipart_condition_refuses(self):
         self.storage.ignore_condition = "complete_multipart_upload"
         with self.assertRaisesRegex(Refusal, "ignored destination condition"):
             self.probe.run()
-        self.assertEqual(self.evidence.value["status"], "unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
 
     def test_wrong_http_rejection_refuses(self):
         self.storage.rejection = 403
         with self.assertRaisesRegex(Refusal, "HTTP 412"):
             self.probe.run()
-        self.assertEqual(self.evidence.value["status"], "unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
 
     def test_changed_readback_refuses_and_closes_body(self):
         self.storage.corrupt_readback = True
@@ -134,7 +134,7 @@ class ProbeTests(unittest.TestCase):
             self.probe.run()
         self.assertTrue(self.storage.bodies)
         self.assertTrue(all(body.closed for body in self.storage.bodies))
-        self.assertEqual(self.evidence.value["status"], "unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
 
     def test_existing_prefix_refuses_without_writes(self):
         self.storage.add(self.probe.prefix + "unrelated", b"retained")

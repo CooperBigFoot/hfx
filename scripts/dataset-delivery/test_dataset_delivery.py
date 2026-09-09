@@ -273,6 +273,47 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(self.storage.read_sizes)
         self.assertTrue(all(body.closed for body in self.storage.bodies))
 
+    def test_recheck_persists_checking_before_first_storage_call(self):
+        self.run_delivery()
+        observed = []
+        def inspect_checkpoint(operation, _request):
+            if not observed:
+                observed.append(json.loads(self.evidence.path.read_bytes()))
+        self.storage.hook = inspect_checkpoint
+        self.run_delivery()
+        self.assertEqual(observed[0]["status"], "checking")
+        self.assertEqual(observed[0]["verification_history"][-1]["status"], "verified-dataset")
+
+    def test_sigterm_after_atomic_success_write_persists_refusal_and_history(self):
+        import os
+        import signal
+        from dataset_delivery import InvocationInterrupted
+        original_save = self.evidence.save
+        interrupted = []
+        def interrupt_saved_success():
+            original_save()
+            if self.evidence.value["status"] == "verified-dataset" and not interrupted:
+                interrupted.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+        self.evidence.save = interrupt_saved_success
+        with self.assertRaisesRegex(InvocationInterrupted, "cancelled"):
+            self.run_delivery()
+        state = json.loads(self.evidence.path.read_bytes())
+        self.assertEqual(state["status"], "refused")
+        self.assertEqual(state["verification_history"][-1]["status"], "verified-dataset")
+        self.assertIn("cancelled", state["last_failure"]["reason"])
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_failed_recheck_invalidates_current_success_receipt(self):
+        self.run_delivery()
+        self.storage.add("hfx/test/graph.parquet", b"replacement")
+        with self.assertRaisesRegex(Refusal, "destination identity changed"):
+            self.run_delivery()
+        state = json.loads(self.evidence.path.read_bytes())
+        self.assertEqual(state["status"], "refused")
+        self.assertIn("destination identity changed", state["last_failure"]["reason"])
+        self.assertEqual(state["verification_history"][-1]["status"], "verified-dataset")
+
     def test_tiny_source_whole_copy_omits_range_and_keeps_conditions(self):
         self.run_delivery()
         copies = [kw for operation, kw in self.storage.events if operation == "upload_part_copy"]
@@ -289,7 +330,7 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, "SHA-256 mismatch"):
             self.run_delivery()
         self.assertNotIn("hfx/test/manifest.json", self.storage.objects)
-        self.assertEqual(self.evidence.value["status"], "partial-unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
         self.assertTrue(all(body.closed for body in self.storage.bodies))
 
     def test_bad_streams_refuse(self):
@@ -472,7 +513,7 @@ class DeliveryTests(unittest.TestCase):
         self.storage.hook = cancel
         with self.assertRaisesRegex(Refusal, "cancelled"):
             self.run_delivery()
-        self.assertEqual(self.evidence.value["status"], "partial-unverified")
+        self.assertEqual(self.evidence.value["status"], "refused")
         self.assertNotIn("hfx/test/manifest.json", self.storage.objects)
         self.assertTrue(all(body.closed for body in self.storage.bodies))
 

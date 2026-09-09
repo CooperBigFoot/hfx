@@ -8,7 +8,6 @@ import argparse
 from dataclasses import asdict
 import json
 import re
-import signal
 import sys
 import uuid
 
@@ -17,8 +16,8 @@ from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from dataset_delivery import (ObjectIdentity, PreservedDataset, Refusal, TransferBudget,
-                              digest, private_evidence, require, stamp)
+from dataset_delivery import (InvocationInterrupted, ObjectIdentity, PreservedDataset, Refusal,
+                              TransferBudget, delivery_attempt, digest, private_evidence, require, stamp)
 from pathlib import Path
 
 
@@ -126,6 +125,9 @@ class ConditionalWritesProbe:
         return upload_id, {"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]}
 
     def run(self):
+        return delivery_attempt(self.evidence, self.budget, self._run)
+
+    def _run(self):
         require(self.evidence.value is None, "probe journal already exists; inspect it without rerunning writes")
         self.evidence.value = {"schema": "hfx-conditional-writes-probe-v1", "endpoint": self.endpoint,
                                "region": self.region, "bucket": self.bucket, "status": "unverified",
@@ -194,30 +196,34 @@ def main():
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument("--max-seconds", type=float, default=300)
     parser.add_argument("--execute", action="store_true", help="explicitly authorize tiny probe writes; no deletion")
     args = parser.parse_args()
     try:
         require(args.execute, "probe writes require --execute after review")
         source = PreservedDataset.load(args.source_inventory)
-        budget = TransferBudget(300, 4096)
-        def cancel(_signum, _frame):
-            budget.cancelled = True
-        signal.signal(signal.SIGINT, cancel)
-        signal.signal(signal.SIGTERM, cancel)
+        require(0 < args.max_seconds <= 300, "probe runtime must be greater than zero and at most 300 seconds")
+        budget = TransferBudget(args.max_seconds, 4096)
         config = dict(connect_timeout=15, read_timeout=15, retries={"total_max_attempts": 1},
                       s3={"addressing_style": "path"}, request_checksum_calculation="when_required",
                       response_checksum_validation="when_required")
-        storage = boto3.Session(profile_name=args.profile).client(
-            "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
-        anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
-                                 config=Config(signature_version=UNSIGNED, **config))
         with private_evidence(args.evidence_dir) as evidence:
-            probe = ConditionalWritesProbe(storage, anonymous, source.endpoint, source.region,
-                                            source.bucket, evidence, budget, uuid.uuid4().hex)
-            probe.run()
-            print(json.dumps({"status": "verified", "evidence": str(evidence.path), "prefix": probe.prefix}))
-    except (Refusal, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
-        message = str(error) if isinstance(error, Refusal) else type(error).__name__
+            def execute():
+                storage = boto3.Session(profile_name=args.profile).client(
+                    "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
+                anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
+                                         config=Config(signature_version=UNSIGNED, **config))
+                try:
+                    probe = ConditionalWritesProbe(storage, anonymous, source.endpoint, source.region,
+                                                    source.bucket, evidence, budget, uuid.uuid4().hex)
+                    probe._run()
+                finally:
+                    storage.close()
+                    anonymous.close()
+            delivery_attempt(evidence, budget, execute)
+            print(json.dumps({"status": "verified", "evidence": str(evidence.path), "prefix": evidence.value["prefix"]}))
+    except (Refusal, InvocationInterrupted, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
+        message = str(error) if isinstance(error, (Refusal, InvocationInterrupted)) else type(error).__name__
         print(json.dumps({"status": "refused", "reason": message}), file=sys.stderr)
         return 1
     return 0

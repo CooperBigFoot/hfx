@@ -70,8 +70,9 @@ The generated `/absolute/private/conditional-write-probe/delivery.json` is the
 conditional-write evidence input. The command name expresses its limited
 purpose; the local filename is the shared atomic journal filename. Without
 `--execute`, the command refuses before creating a client or making requests.
-It never reuses an existing journal. Runtime is bounded to 300 seconds, each
-request timeout to 15 seconds, and processed probe reads to 4 KiB.
+It never reuses an existing journal. Runtime defaults to 300 seconds; use
+`--max-seconds` to choose a shorter positive bound. Each request has a 15-second
+inactivity timeout, and processed probe reads are bounded to 4 KiB.
 
 The receipt has schema `hfx-conditional-writes-probe-v1`, endpoint, region,
 bucket, observed time, status, and two operation summaries (`PutObject` and
@@ -172,18 +173,43 @@ is attempted. There are no automatic read retries. Stream interruption preserves
 the copied state so an operator can rerun unchanged arguments after inspection.
 A same-size replacement with a different identity is refused.
 
-Structured JSON progress emits copied-part and verified-range events. SIGINT and
-SIGTERM request cancellation. Checks occur between operations and body chunks;
-a blocked request can take up to its configured timeout to return. Runtime and
-byte limits are invocation-wide; they are not a system RAM or billing cap.
-The process runs one copy or verification operation at a time. Source bytes
+Structured JSON progress emits copied-part and verified-range events. Both
+commands run in the POSIX main thread. After the durable attempt checkpoint,
+a real-time `ITIMER_REAL` alarm enforces the remaining total runtime across
+client initialization, blocked SDK requests and stream reads. SIGINT and SIGTERM
+raise an immediate dedicated interruption through those calls. The interruption
+inherits `BaseException` so SDK exception retries cannot defer it. Previous
+handlers are restored and the alarm is disabled before failure evidence is
+saved. The tool refuses to replace an existing active real-time timer.
+
+An SDK read timeout measures inactivity. The separate invocation alarm stops
+continuous trickles or multipart keepalive responses even when that timeout
+never fires. Localhost protocol tests cover slow bodies and delayed headers,
+actual deadline expiration and actual SIGTERM for both CLI paths. These tests
+establish local interruption behavior, independently of provider capability.
+The tool preserves uncertain write intent and never automatically retries after
+interruption. Durable checkpoint/failure-file writes happen outside the alarm
+scope so an interrupted journal replacement cannot restore an accepted status.
+The runtime bound controls storage work, rather than disk fsync completion time.
+
+Runtime and byte limits are invocation-wide; they are not a system RAM or billing
+cap. The process runs one copy or verification operation at a time. Source bytes
 remain in storage throughout.
 
 The five non-manifest originals and README must be verified before copying the
 manifest. This controls dataset activation, not secrecy. Unverified payload
-objects are still visible to authorized credentials. If final manifest copy or
-readback fails, status remains `partial-unverified`; no accepted delivery claim
-is made. The final `verified-dataset` receipt follows all six full SHA checks,
+objects are still visible to authorized credentials. Before a new attempt,
+a prior successful receipt is copied into `verification_history` and the current
+status becomes `checking`, durably, before any preflight or deadline alarm.
+A failed attempt, including a contradicted preflight observation, sets the
+current status to `refused` with a sanitized `last_failure`. Earlier failures
+move to `failure_history` on a new attempt. The object and upload state stays
+available for inspection and safe resume. An abrupt process loss can leave
+`checking` or `partial-unverified`; neither is accepted by consumers.
+
+If final manifest copy or readback fails, no current accepted delivery claim
+is made. Historical success evidence is preserved but cannot override a current
+refusal. The final `verified-dataset` receipt follows all six full SHA checks,
 README verification, exact final inventory and repeated source/access checks.
 It records the actual total bytes including README. It does not claim successful
 consumer delineation, comparison, historical validator stdout, or cleanup.

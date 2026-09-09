@@ -30,6 +30,13 @@ class Refusal(Exception):
     """An identity, access, transfer, or evidence prerequisite is absent or changed."""
 
 
+class InvocationInterrupted(BaseException):
+    """A total deadline or operator signal interrupts blocked main-thread I/O.
+
+    BaseException prevents SDK exception retry/wrapping from delaying shutdown.
+    """
+
+
 def require(condition, message):
     if not condition:
         raise Refusal(message)
@@ -138,6 +145,66 @@ class TransferBudget:
         require(time.monotonic() < self.deadline, "runtime limit reached; partial destination retained")
         require(self.bytes + additional <= self.max_bytes, "verification byte budget exceeded")
         self.bytes += additional
+
+
+@contextmanager
+def bounded_invocation(budget):
+    """Interrupt blocking POSIX main-thread I/O at the deadline or operator signal."""
+    budget.check()
+    require(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0), "another invocation timer is active")
+    signals = (signal.SIGALRM, signal.SIGINT, signal.SIGTERM)
+    previous = {number: signal.getsignal(number) for number in signals}
+
+    def interrupt(number, _frame):
+        budget.cancelled = number != signal.SIGALRM
+        reason = "runtime limit reached" if number == signal.SIGALRM else "cancelled"
+        raise InvocationInterrupted(reason + "; uncertain storage effects remain retained")
+
+    try:
+        for number in signals:
+            signal.signal(number, interrupt)
+        remaining = budget.deadline - time.monotonic()
+        require(remaining > 0, "runtime limit reached")
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+        budget.check()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def archive_verification(evidence):
+    value = evidence.value
+    if value is not None and value.get("status") in {"verified-dataset", "verified"}:
+        snapshot = {key: item for key, item in value.items() if key != "verification_history"}
+        value.setdefault("verification_history", []).append(json.loads(canonical(snapshot)))
+
+
+def record_failure(evidence, error):
+    if evidence.value is not None:
+        archive_verification(evidence)
+        evidence.value.update(status="refused", last_failure={
+            "reason": str(error) if isinstance(error, (Refusal, InvocationInterrupted)) else type(error).__name__,
+            "observed_at": stamp()})
+        evidence.save()
+
+
+def delivery_attempt(evidence, budget, operation):
+    # Invalidate a current acceptance before any potentially blocking preflight.
+    if evidence.value is not None:
+        archive_verification(evidence)
+        previous_failure = evidence.value.pop("last_failure", None)
+        if previous_failure is not None:
+            evidence.value.setdefault("failure_history", []).append(previous_failure)
+        evidence.value.update(status="checking", attempt_started_at=stamp())
+        evidence.save()
+    try:
+        with bounded_invocation(budget):
+            return operation()
+    except (Exception, InvocationInterrupted) as error:
+        record_failure(evidence, error)
+        raise
 
 
 class Evidence:
@@ -254,6 +321,9 @@ class DatasetDelivery:
             raise Refusal(f"anonymous object access allowed: {key}")
 
     def preflight(self):
+        return delivery_attempt(self.evidence, self.budget, self._preflight)
+
+    def _preflight(self):
         # Conservative: no policy is the only accepted bucket-policy state.
         # This never attempts to change an existing policy to make delivery pass.
         try:
@@ -410,6 +480,9 @@ class DatasetDelivery:
         return state
 
     def deliver(self, conditional_evidence):
+        return delivery_attempt(self.evidence, self.budget, lambda: self._deliver(conditional_evidence))
+
+    def _deliver(self, conditional_evidence):
         require(conditional_evidence["schema"] == "hfx-conditional-writes-probe-v1" and
                 conditional_evidence["status"] == "verified" and
                 conditional_evidence["endpoint"] == self.source.endpoint and
@@ -451,7 +524,7 @@ class DatasetDelivery:
         require(observed.tzinfo is not None and
                 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 86400,
                 "conditional-write probe must be from the last 24 hours")
-        self.preflight()
+        self._preflight()
         evidence_hash = digest(canonical(conditional_evidence))
         history = self.evidence.value.setdefault("conditional_writes_history", [])
         if evidence_hash not in [item["sha256"] for item in history]:
@@ -475,7 +548,7 @@ class DatasetDelivery:
                 state["verification"] = self.verify(obj.path, obj.sha256, obj.identity.bytes, identity)
                 state["status"] = "verified"
                 self.evidence.save()
-        self.preflight()  # Includes exact source and destination identities and policy checks.
+        self._preflight()  # Includes exact source and destination identities and policy checks.
         require(set(self.inventory(self.destination)) ==
                 {self.destination + obj.path for obj in ordered} | {self.destination + "README.md"},
                 "final destination inventory differs")
@@ -524,29 +597,31 @@ def main():
         require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
         source = PreservedDataset.load(args.source_inventory)
         budget = TransferBudget(args.max_seconds, args.max_read_bytes)
-        def cancel(_signum, _frame):
-            budget.cancelled = True
-        signal.signal(signal.SIGINT, cancel)
-        signal.signal(signal.SIGTERM, cancel)
         config = dict(connect_timeout=args.request_timeout_seconds, read_timeout=args.request_timeout_seconds,
                       retries={"total_max_attempts": 1}, s3={"addressing_style": "path"},
                       request_checksum_calculation="when_required", response_checksum_validation="when_required")
-        storage = boto3.Session(profile_name=args.profile).client(
-            "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
-        anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
-                                 config=Config(signature_version=UNSIGNED, **config))
         with private_evidence(args.evidence_dir) as evidence:
-            delivery = DatasetDelivery(storage, anonymous, source, args.destination_prefix,
-                                       read_small_file(args.readme), evidence, budget)
-            if args.action == "plan":
-                delivery.preflight()
-            else:
-                require(args.conditional_writes_evidence is not None, "conditional-write evidence file required")
-                delivery.deliver(json.loads(read_small_file(args.conditional_writes_evidence)))
+            def execute():
+                storage = boto3.Session(profile_name=args.profile).client(
+                    "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
+                anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
+                                         config=Config(signature_version=UNSIGNED, **config))
+                try:
+                    delivery = DatasetDelivery(storage, anonymous, source, args.destination_prefix,
+                                               read_small_file(args.readme), evidence, budget)
+                    if args.action == "plan":
+                        delivery._preflight()
+                    else:
+                        require(args.conditional_writes_evidence is not None, "conditional-write evidence file required")
+                        delivery._deliver(json.loads(read_small_file(args.conditional_writes_evidence)))
+                finally:
+                    storage.close()
+                    anonymous.close()
+            delivery_attempt(evidence, budget, execute)
             print(json.dumps({"status": evidence.value["status"], "evidence": str(evidence.path)}))
-    except (Refusal, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
+    except (Refusal, InvocationInterrupted, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
         # Never print provider exception text: it may include request/authentication details.
-        message = str(error) if isinstance(error, Refusal) else type(error).__name__
+        message = str(error) if isinstance(error, (Refusal, InvocationInterrupted)) else type(error).__name__
         print(json.dumps({"status": "refused", "reason": message}), file=sys.stderr)
         return 1
     return 0
