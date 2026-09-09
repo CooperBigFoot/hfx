@@ -47,3 +47,17 @@ Final combined rerun after mandatory runtime bindings and historical-refusal tes
 --basetemp <comparison-evidence>/final-review-repair-tests
 exit 0; 75 passed in 10.85s; 56 upstream Cartopy/Matplotlib deprecation warnings.
 No signal fault probe left a running process. Required command handles completed.
+
+Bytecode import repair:
+An isolated copy of the exact wheel retained unchanged verified __init__.py but
+contained an unchecked-hash compiled cache with a marker-writing payload. The
+actual supervised native worker previously succeeded and executed the marker;
+red regression failed its no-marker assertion. After fresh per-worker
+sys.pycache_prefix setup, the same worker succeeds without executing stale cache.
+The supervisor also configures a fresh startup PYTHONPYCACHEPREFIX. Pre-imported
+consumer modules are refused. -B alone was not used as a read-isolation guarantee.
+No shared installed package was changed by this regression. The earlier facade
+integrity test now also uses an isolated wheel copy to avoid shared-state mutation.
+Final bytecode full-suite rerun: 76 passed in 16.33s; 56 upstream deprecation
+warnings; then added preimported-consumer gate test passed independently (1 passed).
+Ruff check/format passed. All package copies are below hfx/.worktrees test evidence.

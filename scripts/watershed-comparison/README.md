@@ -62,7 +62,13 @@ uv run --frozen --no-sync hfx-watershed --help
 Use `--no-sync` for commands after wheel installation: ordinary exact sync can
 remove the separately installed consumer. Never install a PyPI fallback. The
 worker hashes the full installed wheel-owned package, including the Python facade
-and any bundled data, before import. It verifies actual dyld-loaded resolved native
+and any bundled data, before import. The worker refuses pre-imported consumer
+modules and establishes a fresh empty per-worker `sys.pycache_prefix` before the
+first consumer import. Existing package `__pycache__` entries are therefore not
+read, including timestamp-valid or unchecked-hash bytecode. `-B` alone would not
+provide this guarantee. The new `python-bytecode` directory is a regenerable
+cache, and the import policy is recorded in metadata.
+It verifies actual dyld-loaded resolved native
 paths and hashes after initialization and after delineation. A supplemental
 runtime-data receipt binds actual GDAL/PROJ lookup configuration and full local
 data-directory inventories. Remote PROJ grids are disabled. The first absent

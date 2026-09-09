@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -113,8 +114,19 @@ def delineate(request: DelineationRequest, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "request.json", request.model_dump())
     started = time.perf_counter()
-    stage = "consumer_identity"
+    stage = "consumer_import_isolation"
     try:
+        if any(
+            name == "pourpoint" or name.startswith("pourpoint.") for name in sys.modules
+        ):
+            raise ValueError(
+                "consumer must not be imported before fresh worker cache setup"
+            )
+        bytecode = output / "python-bytecode"
+        bytecode.mkdir(exist_ok=False)
+        sys.pycache_prefix = str(bytecode)
+        os.environ["PYTHONPYCACHEPREFIX"] = str(bytecode)
+        stage = "consumer_identity"
         pourpoint = verify_consumer(request.consumer)
         identity_verified = time.perf_counter()
         stage = "manifest_before"
@@ -158,6 +170,10 @@ def delineate(request: DelineationRequest, output: Path) -> None:
                 "delineation": delineated - opened,
             }
             metadata = save_result(result, request, output, timing)
+            metadata["consumer_import_policy"] = {
+                "bytecode_cache": str(bytecode),
+                "policy": "Fresh empty per-worker sys.pycache_prefix established before any consumer import; pre-imported consumer modules are refused. Wheel source/data hashes remain verified before import. Existing package __pycache__ entries are not read.",
+            }
             metadata["runtime_data_after_sha256"] = sha256(
                 output / "runtime-data-after.json"
             )

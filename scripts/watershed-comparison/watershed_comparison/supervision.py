@@ -33,11 +33,14 @@ def isolated_environment(
     home.mkdir()
     cache = output / "cache"
     cache.mkdir()
+    python_cache = output / "python-startup-cache"
+    python_cache.mkdir()
     env = {
         "PATH": os.defpath,
         "HOME": str(home),
         "HFX_CACHE_DIR": str(cache),
         "PYTHONNOUSERSITE": "1",
+        "PYTHONPYCACHEPREFIX": str(python_cache),
         "PYTHONUNBUFFERED": "1",
         "PROJ_NETWORK": "OFF",
         "LANG": "en_US.UTF-8",

@@ -474,3 +474,17 @@ def test_historical_delivery_success_never_overrides_current_refusal(tmp_path):
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="verified destination"):
         verify_delivery(path, dataset)
+
+
+def test_worker_rejects_preimported_consumer_before_open(tmp_path, monkeypatch):
+    import sys
+
+    from watershed_comparison.delineation import delineate
+
+    monkeypatch.setitem(sys.modules, "pourpoint", object())
+    output = tmp_path / "preimported"
+    with pytest.raises(ValueError, match="before fresh"):
+        delineate(request(), output)
+    failure = json.loads((output / "failure.json").read_bytes())
+    assert failure["stage"] == "consumer_import_isolation"
+    assert not (output / "success.json").exists()
