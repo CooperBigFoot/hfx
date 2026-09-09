@@ -1,0 +1,14 @@
+{
+  "checked_at": "2026-09-09T11:11:19.179218+00:00",
+  "method": "hcloud CLI read-only exact-ID describe",
+  "resources": {
+    "server": {
+      "exit_code": 1,
+      "result": "hcloud: Server not found: 164714525"
+    },
+    "volume": {
+      "exit_code": 1,
+      "result": "hcloud: Volume not found: 106799807"
+    }
+  }
+}

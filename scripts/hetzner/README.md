@@ -10,7 +10,7 @@ teardown.
 
 Completed evidence: [TDX-Hydro processing basin 7020000010 pilot](CAMPAIGN-tdx-hydro-7020000010.md), [three-basin TDX-Hydro assembly subset](CAMPAIGN-tdx-hydro-assembly-subset.md), and [55-basin TDX-Hydro planetary campaign](CAMPAIGN-tdx-hydro-planetary.md).
 
-Draft evidence: [62-basin TDX-Hydro extension workload and final driver failure](CAMPAIGN-tdx-hydro-extension.md), with small-manifest verification still required and consumed production authority refused by the executable guard.
+Completed workload evidence: [62-basin TDX-Hydro extension workload and final driver failure](CAMPAIGN-tdx-hydro-extension.md), with authenticated small-manifest verification, retained final state and log, and consumed production authority refused by the executable guard.
 
 Operator runbook: [acquire the seven absent TDX-Hydro basins plus the frozen control](RUNBOOK-tdx-hydro-seven-basin-acquisition.md) (acquisition only).
 

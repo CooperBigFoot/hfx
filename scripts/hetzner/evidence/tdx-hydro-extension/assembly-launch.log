@@ -1,0 +1,43 @@
+launch: started at 2026-09-06T15:24:44Z
+launch: command: /root/hfx/scripts/hetzner/tdx-hydro-campaign.sh assemble --campaign seven-basin-extension --workspace-root /mnt/hfx/work --partial-fabric /mnt/hfx/work/baseline/dataset --partial-fabric-roster /mnt/hfx/work/baseline/roster.json --exclude-control-basin 7020000010
+/root/hfx/adapters/tdx-hydro/build_adapter.py:2185: UserWarning: Geometry is in a geographic CRS. Results from 'centroid' are likely incorrect. Use 'GeoSeries.to_crs()' to re-project geometries to a projected CRS before this operation.
+
+  for value in geometries.centroid.hilbert_distance(
+/root/hfx/adapters/tdx-hydro/build_adapter.py:2508: UserWarning: Geometry is in a geographic CRS. Results from 'centroid' are likely incorrect. Use 'GeoSeries.to_crs()' to re-project geometries to a projected CRS before this operation.
+
+  for value in geometries.centroid.hilbert_distance(
+campaign=seven-basin-extension
+inventory_count=62
+selected_basin_count=8
+unselected_basin_count=54
+retention_policy=retain-all-through-publication
+available_memory_bytes=32000000000
+available_disk_bytes=450755497984
+retained_input_bytes=90000000000
+retained_basin_output_bytes=30000000000
+assembly_memory_ceiling_bytes=30000000000
+assembly_scratch_ceiling_bytes=130000000000
+assembled_artifact_bytes=130000000000
+active_compile_scratch_bytes=20000000000
+filesystem_overhead_bytes=20000000000
+required_memory_bytes=30000000000
+required_disk_bytes=290000000000
+acquire_basins_pending=0
+acquire_basins_running=0
+acquire_basins_succeeded=8
+acquire_basins_failed=0
+acquire_basins_exhausted=0
+acquire_streamnet_pending=0
+acquire_streamnet_running=0
+acquire_streamnet_succeeded=8
+acquire_streamnet_failed=0
+acquire_streamnet_exhausted=0
+compile_pending=0
+compile_running=0
+compile_succeeded=8
+compile_failed=0
+assemble_pending=0
+assemble_running=0
+assemble_succeeded=1
+assemble_failed=0
+launch: finished at 2026-09-07T11:17:46Z with exit 0

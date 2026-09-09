@@ -1,35 +1,35 @@
 # TDX-Hydro extension campaign evidence
 
-This draft record preserves the `seven-basin-extension` campaign outcome for
+This record preserves the `seven-basin-extension` campaign outcome for
 [Effort #195](https://github.com/CooperBigFoot/hfx/issues/195) in
 [Program #103](https://github.com/CooperBigFoot/hfx/issues/103). The workload
 completed on 2026-09-07. Final driver record generation failed afterward.
 This record grants no compute authority and does not close the Effort.
 
-## Recorded outcome and remaining verification
+## Recorded outcome and verified identity
 
 | Field | Evidence-supported value |
 |---|---|
 | Processing-basin coverage | 62 of 62, derived from the frozen 55-item roster plus seven disjoint successful inputs |
 | Added drainage units | 3,188,274, summed from seven retained per-basin manifests |
-| Final drainage units | 15,936,428, derived from the baseline count plus additions; extension manifest observation pending |
+| Final drainage units | 15,936,428, observed in the extension manifest and equal to the baseline count plus additions |
 | Dataset bytes | 142,657,755,797 across six objects in the preserved bucket listing |
 | Strict whole-dataset validation | Passed; assembly launch finished 2026-09-07T11:17:46Z, exit 0 |
 | Final driver | Exit 126 at 2026-09-07T11:39:25Z |
 | Exact-resource teardown | Zero footprint at 2026-09-07T11:39:49Z |
 | Preservation destination at campaign completion | `s3://pourpoint-hfx/scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/` |
 
-The destination records campaign-time preservation, without a claim of public or
-current availability. The small extension manifest is absent from the inspected
-local records. Read-only retrieval currently lacks a configured credential input.
-Its recorded SHA-256 is
+Authenticated read-only observations at 2026-09-09T11:10:27Z confirm the
+[extension manifest](evidence/tdx-hydro-extension/extension-manifest.json) SHA-256
 `af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85`.
-Before this draft can supply final identity evidence, retrieve only that small
-record, verify the digest, and observe its count, region, bbox and format fields.
-Complete coverage requires absent `region` and planetary bbox
-`[-180, -90, 180, 90]`; these are requirements awaiting direct manifest observation.
-The per-basin manifests declare format 0.3.0 and fabric version
-`NGA-TDX-Hydro-20230126`.
+It declares 15,936,428 units, absent `region`, planetary bbox
+`[-180, -90, 180, 90]`, format 0.3.0 and fabric version
+`NGA-TDX-Hydro-20230126`. Its count agrees with the retained input derivation.
+The extension listing contains six objects totaling 142,657,755,797 bytes.
+These observations confirm small manifest bytes and object names/sizes at that
+time. Full large-object digests were not reread; the campaign-time streamed
+readbacks remain the full-byte preservation evidence. No public availability
+or publication under `hfx/` is claimed.
 
 The [small receipt](CAMPAIGN-tdx-hydro-extension.json) contains provenance,
 rosters, per-basin manifest and report digests, validation and control results,
@@ -60,8 +60,11 @@ The [55-basin baseline](CAMPAIGN-tdx-hydro-planetary.md) remains separate:
 12,748,154 units, region `tdx-hydro-partial-4dbff0d6ec31`, and 114,063,230,627 bytes.
 Assembly consumed it once as a frozen input. The campaign read its preservation
 prefix without writing or deleting there. The receipt retains the six digests
-from that pull. Current baseline small-object metadata remains to be checked;
-the recorded read-only pull does not claim a fresh whole-bucket integrity audit.
+from that pull. The authenticated baseline manifest matches its retained digest
+`8e8cdf67d5036d73dd584b16f5318a232796cc417c515e5fb4791d5de195d687`,
+including count, region and format. The current six-object baseline listing
+sums to 114,063,230,627 bytes. This confirms small-record identity and listed
+sizes without claiming a fresh full-byte integrity audit of the large objects.
 
 ## Validation and provenance
 
@@ -88,6 +91,10 @@ Successful HFX stdout and stderr were captured internally and discarded, so this
 record does not fabricate a raw validator transcript. The final launch log and
 code path establish the completed pass independently of the operator milestone.
 All 67 state files, nine reports and nine logs match their retained SHA manifests.
+The exact [final assembly state](evidence/tdx-hydro-extension/final-assembly-state.json)
+and complete [assembly launch log](evidence/tdx-hydro-extension/assembly-launch.log)
+are retained verbatim in Git. The receipt pins their digests and native execution
+revisions, making the final state and exit-zero evidence independently accessible.
 
 The driver later failed during final record generation. Its original
 `campaign-record.json` has zero bytes, and `lifecycle-result.json` is absent.
@@ -162,21 +169,33 @@ relative to each bucket prefix. The extension receipt records the original
 unchanged. No dataset was
 processed or downloaded during this retrospective audit.
 
-The retained bucket listing predates validation completion and shows an assembly
-state of 1,761 bytes. The verified final local succeeded state is 1,763 bytes.
-A small readback must confirm the final bucket state rather than treating that
-old listing as final evidence. Final local state and log digests already match.
-The empty preservation marker supplies no digest proof by itself.
+The authenticated small bucket-state readback confirms a **stale operational
+snapshot**: `status: running`, 1,761 bytes, SHA-256
+`79ff2376b8ebdafd763adf3891077c5fa2b068e991275c959e0e24841351062d`.
+It was uploaded before validation completed. The exact final succeeded state is
+1,763 bytes; it differs from the bucket snapshot only in `status`. The final
+state and exit-zero launch log preserved in Git supersede that snapshot as the
+campaign outcome authority. The [observation receipt](evidence/tdx-hydro-extension/verification-result.json)
+and both state versions remain available to verify this distinction.
+
+This is a known non-dataset operational risk: reading the old bucket state alone
+would misreport an ongoing assembly. It does not indicate incomplete validation
+or a damaged dataset. No S3 object or historical local record was overwritten,
+and no validation was rerun. The empty preservation marker supplies no digest
+proof by itself.
 
 No preserved output, baseline or source was deleted. Pre-directive workstation
 copies and partial salvage remain historical retention matters outside this
 record. Any cleanup requires separate explicit authority.
 
-## Lifecycle, cost and remaining landing gates
+## Lifecycle, cost and authority
 
 Server `164714525` and volume `106799807` were the named ccx33/fsn1/600 GB resources.
 The recorded teardown detached that volume, deleted that server and volume, and
-reported zero footprint. Preflight and final unrelated-server snapshots differ
+reported zero footprint. A fresh read-only hcloud CLI check at
+2026-09-09T11:11:19Z confirms both exact IDs are not found; its
+[receipt](evidence/tdx-hydro-extension/exact-resource-absence.json) is retained.
+Preflight and final unrelated-server snapshots differ
 only in traffic counters. No unrelated configuration change is observed.
 
 Provisioning request at 2026-09-05T21:18:04Z to zero footprint at
@@ -197,12 +216,11 @@ reviewed executable authority guard. Against this completed contract,
 checks current authority before effects in every mode. No driver was executed
 during this evidence verification.
 
-Before this draft can land:
-
-1. Verify the small extension manifest and current baseline metadata through the
-   existing opaque credential interface. Confirm the final small bucket state.
-2. Review this retrospective evidence against the retained small records and
-   reconcile the accepted control and source-adjudication deviations explicitly.
+The authenticated small-object evidence resolves the earlier manifest and
+metadata verification gap. The stale bucket-state risk is preserved explicitly,
+with the exact final state and launch log supplying the outcome authority.
+Independent review evaluates these receipts together with the accepted control
+and source-adjudication deviations above.
 
 No further paid lifecycle is authorized. This record performs no artifact
 publication under `hfx/`, pourpoint integration, external author communication,
