@@ -1,0 +1,28 @@
+name: Dataset delivery
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/dataset-delivery/**'
+      - 'hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/**'
+      - '.github/workflows/dataset-delivery.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/dataset-delivery/**'
+      - 'hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/**'
+      - '.github/workflows/dataset-delivery.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  dataset-delivery:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Verify delivery and conditional-write protocol paths offline
+        run: uv run --frozen --project scripts/dataset-delivery python -m unittest discover -s scripts/dataset-delivery -p 'test_*.py' -v

@@ -1,0 +1,75 @@
+{
+  "schema": "hfx-preserved-dataset-v1",
+  "provenance": {
+    "campaign_record": "scripts/hetzner/CAMPAIGN-tdx-hydro-extension.json",
+    "campaign_audit_revision": "bb1bbe458cb57ab3370525334c7bfed4b6134ceb",
+    "observation": "Authenticated HEAD with ChecksumMode ENABLED; no checksum fields returned. Historical full SHA evidence remains campaign receipt.",
+    "observed_on": "2026-09-09"
+  },
+  "endpoint": "https://fsn1.your-objectstorage.com",
+  "region": "fsn1",
+  "bucket": "pourpoint-hfx",
+  "prefix": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/",
+  "objects": [
+    {
+      "path": "aux/snap_stems.parquet",
+      "sha256": "9c3459148b528d54f7da4bf019bd761f557b6d139e23f592bef2136bd6ef9b3f",
+      "identity": {
+        "bytes": 33828897608,
+        "etag": "\"9900b9f695beaf8998e07d94b6c1c604-4033\"",
+        "last_modified": "2026-09-06T17:25:32+00:00",
+        "version_id": null
+      }
+    },
+    {
+      "path": "catchments.parquet",
+      "sha256": "456a163cb627dd8128dd59f1cd820f7f156f44ebd7a2887e77041cc9259767bd",
+      "identity": {
+        "bytes": 108307447136,
+        "etag": "\"52661a86b3411a838dd9ef7e9400ae54-6456\"",
+        "last_modified": "2026-09-06T17:28:26+00:00",
+        "version_id": null
+      }
+    },
+    {
+      "path": "CITATION.txt",
+      "sha256": "26cf72c81cb2841878979987a0e9345366738e6379ef6f016744d6903449e213",
+      "identity": {
+        "bytes": 714,
+        "etag": "\"a39c326ed6ecc2a36c220a94dbbbf3d2\"",
+        "last_modified": "2026-09-06T17:16:34+00:00",
+        "version_id": null
+      }
+    },
+    {
+      "path": "graph.parquet",
+      "sha256": "b21754976fb176a762bbd6e5bcdd1737dcad82551fdc21fac4bbb7bc8df038ed",
+      "identity": {
+        "bytes": 521408174,
+        "etag": "\"fdb373b59af1c277070ca2b0b1f1a403-63\"",
+        "last_modified": "2026-09-06T17:16:47+00:00",
+        "version_id": null
+      }
+    },
+    {
+      "path": "manifest.json",
+      "sha256": "af443be357742550ea76ef774b83a1f86e683ea828bb796c9ca893425777be85",
+      "identity": {
+        "bytes": 827,
+        "etag": "\"4316ebbb2ea5154ba3d05102e9b7bfdd\"",
+        "last_modified": "2026-09-06T17:16:34+00:00",
+        "version_id": null
+      }
+    },
+    {
+      "path": "NOTICE",
+      "sha256": "d3d3e7a6c45aaf9e13fe471e8b427f7526addb60aa8fa9f47534890775cd4d93",
+      "identity": {
+        "bytes": 1338,
+        "etag": "\"48a71a944ed74ac13e6bdc9ad94976b2\"",
+        "last_modified": "2026-09-06T17:16:34+00:00",
+        "version_id": null
+      }
+    }
+  ]
+}
