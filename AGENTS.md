@@ -10,6 +10,8 @@ A rule appears in this file only if (a) it encodes a project choice that cannot 
 
 The sibling `../pourpoint` repository is the runtime engine that consumes these datasets. Changes to the on-disk contract are consumer-visible; treat them as breaking until proven otherwise.
 
+Maintained watershed delineation and comparison tooling belongs downstream. HFX owns the open specification and its compilation and validation toolkit. One-off study evidence does not justify adding maintained delineation or comparison architecture to HFX.
+
 ## 1. Workspace Layout and Tooling
 
 - `crates/hfx` — library: core domain types and manifest models. All domain logic lives here.

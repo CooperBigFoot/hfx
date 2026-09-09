@@ -1,1 +1,0 @@
-uv run --no-project --with "maturin>=1.7,<2" maturin build --release --locked --out /Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/wheel

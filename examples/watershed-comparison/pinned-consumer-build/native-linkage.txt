@@ -1,7 +1,0 @@
-/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/test-venv/lib/python3.13/site-packages/pourpoint/_pourpoint.abi3.so:
-	@rpath/pourpoint._pourpoint.abi3.so (compatibility version 0.0.0, current version 0.0.0)
-	/opt/homebrew/opt/gdal/lib/libgdal.38.dylib (compatibility version 38.0.0, current version 38.3.12)
-	/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 61901.0.87)
-	/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 4040.1.255)
-	/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)
-	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)
