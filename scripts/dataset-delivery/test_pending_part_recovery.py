@@ -3,11 +3,17 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from dataset_delivery import InvocationInterrupted, digest
+from dataset_delivery import InvocationInterrupted, digest, reconcile_part_main
 from test_exclusive_writer import ExclusiveWriterTests
 
 
 class PendingPartRecoveryTests(ExclusiveWriterTests):
+    def invoke_cli(self, arguments):
+        if arguments[0] == "reconcile_part.py":
+            with patch("test_exclusive_writer.main", reconcile_part_main):
+                return super().invoke_cli(arguments)
+        return super().invoke_cli(arguments)
+
     def interrupted_cli(self):
         arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
         original = self.storage.upload_part_copy
@@ -29,10 +35,7 @@ class PendingPartRecoveryTests(ExclusiveWriterTests):
         self.assertEqual(self.invoke_cli(arguments)[0], 1)
         self.assertFalse(self.writes())
         original = journal.read_bytes()
-        recovery = arguments.copy()
-        recovery[1] = "reconcile-part"
-        recovery += ["--object-path", "CITATION.txt", "--confirm-exclusive-writer",
-                     "--expected-journal-sha256", digest(original), "--expected-part-etag", '"part-1"']
+        recovery = self.recovery_arguments(arguments, journal)
         status, _, stderr = self.invoke_cli(recovery)
         self.assertEqual((status, stderr), (0, ""))
         self.assertFalse(self.writes())
@@ -68,25 +71,63 @@ class PendingPartRecoveryTests(ExclusiveWriterTests):
                 self.assertFalse(self.storage.events)
                 self.assertEqual(json.loads(journal.read_bytes())["status"], "refused")
 
-    def test_recovery_action_after_options_and_abbreviations_preserves_refusal(self):
+    def test_missing_option_value_cannot_promote_another_option_operand_to_action(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        self.assertEqual(self.invoke_cli(arguments)[0], 0)
+        journal = Path(arguments[arguments.index("--evidence-dir") + 1]) / "delivery.json"
+        malformed = [arguments[0], "--max-seconds", "--profile", "reconcile-part"] + arguments[2:] + ["deliver"]
+        self.storage.events.clear()
+        with self.assertRaises(SystemExit):
+            self.invoke_cli(malformed)
+        self.assertFalse(self.storage.events)
+        self.assertEqual(json.loads(journal.read_bytes())["status"], "refused")
+
+    def test_recovery_entrypoint_preserves_parse_refusal_with_abbreviations(self):
         arguments, journal = self.interrupted_cli()
         original = journal.read_bytes()
         recovery = self.recovery_arguments(arguments, journal)
-        recovery.remove("reconcile-part")
-        recovery += ["reconcile-part", "--max-sec", "invalid"]
+        recovery += ["--max-sec", "invalid"]
         recovery[recovery.index("--profile")] = "--prof"
         self.storage.events.clear()
         with self.assertRaises(SystemExit):
             self.invoke_cli(recovery)
         self.assertEqual(journal.read_bytes(), original)
         self.assertFalse(self.storage.events)
+        recovery[-1] = "-1"
+        self.assertEqual(self.invoke_cli(recovery)[0], 1)
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertFalse(self.storage.events)
         recovery[-1] = "60"
         self.assertEqual(self.invoke_cli(recovery)[0], 0)
         self.assertFalse(self.writes())
 
+    def test_recovery_entrypoint_cannot_be_switched_by_positional_delivery_action(self):
+        arguments, journal = self.interrupted_cli()
+        before = journal.read_bytes()
+        self.storage.events.clear()
+        for positional in ("plan", "deliver", "reconcile-part"):
+            with self.subTest(positional=positional), self.assertRaises(SystemExit):
+                self.invoke_cli(self.recovery_arguments(arguments, journal) + [positional])
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertFalse(self.storage.events)
+        with self.assertRaises(SystemExit):
+            self.invoke_cli(self.recovery_arguments(arguments, journal) + ["--help"])
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertFalse(self.storage.events)
+
+    def test_normal_entrypoint_rejects_recovery_action_and_invalidates_acceptance(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        self.assertEqual(self.invoke_cli(arguments)[0], 0)
+        journal = Path(arguments[arguments.index("--evidence-dir") + 1]) / "delivery.json"
+        arguments[1] = "reconcile-part"
+        self.storage.events.clear()
+        with self.assertRaises(SystemExit):
+            self.invoke_cli(arguments)
+        self.assertEqual(json.loads(journal.read_bytes())["status"], "refused")
+        self.assertFalse(self.storage.events)
+
     def recovery_arguments(self, arguments, journal, path="CITATION.txt", etag='"part-1"'):
-        result = arguments.copy()
-        result[1] = "reconcile-part"
+        result = ["reconcile_part.py"] + arguments[2:]
         return result + ["--object-path", path, "--confirm-exclusive-writer",
                          "--expected-journal-sha256", digest(journal.read_bytes()),
                          "--expected-part-etag", etag]

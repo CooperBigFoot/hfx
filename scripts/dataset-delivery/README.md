@@ -247,7 +247,7 @@ exactly equals the recorded parts. No unknown upload ID is adopted.
 
 ### Explicit pending-part reconciliation
 
-After independent review of an interrupted copy, `reconcile-part` can record one
+After independent review of an interrupted copy, `reconcile_part.py` can record one
 observed pending part in the same journal-owned multipart upload. Ordinary
 `deliver` still refuses pending intent. This command supports only the explicitly
 approved `exclusive-writer` publication mode and requires all existing delivery
@@ -255,8 +255,19 @@ arguments, including the original probe, decision and authorization binding.
 
 Stop all writers first, including any process with a replicated journal. Inspect
 the raw journal and read-only provider ListParts response. Pin the raw journal
-SHA-256 and the selected pending part ETag. Then replace action `deliver` with
-`reconcile-part` and add:
+SHA-256 and the selected pending part ETag. Use the separate entrypoint with the
+same delivery options, omit the positional `deliver` action, and add the review
+pins below:
+
+```sh
+uv run --project scripts/dataset-delivery python scripts/dataset-delivery/reconcile_part.py --help
+```
+
+The ordinary `dataset_delivery.py` entrypoint supports only `plan` and `deliver`.
+The recovery entrypoint selects byte-preserving journal access structurally;
+argument values cannot select or change that policy.
+
+Required additional options:
 
 ```text
 --object-path catchments.parquet

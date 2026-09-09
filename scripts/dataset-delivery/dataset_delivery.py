@@ -267,38 +267,15 @@ def delivery_attempt(evidence, budget, operation):
         return operation()
 
 
-def command_action(parser, arguments):
-    """Locate the first positional action without validating any option values.
+class JournalOperation(Enum):
+    """The entrypoint-selected journal transition, independent of argument values."""
 
-    This CLI has only zero- and one-value options. Use argparse's registered
-    option metadata so aliases and unique long-option abbreviations consume the
-    same values. Unknown or ambiguous leading options cannot select recovery.
-    Full argparse validation still runs under the selected evidence policy.
-    """
-    options = parser._option_string_actions
-    index = 0
-    while index < len(arguments):
-        token = arguments[index]
-        if token == "--":
-            return arguments[index + 1] if index + 1 < len(arguments) else None
-        if not token.startswith("-"):
-            return token
-        name, separator, _value = token.partition("=")
-        action = options.get(name)
-        if action is None and name.startswith("--") and parser.allow_abbrev:
-            matches = [option for option in options if option.startswith(name)]
-            if len(matches) == 1:
-                action = options[matches[0]]
-        if action is None or action.nargs not in (None, 0):
-            return None
-        if action.nargs == 0 and separator:
-            return None
-        index += 1 if separator or action.nargs == 0 else 2
-    return None
+    DELIVERY_ATTEMPT = "delivery-attempt"
+    PART_RECONCILIATION = "part-reconciliation"
 
 
 @contextmanager
-def command_evidence(parser):
+def command_evidence(parser, operation=JournalOperation.DELIVERY_ATTEMPT):
     """Lock the explicit journal before parsing remaining invocation inputs."""
     if any(option in sys.argv[1:] for option in ("--help", "-h")):
         parser.parse_args()  # Informational help never starts an attempt.
@@ -311,9 +288,8 @@ def command_evidence(parser):
         arguments = parser.parse_args()
         location.evidence_dir = arguments.evidence_dir
     # Reconciliation preserves the exact interrupted journal, including on refusal.
-    reconciliation = command_action(parser, sys.argv[1:]) == "reconcile-part"
     with private_evidence(location.evidence_dir) as evidence, (
-            nullcontext() if reconciliation else evidence_attempt(evidence)):
+            nullcontext() if operation is JournalOperation.PART_RECONCILIATION else evidence_attempt(evidence)):
         if arguments is None:
             arguments = parser.parse_args()
         require(arguments.evidence_dir == location.evidence_dir, "ambiguous evidence directory arguments")
@@ -964,13 +940,25 @@ class DatasetDelivery:
 
 
 def main():
+    return _main(JournalOperation.DELIVERY_ATTEMPT)
+
+
+def reconcile_part_main():
+    return _main(JournalOperation.PART_RECONCILIATION)
+
+
+def _main(operation):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "deliver", "reconcile-part"))
-    parser.add_argument("--object-path", help="exact preserved object with one pending part")
-    parser.add_argument("--expected-journal-sha256", help="reviewed raw interrupted delivery.json SHA-256")
-    parser.add_argument("--expected-part-etag", help="reviewed pending part ETag, including quotes")
-    parser.add_argument("--confirm-exclusive-writer", action="store_true",
-                        help="confirm all other writers, including replicated journals, are excluded now")
+    if operation is JournalOperation.PART_RECONCILIATION:
+        parser.description = "Observe one pending copy part in an owned upload; no provider writes or dataset acceptance."
+        parser.set_defaults(action="reconcile-part")
+        parser.add_argument("--object-path", help="exact preserved object with one pending part")
+        parser.add_argument("--expected-journal-sha256", help="reviewed raw interrupted delivery.json SHA-256")
+        parser.add_argument("--expected-part-etag", help="reviewed pending part ETag, including quotes")
+        parser.add_argument("--confirm-exclusive-writer", action="store_true",
+                            help="confirm all other writers, including replicated journals, are excluded now")
+    else:
+        parser.add_argument("action", choices=("plan", "deliver"))
     parser.add_argument("--source-inventory", type=Path, required=True)
     parser.add_argument("--destination-prefix", required=True)
     parser.add_argument("--readme", type=Path, required=True)
@@ -985,11 +973,7 @@ def main():
     parser.add_argument("--max-read-bytes", type=int, required=True)
     parser.add_argument("--request-timeout-seconds", type=int, default=30)
     try:
-        with command_evidence(parser) as (args, evidence):
-            require(args.action == "reconcile-part" or
-                    (args.object_path is None and not args.confirm_exclusive_writer and
-                     args.expected_journal_sha256 is None and args.expected_part_etag is None),
-                    "reconciliation options require reconcile-part")
+        with command_evidence(parser, operation) as (args, evidence):
             require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
             budget = TransferBudget(args.max_seconds, args.max_read_bytes)
             with bounded_invocation(budget):
