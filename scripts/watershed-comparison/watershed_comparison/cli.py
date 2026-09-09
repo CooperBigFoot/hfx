@@ -52,6 +52,11 @@ def main():
             from .overlay import compare_saved_watersheds
 
             compare_saved_watersheds(args.first, args.second, args.output)
+    except InterruptedError as exc:
+        parser.exit(
+            128 + getattr(exc, "signum", 2),
+            "delineation cancelled; child stopped; evidence retained\n",
+        )
     except Exception as exc:  # noqa: BLE001 - named credential-safe CLI isolation point
         # SDK errors can contain connection configuration. Never echo their text.
         parser.exit(

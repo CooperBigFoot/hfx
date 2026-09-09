@@ -22,7 +22,7 @@ class Evidence(BaseModel):
 class DatasetIdentity(Evidence):
     uri: str
     fabric_name: str = Field(min_length=1)
-    fabric_version: str = Field(min_length=1)
+    fabric_version: str | None = Field(min_length=1)
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     attribution: str = Field(min_length=1)
     license: str = Field(min_length=1)
@@ -46,6 +46,8 @@ class ConsumerIdentity(Evidence):
     extension_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     build_receipt_path: str
     build_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_data_receipt_path: str
+    runtime_data_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class DelineationSettings(Evidence):

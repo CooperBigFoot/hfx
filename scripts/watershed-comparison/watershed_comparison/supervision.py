@@ -39,6 +39,7 @@ def isolated_environment(
         "HFX_CACHE_DIR": str(cache),
         "PYTHONNOUSERSITE": "1",
         "PYTHONUNBUFFERED": "1",
+        "PROJ_NETWORK": "OFF",
         "LANG": "en_US.UTF-8",
         "TMPDIR": str(output),
         "MPLCONFIGDIR": str(home / "matplotlib"),
@@ -121,21 +122,34 @@ def violation(sample: dict, initial: dict, limits: ResourceLimits) -> str | None
 
 
 def stop_process(process) -> None:
-    if process.poll() is None:
+    """Terminate the entire detached group, including descendants of exited leader."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait(timeout=5)
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        process.poll()  # Reap leader as soon as it exits; group can still live.
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, 0)
         except ProcessLookupError:
             process.wait(timeout=5)
             return
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
+        time.sleep(0.05)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # Group exited after the liveness check.
+    process.wait(timeout=5)
 
 
-def execute_request(
-    request: DelineationRequest, output: Path, credentials, limits: ResourceLimits
+def _execute_request(
+    request: DelineationRequest,
+    output: Path,
+    credentials,
+    limits: ResourceLimits,
+    cancellation: list[int],
 ):
     output.mkdir()
     env = isolated_environment(output, credentials)
@@ -177,6 +191,8 @@ def execute_request(
                 start_new_session=True,
             )
             while True:
+                if cancellation:
+                    raise DelineationCancelled(cancellation[0])
                 sample = resource_sample(process, output, started)
                 resources.write(json.dumps(sample, allow_nan=False) + "\n")
                 resources.flush()
@@ -199,6 +215,59 @@ def execute_request(
             stop_process(process)
 
 
+class DelineationCancelled(InterruptedError):
+    """Raised after an OS cancellation signal, once the child can be reaped safely."""
+
+    def __init__(self, signum: int):
+        super().__init__("supervised delineation cancelled")
+        self.signum = signum
+
+
+def execute_request(
+    request: DelineationRequest, output: Path, credentials, limits: ResourceLimits
+):
+    """Keep SIGTERM/SIGINT under supervision until the child group is reaped."""
+    cancellation = []
+
+    def request_cancellation(signum, frame):
+        cancellation.append(signum)
+
+    previous = {
+        kind: signal.getsignal(kind) for kind in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        for kind in previous:
+            signal.signal(kind, request_cancellation)
+        try:
+            _execute_request(request, output, credentials, limits, cancellation)
+        except BaseException as exc:
+            if output.is_dir():
+                write_json(
+                    output / "supervision_failure.json",
+                    {
+                        "exception_type": type(exc).__name__,
+                        "signal": exc.signum
+                        if isinstance(exc, DelineationCancelled)
+                        else None,
+                        "action": "stop and reap child group; request maintainer decision",
+                    },
+                )
+            raise
+    finally:
+        for kind, handler in previous.items():
+            signal.signal(kind, handler)
+    if cancellation:
+        write_json(
+            output / "supervision_failure.json",
+            {
+                "exception_type": "DelineationCancelled",
+                "signal": cancellation[0],
+                "action": "completed child reaped; comparison cancelled; request maintainer decision",
+            },
+        )
+        raise DelineationCancelled(cancellation[0])
+
+
 def verify_delivery(receipt_path: Path, dataset) -> dict:
     """Require complete destination verification before any private session opens."""
     receipt = json.loads(receipt_path.read_text())
@@ -214,15 +283,34 @@ def verify_delivery(receipt_path: Path, dataset) -> dict:
     manifest = receipt["objects"]["manifest.json"]["verification"]
     if manifest["sha256"] != dataset.manifest_sha256:
         raise ValueError("delivered manifest hash differs from consumer request")
-    for artifact in plan["objects"]:
-        actual = receipt["objects"][artifact["path"]]["verification"]
+    expected = {
+        artifact["path"]: (artifact["sha256"], artifact["identity"]["bytes"])
+        for artifact in plan["objects"]
+    }
+    if len(expected) != len(plan["objects"]) or "README.md" in expected:
+        raise ValueError(
+            "delivery plan object paths are duplicate or conflict with README"
+        )
+    expected["README.md"] = (plan["readme_sha256"], plan["readme_bytes"])
+    if set(receipt["objects"]) != set(expected):
+        raise ValueError("delivery receipt object inventory differs from complete plan")
+    for path, (checksum, size) in expected.items():
+        obj = receipt["objects"][path]
+        actual = obj["verification"]
         if (
-            actual["sha256"] != artifact["sha256"]
-            or actual["bytes"] != artifact["identity"]["bytes"]
+            obj["status"] != "verified"
+            or actual["method"] != "full-ordered-range-stream-sha256"
+            or actual["sha256"] != checksum
+            or actual["bytes"] != size
+            or obj["identity"]["bytes"] != size
         ):
             raise ValueError(
                 "delivery receipt contains incomplete payload verification"
             )
+    if receipt["final_bytes"] != sum(size for _, size in expected.values()):
+        raise ValueError(
+            "delivery receipt final byte total differs from complete inventory"
+        )
     return {
         "path": str(receipt_path.resolve()),
         "sha256": sha256(receipt_path),

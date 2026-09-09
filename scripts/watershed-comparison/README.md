@@ -19,6 +19,8 @@ flowchart LR
 ## Boundaries and evidence
 
 - `models`: strict identity, geographic point and normal consumer settings.
+- `consumer` and `native_data`: installed wheel, loaded-library and data identity.
+- `manifest`: bounded credential-isolated observed manifest reads.
 - `delineation`: one native session and one complete watershed result.
 - `supervision`: sequential processes, credential isolation and resource gates.
 - `overlay`: saved complete geometry to equal-area metrics and figure.
@@ -59,8 +61,17 @@ uv run --frozen --no-sync hfx-watershed --help
 
 Use `--no-sync` for commands after wheel installation: ordinary exact sync can
 remove the separately installed consumer. Never install a PyPI fallback. The
-worker hashes the installed extension and retained wheel/build receipt before
-opening any dataset.
+worker hashes the full installed wheel-owned package, including the Python facade
+and any bundled data, before import. It verifies actual dyld-loaded resolved native
+paths and hashes after initialization and after delineation. A supplemental
+runtime-data receipt binds actual GDAL/PROJ lookup configuration and full local
+data-directory inventories. Remote PROJ grids are disabled. The first absent
+per-user PROJ candidate may relocate beneath isolated HOME only while remaining
+absent; actual lookup paths are preserved. Existing directories must match exact
+paths and hashes. These are file/config identity checks, not in-memory attestation
+or a trace of every resource access. Apple shared-cache images remain separately
+identified. GDAL's anchor lookup identifies its gdalvrt.xsd directory, with the
+API guarantee stated in the supplemental receipt.
 
 ## Requests
 
@@ -83,7 +94,9 @@ with actual identity evidence; do not put credentials in this file.
     "wheel_sha256": "<64 lowercase hex digits>",
     "extension_sha256": "<64 lowercase hex digits>",
     "build_receipt_path": "/absolute/evidence/build-receipt.json",
-    "build_receipt_sha256": "<64 lowercase hex digits>"
+    "build_receipt_sha256": "<64 lowercase hex digits>",
+    "runtime_data_receipt_path": "/absolute/evidence/runtime-data-receipt.json",
+    "runtime_data_receipt_sha256": "<64 lowercase hex digits>"
   },
   "input_outlet": [7.5890, 47.5596],
   "settings": {}
@@ -130,8 +143,24 @@ uv run --frozen --no-sync hfx-watershed compare /absolute/tdx-request.json /abso
 
 The delivery receipt must use `hfx-dataset-delivery-v1`, status
 `verified-dataset`, the requested destination/manifest identity, and matching
-per-object full-payload verification. The receipt is evidence from the separate
-storage verifier, not a new remote integrity check by this tool.
+per-object full-payload verification. The expected inventory is exactly the
+plan's objects plus README.md. Every verification method, status, checksum and
+size must match, and final_bytes must equal their sum. Only the current top-level
+verified status is accepted; historical success does not override refusal.
+The endpoint and region must also match the private configuration.
+The receipt is evidence from the separate storage verifier, not a new complete
+remote payload integrity check by this tool.
+
+Before costly session startup, the worker fetches and preserves manifest bytes
+with a fixed 1 MiB read bound and checks their SHA-256 and actual fabric identity
+against the request. Public HTTPS uses no proxy/auth/redirect handler; private S3
+uses the isolated endpoint and credentials. A second observation after delineation
+must match. Both observations and raw manifests are bound to the saved metadata.
+The consumer performs its own independent reads and exposes no API for injecting
+these exact manifest bytes or pinning object versions. Equal before/after
+observations do not prove an immutable session snapshot. Remote objects could
+change between them; this time-of-check/time-of-use limit is explicit. Do not
+claim the engine's requests were version-pinned.
 
 Private and public children receive fresh HOME and HFX_CACHE_DIR directories.
 Neither inherits user AWS configuration, proxy variables, Python paths or GDAL
@@ -152,7 +181,12 @@ JSONL provides timing and available byte/row-group counters; Python has no
 `http_stats` binding. No total-transfer claim is inferred from these counters.
 
 Any engine, protocol, trace, resource or process failure stops the sequence and
-preserves partial evidence. It never changes semantics, repairs consumer code,
+preserves partial evidence. SIGTERM/SIGINT to the supervisor requests cancellation;
+the whole detached worker group receives SIGTERM, then SIGKILL after a bounded
+grace period if needed, even if its leader exits first. The leader is reaped and
+the CLI exits with signal-derived status. SIGKILL of the supervisor cannot be
+handled; an operator must inspect and stop any surviving process group.
+It never changes semantics, repairs consumer code,
 changes point or provisions compute. Ask Nicolas Lazaro for direction on failed
 real delineation or unsafe resource bounds. A successful fixture run cannot
 establish planetary completion or peak memory.
@@ -163,9 +197,12 @@ establish planetary completion or peak memory.
 uv run --frozen --no-sync hfx-watershed overlay /absolute/new-comparison-output/private/watershed /absolute/new-comparison-output/public/watershed /absolute/new-overlay-output
 ```
 
-The overlay reads complete WKB and GeoJSON, requires nonempty valid polygonal
-geometry with matching coordinates, verifies shared point/build/settings, and
-rejects existing output. Full multipart boundaries and holes remain intact.
+The overlay requires final worker success, no worker/supervisor/comparison failure,
+and checksum-bound metadata, complete WKB/GeoJSON, upstream IDs, observed manifests,
+trace and runtime identity evidence. It verifies unique upstream IDs, terminal
+membership, count, actual manifest identity, refinement consistency, matching
+request data and shared point/build/settings. It requires nonempty valid polygonal
+geometry with matching coordinates and rejects existing output. Full multipart boundaries and holes remain intact.
 No silent geometry repair, simplification or Natural Earth download occurs.
 It labels input/resolved/refined outlets, refinement outcomes and source terms.
 Cartopy receives explicit geographic transforms and a padded full geometry extent.

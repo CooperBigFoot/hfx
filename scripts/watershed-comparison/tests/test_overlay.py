@@ -1,5 +1,6 @@
 """Exercise saved evidence through real Shapely, pyproj, and Cartopy paths."""
 
+import hashlib
 import json
 
 import pytest
@@ -7,6 +8,7 @@ from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Polygon, box, mapping
 from shapely.ops import transform
 
+from watershed_comparison.models import CONSUMER_SHA, DelineationSettings
 from watershed_comparison.overlay import compare_saved_watersheds
 
 
@@ -16,19 +18,26 @@ def save_run(directory, geometry, name="tdx_hydro", **overrides):
         "dataset": {
             "fabric_name": name,
             "fabric_version": "synthetic-v1",
-            "uri": "file:///synthetic",
+            "uri": "/synthetic",
             "manifest_sha256": "a" * 64,
             "attribution": "Synthetic test source attribution",
             "license": "CC BY-SA 4.0" if name == "tdx_hydro" else "CC BY-NC 4.0",
         },
-        "consumer": {"source_sha": "b" * 40, "wheel_sha256": "c" * 64},
-        "settings": {"snap_radius_m": 1000},
+        "consumer": {
+            "source_sha": CONSUMER_SHA,
+            "wheel_sha256": "c" * 64,
+            "wheel_path": "/synthetic/consumer.whl",
+            "extension_sha256": "d" * 64,
+            "build_receipt_path": "/synthetic/build.json",
+            "build_receipt_sha256": "e" * 64,
+        },
+        "settings": DelineationSettings().model_dump(),
         "input_outlet": [7.589, 47.5596],
         "resolved_outlet": [7.59, 47.56],
         "refined_outlet": [7.60, 47.57] if name == "grit" else None,
         "refinement": {
-            "status": "applied" if name == "grit" else "skipped",
-            "seed_kind": "resolved_outlet",
+            "status": "applied" if name == "grit" else "best_effort_skipped",
+            "seed_kind": "raster_ranked" if name == "grit" else "coarse",
             "skip_reason": None
             if name == "grit"
             else {
@@ -47,13 +56,90 @@ def save_run(directory, geometry, name="tdx_hydro", **overrides):
         "upstream_unit_count": 2,
         "terminal_unit_id": 100,
     }
+    manifest = json.dumps(
+        {"fabric_name": name, "fabric_version": "synthetic-v1"}
+    ).encode()
+    metadata["dataset"]["manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+    observations = {}
+    for phase in ("before", "after"):
+        (directory / f"manifest-{phase}.json").write_bytes(manifest)
+        observations[phase] = {
+            "sha256": hashlib.sha256(manifest).hexdigest(),
+            "bytes": len(manifest),
+            "source_uri": "/synthetic/manifest.json",
+            "observed_at": "2026-09-09T00:00:00Z",
+        }
+    (directory / "observations.json").write_text(json.dumps(observations))
+    metadata["observed_manifest_sha256"] = digest(directory / "observations.json")
+    (directory / "trace.jsonl").write_text('{"event":"synthetic_completed"}\n')
+    for filename, field, value in (
+        (
+            "runtime-data-after.json",
+            "runtime_data_after_sha256",
+            {
+                "gdal_anchor": "/synthetic/gdal",
+                "proj_search_paths": ["/synthetic/proj"],
+                "proj_network_enabled": False,
+                "guarantee": "synthetic",
+            },
+        ),
+        (
+            "loaded-libraries-after.json",
+            "loaded_libraries_after_sha256",
+            {
+                "/synthetic/libgdal.dylib": {
+                    "loaded_path": "/synthetic/libgdal.dylib",
+                    "sha256": "f" * 64,
+                }
+            },
+        ),
+    ):
+        (directory / filename).write_text(json.dumps(value))
+        metadata[field] = digest(directory / filename)
     metadata.update(overrides)
-    (directory / "metadata.json").write_text(json.dumps(metadata))
     (directory / "watershed.wkb").write_bytes(geometry.wkb)
     (directory / "watershed.geojson").write_text(
-        json.dumps({"type": "Feature", "properties": {}, "geometry": mapping(geometry)})
+        json.dumps(
+            {
+                "type": "Feature",
+                "properties": {"terminal_unit_id": 100, "upstream_unit_count": 2},
+                "geometry": mapping(geometry),
+            }
+        )
     )
+    (directory / "upstream_unit_ids.json").write_text(json.dumps([100, 101]))
+    metadata["geometry_sha256"] = {
+        "wkb": digest(directory / "watershed.wkb"),
+        "geojson": digest(directory / "watershed.geojson"),
+    }
+    metadata["upstream_unit_ids_sha256"] = digest(directory / "upstream_unit_ids.json")
+    (directory / "metadata.json").write_text(json.dumps(metadata))
+    bind_metadata(directory)
     return directory
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bind_metadata(directory):
+    metadata = json.loads((directory / "metadata.json").read_text())
+    (directory / "request.json").write_text(
+        json.dumps(
+            {
+                key: metadata[key]
+                for key in ("dataset", "consumer", "input_outlet", "settings")
+            }
+        )
+    )
+    (directory / "success.json").write_text(
+        json.dumps(
+            {
+                "metadata_sha256": digest(directory / "metadata.json"),
+                "trace_sha256": digest(directory / "trace.jsonl"),
+            }
+        )
+    )
 
 
 @pytest.fixture
@@ -142,7 +228,7 @@ def test_real_overlay_full_multipart_holes_metrics_and_markers(
         ),
         (
             "consumer",
-            {"source_sha": "b" * 40, "wheel_sha256": "d" * 64},
+            {"source_sha": CONSUMER_SHA, "wheel_sha256": "d" * 64},
             "different consumer wheel_sha256",
         ),
         ("settings", {"snap_radius_m": 2000}, "different consumer settings"),
@@ -158,6 +244,7 @@ def test_metadata_failure_retains_evidence(runs, tmp_path, field, value, error):
     metadata = json.loads(path.read_text())
     metadata[field] = value
     path.write_text(json.dumps(metadata))
+    bind_metadata(second)
     original = path.read_bytes()
     output = tmp_path / "comparison"
     with pytest.raises(ValueError, match=error):
@@ -189,11 +276,15 @@ def test_geojson_mismatch_is_fatal(runs, tmp_path):
         json.dumps(
             {
                 "type": "Feature",
-                "properties": {},
+                "properties": {"terminal_unit_id": 100, "upstream_unit_count": 2},
                 "geometry": mapping(box(7, 47, 7.1, 47.1)),
             }
         )
     )
+    metadata = json.loads((first / "metadata.json").read_text())
+    metadata["geometry_sha256"]["geojson"] = digest(first / "watershed.geojson")
+    (first / "metadata.json").write_text(json.dumps(metadata))
+    bind_metadata(first)
     with pytest.raises(ValueError, match="full geometry mismatch"):
         compare_saved_watersheds(first, second, tmp_path / "output")
 
@@ -240,11 +331,15 @@ def test_topologically_equal_but_changed_vertices_are_refused(tmp_path):
         json.dumps(
             {
                 "type": "Feature",
-                "properties": {},
+                "properties": {"terminal_unit_id": 100, "upstream_unit_count": 2},
                 "geometry": mapping(reversed_geometry),
             }
         )
     )
+    metadata = json.loads((first / "metadata.json").read_text())
+    metadata["geometry_sha256"]["geojson"] = digest(first / "watershed.geojson")
+    (first / "metadata.json").write_text(json.dumps(metadata))
+    bind_metadata(first)
     with pytest.raises(ValueError, match="full geometry mismatch"):
         compare_saved_watersheds(first, second, tmp_path / "output")
 
@@ -269,11 +364,12 @@ def test_native_typed_skip_reason_is_retained_and_captioned(
     path = first / "metadata.json"
     metadata = json.loads(path.read_text())
     metadata["refinement"] = {
-        "status": "skipped",
+        "status": "best_effort_skipped",
         "seed_kind": "coarse",
         "skip_reason": reason,
     }
     path.write_text(json.dumps(metadata))
+    bind_metadata(first)
     captions = []
     original = Figure.text
 
@@ -286,3 +382,149 @@ def test_native_typed_skip_reason_is_retained_and_captioned(
     assert metrics["first"]["refinement"]["skip_reason"] == reason
     assert "auxiliary_unavailable (capability)" in captions[0]
     assert "requested_threshold" not in captions[0]
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("failure", "failure.json"),
+        ("no_success", "success.json"),
+        ("metadata", "metadata.*SHA-256"),
+        ("matching_geometry", "watershed.wkb.*SHA-256"),
+        ("upstream", "upstream_unit_ids.json.*SHA-256"),
+    ],
+)
+def test_composed_evidence_chain_rejects_changed_or_failed_run(
+    runs, tmp_path, mutation, match
+):
+    first, second, _, _ = runs
+    if mutation == "failure":
+        (first / "failure.json").write_text('{"stage": "session_close"}')
+    elif mutation == "no_success":
+        (first / "success.json").unlink()
+    elif mutation == "metadata":
+        (first / "metadata.json").write_text(
+            (first / "metadata.json").read_text() + " "
+        )
+    elif mutation == "matching_geometry":
+        replacement = box(7, 47, 7.8, 47.8)
+        (first / "watershed.wkb").write_bytes(replacement.wkb)
+        document = json.loads((first / "watershed.geojson").read_text())
+        document["geometry"] = mapping(replacement)
+        (first / "watershed.geojson").write_text(json.dumps(document))
+    else:
+        (first / "upstream_unit_ids.json").write_text("[100, 102]")
+    with pytest.raises(ValueError, match=match):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+    assert (tmp_path / "output/failure.json").exists()
+    assert not (tmp_path / "output/overlay.png").exists()
+
+
+@pytest.mark.parametrize("ids", [[100], [100, 100], [101, 102], [100, True]])
+def test_bound_upstream_ids_must_prove_traversal(runs, tmp_path, ids):
+    first, second, _, _ = runs
+    (first / "upstream_unit_ids.json").write_text(json.dumps(ids))
+    metadata = json.loads((first / "metadata.json").read_text())
+    metadata["upstream_unit_ids_sha256"] = digest(first / "upstream_unit_ids.json")
+    (first / "metadata.json").write_text(json.dumps(metadata))
+    bind_metadata(first)
+    with pytest.raises(ValueError, match="upstream_unit_ids"):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    "artifact", ["observations.json", "manifest-before.json", "manifest-after.json"]
+)
+def test_manifest_evidence_changes_are_refused(runs, tmp_path, artifact):
+    first, second, _, _ = runs
+    path = first / artifact
+    path.write_text(path.read_text() + " ")
+    with pytest.raises(ValueError, match="SHA-256"):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+
+
+def test_request_point_disagreement_is_refused(runs, tmp_path):
+    first, second, _, _ = runs
+    path = first / "request.json"
+    request = json.loads(path.read_text())
+    request["input_outlet"] = [8, 48]
+    path.write_text(json.dumps(request))
+    with pytest.raises(ValueError, match="request.json input_outlet disagrees"):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+
+
+def test_bound_inconsistent_refinement_is_refused(runs, tmp_path):
+    first, second, _, _ = runs
+    path = first / "metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["refinement"]["status"] = "applied"
+    path.write_text(json.dumps(metadata))
+    bind_metadata(first)
+    with pytest.raises(ValueError, match="inconsistent best-effort refinement"):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("supervisor", "supervision_failure.json"),
+        ("comparison", "failure.json"),
+        ("missing_trace", "trace.jsonl"),
+        ("empty_trace", "trace.jsonl"),
+        ("changed_trace", "trace.jsonl"),
+        ("runtime-data-after.json", "runtime-data-after.json"),
+        ("loaded-libraries-after.json", "loaded-libraries-after.json"),
+    ],
+)
+def test_supervised_run_trace_and_runtime_evidence(runs, tmp_path, mutation, match):
+    first, second, _, _ = runs
+    campaign = tmp_path / "campaign"
+    parent = campaign / "first-supervision"
+    parent.mkdir(parents=True)
+    nested = parent / "worker"
+    first.rename(nested)
+    first = nested
+    if mutation == "supervisor":
+        (parent / "supervision_failure.json").write_text('{"reason":"rss_limit"}')
+    elif mutation == "comparison":
+        (campaign / "comparison_request.json").write_text("{}")
+        (campaign / "failure.json").write_text('{"stage":"second_run"}')
+    elif mutation == "missing_trace":
+        (first / "trace.jsonl").unlink()
+    elif mutation == "empty_trace":
+        (first / "trace.jsonl").write_bytes(b"")
+        bind_metadata(first)
+    elif mutation == "changed_trace":
+        (first / "trace.jsonl").write_text('{"event":"changed"}')
+    else:
+        (first / mutation).write_text("{}")
+    with pytest.raises((ValueError, FileNotFoundError), match=match):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+    assert not (tmp_path / "output/overlay.png").exists()
+
+
+def test_unmarked_ancestor_failure_does_not_reject_independent_run(runs, tmp_path):
+    first, second, _, _ = runs
+    ancestor = tmp_path / "unrelated"
+    parent = ancestor / "supervision"
+    parent.mkdir(parents=True)
+    nested = parent / "worker"
+    first.rename(nested)
+    (ancestor / "failure.json").write_text('{"unrelated":"evidence"}')
+    compare_saved_watersheds(nested, second, tmp_path / "output")
+    assert (tmp_path / "output/overlay.png").exists()
+
+
+@pytest.mark.parametrize(
+    "field", ["runtime_data_after_sha256", "loaded_libraries_after_sha256"]
+)
+def test_missing_bound_runtime_receipt_is_refused(runs, tmp_path, field):
+    first, second, _, _ = runs
+    path = first / "metadata.json"
+    metadata = json.loads(path.read_text())
+    del metadata[field]
+    path.write_text(json.dumps(metadata))
+    bind_metadata(first)
+    with pytest.raises(ValueError, match=field):
+        compare_saved_watersheds(first, second, tmp_path / "output")
+    assert not (tmp_path / "output/overlay.png").exists()

@@ -2,38 +2,18 @@
 
 from __future__ import annotations
 
-import importlib
 import json
+import os
 import time
 from pathlib import Path
 
 from shapely import from_wkb
 from shapely.geometry import shape
 
+from .consumer import verify_consumer, verify_loaded_libraries
+from .manifest import observe_manifest
 from .models import DelineationRequest, finite_point, sha256, write_json
-
-
-def verify_consumer(identity):
-    """Verify installed native extension and retained build inputs before opening data."""
-    for path, expected in (
-        (identity.wheel_path, identity.wheel_sha256),
-        (identity.build_receipt_path, identity.build_receipt_sha256),
-    ):
-        if sha256(Path(path)) != expected:
-            raise ValueError("consumer build artifact checksum mismatch")
-    receipt = json.loads(Path(identity.build_receipt_path).read_text())
-    for field in ("source_sha", "wheel_sha256", "extension_sha256"):
-        if receipt[field] != getattr(identity, field):
-            raise ValueError("consumer build receipt identity mismatch")
-    if receipt["build_exit_code"] != 0 or not receipt["source_tree_clean"]:
-        raise ValueError("consumer receipt lacks clean successful source build")
-    for library, expected in receipt["native_library_sha256"].items():
-        if sha256(Path(library)) != expected:
-            raise ValueError("linked native library differs from build receipt")
-    extension = importlib.import_module("pourpoint._pourpoint")
-    if sha256(Path(extension.__file__)) != identity.extension_sha256:
-        raise ValueError("installed consumer extension checksum mismatch")
-    return importlib.import_module("pourpoint")
+from .native_data import verify_native_data
 
 
 def save_result(result, request: DelineationRequest, output: Path, timings: dict):
@@ -124,6 +104,7 @@ def save_result(result, request: DelineationRequest, output: Path, timings: dict
         },
     }
     write_json(output / "upstream_unit_ids.json", ids)
+    metadata["upstream_unit_ids_sha256"] = sha256(output / "upstream_unit_ids.json")
     return metadata
 
 
@@ -135,6 +116,10 @@ def delineate(request: DelineationRequest, output: Path) -> None:
     stage = "consumer_identity"
     try:
         pourpoint = verify_consumer(request.consumer)
+        identity_verified = time.perf_counter()
+        stage = "manifest_before"
+        s3 = {key: value for key, value in os.environ.items() if key.startswith("AWS_")}
+        before_manifest = observe_manifest(request.dataset, output, "before", s3)
         stage = "session_open"
         with pourpoint.bench_trace(output / "trace.jsonl"):
             before_open = time.perf_counter()
@@ -146,17 +131,45 @@ def delineate(request: DelineationRequest, output: Path) -> None:
             lon, lat = request.input_outlet
             result = engine.delineate(lat=lat, lon=lon, geometry=True)
             delineated = time.perf_counter()
+            stage = "runtime_identity_after"
+            build = json.loads(Path(request.consumer.build_receipt_path).read_bytes())
+            loaded_after = verify_loaded_libraries(build["native_library_sha256"])
+            data_after = verify_native_data(request.consumer, loaded_after)
+            write_json(output / "runtime-data-after.json", data_after)
+            write_json(output / "loaded-libraries-after.json", loaded_after)
+            stage = "manifest_after"
+            after_manifest = observe_manifest(request.dataset, output, "after", s3)
+            write_json(
+                output / "observations.json",
+                {
+                    "before": before_manifest,
+                    "after": after_manifest,
+                    "guarantee": "Matching bounded manifest bytes observed before and after session use; engine performs independent reads. No immutable session snapshot or object-version pinning is claimed. Remote objects can change between observations.",
+                },
+            )
             stage = "serialization"
+            serialization_started = time.perf_counter()
             timing = {
+                "consumer_identity": identity_verified - started,
+                "manifest_before": before_open - identity_verified,
+                "post_delineation_identity_and_manifest": serialization_started
+                - delineated,
                 "session_open": opened - before_open,
                 "delineation": delineated - opened,
             }
             metadata = save_result(result, request, output, timing)
+            metadata["runtime_data_after_sha256"] = sha256(
+                output / "runtime-data-after.json"
+            )
+            metadata["loaded_libraries_after_sha256"] = sha256(
+                output / "loaded-libraries-after.json"
+            )
+            metadata["observed_manifest_sha256"] = sha256(output / "observations.json")
             metadata["unreadable_auxiliary_schemas"] = (
                 engine.unreadable_auxiliary_schemas
             )
-            timing["serialization"] = time.perf_counter() - delineated
-            timing["total"] = time.perf_counter() - started
+            timing["serialization"] = time.perf_counter() - serialization_started
+            timing["total_before_metadata_write"] = time.perf_counter() - started
             write_json(output / "metadata.json", metadata)
         if (
             not (output / "trace.jsonl").is_file()
@@ -165,7 +178,10 @@ def delineate(request: DelineationRequest, output: Path) -> None:
             raise ValueError("consumer trace is absent or empty")
         write_json(
             output / "success.json",
-            {"metadata_sha256": sha256(output / "metadata.json")},
+            {
+                "metadata_sha256": sha256(output / "metadata.json"),
+                "trace_sha256": sha256(output / "trace.jsonl"),
+            },
         )
     except BaseException as exc:
         # Avoid credential-bearing SDK exception text; stage/type plus retained native

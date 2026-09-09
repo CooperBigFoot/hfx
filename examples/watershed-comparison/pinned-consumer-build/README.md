@@ -20,3 +20,14 @@ The separate HFX worker integration test exercised a supervised isolated process
 against the same exact wheel and tiny source fixture with normal default settings.
 Its successful artifacts and resource trace remain in local comparison-evidence;
 its command and exit result are recorded in native-worker-validation.txt.
+
+## Review repair evidence
+
+`review-repair-validation.txt` records red-first acceptance and cancellation
+regressions and corrected offline validation. `runtime-data-receipt.json` is a
+supplemental system-data observation and leaves the original build receipt
+unchanged. `consumer-identity-v2.json` binds both receipts. The one-off
+`probe-runtime-data.py` reproduces that supplemental observation through the
+native GDAL interface in the exact-wheel environment. API lookup and filesystem
+identity guarantees are stated inside the receipt. The observer does not claim
+immutable reads or trace every GDAL resource access.

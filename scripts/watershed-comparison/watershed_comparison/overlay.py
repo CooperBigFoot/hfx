@@ -4,6 +4,7 @@ Render complete geographic boundaries and measure their EPSG:3035 overlay.
 Input evidence is never changed. Failed comparisons retain a failure record.
 """
 
+import hashlib
 import json
 import math
 import textwrap
@@ -56,8 +57,87 @@ def _polygon(geometry: BaseGeometry, artifact: str) -> None:
         raise ValueError(f"{artifact}: nonfinite geometry bounds")
 
 
+def _verified_bytes(path: Path, expected: str) -> bytes:
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != expected:
+        raise ValueError(f"{path}: SHA-256 does not match retained evidence")
+    return payload
+
+
 def _load(directory: Path) -> SavedWatershed:
-    metadata = json.loads((directory / "metadata.json").read_text())
+    supervisor_failure = directory.parent / "supervision_failure.json"
+    if supervisor_failure.exists():
+        raise ValueError(
+            f"{supervisor_failure}: supervisor failed after worker execution"
+        )
+    comparison = directory.parent.parent
+    if (comparison / "comparison_request.json").exists() and (
+        comparison / "failure.json"
+    ).exists():
+        raise ValueError(f"{comparison}/failure.json: enclosing comparison failed")
+    if (directory / "failure.json").exists():
+        raise ValueError(f"{directory}/failure.json: failed run cannot be compared")
+    if not (directory / "success.json").is_file():
+        raise ValueError(
+            f"{directory}/success.json: completed run evidence is required"
+        )
+    success = json.loads((directory / "success.json").read_bytes())
+    trace = _verified_bytes(directory / "trace.jsonl", success["trace_sha256"])
+    if not trace.strip():
+        raise ValueError(
+            f"{directory}/trace.jsonl: completed run requires a nonempty trace"
+        )
+    metadata = json.loads(
+        _verified_bytes(directory / "metadata.json", success["metadata_sha256"])
+    )
+    for field, filename in (
+        ("runtime_data_after_sha256", "runtime-data-after.json"),
+        ("loaded_libraries_after_sha256", "loaded-libraries-after.json"),
+    ):
+        if field not in metadata:
+            raise ValueError(
+                f"{directory}: required runtime evidence binding {field} is absent"
+            )
+        _verified_bytes(directory / filename, metadata[field])
+    wkb = _verified_bytes(
+        directory / "watershed.wkb", metadata["geometry_sha256"]["wkb"]
+    )
+    geojson = _verified_bytes(
+        directory / "watershed.geojson", metadata["geometry_sha256"]["geojson"]
+    )
+    ids = json.loads(
+        _verified_bytes(
+            directory / "upstream_unit_ids.json", metadata["upstream_unit_ids_sha256"]
+        )
+    )
+    request = json.loads((directory / "request.json").read_bytes())
+    for field in ("dataset", "consumer", "input_outlet", "settings"):
+        if request[field] != metadata[field]:
+            raise ValueError(
+                f"{directory}: request.json {field} disagrees with result metadata"
+            )
+    observations = json.loads(
+        _verified_bytes(
+            directory / "observations.json", metadata["observed_manifest_sha256"]
+        )
+    )
+    for phase in ("before", "after"):
+        manifest_bytes = _verified_bytes(
+            directory / f"manifest-{phase}.json", metadata["dataset"]["manifest_sha256"]
+        )
+        observation = observations[phase]
+        if observation["sha256"] != metadata["dataset"][
+            "manifest_sha256"
+        ] or observation["bytes"] != len(manifest_bytes):
+            raise ValueError(
+                f"{directory}: {phase} manifest observation identity disagrees"
+            )
+        manifest = json.loads(manifest_bytes)
+        for field in ("fabric_name", "fabric_version"):
+            if manifest[field] != metadata["dataset"][field]:
+                raise ValueError(
+                    f"{directory}: observed manifest {field} disagrees with dataset identity"
+                )
     for field in (
         "fabric_name",
         "fabric_version",
@@ -119,10 +199,45 @@ def _load(directory: Path) -> SavedWatershed:
         )
     if type(metadata["terminal_unit_id"]) is not int:
         raise ValueError(f"{directory}: terminal_unit_id must be an integer")
-    geometry = from_wkb((directory / "watershed.wkb").read_bytes())
-    document = json.loads((directory / "watershed.geojson").read_text())
+    if not isinstance(ids, list) or any(type(unit_id) is not int for unit_id in ids):
+        raise ValueError(
+            f"{directory}: upstream_unit_ids must be integer drainage-unit IDs"
+        )
+    if (
+        len(ids) != count
+        or len(set(ids)) != count
+        or metadata["terminal_unit_id"] not in ids
+    ):
+        raise ValueError(
+            f"{directory}: upstream_unit_ids count, uniqueness, or terminal membership disagrees"
+        )
+    refined = metadata.get("refined_outlet")
+    if refined is None:
+        consistent = (
+            refinement["status"] == "best_effort_skipped"
+            and reason is not None
+            and refinement["seed_kind"] == "coarse"
+        )
+    else:
+        consistent = (
+            refinement["status"] == "applied"
+            and reason is None
+            and refinement["seed_kind"] in ("vector_quantized", "raster_ranked")
+        )
+    if not consistent:
+        raise ValueError(f"{directory}: inconsistent best-effort refinement outcome")
+    geometry = from_wkb(wkb)
+    document = json.loads(geojson)
     if document.get("type") != "Feature":
         raise ValueError(f"{directory}: expected consumer GeoJSON Feature")
+    properties = document["properties"]
+    if (
+        properties["terminal_unit_id"] != metadata["terminal_unit_id"]
+        or properties["upstream_unit_count"] != count
+    ):
+        raise ValueError(
+            f"{directory}: GeoJSON traversal properties disagree with result metadata"
+        )
     geographic = shape(document["geometry"])
     _polygon(geometry, f"{directory}/watershed.wkb")
     _polygon(geographic, f"{directory}/watershed.geojson")
