@@ -383,9 +383,13 @@ class DatasetDelivery:
                 copy_source = {"Bucket": self.source.bucket, "Key": source_key}
                 if obj.identity.version_id:
                     copy_source["VersionId"] = obj.identity.version_id
-                result = self.call("upload_part_copy", Key=key, UploadId=state["upload_id"],
-                                   PartNumber=number, CopySource=copy_source,
-                                   CopySourceIfMatch=obj.identity.etag, CopySourceRange=f"bytes={start}-{end}")
+                request = {"Key": key, "UploadId": state["upload_id"], "PartNumber": number,
+                           "CopySource": copy_source, "CopySourceIfMatch": obj.identity.etag}
+                # S3 documents CopySourceRange only for sources greater than 5 MB.
+                # A single part copies the whole source, so no range is needed.
+                if total > 1:
+                    request["CopySourceRange"] = f"bytes={start}-{end}"
+                result = self.call("upload_part_copy", **request)
                 require(result.get("CopyPartResult", {}).get("ETag"), f"part copy has no success ETag: {obj.path}")
                 state["parts"].append({"PartNumber": number, "ETag": result["CopyPartResult"]["ETag"], "Size": end-start+1})
                 del state["pending_part"]

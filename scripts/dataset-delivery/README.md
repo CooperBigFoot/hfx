@@ -140,8 +140,10 @@ explicit operator decision. Exceeding a limit stops the invocation.
 
 Source inventory and HEAD identities are checked on every invocation. Source
 manifest bytes are fully verified before any destination mutation. Each
-`UploadPartCopy` pins the source ETag and exact byte range. A version ID is used
-when present. New objects use explicit private ACL. Multipart completion and
+`UploadPartCopy` pins the source ETag. Multiple-part copies specify each exact
+byte range; a one-part copy omits `CopySourceRange` and copies the whole source.
+This includes the small attribution and manifest objects, for which S3 does not
+permit `CopySourceRange`. A version ID is used when present. New objects use explicit private ACL. Multipart completion and
 README PUT use destination `IfNoneMatch="*"` with no fallback.
 
 Multipart parts are at most 256 MiB by default; only request/response metadata

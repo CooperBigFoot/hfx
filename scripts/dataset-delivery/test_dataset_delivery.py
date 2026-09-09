@@ -114,8 +114,13 @@ class Storage:
         data, identity = self.objects[kw["CopySource"]["Key"]]
         assert kw["CopySourceIfMatch"] == identity.etag
         assert kw["CopySource"]["VersionId"] == identity.version_id
-        start, end = map(int, kw["CopySourceRange"].removeprefix("bytes=").split("-"))
-        part = data[start:end + 1]
+        if "CopySourceRange" in kw:
+            if len(data) <= 5 * 1024**2:
+                raise failure(400, "InvalidRequest")
+            start, end = map(int, kw["CopySourceRange"].removeprefix("bytes=").split("-"))
+            part = data[start:end + 1]
+        else:
+            part = data
         etag = f'"part-{kw["PartNumber"]}"'
         self.uploads[kw["UploadId"]]["parts"][kw["PartNumber"]] = (part, etag)
         return {"CopyPartResult": {"ETag": etag}}
@@ -267,6 +272,17 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(state["final_bytes"], total)
         self.assertTrue(self.storage.read_sizes)
         self.assertTrue(all(body.closed for body in self.storage.bodies))
+
+    def test_tiny_source_whole_copy_omits_range_and_keeps_conditions(self):
+        self.run_delivery()
+        copies = [kw for operation, kw in self.storage.events if operation == "upload_part_copy"]
+        self.assertEqual(len(copies), len(self.source.objects))
+        for request in copies:
+            self.assertNotIn("CopySourceRange", request)
+            identity = self.storage.objects[request["CopySource"]["Key"]][1]
+            self.assertEqual(request["CopySourceIfMatch"], identity.etag)
+            self.assertEqual(request["CopySource"]["VersionId"], identity.version_id)
+        self.assertEqual(self.evidence.value["status"], "verified-dataset")
 
     def test_sha_mismatch_blocks_manifest_and_closes_stream(self):
         self.storage.range_fault = "sha"
