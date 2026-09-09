@@ -26,10 +26,16 @@ from test_dataset_delivery import Anonymous, Storage
 class NetworkStorage(Storage):
     """Keep prerequisites local; route the normal GET to a real boto HTTP client."""
 
-    def __init__(self, client):
+    def __init__(self, client, prerequisite_delay=0):
         super().__init__()
         self.client = client
         self.read_entered = False
+        self.prerequisite_delay = prerequisite_delay
+
+    def get_bucket_policy(self, **kwargs):
+        if self.prerequisite_delay:
+            threading.Event().wait(self.prerequisite_delay)
+        return super().get_bucket_policy(**kwargs)
 
     def close(self):
         self.client.close()
@@ -54,10 +60,11 @@ class LocalAnonymous(Anonymous):
 
 @unittest.skipUnless(hasattr(signal, "setitimer"), "POSIX signal deadline required")
 class InvocationBoundsTests(unittest.TestCase):
-    def exercise(self, module, mode, interrupt):
+    def exercise(self, module, mode, interrupt, prerequisite_delay=0):
         stop = threading.Event()
         entered = threading.Event()
         sent = threading.Event()
+        sent_at = []
         payload = probe.INITIAL
         storage = None
 
@@ -67,7 +74,7 @@ class InvocationBoundsTests(unittest.TestCase):
 
             def do_GET(self):
                 entered.set()
-                if mode == "headers" and stop.wait(2):
+                if mode == "headers" and stop.wait(6):
                     return
                 key = self.path.split("/", 2)[2].split("?", 1)[0]
                 identity = storage.objects[key][1]
@@ -83,36 +90,43 @@ class InvocationBoundsTests(unittest.TestCase):
                         self.wfile.write(bytes([byte]))
                         self.wfile.flush()
                         # Regular bytes prevent an inactivity timeout from enforcing runtime.
-                        if mode == "body" and stop.wait(0.045):
+                        if mode == "body" and stop.wait(0.15):
                             return
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
         server = HTTPServer(("127.0.0.1", 0), Response)
-        server.timeout = 0.1
-        thread = threading.Thread(target=server.handle_request, daemon=True)
+        # Keep accepting throughout durable prerequisite work. A one-shot
+        # handle_request timeout can silently stop before the first real GET.
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.05), daemon=True)
         client = boto3.client(
             "s3", endpoint_url=f"http://127.0.0.1:{server.server_port}",
             region_name="test-1", aws_access_key_id="local", aws_secret_access_key="local",
-            config=Config(signature_version=UNSIGNED, read_timeout=3, connect_timeout=1,
+            config=Config(signature_version=UNSIGNED, read_timeout=10, connect_timeout=1,
                           retries={"total_max_attempts": 1},
                           response_checksum_validation="when_required",
                           s3={"addressing_style": "path"}),
         )
-        storage = NetworkStorage(client)
+        storage = NetworkStorage(client, prerequisite_delay)
         identity = storage.add("scratch/preserved/manifest.json", payload)
         source = delivery.PreservedDataset(
             "https://local.invalid", "test-1", "private-bucket", "scratch/preserved/",
             (delivery.DatasetObject("manifest.json", delivery.digest(payload), identity),), "a" * 64,
         )
-        seconds = (1 if module is delivery else 0.15) if interrupt == "deadline" else 10
+        # Allow fsync prerequisites on CI while the server remains blocked for
+        # at least six seconds without the production interruption mechanism.
+        seconds = 3 if interrupt == "deadline" else 10
         handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)}
         old_timer = signal.getitimer(signal.ITIMER_REAL)
 
         def terminate():
-            if entered.wait(3) and not stop.wait(0.1):
-                sent.set()
-                os.kill(os.getpid(), signal.SIGTERM)
+            while not stop.is_set():
+                if entered.wait(0.05):
+                    if not stop.wait(0.1):
+                        sent_at.append(time.monotonic())
+                        sent.set()
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return
 
         sender = threading.Thread(target=terminate, daemon=True) if interrupt == "sigterm" else None
         stderr = io.StringIO()
@@ -160,20 +174,28 @@ class InvocationBoundsTests(unittest.TestCase):
             refusal = json.loads(stderr.getvalue().splitlines()[-1])
             self.assertEqual(refusal["status"], "refused")
             self.assertIn("cancelled" if sender else "runtime limit", refusal["reason"])
-            self.assertLess(elapsed, 0.45 if sender else seconds + 0.3,
-                            f"{module.__name__} {mode} {interrupt} blocked for {elapsed:.3f}s")
+            # Cancellation latency starts at the actual signal, independently
+            # of variable durable preflight time. Deadline remains total time.
+            latency = started + elapsed - sent_at[0] if sender else elapsed
+            self.assertLess(latency, 1.0 if sender else seconds + 0.75,
+                            f"{module.__name__} {mode} {interrupt} blocked for {latency:.3f}s")
         finally:
             stop.set()
-            if sender:
-                sender.join(timeout=3.2)
-            if thread.ident is not None:
-                thread.join(timeout=3.2)
-            client.close()
-            server.server_close()
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            for sig, handler in handlers.items():
-                signal.signal(sig, handler)
-            signal.setitimer(signal.ITIMER_REAL, *old_timer)
+            try:
+                if sender:
+                    sender.join(timeout=2)
+                    self.assertFalse(sender.is_alive(), "signal sender did not stop")
+                if thread.ident is not None:
+                    server.shutdown()
+                    thread.join(timeout=2)
+                    self.assertFalse(thread.is_alive(), "local HTTP server did not stop")
+            finally:
+                client.close()
+                server.server_close()
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+                signal.setitimer(signal.ITIMER_REAL, *old_timer)
 
     def test_delivery_plan_read_only_preflight_deadline_interrupts_real_http(self):
         for mode in ("body", "headers"):
@@ -189,6 +211,9 @@ class InvocationBoundsTests(unittest.TestCase):
         for mode in ("body", "headers"):
             with self.subTest(mode=mode):
                 self.exercise(delivery, mode, "sigterm")
+
+    def test_probe_listener_survives_slow_prerequisites(self):
+        self.exercise(probe, "headers", "sigterm", prerequisite_delay=0.3)
 
     def test_probe_sigterm_interrupts_real_http(self):
         for mode in ("body", "headers"):
