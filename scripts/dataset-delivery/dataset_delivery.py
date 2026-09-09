@@ -245,8 +245,9 @@ def record_failure(evidence, error):
         evidence.save()
 
 
-def delivery_attempt(evidence, budget, operation):
-    # Invalidate a current acceptance before any potentially blocking preflight.
+@contextmanager
+def evidence_attempt(evidence):
+    # Invalidate current acceptance before fallible invocation prerequisites.
     if evidence.value is not None:
         archive_verification(evidence)
         previous_failure = evidence.value.pop("last_failure", None)
@@ -255,11 +256,35 @@ def delivery_attempt(evidence, budget, operation):
         evidence.value.update(status="checking", attempt_started_at=stamp())
         evidence.save()
     try:
-        with bounded_invocation(budget):
-            return operation()
-    except (Exception, InvocationInterrupted) as error:
+        yield
+    except (Exception, InvocationInterrupted, SystemExit) as error:
         record_failure(evidence, error)
         raise
+
+
+def delivery_attempt(evidence, budget, operation):
+    with evidence_attempt(evidence), bounded_invocation(budget):
+        return operation()
+
+
+@contextmanager
+def command_evidence(parser):
+    """Lock the explicit journal before parsing remaining invocation inputs."""
+    if any(option in sys.argv[1:] for option in ("--help", "-h")):
+        parser.parse_args()  # Informational help never starts an attempt.
+    locator = argparse.ArgumentParser(add_help=False)
+    locator.add_argument("--evidence-dir", type=Path)
+    location, _unknown = locator.parse_known_args()
+    arguments = None
+    if location.evidence_dir is None:
+        # Without an identifiable journal, preserve normal argparse diagnostics.
+        arguments = parser.parse_args()
+        location.evidence_dir = arguments.evidence_dir
+    with private_evidence(location.evidence_dir) as evidence, evidence_attempt(evidence):
+        if arguments is None:
+            arguments = parser.parse_args()
+        require(arguments.evidence_dir == location.evidence_dir, "ambiguous evidence directory arguments")
+        yield arguments, evidence
 
 
 class Evidence:
@@ -820,16 +845,15 @@ def main():
     parser.add_argument("--max-seconds", type=int, default=3600)
     parser.add_argument("--max-read-bytes", type=int, required=True)
     parser.add_argument("--request-timeout-seconds", type=int, default=30)
-    args = parser.parse_args()
     try:
-        require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
-        source = PreservedDataset.load(args.source_inventory)
-        budget = TransferBudget(args.max_seconds, args.max_read_bytes)
-        config = dict(connect_timeout=args.request_timeout_seconds, read_timeout=args.request_timeout_seconds,
-                      retries={"total_max_attempts": 1}, s3={"addressing_style": "path"},
-                      request_checksum_calculation="when_required", response_checksum_validation="when_required")
-        with private_evidence(args.evidence_dir) as evidence:
-            def execute():
+        with command_evidence(parser) as (args, evidence):
+            require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
+            budget = TransferBudget(args.max_seconds, args.max_read_bytes)
+            with bounded_invocation(budget):
+                source = PreservedDataset.load(args.source_inventory)
+                config = dict(connect_timeout=args.request_timeout_seconds, read_timeout=args.request_timeout_seconds,
+                              retries={"total_max_attempts": 1}, s3={"addressing_style": "path"},
+                              request_checksum_calculation="when_required", response_checksum_validation="when_required")
                 storage = boto3.Session(profile_name=args.profile).client(
                     "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
                 anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
@@ -861,7 +885,6 @@ def main():
                 finally:
                     storage.close()
                     anonymous.close()
-            delivery_attempt(evidence, budget, execute)
             print(json.dumps({"status": evidence.value["status"], "evidence": str(evidence.path)}))
     except (Refusal, InvocationInterrupted, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
         # Never print provider exception text: it may include request/authentication details.

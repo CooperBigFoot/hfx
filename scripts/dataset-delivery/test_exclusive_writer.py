@@ -192,6 +192,65 @@ class ExclusiveWriterTests(unittest.TestCase):
             status = main()
         return status, stdout.getvalue(), stderr.getvalue()
 
+    def test_cli_invalid_input_rechecks_refuse_current_success(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        paths = {flag: Path(arguments[arguments.index(flag) + 1]) for flag in
+                 ("--source-inventory", "--readme", "--exclusive-writer-decision",
+                  "--exclusive-writer-authorization-binding", "--conditional-writes-evidence")}
+        originals = {flag: path.read_bytes() for flag, path in paths.items()}
+        journal = Path(arguments[arguments.index("--evidence-dir") + 1]) / "delivery.json"
+        cases = [(flag, "file") for flag in paths] + [("--source-inventory", "missing"),
+            ("--request-timeout-seconds", "0"), ("--max-seconds", "0"), ("--max-read-bytes", "0")]
+        for flag, value in cases:
+            with self.subTest(flag=flag):
+                self.assertEqual(self.invoke_cli(arguments)[0], 0)
+                self.storage.events.clear()
+                invalid = arguments
+                if value == "file":
+                    paths[flag].write_bytes(b"" if flag == "--readme" else b"{invalid json")
+                elif value == "missing":
+                    paths[flag].unlink()
+                else:
+                    invalid = arguments + [flag, value]
+                try:
+                    status, _stdout, stderr = self.invoke_cli(invalid)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(json.loads(stderr)["status"], "refused")
+                    receipt = json.loads(journal.read_bytes())
+                    self.assertEqual(receipt["status"], "refused")
+                    self.assertIn("reason", receipt["last_failure"])
+                    self.assertEqual(receipt["verification_history"][-1]["status"], "verified-dataset")
+                    self.assertFalse(self.storage.events)
+                finally:
+                    for name, content in originals.items():
+                        paths[name].write_bytes(content)
+
+    def test_cli_argument_type_failure_invalidates_known_current_journal(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        self.assertEqual(self.invoke_cli(arguments)[0], 0)
+        self.storage.events.clear()
+        # Preserve argparse's existing unambiguous evidence-option abbreviation.
+        arguments[arguments.index("--evidence-dir")] = "--evidence-d"
+        with self.assertRaises(SystemExit):
+            self.invoke_cli(arguments + ["--max-seconds", "invalid"])
+        journal = Path(arguments[arguments.index("--evidence-d") + 1]) / "delivery.json"
+        receipt = json.loads(journal.read_bytes())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertEqual(receipt["last_failure"]["reason"], "SystemExit")
+        self.assertFalse(self.storage.events)
+
+    def test_cli_help_does_not_invalidate_current_receipt(self):
+        arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
+        self.assertEqual(self.invoke_cli(arguments)[0], 0)
+        journal = Path(arguments[arguments.index("--evidence-dir") + 1]) / "delivery.json"
+        original = journal.read_bytes()
+        self.storage.events.clear()
+        with self.assertRaises(SystemExit) as stopped:
+            self.invoke_cli(arguments + ["--help"])
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertFalse(self.storage.events)
+
     def test_cli_explicit_flags_load_raw_authorization_and_deliver_full_dataset(self):
         arguments = self.cli_arguments() + ["--publication-protection", "exclusive-writer"]
         status, stdout, stderr = self.invoke_cli(arguments)

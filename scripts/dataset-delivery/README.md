@@ -290,6 +290,13 @@ manifest. This controls dataset activation, not secrecy. Unverified payload
 objects are still visible to authorized credentials. Before a new attempt,
 a prior successful receipt is copied into `verification_history` and the current
 status becomes `checking`, durably, before any preflight or deadline alarm.
+The delivery CLI first identifies and locks a readable journal, then places
+remaining argument conversion, source/config reads and runtime-bound validation
+inside that attempt boundary. Invalid prerequisites therefore cannot leave a
+previously accepted current receipt. Normal argparse syntax errors retain their
+exit behavior while recording a sanitized failure; help remains informational
+and never changes a receipt. An unidentifiable or unreadable journal cannot be
+safely rewritten.
 A failed attempt, including a contradicted preflight observation, sets the
 current status to `refused` with a sanitized `last_failure`. Earlier failures
 move to `failure_history` on a new attempt. The object and upload state stays
