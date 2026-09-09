@@ -11,6 +11,9 @@ sessions. Seeded from `spec/HFX_SPEC.md` and `docs/adapter/index.md`.
 | Source hydrofabric / fabric | A source dataset describing a region's river network (e.g. HydroBASINS, GRIT, MERIT-Basins) that an adapter compiles into HFX. Identified in the manifest by `fabric_name` / `fabric_version`. |
 | Adapter | A one-way, offline compile step that turns a source hydrofabric into conformant HFX artifacts. Named `adapters/<source>/`; the engine has no fabric-specific logic. |
 | Consumer / engine | A program that reads an HFX dataset and delineates watersheds from it (e.g. `pourpoint`). Reads HFX exclusively. |
+| Watershed | The complete polygonal geographic area returned by an engine for one requested outlet after upstream traversal and available terminal refinement. |
+| Resolved outlet | The geographic coordinate selected by the consumer's outlet-resolution policy before terminal raster refinement. |
+| Refined outlet | The geographic coordinate used by applied terminal raster refinement; absent when refinement is skipped or disabled. |
 | HFX dataset | The artifact bundle described by a single `manifest.json`: `catchments.parquet`, `graph.parquet`, `manifest.json`, plus any declared auxiliaries. Covers one contiguous extent of its source fabric. |
 | Drainage unit | One polygonal hydrologic unit at one dataset-local level; exactly one row of `catchments.parquet`. |
 | Level | A dataset-local resolution tier. `level = 0` is the recommended coarsest tier; higher is finer. Values are dataset-local and carry no cross-dataset meaning. |

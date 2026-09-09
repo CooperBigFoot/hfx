@@ -1,0 +1,293 @@
+{
+  "schema": "hfx-dataset-delivery-v1",
+  "plan": {
+    "source_record_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "endpoint": "https://storage.example",
+    "region": "test-1",
+    "bucket": "private-bucket",
+    "source_prefix": "scratch/preserved/",
+    "destination_prefix": "hfx/test/",
+    "objects": [
+      {
+        "path": "manifest.json",
+        "sha256": "20d1dbf54211c95b6ae801644a78f0f4f672fb0ecfdcab1a472852105af9b857",
+        "identity": {
+          "bytes": 21,
+          "etag": "\"etag-1\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-1"
+        }
+      },
+      {
+        "path": "catchments.parquet",
+        "sha256": "c16885da174f25872e585815764f38c07d51f573b46674f2dfac8629caf9d696",
+        "identity": {
+          "bytes": 26,
+          "etag": "\"etag-2\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-2"
+        }
+      },
+      {
+        "path": "graph.parquet",
+        "sha256": "2107559c8d1f01acac73cfcf1a1f64bed5ca1af08a7a07430e9ec3c6c323e40c",
+        "identity": {
+          "bytes": 21,
+          "etag": "\"etag-3\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-3"
+        }
+      },
+      {
+        "path": "aux/snap_stems.parquet",
+        "sha256": "97455443d9f55ddcaa87b6ad224045b7b5a8e90effa9e02472737331faee0117",
+        "identity": {
+          "bytes": 30,
+          "etag": "\"etag-4\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-4"
+        }
+      },
+      {
+        "path": "NOTICE",
+        "sha256": "a627c922a27f45313253f50c264cb7f3a21c4a3d44934e141de968a31686a53f",
+        "identity": {
+          "bytes": 14,
+          "etag": "\"etag-5\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-5"
+        }
+      },
+      {
+        "path": "CITATION.txt",
+        "sha256": "f5190fc9ca09f51fd798d6221f73c5ac9c27ec438a414cf749194dbff3bb47bb",
+        "identity": {
+          "bytes": 20,
+          "etag": "\"etag-6\"",
+          "last_modified": "2026-09-09T00:00:00+00:00",
+          "version_id": "version-6"
+        }
+      }
+    ],
+    "readme_sha256": "0e497aff1a2f89b6d376f3c22afb21be04358052898aa516b66a7b75852f61d3",
+    "readme_bytes": 22,
+    "part_bytes": 5242880,
+    "range_bytes": 7
+  },
+  "status": "verified-dataset",
+  "objects": {
+    "CITATION.txt": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 20
+        }
+      ],
+      "upload_id": "upload-0",
+      "identity": {
+        "bytes": 20,
+        "etag": "\"etag-7\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-7"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "CITATION.txt",
+        "bytes": 20,
+        "total": 20,
+        "observed_at": "2026-09-09T12:10:22.225231+00:00"
+      },
+      "verification": {
+        "sha256": "f5190fc9ca09f51fd798d6221f73c5ac9c27ec438a414cf749194dbff3bb47bb",
+        "bytes": 20,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.225389+00:00"
+      }
+    },
+    "NOTICE": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 14
+        }
+      ],
+      "upload_id": "upload-1",
+      "identity": {
+        "bytes": 14,
+        "etag": "\"etag-8\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-8"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "NOTICE",
+        "bytes": 14,
+        "total": 14,
+        "observed_at": "2026-09-09T12:10:22.227013+00:00"
+      },
+      "verification": {
+        "sha256": "a627c922a27f45313253f50c264cb7f3a21c4a3d44934e141de968a31686a53f",
+        "bytes": 14,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.227280+00:00"
+      }
+    },
+    "aux/snap_stems.parquet": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 30
+        }
+      ],
+      "upload_id": "upload-2",
+      "identity": {
+        "bytes": 30,
+        "etag": "\"etag-9\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-9"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "aux/snap_stems.parquet",
+        "bytes": 30,
+        "total": 30,
+        "observed_at": "2026-09-09T12:10:22.229302+00:00"
+      },
+      "verification": {
+        "sha256": "97455443d9f55ddcaa87b6ad224045b7b5a8e90effa9e02472737331faee0117",
+        "bytes": 30,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.229479+00:00"
+      }
+    },
+    "catchments.parquet": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 26
+        }
+      ],
+      "upload_id": "upload-3",
+      "identity": {
+        "bytes": 26,
+        "etag": "\"etag-10\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-10"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "catchments.parquet",
+        "bytes": 26,
+        "total": 26,
+        "observed_at": "2026-09-09T12:10:22.231258+00:00"
+      },
+      "verification": {
+        "sha256": "c16885da174f25872e585815764f38c07d51f573b46674f2dfac8629caf9d696",
+        "bytes": 26,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.231451+00:00"
+      }
+    },
+    "graph.parquet": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 21
+        }
+      ],
+      "upload_id": "upload-4",
+      "identity": {
+        "bytes": 21,
+        "etag": "\"etag-11\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-11"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "graph.parquet",
+        "bytes": 21,
+        "total": 21,
+        "observed_at": "2026-09-09T12:10:22.233058+00:00"
+      },
+      "verification": {
+        "sha256": "2107559c8d1f01acac73cfcf1a1f64bed5ca1af08a7a07430e9ec3c6c323e40c",
+        "bytes": 21,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.233228+00:00"
+      }
+    },
+    "README.md": {
+      "status": "verified",
+      "identity": {
+        "bytes": 22,
+        "etag": "\"etag-12\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-12"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "README.md",
+        "bytes": 22,
+        "total": 22,
+        "observed_at": "2026-09-09T12:10:22.234339+00:00"
+      },
+      "verification": {
+        "sha256": "0e497aff1a2f89b6d376f3c22afb21be04358052898aa516b66a7b75852f61d3",
+        "bytes": 22,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.234509+00:00"
+      }
+    },
+    "manifest.json": {
+      "status": "verified",
+      "parts": [
+        {
+          "PartNumber": 1,
+          "ETag": "\"part-1\"",
+          "Size": 21
+        }
+      ],
+      "upload_id": "upload-5",
+      "identity": {
+        "bytes": 21,
+        "etag": "\"etag-13\"",
+        "last_modified": "2026-09-09T00:00:00+00:00",
+        "version_id": "version-13"
+      },
+      "verification_progress": {
+        "event": "verified-range",
+        "path": "manifest.json",
+        "bytes": 21,
+        "total": 21,
+        "observed_at": "2026-09-09T12:10:22.236103+00:00"
+      },
+      "verification": {
+        "sha256": "20d1dbf54211c95b6ae801644a78f0f4f672fb0ecfdcab1a472852105af9b857",
+        "bytes": 21,
+        "method": "full-ordered-range-stream-sha256",
+        "verified_at": "2026-09-09T12:10:22.236286+00:00"
+      }
+    }
+  },
+  "created_at": "2026-09-09T12:10:22.223109+00:00",
+  "updated_at": "2026-09-09T12:10:22.236547+00:00",
+  "conditional_writes_history": [
+    {
+      "sha256": "1c3f512f197e72dbe173789bb2537e483c6359e2093e01337fb8ec08b0de93c6",
+      "observed_at": "2026-09-09T12:10:22.222703+00:00"
+    }
+  ],
+  "conditional_writes_evidence_sha256": "1c3f512f197e72dbe173789bb2537e483c6359e2093e01337fb8ec08b0de93c6",
+  "completed_at": "2026-09-09T12:10:22.236545+00:00",
+  "final_bytes": 154
+}

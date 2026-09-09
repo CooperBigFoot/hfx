@@ -1,0 +1,7 @@
+HFX_TEST_CONSUMER_IDENTITY=/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/consumer-identity.json
+HFX_TEST_LOCAL_FIXTURE=/Users/nicolaslazaro/Desktop/work/hfx/.worktrees/pourpoint-effort108/crates/core/tests/fixtures/parity/v021_synthetic_refined
+uv run --frozen --no-sync pytest -q tests/test_native_consumer.py --basetemp /Users/nicolaslazaro/Desktop/work/hfx/.worktrees/comparison-evidence/native-worker-tests-2
+exit_code=0
+1 passed in 1.07s
+Scope: tiny local fixture; actual native worker, process isolation, resource sampling, WKB/GeoJSON/refinement serialization and trace success; no real Basel/planetary session.
+Initial test setup failed before native execution because the synthetic manifest omits fabric_version; fixture metadata now explicitly records undeclared version.
