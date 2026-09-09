@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""deliver : PreservedDataset × PrivateDestination → VerifiedDataset | Refusal.
+"""deliver : PreservedDataset × PrivateDestination × PublicationProtection → VerifiedDataset | Refusal.
 
 Storage I/O stays in this standalone composition root, outside the HFX library.
 """
@@ -10,6 +10,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 
 import boto3
 from botocore import UNSIGNED
@@ -130,6 +132,59 @@ class PreservedDataset:
                    tuple(objects), digest(data))
 
 
+class PublicationProtection(str, Enum):
+    """The selected destination-write guarantee; no automatic fallback exists."""
+
+    PROVIDER_CONDITIONAL = "provider-conditional"
+    EXCLUSIVE_WRITER = "exclusive-writer"
+
+
+@dataclass(frozen=True)
+class PublicationScope:
+    endpoint: str
+    region: str
+    bucket: str
+    source_prefix: str
+    destination_prefix: str
+
+
+@dataclass(frozen=True)
+class ExclusiveWriterAuthorization:
+    """An operator decision bound to exact raw decision and failed-probe records."""
+
+    scope: PublicationScope
+    decision_sha256: str
+    failed_probe_sha256: str
+    authorization_binding_sha256: str
+    probe_content_sha256: str
+
+    @classmethod
+    def load(cls, decision_path, binding_path, probe_bytes):
+        decision_bytes = read_small_file(decision_path)
+        binding_bytes = read_small_file(binding_path)
+        decision, binding = json.loads(decision_bytes), json.loads(binding_bytes)
+        require(binding["schema"] == "hfx-exclusive-writer-authorization-binding-v1",
+                "unsupported exclusive-writer authorization binding")
+        require(binding["decision_sha256"] == digest(decision_bytes) and
+                binding["failed_probe_sha256"] == digest(probe_bytes),
+                "exclusive-writer decision or failed probe hash differs")
+        require(decision["decision"] == "proceed-with-exclusive-writer-publication" and
+                isinstance(decision["approved_by"], str) and decision["approved_by"].strip() and
+                isinstance(decision["user_statement"], str) and decision["user_statement"].strip(),
+                "explicit operator exclusive-writer decision is required")
+        require(decision["guarantee"] ==
+                "Operational exclusive-writer protection, not provider-enforced atomic destination no-overwrite.",
+                "exclusive-writer decision must state the weaker guarantee")
+        scope = PublicationScope(**binding["scope"])
+        require(asdict(scope) == decision["scope"], "authorization and decision scopes differ")
+        approved_at = datetime.fromisoformat(decision["recorded_at"])
+        bound_at = datetime.fromisoformat(binding["recorded_at"])
+        require(approved_at.tzinfo is not None and bound_at.tzinfo is not None and
+                approved_at <= bound_at <= datetime.now(timezone.utc), "invalid authorization chronology")
+        return cls(scope, digest(decision_bytes), digest(probe_bytes), digest(binding_bytes),
+                   digest(canonical(json.loads(probe_bytes))))
+
+
 class TransferBudget:
     """One bounded, cancellable delivery invocation."""
 
@@ -190,8 +245,9 @@ def record_failure(evidence, error):
         evidence.save()
 
 
-def delivery_attempt(evidence, budget, operation):
-    # Invalidate a current acceptance before any potentially blocking preflight.
+@contextmanager
+def evidence_attempt(evidence):
+    # Invalidate current acceptance before fallible invocation prerequisites.
     if evidence.value is not None:
         archive_verification(evidence)
         previous_failure = evidence.value.pop("last_failure", None)
@@ -200,11 +256,35 @@ def delivery_attempt(evidence, budget, operation):
         evidence.value.update(status="checking", attempt_started_at=stamp())
         evidence.save()
     try:
-        with bounded_invocation(budget):
-            return operation()
-    except (Exception, InvocationInterrupted) as error:
+        yield
+    except (Exception, InvocationInterrupted, SystemExit) as error:
         record_failure(evidence, error)
         raise
+
+
+def delivery_attempt(evidence, budget, operation):
+    with evidence_attempt(evidence), bounded_invocation(budget):
+        return operation()
+
+
+@contextmanager
+def command_evidence(parser):
+    """Lock the explicit journal before parsing remaining invocation inputs."""
+    if any(option in sys.argv[1:] for option in ("--help", "-h")):
+        parser.parse_args()  # Informational help never starts an attempt.
+    locator = argparse.ArgumentParser(add_help=False)
+    locator.add_argument("--evidence-dir", type=Path)
+    location, _unknown = locator.parse_known_args()
+    arguments = None
+    if location.evidence_dir is None:
+        # Without an identifiable journal, preserve normal argparse diagnostics.
+        arguments = parser.parse_args()
+        location.evidence_dir = arguments.evidence_dir
+    with private_evidence(location.evidence_dir) as evidence, evidence_attempt(evidence):
+        if arguments is None:
+            arguments = parser.parse_args()
+        require(arguments.evidence_dir == location.evidence_dir, "ambiguous evidence directory arguments")
+        yield arguments, evidence
 
 
 class Evidence:
@@ -256,7 +336,10 @@ class DatasetDelivery:
     """Promote preserved objects privately, verify bytes, then activate the manifest."""
 
     def __init__(self, storage, anonymous, source, destination, readme, evidence, budget,
-                 part_bytes=256 * 1024**2, range_bytes=64 * 1024**2, buffer_bytes=1024**2):
+                 part_bytes=256 * 1024**2, range_bytes=64 * 1024**2, buffer_bytes=1024**2,
+                 protection=PublicationProtection.PROVIDER_CONDITIONAL):
+        require(isinstance(protection, PublicationProtection), "publication protection must be a named mode")
+        self.protection = protection
         self.storage, self.anonymous = storage, anonymous
         self.source, self.evidence, self.budget = source, evidence, budget
         self.destination = relative_path(destination.removesuffix("/")) + "/"
@@ -365,6 +448,8 @@ class DatasetDelivery:
         for path, state in self.evidence.value["objects"].items():
             if state["status"] in {"copied", "verified"}:
                 require(self.destination + path in actual, f"recorded destination object missing: {path}")
+        if self.protection is PublicationProtection.EXCLUSIVE_WRITER:
+            self._check_destination_ownership()
         return self.evidence.value
 
     def verify(self, path, expected_sha, expected_bytes, identity, *, prefix=None):
@@ -417,6 +502,7 @@ class DatasetDelivery:
         states = self.evidence.value["objects"]
         state = states.get(obj.path)
         if state is None:
+            self._guard_exclusive_writer()
             require(self.head(key) is None, f"destination already exists: {key}")
             state = {"status": "initializing", "parts": []}
             states[obj.path] = state
@@ -465,6 +551,7 @@ class DatasetDelivery:
                 del state["pending_part"]
                 self.evidence.save()
                 print(json.dumps({"event": "copied-part", "path": obj.path, "part": number, "parts": total}), flush=True)
+            self._guard_exclusive_writer()
             require(self.head(source_key) == obj.identity and self.head(key) is None,
                     f"identity changed before completion: {obj.path}")
             state["status"] = "completing"
@@ -479,10 +566,138 @@ class DatasetDelivery:
             self.evidence.save()
         return state
 
-    def deliver(self, conditional_evidence):
-        return delivery_attempt(self.evidence, self.budget, lambda: self._deliver(conditional_evidence))
+    def deliver(self, conditional_evidence, *, authorization=None):
+        return delivery_attempt(self.evidence, self.budget,
+                                lambda: self._deliver(conditional_evidence, authorization=authorization))
 
-    def _deliver(self, conditional_evidence):
+    def _require_exclusive_probe(self, probe, authorization):
+        require(isinstance(authorization, ExclusiveWriterAuthorization),
+                "exclusive-writer mode requires a bound operator decision")
+        scope = PublicationScope(self.source.endpoint, self.source.region, self.source.bucket,
+                                 self.source.prefix, self.destination)
+        require(authorization.scope == scope, "exclusive-writer authorization scope differs")
+        require(digest(canonical(probe)) == authorization.probe_content_sha256,
+                "exclusive-writer failed probe content changed")
+        require(probe["schema"] == "hfx-conditional-writes-probe-v1" and
+                probe["status"] == "refused" and probe["endpoint"] == scope.endpoint and
+                probe["region"] == scope.region and probe["bucket"] == scope.bucket and
+                probe["last_failure"]["reason"] ==
+                "provider ignored destination condition; promotion is prohibited",
+                "exclusive-writer decision requires the recorded ignored-completion probe")
+        put = probe["operations"]["PutObject"]
+        require(put["condition"] == "IfNoneMatch:*" and put["initial_status"] == 200 and
+                put["replacement_status"] == 412 and put["readback_sha256"] == put["initial_sha256"] and
+                re.fullmatch(r"[a-f0-9]{64}", put["initial_sha256"]) and
+                re.fullmatch(r"[a-f0-9]{64}", put["replacement_sha256"]) and
+                put["initial_sha256"] != put["replacement_sha256"],
+                "exclusive-writer reservation requires working conditional PutObject evidence")
+        writes = [event for event in probe["events"] if event["operation"] == "put_object" and
+                  event.get("key") == put["key"]]
+        reads = [event for event in probe["events"] if event["operation"] == "full-readback" and
+                 event.get("key") == put["key"]]
+        require(len(writes) == 2 and all(event.get("if_none_match") == "*" for event in writes) and
+                [event["response"]["ResponseMetadata"]["HTTPStatusCode"] for event in writes] == [200, 412] and
+                len(reads) == 2 and all(event["sha256"] == put["initial_sha256"] and event["bytes"] > 0 for event in reads),
+                "conditional PutObject probe events disagree")
+        complete = probe["operations"]["CompleteMultipartUpload"]
+        writes = [event for event in probe["events"] if event["operation"] == "complete_multipart_upload" and
+                  event.get("key") == complete["key"]]
+        require(complete["condition"] == "IfNoneMatch:*" and complete["initial_status"] == 200 and
+                re.fullmatch(r"[a-f0-9]{64}", complete["initial_sha256"]) and
+                re.fullmatch(r"[a-f0-9]{64}", complete["replacement_sha256"]) and
+                complete["initial_sha256"] != complete["replacement_sha256"] and
+                len(writes) == 2 and all(event.get("if_none_match") == "*" for event in writes) and
+                [event["response"]["ResponseMetadata"]["HTTPStatusCode"] for event in writes] == [200, 200] and
+                writes[0]["upload_id"] != writes[1]["upload_id"],
+                "retained probe does not establish ignored multipart completion condition")
+        require(put["key"] != complete["key"] and all(relative_path(key).startswith(
+                "scratch/dataset-delivery-probes/") for key in (put["key"], complete["key"])),
+                "failed probe keys differ from isolated probe scope")
+
+    def _destination_uploads(self):
+        uploads, marker, seen = set(), {}, set()
+        while True:
+            page = self.call("list_multipart_uploads", Prefix=self.destination, **marker)
+            for item in page.get("Uploads", []):
+                pair = (item["Key"], item["UploadId"])
+                require(pair[0].startswith(self.destination) and pair not in uploads,
+                        "invalid or duplicate destination multipart upload")
+                uploads.add(pair)
+            if not page.get("IsTruncated"):
+                return uploads
+            pair = (page.get("NextKeyMarker"), page.get("NextUploadIdMarker"))
+            require(all(pair) and pair not in seen, "invalid multipart upload pagination")
+            seen.add(pair)
+            marker = {"KeyMarker": pair[0], "UploadIdMarker": pair[1]}
+
+    def _check_destination_ownership(self):
+        states = self.evidence.value["objects"]
+        expected_uploads = {(self.destination + path, state["upload_id"]) for path, state in states.items()
+                            if state["status"] == "copying" and "upload_id" in state}
+        require(self._destination_uploads() == expected_uploads,
+                "unexpected or missing destination multipart upload")
+        actual = self.inventory(self.destination)
+        expected = {self.destination + path: state["identity"]["bytes"] for path, state in states.items()
+                    if state["status"] in {"copied", "verified"}}
+        require(actual == expected, "unexpected or changed destination object inventory")
+        for path, state in states.items():
+            if state["status"] in {"copied", "verified"}:
+                require(self.head(self.destination + path) == ObjectIdentity(**state["identity"]),
+                        f"destination identity changed: {path}")
+
+    def _reservation_payload(self):
+        protection = self.evidence.value["publication_protection"]
+        return canonical({"schema": "hfx-dataset-publication-ownership-v1",
+                          "scope": protection["scope"], "operation_token": protection["operation_token"],
+                          "plan_sha256": digest(canonical(self.plan)),
+                          "authorization_binding_sha256": protection["authorization_binding_sha256"],
+                          "decision_sha256": protection["decision_sha256"],
+                          "failed_probe_sha256": protection["failed_probe_sha256"]})
+
+    def _reserve_exclusive_writer(self):
+        protection = self.evidence.value["publication_protection"]
+        destination_scope = {key: protection["scope"][key] for key in
+                             ("endpoint", "region", "bucket", "destination_prefix")}
+        key = "scratch/dataset-publication-ownership/" + digest(canonical(destination_scope)) + "/owner.json"
+        reservation = protection.get("reservation")
+        if reservation is None:
+            require(not self.evidence.value["objects"], "existing objects have no ownership reservation")
+            self._check_destination_ownership()
+            require(self.head(key) is None, "destination ownership reservation already exists")
+            protection["operation_token"] = uuid.uuid4().hex
+            payload = self._reservation_payload()
+            reservation = {"status": "putting", "key": key, "sha256": digest(payload)}
+            protection["reservation"] = reservation
+            self.evidence.save()
+            response = self.call("put_object", Key=key, Body=payload, ACL="private",
+                                 ContentType="application/json", IfNoneMatch="*")
+            identity = self.head(key)
+            require(identity is not None and identity.etag == response.get("ETag"),
+                    "ownership reservation write identity differs")
+            reservation.update(status="owned", identity=asdict(identity))
+            self.evidence.save()
+        require(reservation["status"] == "owned" and reservation["key"] == key and
+                re.fullmatch(r"[a-f0-9]{32}", protection["operation_token"]),
+                "uncertain or foreign ownership reservation requires inspection")
+        payload = self._reservation_payload()
+        require(reservation["sha256"] == digest(payload), "ownership reservation payload changed")
+        identity = ObjectIdentity(**reservation["identity"])
+        require(self.head(key) == identity, "ownership reservation identity changed")
+        reservation["verification"] = self.verify("owner.json", digest(payload), len(payload), identity,
+                                                  prefix=key.removesuffix("owner.json"))
+        self.evidence.save()
+
+    def _guard_exclusive_writer(self):
+        if self.protection is PublicationProtection.EXCLUSIVE_WRITER:
+            # Cooperating invocations share this conditional reservation. External
+            # writers remain an operator exclusion; HEAD then complete has a race.
+            self._reserve_exclusive_writer()
+            self._check_destination_ownership()
+            for obj in self.source.objects:
+                require(self.head(self.source.prefix + obj.path) == obj.identity,
+                        f"source changed before destination write: {obj.path}")
+
+    def _require_provider_conditional(self, conditional_evidence):
         require(conditional_evidence["schema"] == "hfx-conditional-writes-probe-v1" and
                 conditional_evidence["status"] == "verified" and
                 conditional_evidence["endpoint"] == self.source.endpoint and
@@ -524,11 +739,43 @@ class DatasetDelivery:
         require(observed.tzinfo is not None and
                 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 86400,
                 "conditional-write probe must be from the last 24 hours")
+
+    def _deliver(self, conditional_evidence, *, authorization=None):
+        if self.protection is PublicationProtection.PROVIDER_CONDITIONAL:
+            require(authorization is None, "exclusive-writer authorization requires explicit exclusive-writer mode")
+            self._require_provider_conditional(conditional_evidence)
+            protection = {"mode": self.protection.value,
+                          "guarantee": "Provider-conditional destination writes with reviewed probe evidence."}
+        else:
+            self._require_exclusive_probe(conditional_evidence, authorization)
+            protection = {"mode": self.protection.value,
+                          "guarantee": "Operational exclusive-writer protection, not provider-enforced atomic destination no-overwrite.",
+                          "decision_sha256": authorization.decision_sha256,
+                          "failed_probe_sha256": authorization.failed_probe_sha256,
+                          "authorization_binding_sha256": authorization.authorization_binding_sha256,
+                          "scope": asdict(authorization.scope)}
         self._preflight()
+        previous = self.evidence.value.get("publication_protection")
+        if previous is None:
+            require(self.protection is PublicationProtection.PROVIDER_CONDITIONAL or
+                    not self.evidence.value["objects"], "existing objects have no exclusive-writer ownership evidence")
+            self.evidence.value["publication_protection"] = protection
+        else:
+            require(all(previous.get(key) == value for key, value in protection.items()),
+                    "publication protection or immutable authorization changed")
+        self.evidence.save()
+        print(json.dumps({"event": "publication-protection", "mode": protection["mode"],
+                          "guarantee": protection["guarantee"]}), flush=True)
+        if self.protection is PublicationProtection.EXCLUSIVE_WRITER:
+            self._guard_exclusive_writer()
         evidence_hash = digest(canonical(conditional_evidence))
         history = self.evidence.value.setdefault("conditional_writes_history", [])
         if evidence_hash not in [item["sha256"] for item in history]:
-            history.append({"sha256": evidence_hash, "observed_at": conditional_evidence["observed_at"]})
+            observed_at = (conditional_evidence["observed_at"] if self.protection is
+                           PublicationProtection.PROVIDER_CONDITIONAL else
+                           conditional_evidence["last_failure"]["observed_at"])
+            history.append({"sha256": evidence_hash, "observed_at": observed_at,
+                            "probe_status": conditional_evidence["status"]})
         self.evidence.value.update(status="partial-unverified", conditional_writes_evidence_sha256=evidence_hash)
         self.evidence.save()
         ordered = sorted(self.source.objects, key=lambda obj: (obj.path == "manifest.json", obj.path))
@@ -549,6 +796,7 @@ class DatasetDelivery:
                 state["status"] = "verified"
                 self.evidence.save()
         self._preflight()  # Includes exact source and destination identities and policy checks.
+        self._guard_exclusive_writer()
         require(set(self.inventory(self.destination)) ==
                 {self.destination + obj.path for obj in ordered} | {self.destination + "README.md"},
                 "final destination inventory differs")
@@ -561,6 +809,7 @@ class DatasetDelivery:
         states = self.evidence.value["objects"]
         state = states.get(path)
         if state is None:
+            self._guard_exclusive_writer()
             require(self.head(key) is None, "README already exists")
             state = {"status": "putting"}
             states[path] = state
@@ -589,35 +838,53 @@ def main():
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--conditional-writes-evidence", type=Path)
+    parser.add_argument("--publication-protection", choices=[mode.value for mode in PublicationProtection],
+                        default=PublicationProtection.PROVIDER_CONDITIONAL.value)
+    parser.add_argument("--exclusive-writer-decision", type=Path)
+    parser.add_argument("--exclusive-writer-authorization-binding", type=Path)
     parser.add_argument("--max-seconds", type=int, default=3600)
     parser.add_argument("--max-read-bytes", type=int, required=True)
     parser.add_argument("--request-timeout-seconds", type=int, default=30)
-    args = parser.parse_args()
     try:
-        require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
-        source = PreservedDataset.load(args.source_inventory)
-        budget = TransferBudget(args.max_seconds, args.max_read_bytes)
-        config = dict(connect_timeout=args.request_timeout_seconds, read_timeout=args.request_timeout_seconds,
-                      retries={"total_max_attempts": 1}, s3={"addressing_style": "path"},
-                      request_checksum_calculation="when_required", response_checksum_validation="when_required")
-        with private_evidence(args.evidence_dir) as evidence:
-            def execute():
+        with command_evidence(parser) as (args, evidence):
+            require(1 <= args.request_timeout_seconds <= 120, "request timeout must be 1..120 seconds")
+            budget = TransferBudget(args.max_seconds, args.max_read_bytes)
+            with bounded_invocation(budget):
+                source = PreservedDataset.load(args.source_inventory)
+                config = dict(connect_timeout=args.request_timeout_seconds, read_timeout=args.request_timeout_seconds,
+                              retries={"total_max_attempts": 1}, s3={"addressing_style": "path"},
+                              request_checksum_calculation="when_required", response_checksum_validation="when_required")
                 storage = boto3.Session(profile_name=args.profile).client(
                     "s3", endpoint_url=source.endpoint, region_name=source.region, config=Config(**config))
                 anonymous = boto3.client("s3", endpoint_url=source.endpoint, region_name=source.region,
                                          config=Config(signature_version=UNSIGNED, **config))
                 try:
+                    protection = PublicationProtection(args.publication_protection)
                     delivery = DatasetDelivery(storage, anonymous, source, args.destination_prefix,
-                                               read_small_file(args.readme), evidence, budget)
+                                               read_small_file(args.readme), evidence, budget, protection=protection)
                     if args.action == "plan":
+                        require(args.exclusive_writer_decision is None and
+                                args.exclusive_writer_authorization_binding is None,
+                                "operator authorization inputs are for deliver, not read-only plan")
                         delivery._preflight()
                     else:
                         require(args.conditional_writes_evidence is not None, "conditional-write evidence file required")
-                        delivery._deliver(json.loads(read_small_file(args.conditional_writes_evidence)))
+                        probe_bytes = read_small_file(args.conditional_writes_evidence)
+                        authorization = None
+                        if protection is PublicationProtection.EXCLUSIVE_WRITER:
+                            require(args.exclusive_writer_decision is not None and
+                                    args.exclusive_writer_authorization_binding is not None,
+                                    "exclusive-writer decision and authorization binding files required")
+                            authorization = ExclusiveWriterAuthorization.load(
+                                args.exclusive_writer_decision, args.exclusive_writer_authorization_binding, probe_bytes)
+                        else:
+                            require(args.exclusive_writer_decision is None and
+                                    args.exclusive_writer_authorization_binding is None,
+                                    "operator authorization requires explicit exclusive-writer mode")
+                        delivery._deliver(json.loads(probe_bytes), authorization=authorization)
                 finally:
                     storage.close()
                     anonymous.close()
-            delivery_attempt(evidence, budget, execute)
             print(json.dumps({"status": evidence.value["status"], "evidence": str(evidence.path)}))
     except (Refusal, InvocationInterrupted, OSError, ValueError, KeyError, TypeError, BotoCoreError, ClientError) as error:
         # Never print provider exception text: it may include request/authentication details.

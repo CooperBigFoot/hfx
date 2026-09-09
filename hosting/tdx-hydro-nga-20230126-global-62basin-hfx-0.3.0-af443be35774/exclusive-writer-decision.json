@@ -1,0 +1,24 @@
+{
+  "decision": "proceed-with-exclusive-writer-publication",
+  "recorded_at": "2026-09-09T12:53:11.974289+00:00",
+  "effort": "https://github.com/CooperBigFoot/hfx/issues/108",
+  "approved_by": "Nicolas Lazaro",
+  "user_statement": "seems straight forward enough, proceed",
+  "presented_tradeoff": "Proceeding needs another safeguard, such as ensuring no other process can write to the chosen destination during delivery. Hetzner ignored multipart no-overwrite condition in a tiny probe; no dataset was copied or overwritten.",
+  "scope": {
+    "endpoint": "https://fsn1.your-objectstorage.com",
+    "region": "fsn1",
+    "bucket": "pourpoint-hfx",
+    "destination_prefix": "hfx/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/",
+    "source_prefix": "scratch/tdx-hydro-seven-basin-extension/extension-hfx-v0-3-0/dataset/"
+  },
+  "guarantee": "Operational exclusive-writer protection, not provider-enforced atomic destination no-overwrite.",
+  "constraints": [
+    "Only this invocation writes the selected fresh destination prefix.",
+    "Check exact source/destination identities and refuse unexpected changes.",
+    "Full delivered SHA-256 verification and manifest-last activation remain required.",
+    "No source/unrelated-object/probe deletion without later exact inventory approval.",
+    "No paid compute, rebuild, public release or consumer repair.",
+    "Independent review and passing tests before changed method executes."
+  ]
+}

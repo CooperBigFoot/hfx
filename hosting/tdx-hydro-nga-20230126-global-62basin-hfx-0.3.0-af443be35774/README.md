@@ -134,3 +134,25 @@ this README.
 Retain the preserved source until destination verification, real consumption,
 comparison, and exact human-approved cleanup prerequisites succeed. This
 artifact's delivery tooling has no source deletion or cleanup command.
+
+## Recorded publication protection decision
+
+The 2026-09-09 tiny provider probe rejected a conditional PUT replacement but
+accepted a multipart completion replacement despite `IfNoneMatch="*"`.
+The probe remains refused. No dataset payload was part of that test.
+Nicolas Lazaro then approved proceeding with operational single-writer exclusion
+for this exact source and destination. The original
+[decision](https://github.com/CooperBigFoot/hfx/blob/7fde62b2b3acf79715ddd6830eb7845b891fd7ba/hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-decision.json) and separate
+[authorization binding](https://github.com/CooperBigFoot/hfx/blob/7fde62b2b3acf79715ddd6830eb7845b891fd7ba/hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-authorization-binding.json) retain
+that scope and the raw failed-probe checksum.
+
+This is weaker than provider-enforced atomic destination no-overwrite.
+A conditional private scratch ownership object coordinates cooperating tool
+invocations; it does not prevent external writers. The operator must ensure
+that only the approved invocation writes the chosen dataset prefix. HEAD checks
+before multipart completion still have a TOCTOU interval. The complete delivery
+receipt must disclose its actual `publication_protection` mode and retain the
+operator decision, probe and ownership evidence. Full SHA-256 verification,
+manifest-last activation, private access and all cleanup prerequisites remain
+required. This decision grants no deletion authority and does not claim that
+publication or the watershed comparison has completed.

@@ -33,11 +33,13 @@ from compiler adapters and the Rust library.
    policy or permissions on existing objects. Both authenticated object access
    and explicit anonymous 403 denial must work. If a legitimate private policy
    exists, stop for reviewed changes rather than bypass the check.
-5. Prove provider-enforced conditional writes in a separately approved small
-   probe. API parameter availability and HEAD-then-write checks are insufficient.
-   The probe must prove `IfNoneMatch="*"` on both `PutObject` and
-   `CompleteMultipartUpload`. Retain probe objects and upload IDs for a later
-   exact cleanup decision. No automatic cleanup follows a failed probe.
+5. In the default `provider-conditional` mode, prove provider-enforced conditional
+   writes in a separately approved small probe. API parameter availability and
+   HEAD-then-write checks are insufficient. The probe must prove
+   `IfNoneMatch="*"` on both `PutObject` and `CompleteMultipartUpload`. A failed
+   probe remains a failure. The separate, explicitly approved `exclusive-writer`
+   mode below records a weaker operational guarantee. It is never an automatic
+   fallback. Retain probe objects and upload IDs for later exact cleanup approval.
 
 Hetzner's supported-actions documentation warns storage copy can fail due to
 internal factors even in the same location. The tool propagates that failure.
@@ -137,6 +139,91 @@ cloud egress spending by itself. Confirm remaining
 provider transfer quota/cost before a full run. Raise limits only through an
 explicit operator decision. Exceeding a limit stops the invocation.
 
+## Explicit exclusive-writer publication
+
+`--publication-protection provider-conditional` remains the default. Its probe
+validation and rejection of failed capability evidence remain unchanged.
+`--publication-protection exclusive-writer` is a separate domain choice that
+requires the operator's exact decision, a separate immutable authorization
+binding, and the original failed probe. It does not reinterpret that probe as
+successful. The failed record must demonstrate working conditional `PutObject`
+creation/replacement rejection and ignored conditional multipart completion.
+
+For the selected TDX-Hydro dataset, Nicolas Lazaro approved this weaker
+single-writer approach on 2026-09-09 after the limitation was explained. The
+original decision and its separate binding are retained byte-for-byte in the
+repository's dataset hosting directory. The accepted vision is unchanged.
+The binding pins both raw-file SHA-256 values and exactly the endpoint, region,
+bucket, source prefix and destination prefix. Supplying a decision file is an
+operator action: these records bind reviewed authority, rather than deriving
+human permission from a JSON flag.
+
+Add these arguments to the `deliver` command above only after the new method
+has independent review and an operational go decision:
+
+```text
+--publication-protection exclusive-writer
+--exclusive-writer-decision hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-decision.json
+--exclusive-writer-authorization-binding hosting/tdx-hydro-nga-20230126-global-62basin-hfx-0.3.0-af443be35774/exclusive-writer-authorization-binding.json
+--conditional-writes-evidence /absolute/private/original-failed-probe/delivery.json
+```
+
+The original failed probe must match raw SHA-256
+`100047cf7498bc52afc897ee54200a323c2cb2f91ef36411633e6cd51aa929be`.
+The root operator retains it unchanged. A normalized or edited copy fails the
+binding. Both operator record files must also retain their exact original bytes.
+Use only `--publication-protection exclusive-writer` with `plan`; decision inputs
+belong to `deliver`. Planning remains read-only and does not acquire ownership.
+
+Before the first dataset write, the tool requires the destination to have no
+complete objects or multipart uploads. It conditionally creates a private
+`owner.json` under `scratch/dataset-publication-ownership/<destination-hash>/`.
+The hash binds endpoint, region, bucket and destination prefix. It excludes the
+source prefix so alternate source plans cannot reserve the same destination
+under another key. The ownership payload binds the source scope, immutable plan,
+decision/binding/probe hashes and a unique operation token saved in the journal.
+The exact final dataset inventory remains the six originals plus README.
+
+The reservation uses the working `PutObject IfNoneMatch="*"` condition. It
+coordinates cooperating invocations with distinct journals. The existing local
+journal file lock prevents concurrent use of the same local journal. A foreign
+reservation is refused. There is no automatic takeover, lease expiry, token
+replacement, deletion, abort or cleanup. Do not copy an active journal to another
+writer: the token identifies the recorded operation and is not a distributed
+process lock. The operator must exclude all other writers to the selected
+prefix, including external clients and replicated journals.
+
+Reservation bytes and HEAD identity are checked through the existing bounded
+full-SHA reader before each initiation, completion and README write, and before
+acceptance. Source identities and the exact destination inventory are rechecked.
+Active destination uploads must exactly equal the key/upload-ID pairs recorded
+as copying in this journal. Foreign, missing or unexpected uploads refuse fresh
+acquisition or resume. Existing completed payloads need their recorded identities
+and full-SHA receipts. Unknown or uncertain reservation, part, completion or
+README effects stop for inspection; they are never blindly repeated.
+
+Immediately before each completion/write, the destination key must still be
+absent. Source ETag/version guards and conditional README PUT remain enabled.
+The completion request still carries `IfNoneMatch="*"` as best effort, with no
+claim that the provider enforces it. A writer can appear between HEAD and
+multipart completion. This TOCTOU race remains; the user-approved operational
+single-writer exclusion is the safeguard. The reservation does not fence an
+external writer or make multipart completion atomic.
+
+The current receipt adds `publication_protection` with mode, the explicit weaker
+guarantee, raw decision/probe/binding hashes, scope, operation token and reservation
+key/identity/full-SHA evidence. Mode and authorization hashes become immutable
+once recorded. Historical failed probe status remains visible in capability
+history. Consumers still require current `status: verified-dataset` and all
+existing complete payload checks; a refused or checking receipt cannot borrow
+historical success. Retain the complete receipt with comparison outputs so its
+protection disclosure survives normalization of dataset identity.
+
+The ownership reservation and any incomplete artifacts stay in storage for the
+later exact cleanup inventory and human approval. Existing HydroBASINS, sources,
+probe objects and unrelated data remain untouched by cleanup operations because
+this tool has no deletion command.
+
 ## Integrity, progress and interrupted execution
 
 Source inventory and HEAD identities are checked on every invocation. Source
@@ -145,7 +232,9 @@ manifest bytes are fully verified before any destination mutation. Each
 byte range; a one-part copy omits `CopySourceRange` and copies the whole source.
 This includes the small attribution and manifest objects, for which S3 does not
 permit `CopySourceRange`. A version ID is used when present. New objects use explicit private ACL. Multipart completion and
-README PUT use destination `IfNoneMatch="*"` with no fallback.
+README PUT use destination `IfNoneMatch="*"` with no automatic fallback.
+In exclusive-writer mode the multipart condition is documented best effort;
+its lack of enforcement remains explicit in the protection receipt.
 
 Multipart parts are at most 256 MiB by default; only request/response metadata
 passes through the laptop. Upload IDs, exact part sizes and ETags are persisted
@@ -201,6 +290,13 @@ manifest. This controls dataset activation, not secrecy. Unverified payload
 objects are still visible to authorized credentials. Before a new attempt,
 a prior successful receipt is copied into `verification_history` and the current
 status becomes `checking`, durably, before any preflight or deadline alarm.
+The delivery CLI first identifies and locks a readable journal, then places
+remaining argument conversion, source/config reads and runtime-bound validation
+inside that attempt boundary. Invalid prerequisites therefore cannot leave a
+previously accepted current receipt. Normal argparse syntax errors retain their
+exit behavior while recording a sanitized failure; help remains informational
+and never changes a receipt. An unidentifiable or unreadable journal cannot be
+safely rewritten.
 A failed attempt, including a contradicted preflight observation, sets the
 current status to `refused` with a sanitized `last_failure`. Earlier failures
 move to `failure_history` on a new attempt. The object and upload state stays
