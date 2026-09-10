@@ -305,6 +305,89 @@ The underlying Rust command is
 `catchments.parquet` and `aux/snap_stems.parquet` as GeoParquet 1.1 and verifies
 that `graph.parquet` has the expected non-GeoParquet classification.
 
+
+### Retaining new validation evidence
+
+The adapter forwards the native validator's stdout and stderr to the same CLI
+streams on success and failure. A nonzero native exit raises `RuntimeError` with
+the native return code and stops before GeoParquet checks. Native diagnostics
+remain in the streams rather than in the exception message. A later GeoParquet
+failure can make the adapter fail after native validation succeeds.
+
+From the repository root, save wrapper logs outside disposable build directories:
+
+```bash
+EVIDENCE=/absolute/durable/path/to/new-validation
+DATASET=/absolute/path/to/assembled
+HFX_BINARY=/absolute/path/to/hfx/target/release/hfx
+mkdir -p "$EVIDENCE"
+if uv run --project adapters/tdx-hydro python adapters/tdx-hydro/build_adapter.py \
+  validate "$DATASET" --hfx-binary "$HFX_BINARY" \
+  >"$EVIDENCE/adapter.stdout" 2>"$EVIDENCE/adapter.stderr"; then
+  adapter_status=0
+else
+  adapter_status=$?
+fi
+printf '%s\n' "$adapter_status" >"$EVIDENCE/adapter.exit-code"
+```
+
+These are composed adapter logs: they include native output and may also include
+Python/GeoParquet diagnostics. The adapter exit code describes the composed
+operation. To retain separate native stdout, stderr, exact argv and native exit
+status, run the same strict native command directly as a separately identified
+validation invocation. This repeats full validation; budget its time and memory.
+For a release build, record the build in the checkout selected for validation:
+
+```bash
+printf '%s\n' 'cargo build --locked --release -p hfx-cli' >"$EVIDENCE/native.build-command"
+if cargo build --locked --release -p hfx-cli >"$EVIDENCE/native.build.log" 2>&1; then
+  printf '0\n' >"$EVIDENCE/native.build-exit-code"
+else
+  build_status=$?
+  printf '%s\n' "$build_status" >"$EVIDENCE/native.build-exit-code"
+  exit "$build_status"
+fi
+```
+
+Set `HFX_BINARY` to that checkout's resulting release binary, then run:
+
+```bash
+# Run in the checkout that actually built HFX_BINARY. Record any dirty changes.
+git rev-parse HEAD >"$EVIDENCE/native.source-commit"
+git status --porcelain >"$EVIDENCE/native.source-status"
+git diff HEAD --binary >"$EVIDENCE/native.source-diff"
+rustc --version >"$EVIDENCE/native.rustc-version"
+"$HFX_BINARY" --version >"$EVIDENCE/native.version"
+shasum -a 256 "$HFX_BINARY" >"$EVIDENCE/native.binary-sha256"
+shasum -a 256 "$DATASET/manifest.json" >"$EVIDENCE/dataset.manifest-sha256"
+# NUL-separated argv preserves paths containing whitespace.
+printf '%s\0' "$HFX_BINARY" "$DATASET" --strict --sample-pct 100 --format text \
+  >"$EVIDENCE/native.argv.nul"
+if "$HFX_BINARY" "$DATASET" --strict --sample-pct 100 --format text \
+  >"$EVIDENCE/native.stdout" 2>"$EVIDENCE/native.stderr"; then
+  native_status=0
+else
+  native_status=$?
+fi
+printf '%s\n' "$native_status" >"$EVIDENCE/native.exit-code"
+if [ "$native_status" -eq 0 ]; then
+  printf 'PASS: native strict validation\n' >"$EVIDENCE/native.status"
+else
+  printf 'FAIL: native exit %s\n' "$native_status" >"$EVIDENCE/native.status"
+fi
+```
+
+Use a fresh evidence directory for each invocation. Retain the actual build
+command and build log alongside these files; a checkout commit or `--version`
+alone does not identify a binary. Record untracked build inputs separately if
+present, dataset payload digests, and relevant environment settings. Keep the
+dataset immutable during validation. An absent exit-code/status file means the
+run is incomplete, not successful. Preserve empty stderr as an actual file.
+Native success does not establish the later GeoParquet outcome; retain both
+outcomes when both are required. These commands produce new evidence. Historical
+successful output that was discarded cannot be reconstructed from wrapper
+success or represented as a recovered native transcript.
+
 ## Local basin adjudication
 
 The adapter can deterministically adjudicate the seven absent TDX-Hydro

@@ -6638,6 +6638,56 @@ class BuildCliTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(report.exists())
 
+    def test_validate_cli_preserves_native_success_and_failure_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, *build_cli_frames())
+            output = root / "output"
+            main(self.build_args(basins_path, streamnet_path, output, root / "report.json"))
+            native_argv = [str(HFX_BINARY), str(output), "--strict", "--sample-pct", "100", "--format", "text"]
+            adapter_argv = [sys.executable, str(Path(build_adapter.__file__).resolve()), "validate", str(output), "--hfx-binary", str(HFX_BINARY)]
+            for outcome in ("success", "failure"):
+                with self.subTest(outcome=outcome):
+                    if outcome == "failure":
+                        (output / "manifest.json").unlink()
+                    native = subprocess.run(native_argv, capture_output=True, check=False)
+                    completed = subprocess.run(adapter_argv, capture_output=True, check=False)
+                    self.assertEqual(native.returncode, 0 if outcome == "success" else 1)
+                    self.assertEqual(completed.returncode, 0 if outcome == "success" else 1)
+                    self.assertTrue(native.stdout, "native text report must be nonempty")
+                    self.assertIn(native.stdout, completed.stdout)
+                    # Native tracing includes timestamps, so compare its stable message.
+                    self.assertIn(b"validating HFX dataset", native.stderr)
+                    self.assertIn(b"validating HFX dataset", completed.stderr)
+                    if outcome == "failure":
+                        self.assertIn(b"HFX validation failed with return code 1", completed.stderr)
+
+    def test_validate_cli_preserves_native_output_when_layer_check_fails(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            basins_path, streamnet_path = write_pair(root, *build_cli_frames())
+            output = root / "output"
+            main(self.build_args(basins_path, streamnet_path, output, root / "report.json"))
+            # HFX accepts the declared path; the adapter also requires its fixed layer.
+            (output / "aux/snap_stems.parquet").rename(output / "aux/declared_stems.parquet")
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["auxiliary"][0]["artifacts"]["snap"] = "aux/declared_stems.parquet"
+            manifest_path.write_text(json.dumps(manifest))
+            native = subprocess.run(
+                [str(HFX_BINARY), str(output), "--strict", "--sample-pct", "100", "--format", "text"],
+                capture_output=True, check=False,
+            )
+            self.assertEqual(native.returncode, 0, native.stderr)
+            completed = subprocess.run(
+                [sys.executable, str(Path(build_adapter.__file__).resolve()), "validate", str(output), "--hfx-binary", str(HFX_BINARY)],
+                capture_output=True, check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(native.stdout, completed.stdout)
+            self.assertIn(b"validating HFX dataset", completed.stderr)
+            self.assertIn(b"snap_stems.parquet", completed.stderr)
+
     def test_validate_cli_runs_explicit_binary_and_all_dataset_layer_checks(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
