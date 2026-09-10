@@ -4796,14 +4796,27 @@ def _read_streamnet_topology_columns(streamnet_path: Path) -> _StreamnetTopology
                     {"LineString"},
                     allow_tdx_degenerate_reaches=True,
                 )
+                degenerate_before = np.asarray(
+                    [_is_tdx_degenerate_reach(geometry) for geometry in series], dtype=bool
+                )
                 normalized, count, changed = _clamp_coordinate_batch(
                     series, native, "streamnet", "LINKNO"
                 )
+                normalized_series = gpd.GeoSeries(normalized, crs=CRS)
+                _validate_layer_geometry(
+                    gpd.GeoDataFrame({"native_id": native}, geometry=normalized_series, crs=CRS),
+                    "streamnet",
+                    {"LineString"},
+                    allow_tdx_degenerate_reaches=True,
+                )
+                endpoints, degenerate = _stream_batch_endpoints(native, normalized_series)
+                if not np.array_equal(degenerate_before, degenerate):
+                    raise ValueError(
+                        "streamnet degenerate reach classification changed during coordinate "
+                        "normalization"
+                    )
                 altered += count
                 altered_ids.update(changed)
-                endpoints, degenerate = _stream_batch_endpoints(
-                    native, gpd.GeoSeries(normalized, crs=CRS)
-                )
                 native_batches.append(native)
                 downstream_batches.append(downstream)
                 area_batches.append(areas)

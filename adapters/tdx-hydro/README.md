@@ -670,3 +670,122 @@ resources; independent listings confirmed zero footprint.
 
 Full record:
 [`scripts/hetzner/CAMPAIGN-tdx-hydro-7020000010.md`](../../scripts/hetzner/CAMPAIGN-tdx-hydro-7020000010.md).
+
+## Native-source outlet regeneration
+
+`regenerate_outlets.py` corrects unit outlets in an authenticated global artifact.
+It uses the same native stream reader, identity checks and compact topology as
+`build`. Every native reach contributes before polygon-less contraction. The
+reference Global LINKNOs and pinned crosswalk define polygon-bearing membership.
+No fresh polygon GeoPackage is needed when every complete native stream file
+matches its historical SHA-256. The tool never fetches sources. For each basin,
+exactly one supported DSContArea conversion (native m² divided by 1,000,000, or
+native km² unchanged) must reproduce every authenticated polygon-bearing
+`up_area_km2` value after its stored float32 rounding. The selected conversion
+then applies to every native float64 value before orientation, using the same
+arithmetic as the full build. This preserves normalization-induced ties. Missing,
+nonfinite, nonpositive, ambiguous or mismatched normalization evidence refuses;
+there is no sampling or approximate comparison.
+
+Prepare an explicit JSON inventory outside the dataset:
+
+```json
+{
+  "schema_version": 1,
+  "build_identity": "reviewed historical reference build and source receipt",
+  "crosswalk_sha256": "<SHA-256 of data/tdx_header_numbers.json>",
+  "reference_files": [
+    {"path": "catchments.parquet", "bytes": 123, "sha256": "<historical full-content SHA-256>"}
+  ],
+  "sources": [
+    {"processing_basin_id": "1020000010", "path": "/scratch/native/1020000010-streamnet.gpkg", "bytes": 456, "sha256": "<historical full-content SHA-256>"}
+  ],
+  "replacement_readme": {
+    "path": "/scratch/corrected-README.md",
+    "bytes": 789,
+    "sha256": "<reviewed replacement documentation SHA-256>"
+  }
+}
+```
+
+The abbreviated lists above must contain **every reference file** and exactly
+**all 62 canonical processing basins**, once each. Include `manifest.json`,
+`graph.parquet`, `aux/snap_stems.parquet`, `NOTICE`, `CITATION.txt` and `README.md`.
+All source paths are absolute. Source `sha256` and `bytes` are the historical
+expected identity, with original receipt citations retained as extra record
+metadata. The reference pins must come from complete-content delivery evidence.
+A newly computed source digest, multipart ETag or version label cannot establish
+historical identity. Review the assembled inventory and supply its SHA-256 as a
+separate invocation pin. Do not regenerate that pin to bypass a refusal.
+
+```bash
+uv run regenerate_outlets.py regenerate \
+  --reference /scratch/reference --candidate /scratch/corrected \
+  --inventory /scratch/inventory.json --inventory-sha256 "$INVENTORY_SHA256" \
+  --evidence /scratch/regeneration-evidence --batch-size 1024
+
+uv run regenerate_outlets.py verify \
+  --reference /scratch/reference --candidate /scratch/corrected \
+  --inventory /scratch/inventory.json --inventory-sha256 "$INVENTORY_SHA256" \
+  --evidence /scratch/independent-verification --batch-size 1024
+```
+
+`verify` reauthenticates the supplied reference/source authority and recomputes
+all native orientations. It does not trust a caller-edited outlet table or prior
+provenance report. `outlet_invariance.verify_outlet_invariance` is the lower-level
+exhaustive checker and requires a freshly derived trusted index/provenance from
+this entrypoint; it alone does not authenticate historical source identity.
+
+The reference remains untouched. The candidate changes only `outlet_lon` and
+`outlet_lat` in catchment data. The pass preserves every other column dynamically,
+including unknown columns, nulls, field types/nullability, schema/field metadata,
+WKB bytes and row order. Reference row-group boundaries remain exact. The
+rewriter buffers one legal source row group (at most 8,192 rows) as Arrow chunks
+before writing it. `--batch-size` controls decoding and independent verification;
+it cannot reduce the rewriter's one-row-group memory floor. Parquet compression,
+statistics and physical encoding can change. Graph, snap, manifest, NOTICE,
+CITATION and every other payload remain byte-identical. The manifest timestamp
+also remains byte-identical. `README.md` is the sole documentation exception: its
+bytes must equal the explicit pinned operator-supplied replacement. The original
+README is retained as historical evidence, rather than copied as current claims.
+The format remains HFX 0.3.0.
+
+Evidence includes the exact inventory/invocation, source hashes and paths,
+implementation/lockfile digests, environment versions, normalized native arrays,
+all native endpoint-index/resolution classifications, per-basin polarity/clamp
+records, default tolerance, orientation digests and the compact outlet index.
+Exhaustive verification checks the complete contracted graph, every drainage-unit
+identity and every candidate outlet against native derivation. It compares every
+non-outlet field and unchanged payload, including snap for moved-outlet units.
+`changes.jsonl` records actual unit/basin differences, native resolution and
+geodesic shifts. Per-basin summaries report observed totals and maximum shifts;
+historical correction counts are never acceptance thresholds.
+
+The destination and evidence directory must be new and disjoint from inputs.
+Symlink components and GeoPackage journal/WAL sidecars are refused before and
+after native parsing. Native files are authenticated before/after parsing and
+file mutation stamps are checked. Operators must exclude concurrent input writers;
+these checks are drift detection, rather than a hostile-writer isolation boundary.
+Local publication uses an atomic no-replace directory rename on Linux or macOS
+and refuses unsupported platforms/filesystems. A sibling cooperating-writer lock
+also protects publication. Failed staging and a refused status remain for audit;
+there is no successful candidate marker on a handled failure. Interrupted staging
+and stale locks require explicit operator inspection. This local operation grants
+no cloud publication or cleanup authority.
+
+Memory consists of a disk-backed fixed-width global index, aligned reference
+upstream-area column, coverage bitmaps, one processing basin's native topology,
+and one bounded catchment row group plus decoder/writer buffers. The native
+reader itself uses 4096-row batches. A single large geometry still sets a minimum
+batch-memory floor. There are no global polygon or snap dictionaries. Scratch
+must hold the complete reference and separate candidate, explicit native sources,
+normalized evidence and headroom. Sources are processed serially; all explicitly
+listed files must be available. There is no source fetching, automatic deletion,
+resume scheduler, or automatic scratch reclamation. Benchmark real native topology,
+large-WKB rewrite, disk throughput and validator RSS off the laptop before sizing
+a campaign. Tiny fixtures are correctness evidence, not a production resource bound.
+
+A complete regeneration status certifies native outlet derivation and artifact
+invariance. Run the full strict HFX validator separately and retain its actual
+stdout, stderr, build identity and exit status before delivery. The command does
+not certify validation, upload integrity or consumer acceptance.
