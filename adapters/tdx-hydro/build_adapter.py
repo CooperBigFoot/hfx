@@ -6003,14 +6003,12 @@ def validate_dataset(
             "--format",
             "text",
         ],
-        capture_output=True,
-        text=True,
+        # Inherit both streams so native evidence survives every exit outcome.
         check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            f"HFX validation failed with return code {completed.returncode}: "
-            f"stderr={completed.stderr!r} stdout={completed.stdout!r}"
+            f"HFX validation failed with return code {completed.returncode}"
         )
 
     catchments_path = dataset / "catchments.parquet"
