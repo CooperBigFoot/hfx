@@ -1,5 +1,4 @@
 # Consistently corrected TDX-Hydro delivery
-
 Program: https://github.com/CooperBigFoot/hfx/issues/103
 Effort: https://github.com/CooperBigFoot/hfx/issues/251
 
