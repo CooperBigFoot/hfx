@@ -10,7 +10,6 @@ No historical change count or distance threshold participates in acceptance.
 from __future__ import annotations
 
 import hashlib
-from itertools import zip_longest
 import json
 import math
 from pathlib import Path
@@ -77,9 +76,16 @@ def _exact_array_equal(left, right):
         b = right.to_numpy(zero_copy_only=False)
         bits = np.dtype(f"u{dtype.bit_width // 8}")
         return np.array_equal(a.view(bits)[valid], b.view(bits)[valid])
+    if isinstance(left, pa.ExtensionArray):
+        return _exact_array_equal(left.storage, right.storage)
+    if pa.types.is_fixed_size_list(dtype):
+        size = dtype.list_size
+        return _exact_array_equal(
+            left.values.slice(left.offset * size, len(left) * size),
+            right.values.slice(right.offset * size, len(right) * size))
     if pa.types.is_struct(dtype):
         return all(_exact_array_equal(left.field(i), right.field(i)) for i in range(dtype.num_fields))
-    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_map(dtype):
         a = left.offsets.to_numpy(zero_copy_only=False)
         b = right.offsets.to_numpy(zero_copy_only=False)
         return np.array_equal(a - a[0], b - b[0]) and _exact_array_equal(
@@ -268,6 +274,17 @@ def verify_outlet_invariance(reference: Path, candidate: Path, outlet_index: Pat
     _require(left.schema_arrow.equals(right.schema_arrow, check_metadata=True), "catchments schema/field/metadata differs")
     _require(left.schema.equals(right.schema), "catchments physical schema differs")
     _require(left.metadata.metadata == right.metadata.metadata, "catchments file metadata differs")
+    if left.metadata.num_rows < 4096:
+        _require(left.metadata.num_row_groups == 1,
+                 "reference catchments row-group rule: fewer than 4096 rows requires one group")
+    else:
+        _require(all(4096 <= left.metadata.row_group(i).num_rows <= 8192
+                     for i in range(left.metadata.num_row_groups)),
+                 "reference catchments row-group rule: every group must contain 4096-8192 rows")
+    _require(left.metadata.num_row_groups == right.metadata.num_row_groups
+             and all(left.metadata.row_group(i).num_rows == right.metadata.row_group(i).num_rows
+                     for i in range(left.metadata.num_row_groups)),
+             "catchments row-group boundaries differ")
     _require(len(set(left.schema_arrow.names)) == len(left.schema_arrow.names), "catchments duplicate column names")
     _require({"id", "outlet_lon", "outlet_lat"} <= set(left.schema_arrow.names), "catchments required column missing")
     _require(left.metadata.num_rows == right.metadata.num_rows == len(index), "catchments/index row count differs")
@@ -280,9 +297,13 @@ def verify_outlet_invariance(reference: Path, candidate: Path, outlet_index: Pat
     row_offset = 0
     geod = Geod(ellps="WGS84")
     with (evidence / "changes.jsonl").open("x") as changes:
-        batches = zip_longest(left.iter_batches(batch_size=batch_size, use_threads=False),
-                             right.iter_batches(batch_size=batch_size, use_threads=False))
-        for old, new in batches:
+        old_batches = left.iter_batches(batch_size=batch_size, use_threads=False)
+        new_batches = right.iter_batches(batch_size=batch_size, use_threads=False)
+        while True:
+            old = next(old_batches, None)
+            new = next(new_batches, None)
+            if old is None and new is None:
+                break
             _require(old is not None and new is not None, "catchments batch coverage differs")
             _compare_batch(old, new, row_offset)
             _require(new.column("id").null_count == 0, "catchments: null ID")

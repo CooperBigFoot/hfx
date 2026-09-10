@@ -678,7 +678,14 @@ It uses the same native stream reader, identity checks and compact topology as
 `build`. Every native reach contributes before polygon-less contraction. The
 reference Global LINKNOs and pinned crosswalk define polygon-bearing membership.
 No fresh polygon GeoPackage is needed when every complete native stream file
-matches its historical SHA-256. The tool never fetches sources.
+matches its historical SHA-256. The tool never fetches sources. For each basin,
+exactly one supported DSContArea conversion (native m² divided by 1,000,000, or
+native km² unchanged) must reproduce every authenticated polygon-bearing
+`up_area_km2` value after its stored float32 rounding. The selected conversion
+then applies to every native float64 value before orientation, using the same
+arithmetic as the full build. This preserves normalization-induced ties. Missing,
+nonfinite, nonpositive, ambiguous or mismatched normalization evidence refuses;
+there is no sampling or approximate comparison.
 
 Prepare an explicit JSON inventory outside the dataset:
 
@@ -732,8 +739,10 @@ this entrypoint; it alone does not authenticate historical source identity.
 The reference remains untouched. The candidate changes only `outlet_lon` and
 `outlet_lat` in catchment data. The pass preserves every other column dynamically,
 including unknown columns, nulls, field types/nullability, schema/field metadata,
-WKB bytes and row order. Large row groups split at batch boundaries to bound WKB
-memory; existing group boundaries are never crossed. Parquet compression,
+WKB bytes and row order. Reference row-group boundaries remain exact. The
+rewriter buffers one legal source row group (at most 8,192 rows) as Arrow chunks
+before writing it. `--batch-size` controls decoding and independent verification;
+it cannot reduce the rewriter's one-row-group memory floor. Parquet compression,
 statistics and physical encoding can change. Graph, snap, manifest, NOTICE,
 CITATION and every other payload remain byte-identical. The manifest timestamp
 also remains byte-identical. `README.md` is the sole documentation exception: its
@@ -753,8 +762,10 @@ geodesic shifts. Per-basin summaries report observed totals and maximum shifts;
 historical correction counts are never acceptance thresholds.
 
 The destination and evidence directory must be new and disjoint from inputs.
-Symlink components and GeoPackage journal/WAL sidecars are refused. Native files
-are authenticated before/after parsing and file mutation stamps are checked.
+Symlink components and GeoPackage journal/WAL sidecars are refused before and
+after native parsing. Native files are authenticated before/after parsing and
+file mutation stamps are checked. Operators must exclude concurrent input writers;
+these checks are drift detection, rather than a hostile-writer isolation boundary.
 Local publication uses an atomic no-replace directory rename on Linux or macOS
 and refuses unsupported platforms/filesystems. A sibling cooperating-writer lock
 also protects publication. Failed staging and a refused status remain for audit;
@@ -762,8 +773,9 @@ there is no successful candidate marker on a handled failure. Interrupted stagin
 and stale locks require explicit operator inspection. This local operation grants
 no cloud publication or cleanup authority.
 
-Memory consists of a disk-backed fixed-width global index, coverage bitmaps,
-one processing basin's native topology and bounded Arrow batches. The native
+Memory consists of a disk-backed fixed-width global index, aligned reference
+upstream-area column, coverage bitmaps, one processing basin's native topology,
+and one bounded catchment row group plus decoder/writer buffers. The native
 reader itself uses 4096-row batches. A single large geometry still sets a minimum
 batch-memory floor. There are no global polygon or snap dictionaries. Scratch
 must hold the complete reference and separate candidate, explicit native sources,

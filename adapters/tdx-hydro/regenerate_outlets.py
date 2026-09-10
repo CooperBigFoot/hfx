@@ -177,7 +177,7 @@ def authenticate_inventory(reference: Path, inventory_path: Path, inventory_sha2
     return inventory, crosswalk
 
 
-def derive_native_outlets(native_ids: np.ndarray, source_path: Path, header_number: int, *, native_evidence_path: Path | None = None) -> tuple[adapter._CompactTopology, dict]:
+def derive_native_outlets(native_ids: np.ndarray, source_path: Path, header_number: int, *, reference_up_area_km2: np.ndarray, native_evidence_path: Path | None = None) -> tuple[adapter._CompactTopology, dict]:
     """Derive historical polygon-bearing outlets from EVERY native reach.
 
     Raises ValueError for every refusal of the shared native parser/topology.
@@ -188,20 +188,42 @@ def derive_native_outlets(native_ids: np.ndarray, source_path: Path, header_numb
         if Path(str(source_path) + suffix).exists():
             raise ValueError(f"GeoPackage sidecar refused: {source_path}{suffix}")
     columns = adapter._read_streamnet_topology_columns(source_path)
+    for suffix in ("-wal", "-journal", "-shm"):
+        if Path(str(source_path) + suffix).exists():
+            raise ValueError(f"GeoPackage sidecar appeared during native read: {source_path}{suffix}")
     basin, native, downstream = adapter._validated_native_identities(native_ids, columns.native_ids, columns.downstream_native_ids)
     if np.any(native >= adapter.GLOBAL_LINKNO_STRIDE):
         raise ValueError("native LINKNO exceeds crosswalk stride")
     order = np.argsort(columns.native_ids, kind="stable")
     endpoints = columns.endpoints[order]
     degenerate = columns.degenerate[order]
-    area = columns.dscontarea_raw[order]
+    raw_area = columns.dscontarea_raw[order]
+    reference_area = np.asarray(reference_up_area_km2)
+    if reference_area.dtype != np.dtype("float32") or reference_area.shape != native_ids.shape or not np.all(np.isfinite(reference_area) & (reference_area > 0)):
+        raise ValueError("reference up_area_km2 must be positive finite float32 for every polygon-bearing ID")
+    reference_area = reference_area[np.argsort(native_ids, kind="stable")]
+    polygon_rows = np.searchsorted(native, basin)
+    matching_units = []
+    for source_unit in ("m2", "km2"):
+        samples = raw_area[polygon_rows]
+        if source_unit == "m2":
+            samples = samples / 1_000_000
+        with np.errstate(over="ignore", under="ignore"):
+            encoded = samples.astype("float32")
+        if np.array_equal(encoded.view("uint32"), reference_area.view("uint32")):
+            matching_units.append(source_unit)
+    if len(matching_units) != 1:
+        raise ValueError("reference up_area_km2 does not establish exactly one native DSContArea normalization")
+    source_unit = matching_units[0]
+    # Match full build arithmetic exactly, including float64 division rounding.
+    area = raw_area / 1_000_000 if source_unit == "m2" else raw_area.copy()
     topology = adapter._build_compact_topology(basin, native, downstream, endpoints, degenerate, area, header_number, adapter.DEFAULT_ENDPOINT_TOLERANCE)
     if _stamp(source_path) != before:
         raise ValueError(f"source changed during native derivation: {source_path}")
     resolutions = topology.reach_resolutions
     if resolutions is None or topology.diagnostics.basin_polarity is None:
         raise RuntimeError("shared topology omitted native orientation evidence")
-    evidence = dict(native_ids=native, downstream_native_ids=downstream, endpoints=endpoints, degenerate=degenerate, dscontarea_raw=area, polygon_native_ids=basin, downstream_endpoint_index=resolutions.downstream_endpoint_index, resolution=resolutions.resolution)
+    evidence = dict(native_ids=native, downstream_native_ids=downstream, endpoints=endpoints, degenerate=degenerate, dscontarea_raw=raw_area, up_area_km2=area, reference_up_area_km2=reference_area, polygon_native_ids=basin, downstream_endpoint_index=resolutions.downstream_endpoint_index, resolution=resolutions.resolution)
     normalized_digest = hashlib.sha256()
     for name, values in evidence.items():
         normalized_digest.update(name.encode("ascii") + b"\0")
@@ -211,6 +233,7 @@ def derive_native_outlets(native_ids: np.ndarray, source_path: Path, header_numb
         "endpoint_tolerance": adapter.DEFAULT_ENDPOINT_TOLERANCE,
         "orientation_digest": adapter._orientation_digest(topology),
         "normalized_native_sha256": normalized_digest.hexdigest(),
+        "dscontarea_normalization": {"source_unit": source_unit, "operation": "float64 / 1000000" if source_unit == "m2" else "float64 identity", "authority": "all authenticated reference polygon-bearing up_area_km2 float32 values, bit-exact", "matched_unit_count": len(basin)},
         "native_reach_count": len(native), "unit_count": len(basin),
         "polygonless_reach_count": len(native) - len(basin),
         "streamnet_clamp": asdict(columns.clamp),
@@ -233,24 +256,47 @@ def _positions(index: np.ndarray, ids: np.ndarray) -> np.ndarray:
     return positions
 
 
-def _reference_index(reference: Path, crosswalk: dict[str, int], path: Path, batch_size: int) -> np.ndarray:
+def _legal_row_groups(parquet: pq.ParquetFile) -> tuple[int, ...]:
+    groups = tuple(parquet.metadata.row_group(i).num_rows for i in range(parquet.num_row_groups))
+    count = parquet.metadata.num_rows
+    if count <= 0 or (count < adapter.ROW_GROUP_MIN and len(groups) != 1) or (count >= adapter.ROW_GROUP_MIN and any(not adapter.ROW_GROUP_MIN <= size <= adapter.ROW_GROUP_MAX for size in groups)):
+        raise ValueError("catchments source row groups violate HFX Spatial Partitioning (one group below 4096 rows; otherwise 4096-8192 rows per group)")
+    return groups
+
+
+def _reference_index(reference: Path, crosswalk: dict[str, int], path: Path, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
     manifest = _read_json(reference / "manifest.json")
     count = manifest.get("unit_count")
     parquet = pq.ParquetFile(reference / "catchments.parquet")
+    _legal_row_groups(parquet)
     if type(count) is not int or count <= 0 or count != parquet.metadata.num_rows:
         raise ValueError("reference manifest unit_count mismatch")
     if not pa.types.is_int64(parquet.schema_arrow.field("id").type):
         raise ValueError("reference drainage-unit id must be int64")
     index = np.lib.format.open_memmap(path, mode="w+", dtype=OUTLET_DTYPE, shape=(count,))
+    if parquet.schema_arrow.field("up_area_km2").type != pa.float32():
+        raise ValueError("reference up_area_km2 must be float32")
+    reference_area = np.lib.format.open_memmap(path.with_name("reference-up-area.npy"), mode="w+", dtype="float32", shape=(count,))
     cursor = 0
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=["id"]):
+    for batch in parquet.iter_batches(batch_size=batch_size, columns=["id", "up_area_km2"]):
         column = batch.column(0)
         if column.null_count:
             raise ValueError("null drainage-unit ID")
         ids = column.to_numpy(zero_copy_only=False)
+        area_column = batch.column(1)
+        if area_column.null_count:
+            raise ValueError("null reference up_area_km2")
+        area = area_column.to_numpy(zero_copy_only=False)
+        if not np.all(np.isfinite(area) & (area > 0)):
+            raise ValueError("reference up_area_km2 must be positive finite")
         index["id"][cursor:cursor+len(ids)] = ids
+        reference_area[cursor:cursor+len(ids)] = area
         cursor += len(ids)
-    index.sort(order="id")
+    order = np.argsort(index["id"], kind="stable")
+    index["id"][:] = index["id"][order]
+    reference_area[:] = reference_area[order]
+    reference_area.flush()
+    del order
     ids = index["id"]
     if np.any(ids[1:] == ids[:-1]):
         raise ValueError("duplicate reference drainage-unit ID")
@@ -259,7 +305,7 @@ def _reference_index(reference: Path, crosswalk: dict[str, int], path: Path, bat
         raise ValueError("reference drainage units must cover exactly all 62 canonical headers")
     index["downstream_id"] = -1
     index.flush()
-    return index
+    return index, reference_area
 
 
 def _verify_graph(reference: Path, index: np.ndarray, batch_size: int) -> None:
@@ -290,7 +336,7 @@ def _verify_graph(reference: Path, index: np.ndarray, batch_size: int) -> None:
 
 def _derive(reference: Path, inventory: dict, crosswalk: dict[str, int], evidence: Path, batch_size: int) -> tuple[Path, dict]:
     path = evidence / "outlets.npy"
-    index = _reference_index(reference, crosswalk, path, batch_size)
+    index, reference_area = _reference_index(reference, crosswalk, path, batch_size)
     provenance = {
         "schema_version": 1, "basins": [], "historical_build_identity": inventory["build_identity"],
         "crosswalk_sha256": inventory["crosswalk_sha256"],
@@ -309,7 +355,7 @@ def _derive(reference: Path, inventory: dict, crosswalk: dict[str, int], evidenc
         stamp = _stamp(source_path)
         start, stop = np.searchsorted(index["id"], [header * adapter.GLOBAL_LINKNO_STRIDE, (header+1) * adapter.GLOBAL_LINKNO_STRIDE])
         native_ids = index["id"][start:stop] - header * adapter.GLOBAL_LINKNO_STRIDE
-        topology, report = derive_native_outlets(native_ids, source_path, header, native_evidence_path=evidence / f"native-{basin}.npz")
+        topology, report = derive_native_outlets(native_ids, source_path, header, reference_up_area_km2=reference_area[start:stop], native_evidence_path=evidence / f"native-{basin}.npz")
         if _stamp(source_path) != stamp:
             raise ValueError(f"native source changed after authentication: {source_path}")
         _authenticate(source_path, record)
@@ -334,25 +380,31 @@ def _derive(reference: Path, inventory: dict, crosswalk: dict[str, int], evidenc
 
 
 def rewrite_catchments(reference: Path, destination: Path, outlet_index: Path, *, batch_size: int = 1024) -> None:
-    """Rewrite only outlet columns in bounded batches within input row groups.
+    """Rewrite outlet columns while preserving every legal input row group.
 
-    Raises ValueError for missing IDs or incompatible outlet types. Large input
-    row groups are split at batch boundaries to bound live WKB memory.
+    Raises ValueError for missing IDs, incompatible types, or illegal row groups.
+    Memory includes one full source row group (at most 8192 rows), Arrow decoder
+    and writer buffers. Decoding batch size cannot reduce that row-group floor.
     """
     index = np.load(outlet_index, mmap_mode="r", allow_pickle=False)
     source = pq.ParquetFile(reference)
+    groups = _legal_row_groups(source)
     schema = source.schema_arrow
     for name in ("outlet_lon", "outlet_lat"):
         if schema.field(name).type != pa.float64():
             raise ValueError(f"outlet column must be float64: {name}")
     with pq.ParquetWriter(destination, schema, compression="zstd") as writer:
-        for group in range(source.num_row_groups):
-            for batch in source.iter_batches(batch_size=batch_size, row_groups=[group]):
+        for group, group_rows in enumerate(groups):
+            rewritten = []
+            for batch in source.iter_batches(batch_size=batch_size, row_groups=[group], use_threads=False):
                 positions = _positions(index, batch.column(schema.get_field_index("id")).to_numpy(zero_copy_only=False))
                 columns = list(batch.columns)
                 for name in ("outlet_lon", "outlet_lat"):
                     columns[schema.get_field_index(name)] = pa.array(index[name][positions], type=schema.field(name).type)
-                writer.write_batch(pa.RecordBatch.from_arrays(columns, schema=schema))
+                rewritten.append(pa.RecordBatch.from_arrays(columns, schema=schema))
+            writer.write_table(pa.Table.from_batches(rewritten, schema=schema), row_group_size=group_rows)
+            rewritten.clear()
+            del batch, columns, positions
 
 
 def _locations(reference: Path, evidence: Path, destination: Path | None) -> tuple[Path, Path, Path | None]:

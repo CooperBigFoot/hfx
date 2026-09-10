@@ -56,7 +56,7 @@ class OutletInvarianceTests(unittest.TestCase):
         table = pq.read_table(path)
         i = table.schema.get_field_index(column)
         table = table.set_column(i, table.schema.field(i), pa.array(values, type=table.column(i).type))
-        pq.write_table(table, path, row_group_size=3)
+        pq.write_table(table, path)
 
     def test_exhaustive_changes_and_digests(self):
         report = self.verify()
@@ -77,6 +77,94 @@ class OutletInvarianceTests(unittest.TestCase):
             expected.append(shift_m)
         self.assertAlmostEqual(report["max_shift_m"], max(expected))
         self.assertAlmostEqual(report["basins"][0]["max_shift_m"], max(expected))
+
+    def test_nested_float_nan_and_signed_zero_exactness(self):
+        variants = [
+            ("fixed_list", pa.list_(pa.float64(), 2), [[float("nan"), -0.]] * 5,
+             [[float("nan"), 0.]] * 5),
+            ("map", pa.map_(pa.string(), pa.float64()), [[("nan", float("nan")), ("zero", -0.)]] * 5,
+             [[("nan", float("nan")), ("zero", 0.)]] * 5),
+            ("dictionary", pa.dictionary(pa.int8(), pa.float64()),
+             [float("nan"), -0., 1., None, 2.], [float("nan"), 0., 1., None, 2.]),
+        ]
+        reference_path = self.fixture.reference / "catchments.parquet"
+        candidate_path = self.fixture.candidate / "catchments.parquet"
+        original_reference = pq.read_table(reference_path)
+        original_candidate = pq.read_table(candidate_path)
+        for name, dtype, unchanged, changed in variants:
+            shutil.rmtree(self.root / "evidence", ignore_errors=True)
+            with self.subTest(type=name):
+                values = pa.array(unchanged, type=dtype)
+                pq.write_table(original_reference.append_column("future_nested", values), reference_path)
+                pq.write_table(original_candidate.append_column("future_nested", values), candidate_path)
+                self.verify()
+                shutil.rmtree(self.root / "evidence")
+                pq.write_table(original_candidate.append_column("future_nested", pa.array(changed, type=dtype)), candidate_path)
+                with self.assertRaisesRegex(invariance.InvarianceRefusal, "future_nested"):
+                    self.verify()
+                shutil.rmtree(self.root / "evidence", ignore_errors=True)
+
+    def test_signed_zero_fixed_list_mutation_refuses(self):
+        dtype = pa.list_(pa.float64(), 2)
+        for root, zero in ((self.fixture.reference, -0.), (self.fixture.candidate, 0.)):
+            path = root / "catchments.parquet"
+            values = pa.array([[1., zero]] * 5, type=dtype)
+            pq.write_table(pq.read_table(path).append_column("future_fixed_zero", values), path)
+        with self.assertRaisesRegex(invariance.InvarianceRefusal, "future_fixed_zero"):
+            self.verify()
+
+    def test_extension_float_storage_nan_and_signed_zero_exactness(self):
+        dtype = pa.fixed_shape_tensor(pa.float64(), [2])
+        unchanged = pa.ExtensionArray.from_storage(dtype, pa.array([[float("nan"), -0.]] * 5, type=dtype.storage_type))
+        changed = pa.ExtensionArray.from_storage(dtype, pa.array([[float("nan"), 0.]] * 5, type=dtype.storage_type))
+        for root in (self.fixture.reference, self.fixture.candidate):
+            path = root / "catchments.parquet"
+            pq.write_table(pq.read_table(path).append_column("future_tensor", unchanged), path)
+        self.verify()
+        shutil.rmtree(self.root / "evidence")
+        path = self.fixture.candidate / "catchments.parquet"
+        table = pq.read_table(path)
+        i = table.schema.get_field_index("future_tensor")
+        pq.write_table(table.set_column(i, table.schema.field(i), changed), path)
+        with self.assertRaisesRegex(invariance.InvarianceRefusal, "future_tensor"):
+            self.verify()
+
+    def test_actual_reader_releases_previous_geometry_batches(self):
+        import gc
+        import weakref
+        from unittest.mock import patch
+        from shapely.geometry import Polygon
+        angles = np.linspace(0, 2 * np.pi, 32768)
+        blob = Polygon(np.column_stack((np.cos(angles), np.sin(angles)))).wkb
+        for root in (self.fixture.reference, self.fixture.candidate):
+            path = root / "catchments.parquet"
+            table = pq.read_table(path)
+            i = table.schema.get_field_index("geometry")
+            pq.write_table(table.set_column(i, table.schema.field(i), pa.array([blob] * 5)), path)
+        original = pq.ParquetFile.iter_batches
+        refs = []
+        observations = []
+        def observe(reader, *args, **kwargs):
+            iterator = original(reader, *args, **kwargs)
+            while True:
+                gc.collect()
+                live = sum(ref() is not None for ref in refs)
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    return
+                if "geometry" in batch.schema.names:
+                    observations.append(live)
+                    refs.append(weakref.ref(batch))
+                yield batch
+                del batch
+        with patch.object(pq.ParquetFile, "iter_batches", observe):
+            self.verify()
+        self.assertEqual(len(observations), 6)
+        # One opposite-side iterator may retain its last yield. No read may
+        # start with two previous batches alive, which would create a third.
+        self.assertEqual(observations[:2], [0, 1])
+        self.assertLessEqual(max(observations), 1)
 
     def test_unknown_existing_column_is_compared_and_float_bits_preserved(self):
         for root in (self.fixture.reference, self.fixture.candidate):
@@ -155,6 +243,67 @@ class OutletInvarianceTests(unittest.TestCase):
         np.save(path, rows)
         record["unit_resolution_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         self.assertEqual(self.verify()["unit_count"], 5)
+
+    def _resize_dataset(self, count, row_group_size):
+        ids = np.arange(OFFSET + 1, OFFSET + count + 1, dtype="int64")
+        units = pq.read_table(self.fixture.candidate / "catchments.parquet").take(pa.array(np.zeros(count, dtype="int64")))
+        i = units.schema.get_field_index("id")
+        units = units.set_column(i, units.schema.field(i), pa.array(ids))
+        graph = pq.read_table(self.fixture.candidate / "graph.parquet").take(pa.array(np.zeros(count, dtype="int64")))
+        for name, values in (("id", pa.array(ids)), ("upstream_ids", pa.array([[]] * count, type=pa.list_(pa.int64())))):
+            i = graph.schema.get_field_index(name)
+            graph = graph.set_column(i, graph.schema.field(i), values)
+        for root in (self.fixture.reference, self.fixture.candidate):
+            pq.write_table(units, root / "catchments.parquet", row_group_size=row_group_size)
+            pq.write_table(graph, root / "graph.parquet")
+            manifest = json.loads((root / "manifest.json").read_text())
+            manifest["unit_count"] = count
+            (root / "manifest.json").write_text(json.dumps(manifest))
+        self.index = np.zeros(count, dtype=invariance.OUTLET_DTYPE)
+        self.index["id"] = ids
+        self.index["downstream_id"] = -1
+        for name in ("outlet_lon", "outlet_lat"):
+            self.index[name] = units[name].to_numpy()
+        np.save(self.path, self.index)
+        digest = hashlib.sha256()
+        for name in self.index.dtype.names:
+            values = self.index[name].copy()
+            if name in ("id", "downstream_id"):
+                values[values != -1] -= OFFSET
+            digest.update(values.tobytes())
+        record = self.provenance["basins"][0]
+        record["orientation_digest"] = digest.hexdigest()
+        path = Path(record["unit_resolution_path"])
+        rows = np.zeros(count, dtype=[("native_id", "<i8"), ("resolution", "i1")])
+        rows["native_id"] = ids - OFFSET
+        np.save(path, rows)
+        record["unit_resolution_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_illegal_reference_row_groups_refuse(self):
+        for count, size in ((5, 3), (8193, 8193), (8193, 4096)):
+            with self.subTest(count=count, group_size=size):
+                shutil.rmtree(self.root / "evidence", ignore_errors=True)
+                self._resize_dataset(count, size)
+                with self.assertRaisesRegex(invariance.InvarianceRefusal, "row.group"):
+                    self.verify()
+
+    def test_valid_large_row_groups_and_exact_boundary_mismatch(self):
+        self._resize_dataset(8192, 4096)
+        report = invariance.verify_outlet_invariance(self.fixture.reference, self.fixture.candidate,
+            self.path, self.provenance, self.root / "evidence", batch_size=1024)
+        self.assertEqual(report["unit_count"], 8192)
+        shutil.rmtree(self.root / "evidence")
+        path = self.fixture.candidate / "catchments.parquet"
+        pq.write_table(pq.read_table(path), path, row_group_size=8192)
+        with self.assertRaisesRegex(invariance.InvarianceRefusal, "row.group"):
+            self.verify()
+
+    def test_changed_row_group_boundaries_refuse(self):
+        path = self.fixture.candidate / "catchments.parquet"
+        table = pq.read_table(path)
+        pq.write_table(table, path, row_group_size=3)
+        with self.assertRaisesRegex(invariance.InvarianceRefusal, "row.group"):
+            self.verify()
 
     def test_noop(self):
         shutil.copyfile(self.fixture.candidate / "catchments.parquet", self.fixture.reference / "catchments.parquet")
@@ -349,7 +498,7 @@ class OutletInvarianceTests(unittest.TestCase):
             table = pq.read_table(path)
             i = table.schema.get_field_index("geometry")
             table = table.set_column(i, table.schema.field(i), pa.array([blob] * 5))
-            pq.write_table(table, path, row_group_size=3)
+            pq.write_table(table, path)
         from unittest.mock import patch
         original = invariance._compare_batch
         observed = []

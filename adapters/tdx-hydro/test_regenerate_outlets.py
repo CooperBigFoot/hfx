@@ -3,6 +3,10 @@
 import hashlib
 import importlib
 import json
+import multiprocessing
+import sqlite3
+import os
+import subprocess
 import shutil
 import tempfile
 import unittest
@@ -29,6 +33,35 @@ def write_streamnet(path, rows):
     gpd.GeoDataFrame(rows, crs="EPSG:4326").to_file(
         path, layer="streamnet", driver="GPKG", engine="pyogrio"
     )
+
+
+def write_native_area_transaction(path, connection):
+    """Keep a real polygon-less area mutation committed only to SQLite WAL."""
+    from shapely import from_wkb
+
+    connection.recv()
+    writer = sqlite3.connect(path)
+
+    def shape(blob):
+        offset = 8 + {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}[(blob[3] >> 1) & 7]
+        return from_wkb(blob[offset:])
+
+    writer.create_function("ST_IsEmpty", 1, lambda blob: int(shape(blob).is_empty))
+    for position, axis in enumerate(("MinX", "MinY", "MaxX", "MaxY")):
+        writer.create_function("ST_" + axis, 1,
+                               lambda blob, position=position: shape(blob).bounds[position])
+    guard = sqlite3.connect(path)
+    try:
+        guard.execute("BEGIN")
+        guard.execute("SELECT * FROM streamnet").fetchall()
+        writer.execute("UPDATE streamnet SET DSContArea=DSContArea+0.001 WHERE LINKNO=2")
+        writer.commit()
+        connection.send("committed")
+        connection.recv()
+    finally:
+        guard.close()
+        writer.close()
+        connection.close()
 
 
 def native_rows(reverse=False):
@@ -82,7 +115,7 @@ def compile_reference(root, reverse=False, *, source_rows=None, polygon_ids=(1, 
                     row["upstream_ids"] = [value + delta for value in row["upstream_ids"]]
                 authored.append(row)
         pq.write_table(pa.Table.from_pylist(authored, schema=table.schema),
-                       reference / relative, row_group_size=7)
+                       reference / relative, row_group_size=len(authored))
     manifest = json.loads((reference / "manifest.json").read_text())
     manifest.pop("region", None)
     manifest["bbox"] = [-180., -90., 180., 90.]
@@ -114,7 +147,9 @@ def inventory(reference, source):
 class NativeOutletRegenerationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="native-regeneration-")
+        scratch = Path(__file__).resolve().parents[2] / ".test-tmp"
+        scratch.mkdir(exist_ok=True)
+        cls.temporary = tempfile.TemporaryDirectory(prefix="native-regeneration-", dir=scratch)
         cls.root = Path(cls.temporary.name)
         cls.reference, cls.source = compile_reference(cls.root)
 
@@ -157,7 +192,7 @@ class NativeOutletRegenerationTests(unittest.TestCase):
         for row in rows:
             row["outlet_lon"] += .0001
         pq.write_table(pa.Table.from_pylist(rows, schema=expected.schema),
-                       self.reference / "catchments.parquet", row_group_size=7)
+                       self.reference / "catchments.parquet", row_group_size=len(rows))
         self.authenticate()
         before = {str(p.relative_to(self.reference)): digest(p)
                   for p in self.reference.rglob("*") if p.is_file()}
@@ -203,6 +238,82 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                 self.assertEqual(native["polygon_native_ids"].tolist(), [1, 3, 4, 5])
                 self.assertEqual(len(native["resolution"]), 5)
                 self.assertEqual(len(native["downstream_endpoint_index"]), 5)
+
+    def test_rewrite_retains_validator_valid_physical_row_groups(self):
+        module = importlib.import_module("regenerate_outlets")
+        reference = self.case / "rowgroup-reference"
+        shutil.copytree(self.root / "compiled", reference)
+        count = 4160
+        native_unit = next(row for row in pq.read_table(reference / "catchments.parquet").to_pylist()
+                           if row["id"] % 10_000_000 == 4)
+        ids = np.arange(native_unit["id"] + 10_000, native_unit["id"] + 10_000 + count,
+                        dtype="int64")
+        for relative in ("catchments.parquet", "graph.parquet", "aux/snap_stems.parquet"):
+            table = pq.read_table(reference / relative)
+            key = "unit_id" if "unit_id" in table.column_names else "id"
+            row = next(row for row in table.to_pylist() if row[key] == native_unit["id"])
+            authored = []
+            for identity in ids:
+                copy = dict(row, id=int(identity))
+                if key == "unit_id":
+                    copy["unit_id"] = int(identity)
+                if relative == "catchments.parquet":
+                    copy["outlet_lon"] = .1025
+                    copy["outlet_lat"] = .0025
+                authored.append(copy)
+            pq.write_table(pa.Table.from_pylist(authored, schema=table.schema),
+                           reference / relative, row_group_size=count)
+        manifest_path = reference / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["unit_count"] = count
+        manifest["bbox"] = [native_unit["bbox"][name] for name in
+                            ("xmin", "ymin", "xmax", "ymax")]
+        manifest_path.write_text(json.dumps(manifest))
+        validator = Path(os.environ["HFX_BINARY"]).resolve(strict=True)
+
+        def validate(dataset):
+            result = subprocess.run([str(validator), str(dataset), "--strict",
+                                     "--sample-pct", "100"], capture_output=True,
+                                    text=True, check=False, cwd=self.case)
+            print(f"Strict validator dataset={dataset.name} exit={result.returncode}")
+            print(result.stdout, end="")
+            print(result.stderr, end="")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Result: VALID", result.stdout)
+            return result
+
+        validate(reference)
+        candidate = self.case / "rowgroup-candidate"
+        shutil.copytree(reference, candidate)
+        index = np.empty(count, dtype=[("id", "<i8"), ("outlet_lon", "<f8"),
+                                      ("outlet_lat", "<f8")])
+        index["id"] = ids
+        index["outlet_lon"] = .1025
+        index["outlet_lat"] = .0025
+        index_path = self.case / "rowgroup-outlets.npy"
+        np.save(index_path, index, allow_pickle=False)
+        module.rewrite_catchments(reference / "catchments.parquet",
+                                  candidate / "catchments.parquet", index_path,
+                                  batch_size=1024)
+        validate(candidate)
+        before = pq.ParquetFile(reference / "catchments.parquet").metadata
+        after = pq.ParquetFile(candidate / "catchments.parquet").metadata
+        self.assertEqual([after.row_group(i).num_rows for i in range(after.num_row_groups)],
+                         [before.row_group(i).num_rows for i in range(before.num_row_groups)])
+
+    def test_regeneration_preserves_reference_row_group_sizes(self):
+        self.regenerate()
+        before = pq.ParquetFile(self.reference / "catchments.parquet").metadata
+        after = pq.ParquetFile(self.destination / "catchments.parquet").metadata
+        expected = [before.row_group(i).num_rows for i in range(before.num_row_groups)]
+        actual = [after.row_group(i).num_rows for i in range(after.num_row_groups)]
+        self.assertEqual(actual, expected)
+        validator = Path(os.environ["HFX_BINARY"]).resolve(strict=True)
+        result = subprocess.run([str(validator), str(self.destination), "--strict",
+                                 "--sample-pct", "100"], capture_output=True, text=True,
+                                check=False, cwd=self.case)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Result: VALID", result.stdout)
 
     def test_noop_still_derives_all_processing_basins(self):
         with patch.object(build_adapter, "_read_streamnet_topology_columns",
@@ -273,6 +384,98 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                     record["sources"][-1] = record["sources"][0]
                 self.inventory_path.write_text(json.dumps(record))
                 self.refuse()
+
+    def test_real_sqlite_wal_mutation_cannot_bypass_native_identity(self):
+        self.assert_real_sqlite_wal_refusal(full_regeneration=False)
+
+    def test_final_native_read_sqlite_wal_cannot_publish_regeneration(self):
+        self.assert_real_sqlite_wal_refusal(full_regeneration=True)
+
+    def assert_real_sqlite_wal_refusal(self, *, full_regeneration):
+        module = importlib.import_module("regenerate_outlets")
+        with sqlite3.connect(self.source) as database:
+            database.execute("PRAGMA journal_mode=WAL")
+        database.close()
+        self.authenticate()
+        before = digest(self.source)
+        before_stamp = module._stamp(self.source)
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        process = context.Process(target=write_native_area_transaction,
+                                  args=(str(self.source), child))
+        process.start()
+        child.close()
+        real_reader = build_adapter._read_streamnet_topology_columns
+        observed = []
+        calls = 0
+        trigger = 62 if full_regeneration else 1
+
+        def read(path):
+            nonlocal calls
+            calls += 1
+            if calls < trigger:
+                return real_reader(path)
+            parent.send("write")
+            self.assertTrue(parent.poll(10), "SQLite writer failed to report commit")
+            self.assertEqual(parent.recv(), "committed")
+            self.assertTrue(Path(str(path) + "-wal").exists())
+            self.assertEqual(digest(path), before)
+            self.assertEqual(module._stamp(path), before_stamp)
+            columns = real_reader(path)
+            position = np.flatnonzero(columns.native_ids == 2)[0]
+            observed.append(columns.dscontarea_raw[position])
+            self.assertAlmostEqual(observed[0], .461)
+            self.assertEqual(digest(path), before)
+            self.assertEqual(module._stamp(path), before_stamp)
+            return columns
+
+        try:
+            with patch.object(build_adapter, "_read_streamnet_topology_columns", side_effect=read):
+                with self.assertRaisesRegex(ValueError, "sidecar"):
+                    if full_regeneration:
+                        self.regenerate()
+                    else:
+                        module.derive_native_outlets(
+                            np.array([1, 3, 4, 5], dtype="int64"), self.source,
+                            next(iter(build_adapter.load_header_crosswalk().values())),
+                            reference_up_area_km2=np.array([.3077, .6154, .3077, .3077],
+                                                          dtype="float32"))
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(calls, trigger)
+            if full_regeneration:
+                self.assertFalse((self.destination / "manifest.json").exists())
+                self.assertEqual(json.loads((self.evidence / "status.json").read_text())["status"],
+                                 "refused")
+        finally:
+            if process.is_alive():
+                parent.send("close")
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join(10)
+            parent.close()
+            self.assertEqual(process.exitcode, 0)
+
+    def test_native_sidecar_created_during_real_read_refuses(self):
+        real_reader = build_adapter._read_streamnet_topology_columns
+        reads = []
+
+        def add_sidecar(path):
+            columns = real_reader(path)
+            reads.append(path)
+            Path(str(path) + "-wal").write_bytes(b"concurrent transaction marker")
+            return columns
+
+        module = importlib.import_module("regenerate_outlets")
+        header = next(iter(build_adapter.load_header_crosswalk().values()))
+        with patch.object(build_adapter, "_read_streamnet_topology_columns", side_effect=add_sidecar):
+            with self.assertRaisesRegex(ValueError, "sidecar"):
+                module.derive_native_outlets(np.array([1, 3, 4, 5], dtype="int64"),
+                                             self.source, header,
+                                             reference_up_area_km2=np.array(
+                                                 [.3077, .6154, .3077, .3077], dtype="float32"))
+        self.assertEqual(len(reads), 1)
+        self.assertFalse((self.destination / "manifest.json").exists())
 
     def test_source_mutation_during_real_reader_refuses(self):
         real_reader = build_adapter._read_streamnet_topology_columns
@@ -395,6 +598,54 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                 self.authenticate()
                 self.refuse()
 
+    def test_m2_and_km2_native_areas_match_corrected_full_build(self):
+        for unit, factor in (("m2", 1_000_000), ("km2", 1)):
+            with self.subTest(source_unit=unit):
+                scenario = self.case / unit
+                scenario.mkdir()
+                rows = native_rows()
+                for row in rows:
+                    row["DSContArea"] *= factor
+                self.reference, self.source = compile_reference(scenario, source_rows=rows)
+                self.destination = scenario / "candidate"
+                self.evidence = scenario / "evidence"
+                self.authenticate()
+                self.regenerate()
+                self.assertTrue(pq.read_table(self.destination / "catchments.parquet").equals(
+                    pq.read_table(self.reference / "catchments.parquet"), check_metadata=True))
+
+    def test_reference_upstream_area_cannot_select_inconsistent_native_scale(self):
+        path = self.reference / "catchments.parquet"
+        table = pq.read_table(path)
+        rows = table.to_pylist()
+        rows[0]["up_area_km2"] = np.nextafter(np.float32(rows[0]["up_area_km2"]), np.float32(np.inf))
+        pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
+        self.authenticate()
+        with self.assertRaisesRegex(ValueError, "DSContArea|normalization|up_area"):
+            self.regenerate()
+        self.assertFalse((self.destination / "manifest.json").exists())
+
+    def test_native_area_normalization_preserves_full_build_tie_refusal(self):
+        module = importlib.import_module("regenerate_outlets")
+        area = 260_000.0
+        adjacent = np.nextafter(area, np.inf)
+        self.assertNotEqual(area, adjacent)
+        self.assertEqual(area / 1_000_000, adjacent / 1_000_000)
+        rows = [dict(LINKNO=i, DSLINKNO=d, DSContArea=a,
+                     geometry=LineString(coords)) for i, d, a, coords in (
+            (1, 2, area, [(.0015, 0), (.0018, 0)]),
+            (2, 3, adjacent, [(.01, 0), (.0015, 0)]),
+            (3, -1, 900_000., [(.02, 0), (.01, 0)]))]
+        scenario = self.case / "area-normalization"
+        scenario.mkdir()
+        with self.assertRaisesRegex(ValueError, "tied"):
+            compile_reference(scenario, source_rows=rows, polygon_ids=(1,))
+        header = next(iter(build_adapter.load_header_crosswalk().values()))
+        with self.assertRaisesRegex(ValueError, "tied"):
+            module.derive_native_outlets(np.array([1], dtype="int64"),
+                                         scenario / "streamnet.gpkg", header,
+                                         reference_up_area_km2=np.array([area / 1_000_000], dtype="float32"))
+
     def test_native_ambiguity_and_area_guards_refuse_real_sources(self):
         module = importlib.import_module("regenerate_outlets")
         header = next(iter(build_adapter.load_header_crosswalk().values()))
@@ -421,7 +672,8 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                 write_streamnet(self.source, rows)
                 with self.assertRaisesRegex(ValueError, pattern):
                     module.derive_native_outlets(np.array([1], dtype="int64"),
-                                                 self.source, header)
+                                                 self.source, header,
+                                                 reference_up_area_km2=np.array([rows[0]["DSContArea"]], dtype="float32"))
 
     def test_polygonless_evidence_cannot_be_replaced_with_delivered_links(self):
         # Removing native reach 2 and contracting 1 -> 3 reproduces delivered
@@ -453,7 +705,7 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                                       row["outlet_lat"])
         index_path = self.case / "large-wkb-outlets.npy"
         np.save(index_path, outlet_index, allow_pickle=False)
-        real_write = pq.ParquetWriter.write_batch
+        real_write = pq.ParquetWriter.write_table
         real_batches = pq.ParquetFile.iter_batches
         reads, writes = [], []
 
@@ -462,16 +714,20 @@ class NativeOutletRegenerationTests(unittest.TestCase):
                 reads.append((batch.num_rows, batch.nbytes))
                 yield batch
 
-        def write_batch(writer, batch, *args, **kwargs):
-            writes.append((batch.num_rows, batch.nbytes))
-            return real_write(writer, batch, *args, **kwargs)
+        def write_table(writer, table, *args, **kwargs):
+            writes.append((table.num_rows, table.nbytes))
+            return real_write(writer, table, *args, **kwargs)
 
         with patch.object(pq.ParquetFile, "iter_batches", iter_batches), \
-             patch.object(pq.ParquetWriter, "write_batch", write_batch):
+             patch.object(pq.ParquetWriter, "write_table", write_table):
             module.rewrite_catchments(source, destination, index_path, batch_size=2)
         self.assertEqual([rows for rows, _ in reads], [2, 2, 1])
-        self.assertEqual([rows for rows, _ in writes], [2, 2, 1])
-        self.assertLess(max(size for _, size in reads + writes), 1_400_000)
+        self.assertEqual([rows for rows, _ in writes], [5])
+        self.assertLess(max(size for _, size in reads), 1_400_000)
+        self.assertLess(max(size for _, size in writes), 3_300_000)
+        metadata = pq.ParquetFile(destination).metadata
+        self.assertEqual(metadata.num_row_groups, 1)
+        self.assertEqual(metadata.row_group(0).num_rows, 5)
         actual = pq.read_table(destination)
         for name in original.column_names:
             if name != "outlet_lon":
