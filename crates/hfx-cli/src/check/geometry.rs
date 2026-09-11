@@ -7,14 +7,17 @@ use tracing::debug;
 use geozero::GeomProcessor;
 use geozero::wkb::process_wkb_geom;
 
-use crate::dataset::{CatchmentsData, SnapData};
+use crate::dataset::{CatchmentsData, GeometryRetention, SnapData};
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate a random sample of catchment geometries as WKB Polygon/MultiPolygon.
+/// Validate catchment geometries as WKB Polygon/MultiPolygon.
+///
+/// Exactly 100% coverage visits rows sequentially, or returns checks completed
+/// during reading. Partial coverage retains the existing random sample.
 ///
 /// Samples `sample_pct`% of rows (minimum 1 row if any rows exist). For each
 /// sampled row, the geometry bytes are checked in three layers:
@@ -24,14 +27,18 @@ use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 ///
 /// An empty geometry list produces no diagnostics.
 pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec<Diagnostic> {
-    let n = data.geometry_wkb.len();
+    let payloads = match &data.geometry {
+        GeometryRetention::Checked(diags) => return diags.clone(),
+        GeometryRetention::Buffered(payloads) => payloads,
+    };
+    let n = payloads.len();
     if n == 0 {
         return Vec::new();
     }
 
     if sample_pct == 100.0 {
         let mut diags = Vec::new();
-        for (idx, wkb) in data.geometry_wkb.iter().enumerate() {
+        for (idx, wkb) in payloads.iter().enumerate() {
             check_single_catchment_geometry(wkb, idx, &mut diags);
         }
         debug!(
@@ -51,7 +58,7 @@ pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec
 
     let mut diags = Vec::new();
     for idx in indices {
-        check_single_catchment_geometry(&data.geometry_wkb[idx], idx, &mut diags);
+        check_single_catchment_geometry(&payloads[idx], idx, &mut diags);
     }
 
     debug!(
@@ -72,14 +79,18 @@ pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec
 ///
 /// An empty geometry list produces no diagnostics.
 pub fn check_snap_geometries(data: &SnapData) -> Vec<Diagnostic> {
+    let payloads = match &data.geometry {
+        GeometryRetention::Checked(diags) => return diags.clone(),
+        GeometryRetention::Buffered(payloads) => payloads,
+    };
     let mut diags = Vec::new();
 
-    for (idx, wkb) in data.geometry_wkb.iter().enumerate() {
+    for (idx, wkb) in payloads.iter().enumerate() {
         check_single_snap_geometry(wkb, idx, &mut diags);
     }
 
     debug!(
-        total = data.geometry_wkb.len(),
+        total = payloads.len(),
         errors = diags.len(),
         "snap geometry checks complete"
     );
@@ -90,7 +101,7 @@ pub fn check_snap_geometries(data: &SnapData) -> Vec<Diagnostic> {
 // Per-row helpers
 // ---------------------------------------------------------------------------
 
-fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
+pub(crate) fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
     let location = Location::Row { index: row };
 
     if wkb.len() < 5 {
@@ -143,7 +154,7 @@ fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagn
     }
 }
 
-fn check_single_snap_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
+pub(crate) fn check_single_snap_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
     let location = Location::Row { index: row };
 
     if wkb.len() < 5 {

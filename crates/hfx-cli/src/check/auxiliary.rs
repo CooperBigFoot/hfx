@@ -159,7 +159,11 @@ fn check_snap_v2(
     }
 
     let path = dataset_root.join(rel_path);
-    let (snap, read_diags) = reader::snap::read_snap(&path, &label);
+    let (snap, read_diags) = reader::snap::read_snap_with_geometry(
+        &path,
+        &label,
+        crate::dataset::GeometrySelection::ValidateAll,
+    );
     diags.extend(read_diags);
 
     let Some(snap) = snap else {
@@ -307,7 +311,7 @@ mod tests {
                 .map(|role| role.map(str::to_owned))
                 .collect(),
             bboxes: vec![None; row_count],
-            geometry_wkb: vec![Vec::new(); row_count],
+            geometry: crate::dataset::GeometryRetention::Buffered(vec![Vec::new(); row_count]),
             row_group_sizes: vec![row_count],
             row_group_has_bbox_stats: vec![true],
         }
@@ -327,7 +331,7 @@ mod tests {
             up_area_null_count: row_count,
             first_up_area_non_null_row: None,
             up_area_total: row_count,
-            geometry_wkb: vec![Vec::new(); row_count],
+            geometry: crate::dataset::GeometryRetention::Buffered(vec![Vec::new(); row_count]),
             row_group_sizes: vec![row_count],
             row_group_has_bbox_stats: vec![true],
         }

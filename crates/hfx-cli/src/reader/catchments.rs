@@ -13,7 +13,8 @@ use tracing::{debug, warn};
 use super::{
     MAX_CONSECUTIVE_BATCH_FAILURES, MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_TOTAL_BATCH_FAILURES,
 };
-use crate::dataset::CatchmentsData;
+use crate::check::geometry::check_single_catchment_geometry;
+use crate::dataset::{CatchmentsData, GeometryRetention, GeometrySelection};
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{
     ExpectedColumn, bbox_struct_type, check_bbox_covering, row_group_has_struct_bbox_stats,
@@ -39,6 +40,14 @@ fn expected_columns() -> Vec<ExpectedColumn> {
 ///
 /// Returns `(None, diagnostics)` on I/O or schema errors that prevent reading.
 pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>) {
+    read_catchments_with_geometry(path, GeometrySelection::Buffered)
+}
+
+/// Read scalar columns and retain geometry according to the selected policy.
+pub fn read_catchments_with_geometry(
+    path: &Path,
+    selection: GeometrySelection,
+) -> (Option<CatchmentsData>, Vec<Diagnostic>) {
     debug!(path = %path.display(), "reading catchments.parquet");
 
     let file = match std::fs::File::open(path) {
@@ -126,11 +135,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
     let mut outlet_lons: Vec<f64> = Vec::new();
     let mut outlet_lats: Vec<f64> = Vec::new();
     let mut bboxes: Vec<[f32; 4]> = Vec::new();
-    // TODO: For large datasets, geometry should be read lazily or sampled during reading.
-    // Currently all WKB bytes are loaded into memory even though the geometry checker only
-    // samples ~1% of rows.  A future improvement would be to accept row indices from the
-    // checker and re-read the parquet file for just those rows, avoiding the full load.
-    let mut geometry_wkb: Vec<Vec<u8>> = Vec::new();
+    let mut geometry = GeometryRetention::new(selection);
     let mut up_area_null_count: usize = 0;
     let mut first_up_area_non_null_row: Option<usize> = None;
     let mut up_area_total: usize = 0;
@@ -399,9 +404,13 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
                                 }),
                             );
                         }
-                        geometry_wkb.push(Vec::new()); // sentinel
+                        geometry.accept(&[], total_rows + i, check_single_catchment_geometry);
                     } else {
-                        geometry_wkb.push(arr.value(i).to_vec());
+                        geometry.accept(
+                            arr.value(i),
+                            total_rows + i,
+                            check_single_catchment_geometry,
+                        );
                     }
                 }
             } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
@@ -424,9 +433,13 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
                                 }),
                             );
                         }
-                        geometry_wkb.push(Vec::new()); // sentinel
+                        geometry.accept(&[], total_rows + i, check_single_catchment_geometry);
                     } else {
-                        geometry_wkb.push(arr.value(i).to_vec());
+                        geometry.accept(
+                            arr.value(i),
+                            total_rows + i,
+                            check_single_catchment_geometry,
+                        );
                     }
                 }
             }
@@ -542,7 +555,7 @@ pub fn read_catchments(path: &Path) -> (Option<CatchmentsData>, Vec<Diagnostic>)
             up_area_null_count,
             first_up_area_non_null_row,
             up_area_total,
-            geometry_wkb,
+            geometry,
             row_group_sizes,
             row_group_has_bbox_stats: row_group_has_bbox_stats_vec,
         }),
