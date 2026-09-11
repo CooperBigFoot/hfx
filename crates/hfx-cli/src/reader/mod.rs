@@ -39,6 +39,20 @@ pub fn read_dataset(dir: &Path) -> ParsedDataset {
 /// This function never panics. All I/O errors become diagnostics.
 #[tracing::instrument(skip_all, fields(dir = %dir.display(), skip_rasters))]
 pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDataset {
+    read_dataset_with_geometry(
+        dir,
+        skip_rasters,
+        crate::dataset::GeometrySelection::Buffered,
+    )
+}
+
+/// Read a dataset with an explicit geometry retention policy.
+#[tracing::instrument(skip_all, fields(dir = %dir.display(), skip_rasters, ?selection))]
+pub fn read_dataset_with_geometry(
+    dir: &Path,
+    skip_rasters: bool,
+    selection: crate::dataset::GeometrySelection,
+) -> ParsedDataset {
     let files = discover_files(dir);
     let mut read_diagnostics: Vec<crate::diagnostic::Diagnostic> = Vec::new();
 
@@ -53,7 +67,7 @@ pub fn read_dataset_with_options(dir: &Path, skip_rasters: bool) -> ParsedDatase
 
     // --- Catchments ---
     let catchments = if let Some(path) = &files.catchments_path {
-        let (data, diags) = catchments::read_catchments(path);
+        let (data, diags) = catchments::read_catchments_with_geometry(path, selection);
         read_diagnostics.extend(diags);
         data
     } else {

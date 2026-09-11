@@ -12,7 +12,8 @@ use tracing::{debug, warn};
 use super::{
     MAX_CONSECUTIVE_BATCH_FAILURES, MAX_NULL_DIAGNOSTICS_PER_COLUMN, MAX_TOTAL_BATCH_FAILURES,
 };
-use crate::dataset::SnapData;
+use crate::check::geometry::check_single_snap_geometry;
+use crate::dataset::{GeometryRetention, GeometrySelection, SnapData};
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 use crate::reader::schema::{
     ExpectedColumn, bbox_struct_type, check_bbox_covering, row_group_has_struct_bbox_stats,
@@ -35,6 +36,15 @@ fn expected_columns() -> Vec<ExpectedColumn> {
 ///
 /// Returns `(None, diagnostics)` on I/O or schema errors that prevent reading.
 pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>) {
+    read_snap_with_geometry(path, label, GeometrySelection::Buffered)
+}
+
+/// Read scalar columns and retain geometry according to the selected policy.
+pub fn read_snap_with_geometry(
+    path: &Path,
+    label: &str,
+    selection: GeometrySelection,
+) -> (Option<SnapData>, Vec<Diagnostic>) {
     debug!(path = %path.display(), label, "reading snap parquet");
 
     let file = match std::fs::File::open(path) {
@@ -124,7 +134,7 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
     let mut stem_roles: Vec<Option<String>> = Vec::new();
     let mut weights: Vec<f32> = Vec::new();
     let mut bboxes: Vec<Option<[f32; 4]>> = Vec::new();
-    let mut geometry_wkb: Vec<Vec<u8>> = Vec::new();
+    let mut geometry = GeometryRetention::new(selection);
     let mut total_rows: usize = 0;
 
     // Per-column null counters (used to cap per-row diagnostics).
@@ -330,9 +340,9 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
                                 }),
                             );
                         }
-                        geometry_wkb.push(Vec::new()); // sentinel
+                        geometry.accept(&[], total_rows + i, check_single_snap_geometry);
                     } else {
-                        geometry_wkb.push(arr.value(i).to_vec());
+                        geometry.accept(arr.value(i), total_rows + i, check_single_snap_geometry);
                     }
                 }
             } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
@@ -355,9 +365,9 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
                                 }),
                             );
                         }
-                        geometry_wkb.push(Vec::new()); // sentinel
+                        geometry.accept(&[], total_rows + i, check_single_snap_geometry);
                     } else {
-                        geometry_wkb.push(arr.value(i).to_vec());
+                        geometry.accept(arr.value(i), total_rows + i, check_single_snap_geometry);
                     }
                 }
             }
@@ -447,7 +457,7 @@ pub fn read_snap(path: &Path, label: &str) -> (Option<SnapData>, Vec<Diagnostic>
             weights,
             stem_roles,
             bboxes,
-            geometry_wkb,
+            geometry,
             row_group_sizes,
             row_group_has_bbox_stats: row_group_has_bbox_stats_vec,
         }),

@@ -18,6 +18,65 @@ pub struct FilePresenceMap {
     pub d8_rasters: Vec<D8RasterEntry>,
 }
 
+/// Geometry payload policy at the Arrow batch boundary.
+#[derive(Debug, Clone, Copy)]
+pub enum GeometrySelection {
+    Buffered,
+    ValidateAll,
+}
+
+impl GeometrySelection {
+    pub fn from_sample_pct(sample_pct: f64) -> Self {
+        if sample_pct == 100.0 {
+            Self::ValidateAll
+        } else {
+            Self::Buffered
+        }
+    }
+}
+
+/// Retained WKB for sampling, or completed per-row checks without payloads.
+#[derive(Debug)]
+pub enum GeometryRetention {
+    Buffered(Vec<Vec<u8>>),
+    Checked(Vec<Diagnostic>),
+}
+
+impl GeometryRetention {
+    pub fn new(selection: GeometrySelection) -> Self {
+        match selection {
+            GeometrySelection::Buffered => Self::Buffered(Vec::new()),
+            GeometrySelection::ValidateAll => Self::Checked(Vec::new()),
+        }
+    }
+
+    pub fn accept(
+        &mut self,
+        wkb: &[u8],
+        row: usize,
+        check: fn(&[u8], usize, &mut Vec<Diagnostic>),
+    ) {
+        match self {
+            Self::Buffered(payloads) => {
+                #[cfg(test)]
+                GEOMETRY_COPIED_BYTES.with(|bytes| bytes.set(bytes.get() + wkb.len()));
+                payloads.push(wkb.to_vec());
+            }
+            Self::Checked(diagnostics) => {
+                #[cfg(test)]
+                GEOMETRY_CHECKED_ROWS.with(|rows| rows.set(rows.get() + 1));
+                check(wkb, row, diagnostics);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GEOMETRY_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static GEOMETRY_CHECKED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Column-level data extracted from catchments.parquet.
 #[derive(Debug)]
 pub struct CatchmentsData {
@@ -32,7 +91,7 @@ pub struct CatchmentsData {
     pub up_area_null_count: usize,
     pub first_up_area_non_null_row: Option<usize>,
     pub up_area_total: usize,
-    pub geometry_wkb: Vec<Vec<u8>>,
+    pub geometry: GeometryRetention,
     pub row_group_sizes: Vec<usize>,
     pub row_group_has_bbox_stats: Vec<bool>,
 }
@@ -57,7 +116,7 @@ pub struct SnapData {
     pub weights: Vec<f32>,
     pub stem_roles: Vec<Option<String>>,
     pub bboxes: Vec<Option<[f32; 4]>>,
-    pub geometry_wkb: Vec<Vec<u8>>,
+    pub geometry: GeometryRetention,
     pub row_group_sizes: Vec<usize>,
     pub row_group_has_bbox_stats: Vec<bool>,
 }

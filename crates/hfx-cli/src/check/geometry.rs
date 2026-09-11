@@ -7,14 +7,17 @@ use tracing::debug;
 use geozero::GeomProcessor;
 use geozero::wkb::process_wkb_geom;
 
-use crate::dataset::{CatchmentsData, SnapData};
+use crate::dataset::{CatchmentsData, GeometryRetention, SnapData};
 use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate a random sample of catchment geometries as WKB Polygon/MultiPolygon.
+/// Validate catchment geometries as WKB Polygon/MultiPolygon.
+///
+/// Exactly 100% coverage visits rows sequentially, or returns checks completed
+/// during reading. Partial coverage retains the existing random sample.
 ///
 /// Samples `sample_pct`% of rows (minimum 1 row if any rows exist). For each
 /// sampled row, the geometry bytes are checked in three layers:
@@ -24,18 +27,38 @@ use crate::diagnostic::{Artifact, Category, Diagnostic, Location};
 ///
 /// An empty geometry list produces no diagnostics.
 pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec<Diagnostic> {
-    let n = data.geometry_wkb.len();
+    let payloads = match &data.geometry {
+        GeometryRetention::Checked(diags) => return diags.clone(),
+        GeometryRetention::Buffered(payloads) => payloads,
+    };
+    let n = payloads.len();
     if n == 0 {
         return Vec::new();
     }
 
+    if sample_pct == 100.0 {
+        let mut diags = Vec::new();
+        for (idx, wkb) in payloads.iter().enumerate() {
+            check_single_catchment_geometry(wkb, idx, &mut diags);
+        }
+        debug!(
+            sampled = n,
+            total = n,
+            errors = diags.len(),
+            "catchment geometry checks complete"
+        );
+        return diags;
+    }
+
     let sample_count = ((n as f64) * sample_pct / 100.0).ceil().max(1.0) as usize;
     let sample_count = sample_count.min(n);
+    #[cfg(test)]
+    RANDOM_SELECTIONS.with(|count| count.set(count.get() + 1));
     let indices = sample(&mut thread_rng(), n, sample_count);
 
     let mut diags = Vec::new();
     for idx in indices {
-        check_single_catchment_geometry(&data.geometry_wkb[idx], idx, &mut diags);
+        check_single_catchment_geometry(&payloads[idx], idx, &mut diags);
     }
 
     debug!(
@@ -56,14 +79,18 @@ pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec
 ///
 /// An empty geometry list produces no diagnostics.
 pub fn check_snap_geometries(data: &SnapData) -> Vec<Diagnostic> {
+    let payloads = match &data.geometry {
+        GeometryRetention::Checked(diags) => return diags.clone(),
+        GeometryRetention::Buffered(payloads) => payloads,
+    };
     let mut diags = Vec::new();
 
-    for (idx, wkb) in data.geometry_wkb.iter().enumerate() {
+    for (idx, wkb) in payloads.iter().enumerate() {
         check_single_snap_geometry(wkb, idx, &mut diags);
     }
 
     debug!(
-        total = data.geometry_wkb.len(),
+        total = payloads.len(),
         errors = diags.len(),
         "snap geometry checks complete"
     );
@@ -74,7 +101,7 @@ pub fn check_snap_geometries(data: &SnapData) -> Vec<Diagnostic> {
 // Per-row helpers
 // ---------------------------------------------------------------------------
 
-fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
+pub(crate) fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
     let location = Location::Row { index: row };
 
     if wkb.len() < 5 {
@@ -127,7 +154,7 @@ fn check_single_catchment_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagn
     }
 }
 
-fn check_single_snap_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
+pub(crate) fn check_single_snap_geometry(wkb: &[u8], row: usize, diags: &mut Vec<Diagnostic>) {
     let location = Location::Row { index: row };
 
     if wkb.len() < 5 {
@@ -230,3 +257,29 @@ fn is_valid_wkb(mut wkb: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static RANDOM_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RANDOM_SELECTIONS, check_catchment_geometries};
+
+    #[test]
+    fn full_parquet_geometry_check_avoids_random_selection() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/valid/tiny/catchments.parquet");
+        let (data, _) = crate::reader::catchments::read_catchments(&path);
+        let data = data.expect("real Parquet fixture must read");
+        assert!(data.row_count > 0);
+        RANDOM_SELECTIONS.with(|count| count.set(0));
+        check_catchment_geometries(&data, 100.0);
+        RANDOM_SELECTIONS
+            .with(|count| assert_eq!(count.get(), 0, "full coverage entered random sampling"));
+        check_catchment_geometries(&data, 1.0);
+        RANDOM_SELECTIONS
+            .with(|count| assert_eq!(count.get(), 1, "partial coverage must retain sampling"));
+    }
+}

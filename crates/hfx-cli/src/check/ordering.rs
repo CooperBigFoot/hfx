@@ -101,7 +101,7 @@ mod tests {
             up_area_null_count: row_count,
             first_up_area_non_null_row: None,
             up_area_total: row_count,
-            geometry_wkb: vec![Vec::new(); row_count],
+            geometry: crate::dataset::GeometryRetention::Buffered(vec![Vec::new(); row_count]),
             row_group_sizes: vec![row_count],
             row_group_has_bbox_stats: vec![true],
         }
