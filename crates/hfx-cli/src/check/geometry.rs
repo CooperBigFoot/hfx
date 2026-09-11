@@ -29,8 +29,24 @@ pub fn check_catchment_geometries(data: &CatchmentsData, sample_pct: f64) -> Vec
         return Vec::new();
     }
 
+    if sample_pct == 100.0 {
+        let mut diags = Vec::new();
+        for (idx, wkb) in data.geometry_wkb.iter().enumerate() {
+            check_single_catchment_geometry(wkb, idx, &mut diags);
+        }
+        debug!(
+            sampled = n,
+            total = n,
+            errors = diags.len(),
+            "catchment geometry checks complete"
+        );
+        return diags;
+    }
+
     let sample_count = ((n as f64) * sample_pct / 100.0).ceil().max(1.0) as usize;
     let sample_count = sample_count.min(n);
+    #[cfg(test)]
+    RANDOM_SELECTIONS.with(|count| count.set(count.get() + 1));
     let indices = sample(&mut thread_rng(), n, sample_count);
 
     let mut diags = Vec::new();
@@ -230,3 +246,29 @@ fn is_valid_wkb(mut wkb: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static RANDOM_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RANDOM_SELECTIONS, check_catchment_geometries};
+
+    #[test]
+    fn full_parquet_geometry_check_avoids_random_selection() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/valid/tiny/catchments.parquet");
+        let (data, _) = crate::reader::catchments::read_catchments(&path);
+        let data = data.expect("real Parquet fixture must read");
+        assert!(data.row_count > 0);
+        RANDOM_SELECTIONS.with(|count| count.set(0));
+        check_catchment_geometries(&data, 100.0);
+        RANDOM_SELECTIONS
+            .with(|count| assert_eq!(count.get(), 0, "full coverage entered random sampling"));
+        check_catchment_geometries(&data, 1.0);
+        RANDOM_SELECTIONS
+            .with(|count| assert_eq!(count.get(), 1, "partial coverage must retain sampling"));
+    }
+}
